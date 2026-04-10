@@ -13,18 +13,20 @@ The **Dromon** (from the Greek *dromōn*, "runner") was the primary warship of t
 ## Architecture
 
 ```
-                    demo-fhir-server
+                       test-server
                    (Integrant system)
-                    /             \
-            fhir-server      fhir-store-xtdb2
-         (routing, auth,       (XTDB v2 SQL
-          handlers, MW)         temporal DB)
-                \                /
-             fhir-store-protocol
-               (IFHIRStore)
+                    /       |        \
+            fhir-server    store    malli schemas
+         (routing, auth,  (xtdb2 /   (r4b, uscore8,
+          handlers, MW)    mock)      ...)
+                \           |          /
+                 fhir-store-protocol
+                    (IFHIRStore)
 ```
 
 The server is built around the `IFHIRStore` protocol, which defines FHIR operations (create, read, update, delete, search, history, vread, transact-bundle). Storage backends implement this protocol, making the server database-agnostic.
+
+`fhir-server` has no static dependency on any storage backend or Malli schema package. `test-server` selects both at startup -- the store via the `:store/*` aliases (or `TEST_SERVER_STORE`) and the schema package via the `:malli/*` aliases (or `TEST_SERVER_SCHEMAS`). Schemas are resolved from config by `server.core/resolve-schemas` using `requiring-resolve`.
 
 Routes are generated dynamically from Malli schemas. Each schema carries metadata describing its FHIR type, supported interactions, handler functions, and custom operations. Reitit builds the route tree at startup.
 
@@ -38,20 +40,21 @@ dromon/
   docker/                       Ory Kratos/Keto/Hydra configs
   fhir-store-protocol/          IFHIRStore protocol definition
   fhir-store-xtdb2/             XTDB v2 backend (SQL, temporal queries)
-  fhir-store-datomic/           Datomic backend
   fhir-store-mock/              In-memory backend for testing
   fhir-server/                  Core server (routing, handlers, auth, middleware)
+  fhir-terminology/             FHIR terminology service support
   fhir-primitives/              FHIR primitive types & lazy refs for Malli
   malli-decimal/                Arbitrary-precision decimal schema for Malli
   fhir-defintions-to-malli/     FHIR StructureDefinition -> Malli schema generator
-  demo-fhir-server/             Runnable server with XTDB v2
+  test-server/                  Runnable server, configurable store + schema package
 ```
 
 ### Dependency Graph
 
 ```
-demo-fhir-server --> fhir-server --> fhir-store-protocol
-                 \-> fhir-store-xtdb2 --/
+test-server --> fhir-server --> fhir-store-protocol
+            \-> fhir-store-xtdb2 (or fhir-store-mock) --/
+            \-> fhir/malli/uscore8 (or other malli pkgs, alias-controlled)
 
 fhir-defintions-to-malli --> fhir-primitives --> malli-decimal
 ```
@@ -66,11 +69,11 @@ fhir-defintions-to-malli --> fhir-primitives --> malli-decimal
 
 ## Quick Start
 
-Start the demo server with an in-memory XTDB v2 node:
+Start `test-server` with an in-memory XTDB v2 node and the US Core STU8 schema package:
 
 ```bash
-cd demo-fhir-server
-clj -X demo.core/-main
+cd test-server
+clj -A:store/xtdb2:malli/uscore8 -X test-server.core/-main
 ```
 
 The server starts on port `8080` (HTTP) and `8443` (HTTPS).
@@ -80,6 +83,8 @@ Test it:
 ```bash
 curl http://localhost:8080/default/fhir/metadata
 ```
+
+Switch backends or schema packages by changing the aliases (e.g. `-A:store/mock:malli/r4b`) or via env vars `TEST_SERVER_STORE` and `TEST_SERVER_SCHEMAS`.
 
 ## Babashka Tasks
 
@@ -130,13 +135,17 @@ The primary backend. Maps FHIR resources to dynamic SQL tables, stores original 
 
 Atom-backed in-memory store for testing. Tracks version history and supports all protocol operations. No external dependencies.
 
-### Datomic (`fhir-store-datomic`)
-
-Datomic-based backend (work in progress).
-
 ## FHIR Schema Generation
 
 The `fhir-defintions-to-malli` project downloads official FHIR StructureDefinitions and generates Malli schemas. The `fhir-primitives` and `malli-decimal` libraries provide the type foundations, including support for FHIR's recursive type references and arbitrary-precision decimals.
+
+The generator runs a 6-step pipeline that produces independent schema packages under `fhir/malli/`: `r4b`, `xver` (cross-version extensions), `fhir-extensions`, `sdc`, and `uscore8` (which also writes CapabilityStatement `:multi` schemas). Each package is consumable as its own deps.edn dependency.
+
+```bash
+cd fhir-defintions-to-malli
+mkdir -p target/staging/src
+clj -X com.breezeehr.main/generate-uscore!
+```
 
 ## License
 
