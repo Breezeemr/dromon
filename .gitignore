@@ -13,3 +13,8 @@ inferno-test-kit/
 fhir/malli/
 target
 server.log
+
+# Downloaded FHIR definition packages live here; keep the directory but
+# ignore everything inside it except the .keep marker.
+fhir-defintions-to-malli/scratch/*
+!fhir-defintions-to-malli/scratch/.keep

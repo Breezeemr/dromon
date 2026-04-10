@@ -220,6 +220,6 @@
 (comment
   ;; Generate US Core STU8 capability namespaces
   (generate-from-capability-statement!
-   (io/file "resources/us-core/STU8.0.1/package/CapabilityStatement-us-core-server.json")
+   (io/file "scratch/us-core/STU8.0.1/package/CapabilityStatement-us-core-server.json")
    "us-core" "8.0.1" "8.0.1" "4.3.0"
    ["target" "staging" "src"]))

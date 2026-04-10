@@ -48,15 +48,16 @@
       deref))
 
 (defn download [version & {:keys [force?] :or {force? false}}]
-  (let [base (Paths/get "resources" (make-array String 0))
-        marker (io/file "resources" "definitions.json" "profiles-types.json")]
+  (let [base (Paths/get "scratch" (make-array String 0))
+        marker (io/file "scratch" "definitions.json" "profiles-types.json")]
+    (Files/createDirectories base (make-array FileAttribute 0))
     (if (and (not force?) (.exists marker))
       (println "FHIR definitions for" version "already downloaded, skipping.")
       (let [req (hc/request {:method :get :url (fhir-downloads-url version) :as :stream
                              :async? true})]
         (do-download req base)))))
 
-(def target-dir "resources/us-core")
+(def target-dir "scratch/us-core")
 
 (defn download-and-extract-uscore!  [version & {:keys [force?] :or {force? false}}]
   (let [package-url (str "https://hl7.org/fhir/us/core/" version "/package.tgz")
@@ -83,7 +84,7 @@
             (println "Error extracting:" (:err result))))
         (println "Done.")))))
 
-(def sdc-target-dir "resources/sdc")
+(def sdc-target-dir "scratch/sdc")
 
 (defn download-and-extract-sdc! [version & {:keys [force?] :or {force? false}}]
   (let [package-url (str "https://hl7.org/fhir/uv/sdc/" version "/full-ig.zip")
@@ -111,7 +112,7 @@
             (println "Error extracting:" (:err result))))
         (println "Done.")))))
 
-(def xver-target-dir "resources/xver")
+(def xver-target-dir "scratch/xver")
 
 (defn download-and-extract-xver! [version & {:keys [force?] :or {force? false}}]
   (let [package-url (str "https://hl7.org/fhir/uv/xver-r5.r4/" version "/package.tgz")
@@ -138,7 +139,7 @@
             (println "Error extracting:" (:err result))))
         (println "Done.")))))
 
-(def fhir-extensions-target-dir "resources/fhir-extensions")
+(def fhir-extensions-target-dir "scratch/fhir-extensions")
 
 (defn download-and-extract-fhir-extensions! [version & {:keys [force?] :or {force? false}}]
   (let [package-url (str "https://packages.fhir.org/hl7.fhir.uv.extensions.r4/" version)

@@ -160,7 +160,7 @@
 (defn -main [& [version out-dir]]
   (let [lower-version (if version (.toLowerCase ^String version) "r4b")
         prefix (case lower-version
-                 "r4b" "definitions.json/"
+                 "r4b" "scratch/definitions.json/"
                  "")
         out-dir (or out-dir [".." "fhir" "malli" lower-version "src"])
         staging-dir ["target" "staging" "src"]]
@@ -201,7 +201,7 @@
   (println "Clearing staging directory...")
   (delete-directory-recursive! (Paths/get (first staging-dir) (into-array String (rest staging-dir))))
   (let [sa          (atom {})
-        r4b-sources (version-sources "definitions.json/")
+        r4b-sources (version-sources "scratch/definitions.json/")
         r4b-pkg     (conj base-dir "r4b")
         xver-pkg    (conj base-dir "xver")
         fhirext-pkg (conj base-dir "fhir-extensions")
@@ -217,14 +217,14 @@
         r4b-urls    (into #{nil} (map :url) r4b-plan)
         _           (println "  Copying R4B SearchParameters...")
         r4b-sp      (copy-search-parameters!
-                     [{:type :bundle :path "resources/definitions.json/search-parameters.json"}]
+                     [{:type :bundle :path "scratch/definitions.json/search-parameters.json"}]
                      r4b-pkg)
         _           (println "  Copied" r4b-sp "R4B SearchParameter resources")
 
         ;; --- 2. xver-r5.r4 cross-version extensions ---
         _           (println "\n=== Step 2: xver-r5.r4 cross-version extensions ===")
         _           (download-fhir/download-and-extract-xver! "0.1.0" :force? force-download?)
-        xver-plan   (gen/plan [{:type :directory :path "resources/xver/0.1.0/package"}] r4b-urls
+        xver-plan   (gen/plan [{:type :directory :path "scratch/xver/0.1.0/package"}] r4b-urls
                               :skip-missing true)
         xver-result (gen/generate! sa staging-dir (conj xver-pkg "src") xver-plan)
         _           (write-deps-edn! xver-pkg [{:name "r4b" :relative-path "../r4b"}])
@@ -234,7 +234,7 @@
         ;; --- 3. FHIR Extensions IG (common extensions needed by SDC) ---
         _              (println "\n=== Step 3: FHIR Extensions IG ===")
         _              (download-fhir/download-and-extract-fhir-extensions! "5.3.0-ballot-tc1" :force? force-download?)
-        fhirext-plan   (gen/plan [{:type :directory :path "resources/fhir-extensions/5.3.0-ballot-tc1/package"}]
+        fhirext-plan   (gen/plan [{:type :directory :path "scratch/fhir-extensions/5.3.0-ballot-tc1/package"}]
                                  xver-urls :skip-missing true)
         fhirext-result (gen/generate! sa staging-dir (conj fhirext-pkg "src") fhirext-plan)
         _              (write-deps-edn! fhirext-pkg [{:name "r4b" :relative-path "../r4b"}
@@ -243,14 +243,14 @@
         fhirext-urls   (into xver-urls (map :url) fhirext-plan)
         _              (println "  Copying FHIR Extensions SearchParameters...")
         fhirext-sp     (copy-search-parameters!
-                        [{:type :directory :path "resources/fhir-extensions/5.3.0-ballot-tc1/package"}]
+                        [{:type :directory :path "scratch/fhir-extensions/5.3.0-ballot-tc1/package"}]
                         fhirext-pkg)
         _              (println "  Copied" fhirext-sp "FHIR Extensions SearchParameter resources")
 
         ;; --- 4. SDC IG ---
         _           (println "\n=== Step 4: SDC IG (intermediate dependency) ===")
         _           (download-fhir/download-and-extract-sdc! "STU4" :force? force-download?)
-        sdc-plan    (gen/plan [{:type :directory :path "resources/sdc/STU4/site"}] fhirext-urls
+        sdc-plan    (gen/plan [{:type :directory :path "scratch/sdc/STU4/site"}] fhirext-urls
                               :skip-missing true)
         sdc-result  (gen/generate! sa staging-dir (conj sdc-pkg "src") sdc-plan)
         _           (write-deps-edn! sdc-pkg [{:name "r4b" :relative-path "../r4b"}
@@ -260,14 +260,14 @@
         sdc-urls    (into fhirext-urls (map :url) sdc-plan)
         _           (println "  Copying SDC SearchParameters...")
         sdc-sp      (copy-search-parameters!
-                     [{:type :directory :path "resources/sdc/STU4/site"}]
+                     [{:type :directory :path "scratch/sdc/STU4/site"}]
                      sdc-pkg)
         _           (println "  Copied" sdc-sp "SDC SearchParameter resources")
 
         ;; --- 5. US Core STU8 ---
         _           (println "\n=== Step 5: US Core STU8 profiles ===")
         _           (download-fhir/download-and-extract-uscore! "STU8.0.1" :force? force-download?)
-        uscore-plan (gen/plan [{:type :directory :path "resources/us-core/STU8.0.1/package"}] sdc-urls)
+        uscore-plan (gen/plan [{:type :directory :path "scratch/us-core/STU8.0.1/package"}] sdc-urls)
         uscore-result (gen/generate! sa staging-dir (conj uscore-pkg "src") uscore-plan)
         _           (write-deps-edn! uscore-pkg [{:name "r4b" :relative-path "../r4b"}
                                                   {:name "xver" :relative-path "../xver"}
@@ -278,7 +278,7 @@
         ;; --- 6. CapabilityStatement ---
         _           (println "\n=== Step 6: US Core CapabilityStatement ===")
         cap-result  (cs/generate-from-capability-statement!
-                      (io/file "resources/us-core/STU8.0.1/package/CapabilityStatement-us-core-server.json")
+                      (io/file "scratch/us-core/STU8.0.1/package/CapabilityStatement-us-core-server.json")
                       "us-core" "8.0.1" "8.0.1" "4.3.0"
                       (conj uscore-pkg "src")
                       :schema-atom sa)
@@ -286,7 +286,7 @@
         ;; --- 7. US Core SearchParameter resources ---
         _           (println "\n=== Step 7: Copy SearchParameter resources ===")
         uscore-sp   (copy-search-parameters!
-                     [{:type :directory :path "resources/us-core/STU8.0.1/package"}]
+                     [{:type :directory :path "scratch/us-core/STU8.0.1/package"}]
                      uscore-pkg)
         _           (println "  Copied" uscore-sp "US Core SearchParameter resources")]
     {:r4b            r4b-result

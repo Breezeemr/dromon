@@ -22,10 +22,15 @@
 
 (defn- read-bundle
   "Read StructureDefinition entries from a FHIR bundle JSON file.
-   `source` can be a classpath resource path (string) or a java.io.File."
+   `source` may be a filesystem path string (e.g. \"scratch/definitions.json/profiles-types.json\")
+   or a java.io.File. Downloads land under `scratch/`, which is intentionally
+   not on the classpath -- URLClassLoader caches an empty view of any path
+   that doesn't exist at JVM startup, which would silently break a fresh run."
   [source]
   (let [reader (cond
-                 (string? source) (some-> (io/resource source) io/reader)
+                 (string? source)
+                 (let [f (io/file source)]
+                   (when (.exists f) (io/reader f)))
                  (instance? java.io.File source) (when (.exists ^java.io.File source) (io/reader source))
                  :else (io/reader source))]
     (when reader
@@ -54,8 +59,8 @@
 (defn load-definitions
   "Load StructureDefinitions from multiple sources.
    Each source is a map with :type and :path:
-     {:type :bundle    :path \"definitions.json/profiles-types.json\"}
-     {:type :directory :path \"resources/us-core/STU8.0.1/package\"}
+     {:type :bundle    :path \"scratch/definitions.json/profiles-types.json\"}
+     {:type :directory :path \"scratch/us-core/STU8.0.1/package\"}
 
    Returns a flat sequence of StructureDefinition maps, deduplicated by :url."
   [sources]
@@ -469,7 +474,7 @@
 
   ;; === US Core STU8 (extends R4B — uses same schema-atom) ===
   (def r4b-urls (into #{nil} (map :url) r4b-plan))
-  (def uscore8-plan (plan [{:type :directory :path "resources/us-core/STU8.0.1/package"}]
+  (def uscore8-plan (plan [{:type :directory :path "scratch/us-core/STU8.0.1/package"}]
                           r4b-urls))
 
   (time (def uscore8-results
