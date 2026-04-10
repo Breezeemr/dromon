@@ -16,12 +16,11 @@
 
   tls-setup
   {:doc "Updates /etc/hosts to point fhir.local to 127.0.0.1 and generates a TLS dev certificate with mkcert."
-   :task (let [domain        "fhir.local"
-               keystore      (clojure.java.io/file "fhir-server/dev-keystore.p12")
-               rootca-target (clojure.java.io/file "inferno-test-kit/rootCA.pem")
-               hosts-ok?     (clojure.string/includes? (slurp "/etc/hosts") domain)]
-           (if (and hosts-ok? (.exists keystore) (.exists rootca-target))
-             (println "TLS already set up (hosts entry, dev-keystore.p12, rootCA.pem) -- skipping.")
+   :task (let [domain    "fhir.local"
+               keystore  (clojure.java.io/file "fhir-server/dev-keystore.p12")
+               hosts-ok? (clojure.string/includes? (slurp "/etc/hosts") domain)]
+           (if (and hosts-ok? (.exists keystore))
+             (println "TLS already set up (hosts entry, dev-keystore.p12) -- skipping.")
              (do
                (if hosts-ok?
                  (println "Domain" domain "already in /etc/hosts.")
@@ -33,12 +32,7 @@
                  (do
                    (println "Generating dev certificate with mkcert...")
                    (shell "mkcert" "-install")
-                   (shell "mkcert" "-pkcs12" "-p12-file" (.getPath keystore) domain)))
-               (when (.exists (clojure.java.io/file "inferno-test-kit"))
-                 (let [caroot (clojure.string/trim (:out (shell {:out :string} "mkcert" "-CAROOT")))]
-                   (println "Copying rootCA.pem into inferno-test-kit/...")
-                   (clojure.java.io/copy (clojure.java.io/file caroot "rootCA.pem")
-                                         rootca-target))))))}
+                   (shell "mkcert" "-pkcs12" "-p12-file" (.getPath keystore) domain))))))}
 
   inferno-setup
   {:doc "Clones the US Core Test Kit and runs its setup script to build docker images."
@@ -46,12 +40,26 @@
    :requires ([clj-yaml.core :as yaml])
    :task (let [compose-file "inferno-test-kit/docker-compose.yml"
                bg-file      "inferno-test-kit/docker-compose.background.yml"
+               rootca-file  (clojure.java.io/file "inferno-test-kit/rootCA.pem")
                patched?     (fn [f]
                               (and (.exists (clojure.java.io/file f))
                                    (clojure.string/includes? (slurp f) "fhir.local:host-gateway")))]
            (when-not (.exists (clojure.java.io/file "inferno-test-kit"))
              (println "Cloning us-core-test-kit...")
              (shell "git" "clone" "https://github.com/inferno-framework/us-core-test-kit" "inferno-test-kit"))
+           ;; Ensure rootCA.pem exists *before* any container start: the compose patch
+           ;; bind-mounts ./rootCA.pem into the inferno/worker containers, and Podman
+           ;; will silently create an empty directory at the bind source if the file is
+           ;; missing -- which then renders the in-container path unreadable as a cert,
+           ;; making every Ruby fhir_client TLS handshake fail. Recover from that case
+           ;; by removing any pre-existing stub before copying.
+           (when (and (.exists rootca-file) (.isDirectory rootca-file))
+             (println "Removing stub rootCA.pem directory left by Podman bind-mount...")
+             (shell "rm" "-rf" (.getPath rootca-file)))
+           (when-not (.isFile rootca-file)
+             (let [caroot (clojure.string/trim (:out (shell {:out :string} "mkcert" "-CAROOT")))]
+               (println "Copying mkcert rootCA.pem into inferno-test-kit/ ...")
+               (clojure.java.io/copy (clojure.java.io/file caroot "rootCA.pem") rootca-file)))
            (if (and (patched? compose-file) (patched? bg-file))
              (println "Inferno test kit already set up and patched -- skipping.")
              (do
