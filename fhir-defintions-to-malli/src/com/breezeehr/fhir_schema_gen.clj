@@ -243,11 +243,19 @@
     (Files/createDirectories (.getParent path) (make-array FileAttribute 0))
     (with-open [w (Files/newBufferedWriter path (make-array OpenOption 0))]
       (if staging?
-        ;; Staging: minimal file — ns + base fns + sch def
+        ;; Staging: minimal file — ns + base fns + local-registry :own defs + sch def.
+        ;; Local-registry defs (e.g. Questionnaire-item) must be staged so that the
+        ;; runtime registry built by resolve-local-registry-schemas can locate them
+        ;; via requiring-resolve when later sibling/child profiles are being processed.
         (do
           (emit-ns-form w k)
           (when (seq base-refs)
             (emit-base-fns w base-refs true nil))
+          (when local-registry
+            (doseq [[lr-name {:keys [type form]}] local-registry
+                    :when (= type :own)]
+              (let [def-sym (symbol (lr-key->def-name lr-name))]
+                (fipp (list 'def def-sym form) {:writer w}))))
           (fipp (list 'def 'sch (fdm/make-into-schema-form form)) {:writer w}))
         ;; Final: full file with deps, base fns, local-registry defs, sch, and full-sch for resources
         (let [;; For resources, compute the full transitive dependency set

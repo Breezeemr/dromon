@@ -203,16 +203,39 @@
                     (some-> (kw->sch-sym kw) requiring-resolve var-get)))
                 (-schemas [_] {})))})
 
+(defn- lr-key->def-name
+  "Convert a local-registry key like \"#Bundle.link\" to a def name like \"Bundle-link\".
+   Mirrors com.breezeehr.fhir-schema-gen/lr-key->def-name; duplicated here to avoid
+   a circular require."
+  [lr-key]
+  (str/replace lr-key #"[#.]" {"#" "" "." "-"}))
+
+(defn- requiring-resolve-local-def
+  "Look up the var that backs a local-registry entry by requiring-resolving the
+   parent namespace's emitted def. Returns the dereffed value, or nil if the var
+   is not (yet) available."
+  [source-kw lr-key]
+  (try
+    (let [def-sym (symbol (str (kw->ns-sym source-kw)) (lr-key->def-name lr-key))]
+      (some-> (requiring-resolve def-sym) var-get))
+    (catch Exception _ nil)))
+
 (defn- resolve-local-registry-schemas
   "Build a malli-compatible registry map from local-registry entries.
-   For :own entries, use the stored :sch. For :ref entries, resolve from the source."
+   Prefers a live `requiring-resolve` of the parent namespace's emitted def, since
+   the in-memory `:sch` snapshot in a local-registry entry is unreliable -- the
+   patcher accumulates field changes onto `:form` without mirroring them onto
+   `:sch`, so the cached schema can be stale (e.g., bare BackboneElement instead
+   of a fully populated Questionnaire.item). Falls back to the stored `:sch` when
+   the parent file hasn't been written yet."
   [local-reg]
   (into {}
         (map (fn [[k entry]]
                [k (case (:type entry)
                     :own (:sch entry)
-                    :ref (let [src-lr (:local-registry (get @*schema-atom* (:source-kw entry)))]
-                           (:sch (get src-lr k))))]))
+                    :ref (or (requiring-resolve-local-def (:source-kw entry) k)
+                             (let [src-lr (:local-registry (get @*schema-atom* (:source-kw entry)))]
+                               (:sch (get src-lr k)))))]))
         local-reg))
 
 (defn resolve-malli-sch
