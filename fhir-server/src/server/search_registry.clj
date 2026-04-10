@@ -83,6 +83,19 @@
                {:fhir-type prim :array? false}))))
        (catch Exception _ nil)))))
 
+(defn- value-key->fhir-type
+  "Derives the FHIR type name from a :fhir/value-key like :valueDateTime.
+   Strips the 'value' prefix and lowercases the first char to get 'dateTime'.
+   Returns nil when the key does not follow the value[Type] convention."
+  [value-key]
+  (when value-key
+    (let [s (name value-key)]
+      (when (str/starts-with? s "value")
+        (let [type-part (subs s 5)]
+          (when (seq type-part)
+            (str (Character/toLowerCase ^char (first type-part))
+                 (subs type-part 1))))))))
+
 (defn- extract-field-map
   "Extracts a map of {field-name -> {:fhir-type, :array?, :fhir/extension, :url, :children}}
    from a compiled Malli :map schema."
@@ -97,7 +110,16 @@
                   (cond-> classification
                     (:fhir/extension entry-props)
                     (assoc :fhir/extension true
-                           :url (:url entry-props))))
+                           :url (:url entry-props))
+                    ;; For promoted extensions, override the fhir-type with the
+                    ;; actual value type derived from :fhir/value-key (e.g.
+                    ;; :valueDateTime -> "dateTime") instead of keeping the
+                    ;; extension ref name (e.g. "condition-assertedDate").
+                    (and (:fhir/extension entry-props)
+                         (:fhir/value-key entry-props))
+                    (assoc :fhir-type
+                           (or (value-key->fhir-type (:fhir/value-key entry-props))
+                               (:fhir-type classification)))))
            acc)))
      {}
      (m/children map-schema))
