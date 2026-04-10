@@ -1,0 +1,9 @@
+{:paths ["src" "resources"]
+ :deps  {org.clojure/clojure                 {:mvn/version "1.12.4"}
+         metosin/malli                       {:mvn/version "0.20.0"}
+         com.breezeehr/malli-decimal         {:local/root "../malli-decimal"}
+         #_#_io.github.Breezeemr/malli-java-time {:sha "c9a03b115f7da61d483a90a882d7e0e353af15c6"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps  {com.breezeehr/fhir-malli-uscore8 {:local/root "../fhir/malli/uscore8"}
+                       lambdaisland/kaocha {:mvn/version "1.91.1392"}}}}}

@@ -1,0 +1,5689 @@
+{
+  "resourceType": "Bundle",
+  "type": "transaction",
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:99660d57-47bf-50a9-9c9c-0236ac8caba0",
+      "resource": {
+        "resourceType": "Patient",
+        "id": "123",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">John Smith</div>"
+        },
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race",
+            "extension": [
+              {
+                "url": "ombCategory",
+                "valueCoding": {
+                  "system": "urn:oid:2.16.840.1.113883.6.238",
+                  "code": "2106-3",
+                  "display": "White"
+                }
+              },
+              {
+                "url": "text",
+                "valueString": "White"
+              }
+            ]
+          },
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity",
+            "extension": [
+              {
+                "url": "ombCategory",
+                "valueCoding": {
+                  "system": "urn:oid:2.16.840.1.113883.6.238",
+                  "code": "2186-5",
+                  "display": "Not Hispanic or Latino"
+                }
+              },
+              {
+                "url": "text",
+                "valueString": "Not Hispanic or Latino"
+              }
+            ]
+          },
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex",
+            "valueCode": "M"
+          },
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-tribal-affiliation",
+            "extension": [
+              {
+                "url": "tribalAffiliation",
+                "valueCodeableConcept": {
+                  "coding": [
+                    {
+                      "system": "http://terminology.hl7.org/CodeSystem/v3-TribalEntityUS",
+                      "code": "91",
+                      "display": "Fort Mojave Indian Tribe of Arizona, California & Nevada"
+                    }
+                  ],
+                  "text": "Fort Mojave Indian Tribe"
+                }
+              },
+              {
+                "url": "isEnrolled",
+                "valueBoolean": false
+              }
+            ]
+          },
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-sex",
+            "valueCode": "248153007"
+          }
+        ],
+        "identifier": [
+          {
+            "system": "urn:oid:1.2.36.146.595.217.0.1",
+            "value": "pat-123"
+          }
+        ],
+        "active": true,
+        "name": [
+          {
+            "family": "Smith",
+            "given": [
+              "John"
+            ]
+          },
+          {
+            "use": "old",
+            "family": "Oldname",
+            "given": [
+              "Jonathan"
+            ],
+            "suffix": [
+              "Jr."
+            ],
+            "period": {
+              "end": "2020-01-01"
+            }
+          }
+        ],
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "555-555-5555",
+            "use": "home"
+          }
+        ],
+        "gender": "male",
+        "birthDate": "1980-01-01",
+        "address": [
+          {
+            "line": [
+              "123 Main St"
+            ],
+            "city": "Anytown",
+            "state": "NY",
+            "postalCode": "12345",
+            "country": "US"
+          },
+          {
+            "use": "old",
+            "line": [
+              "456 Previous St"
+            ],
+            "city": "Oldtown",
+            "state": "NY",
+            "postalCode": "10001",
+            "period": {
+              "end": "2020-01-01"
+            }
+          }
+        ],
+        "deceasedDateTime": "2025-12-15",
+        "communication": [
+          {
+            "language": {
+              "coding": [
+                {
+                  "system": "urn:ietf:bcp:47",
+                  "code": "en",
+                  "display": "English"
+                }
+              ]
+            },
+            "preferred": true
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Patient/123"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:72f12c3e-0f09-5586-9ed5-276d06da1c9c",
+      "resource": {
+        "resourceType": "Practitioner",
+        "id": "practitioner-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-practitioner"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Dr. Sarah Jones</div>"
+        },
+        "identifier": [
+          {
+            "system": "http://hl7.org/fhir/sid/us-npi",
+            "value": "1234567893"
+          }
+        ],
+        "name": [
+          {
+            "family": "Jones",
+            "given": [
+              "Sarah"
+            ],
+            "prefix": [
+              "Dr."
+            ]
+          }
+        ],
+        "telecom": [
+          {
+            "system": "email",
+            "value": "sarah.jones@example.com"
+          }
+        ],
+        "address": [
+          {
+            "line": [
+              "456 Hospital Rd"
+            ],
+            "city": "Anytown",
+            "state": "NY",
+            "postalCode": "12345",
+            "country": "US"
+          }
+        ],
+        "gender": "female"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Practitioner/practitioner-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:ce754e0a-4775-5fa7-9e13-443aea263cfa",
+      "resource": {
+        "resourceType": "Organization",
+        "id": "organization-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-organization"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Anytown General Hospital</div>"
+        },
+        "identifier": [
+          {
+            "system": "http://hl7.org/fhir/sid/us-npi",
+            "value": "9876543213"
+          }
+        ],
+        "active": true,
+        "name": "Anytown General Hospital",
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "555-123-4567"
+          }
+        ],
+        "address": [
+          {
+            "line": [
+              "456 Hospital Rd"
+            ],
+            "city": "Anytown",
+            "state": "NY",
+            "postalCode": "12345",
+            "country": "US"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Organization/organization-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:dca18953-4e40-52e5-b9f4-6ec7d4a53821",
+      "resource": {
+        "resourceType": "PractitionerRole",
+        "id": "practitionerrole-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-practitionerrole"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">PractitionerRole: Dr. Sarah Jones at Anytown General Hospital</div>"
+        },
+        "active": true,
+        "practitioner": {
+          "reference": "Practitioner/practitioner-1",
+          "display": "Dr. Sarah Jones"
+        },
+        "organization": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        },
+        "code": [
+          {
+            "coding": [
+              {
+                "system": "http://nucc.org/provider-taxonomy",
+                "code": "208D00000X",
+                "display": "General Practice Physician"
+              }
+            ]
+          }
+        ],
+        "specialty": [
+          {
+            "coding": [
+              {
+                "system": "http://nucc.org/provider-taxonomy",
+                "code": "208D00000X",
+                "display": "General Practice Physician"
+              }
+            ]
+          }
+        ],
+        "location": [
+          {
+            "reference": "Location/location-1",
+            "display": "Anytown General Hospital"
+          }
+        ],
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "555-123-4567"
+          }
+        ],
+        "endpoint": [
+          {
+            "reference": "Endpoint/endpoint-1",
+            "display": "Direct messaging endpoint"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "PractitionerRole/practitionerrole-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:eca81a31-1b48-5868-bcab-9a99a43ba6a8",
+      "resource": {
+        "resourceType": "Encounter",
+        "id": "encounter-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-encounter"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Encounter: Office Visit on 2024-01-15</div>"
+        },
+        "status": "finished",
+        "class": {
+          "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+          "code": "AMB",
+          "display": "ambulatory"
+        },
+        "type": [
+          {
+            "coding": [
+              {
+                "system": "http://www.ama-assn.org/go/cpt",
+                "code": "99213",
+                "display": "Office or other outpatient visit for the evaluation and management of an established patient, which requires a medically appropriate history and/or examination and low level of medical decision making. When using time for code selection, 20-29 minutes of total time is spent on the date of the encounter."
+              }
+            ],
+            "text": "Office Visit"
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "participant": [
+          {
+            "type": [
+              {
+                "coding": [
+                  {
+                    "system": "http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                    "code": "PPRF",
+                    "display": "primary performer"
+                  }
+                ]
+              }
+            ],
+            "period": {
+              "start": "2024-01-15T10:00:00Z",
+              "end": "2024-01-15T10:30:00Z"
+            },
+            "individual": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            }
+          },
+          {
+            "type": [
+              {
+                "coding": [
+                  {
+                    "system": "http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                    "code": "ATND",
+                    "display": "attender"
+                  }
+                ]
+              }
+            ],
+            "individual": {
+              "reference": "PractitionerRole/practitionerrole-1",
+              "display": "Dr. Sarah Jones (PractitionerRole)"
+            }
+          }
+        ],
+        "period": {
+          "start": "2024-01-15T10:00:00Z",
+          "end": "2024-01-15T10:30:00Z"
+        },
+        "location": [
+          {
+            "location": {
+              "reference": "Location/location-1",
+              "display": "Anytown General Hospital"
+            }
+          }
+        ],
+        "identifier": [
+          {
+            "system": "urn:oid:2.16.840.1.113883.19.5",
+            "value": "ENC-12345"
+          }
+        ],
+        "reasonCode": [
+          {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "36971009",
+                "display": "Sinusitis"
+              }
+            ]
+          }
+        ],
+        "reasonReference": [
+          {
+            "reference": "Condition/condition-encounter-1"
+          }
+        ],
+        "hospitalization": {
+          "dischargeDisposition": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/discharge-disposition",
+                "code": "home",
+                "display": "Home"
+              }
+            ]
+          }
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Encounter/encounter-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:c3f912cd-b350-5efb-b6c6-9af962feaf9a",
+      "resource": {
+        "resourceType": "Condition",
+        "id": "condition-problem-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-condition-problems-health-concerns"
+          ]
+        },
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/condition-assertedDate",
+            "valueDateTime": "2015-06-01"
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Condition: Type 2 diabetes mellitus</div>"
+        },
+        "clinicalStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+              "code": "resolved",
+              "display": "Resolved"
+            }
+          ]
+        },
+        "verificationStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+              "code": "confirmed",
+              "display": "Confirmed"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/condition-category",
+                "code": "problem-list-item",
+                "display": "Problem List Item"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "44054006",
+              "display": "Type 2 diabetes mellitus"
+            }
+          ],
+          "text": "Type 2 diabetes mellitus"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "onsetDateTime": "2015-06-01",
+        "recordedDate": "2015-06-01",
+        "abatementDateTime": "2024-06-15"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Condition/condition-problem-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:406b0c14-7928-5735-849f-a312cf62afb7",
+      "resource": {
+        "resourceType": "Condition",
+        "id": "condition-encounter-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-condition-encounter-diagnosis"
+          ]
+        },
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/condition-assertedDate",
+            "valueDateTime": "2024-01-15"
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Condition: Hypertension</div>"
+        },
+        "clinicalStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+              "code": "resolved",
+              "display": "Resolved"
+            }
+          ]
+        },
+        "verificationStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+              "code": "confirmed",
+              "display": "Confirmed"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/condition-category",
+                "code": "encounter-diagnosis",
+                "display": "Encounter Diagnosis"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "38341003",
+              "display": "Hypertensive disorder"
+            }
+          ],
+          "text": "Hypertension"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "onsetDateTime": "2024-01-15",
+        "recordedDate": "2024-01-15",
+        "abatementDateTime": "2024-02-15"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Condition/condition-encounter-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:31b3a466-4a99-5c17-a652-77bcc175e678",
+      "resource": {
+        "resourceType": "Condition",
+        "id": "condition-health-concern-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-condition-problems-health-concerns"
+          ]
+        },
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/StructureDefinition/condition-assertedDate",
+            "valueDateTime": "2023-06-01"
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Condition: Food insecurity</div>"
+        },
+        "clinicalStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+              "code": "active",
+              "display": "Active"
+            }
+          ]
+        },
+        "verificationStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+              "code": "confirmed",
+              "display": "Confirmed"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "sdoh",
+                "display": "SDOH"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/condition-category",
+                "code": "health-concern",
+                "display": "Health Concern"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/condition-category",
+                "code": "problem-list-item",
+                "display": "Problem List Item"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "733423003",
+              "display": "Food insecurity"
+            }
+          ],
+          "text": "Food insecurity"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "onsetDateTime": "2023-06-01",
+        "recordedDate": "2023-06-01"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Condition/condition-health-concern-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:9aeb4df4-9662-5f0a-892f-40742de609d6",
+      "resource": {
+        "resourceType": "AllergyIntolerance",
+        "id": "allergyintolerance-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-allergyintolerance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Allergy to penicillin</div>"
+        },
+        "clinicalStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+              "code": "active",
+              "display": "Active"
+            }
+          ]
+        },
+        "verificationStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-verification",
+              "code": "confirmed",
+              "display": "Confirmed"
+            }
+          ]
+        },
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "91936005",
+              "display": "Allergy to penicillin"
+            }
+          ],
+          "text": "Penicillin"
+        },
+        "patient": {
+          "reference": "Patient/123"
+        },
+        "reaction": [
+          {
+            "manifestation": [
+              {
+                "coding": [
+                  {
+                    "system": "http://snomed.info/sct",
+                    "code": "271807003",
+                    "display": "Skin rash"
+                  }
+                ],
+                "text": "Skin rash"
+              }
+            ],
+            "severity": "moderate"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "AllergyIntolerance/allergyintolerance-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:c5e1f80a-1476-50c6-a2e4-24dcd510febd",
+      "resource": {
+        "resourceType": "CarePlan",
+        "id": "careplan-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-careplan"
+          ]
+        },
+        "text": {
+          "status": "additional",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Diabetes management care plan: diet, exercise, and medication adherence.</div>"
+        },
+        "status": "active",
+        "intent": "plan",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/careplan-category",
+                "code": "assess-plan"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "period": {
+          "start": "2024-01-01",
+          "end": "2024-12-31"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "CarePlan/careplan-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:834c0e69-25b6-5959-9140-fde4d427c708",
+      "resource": {
+        "resourceType": "CareTeam",
+        "id": "careteam-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-careteam"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Care Team for Patient John Smith</div>"
+        },
+        "status": "active",
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "participant": [
+          {
+            "role": [
+              {
+                "coding": [
+                  {
+                    "system": "http://snomed.info/sct",
+                    "code": "17561000",
+                    "display": "Cardiologist"
+                  }
+                ]
+              }
+            ],
+            "member": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            }
+          },
+          {
+            "role": [
+              {
+                "coding": [
+                  {
+                    "system": "http://snomed.info/sct",
+                    "code": "224535009",
+                    "display": "Registered nurse"
+                  }
+                ]
+              }
+            ],
+            "member": {
+              "reference": "PractitionerRole/practitionerrole-1",
+              "display": "Dr. Sarah Jones (PractitionerRole)"
+            }
+          },
+          {
+            "role": [
+              {
+                "coding": [
+                  {
+                    "system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode",
+                    "code": "SPS",
+                    "display": "spouse"
+                  }
+                ]
+              }
+            ],
+            "member": {
+              "reference": "RelatedPerson/relatedperson-1",
+              "display": "Jane Smith (spouse)"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "CareTeam/careteam-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:e054756b-3e45-5cbe-b93e-33e295711efa",
+      "resource": {
+        "resourceType": "Coverage",
+        "id": "coverage-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-coverage"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Coverage: HMO Gold Plan</div>"
+        },
+        "status": "active",
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+              "code": "HIP",
+              "display": "health insurance plan policy"
+            }
+          ]
+        },
+        "subscriber": {
+          "reference": "Patient/123"
+        },
+        "subscriberId": "ABC12345",
+        "beneficiary": {
+          "reference": "Patient/123"
+        },
+        "relationship": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/subscriber-relationship",
+              "code": "self",
+              "display": "Self"
+            }
+          ]
+        },
+        "period": {
+          "start": "2024-01-01",
+          "end": "2024-12-31"
+        },
+        "payor": [
+          {
+            "reference": "Organization/organization-1",
+            "display": "Anytown General Hospital"
+          }
+        ],
+        "class": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/coverage-class",
+                  "code": "plan",
+                  "display": "Plan"
+                }
+              ]
+            },
+            "value": "HMO-123",
+            "name": "HMO Gold Plan"
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/coverage-class",
+                  "code": "group",
+                  "display": "Group"
+                }
+              ]
+            },
+            "value": "GRP-123",
+            "name": "Corporate Group Plan"
+          }
+        ],
+        "identifier": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                  "code": "MB",
+                  "display": "Member Number"
+                }
+              ]
+            },
+            "system": "urn:oid:2.16.840.1.113883.4.642",
+            "value": "12345"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Coverage/coverage-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:318827a4-dbc6-5366-8dc5-76fcdbdbaf75",
+      "resource": {
+        "resourceType": "Device",
+        "id": "device-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-implantable-device"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Device: Cardiac pacemaker</div>"
+        },
+        "udiCarrier": [
+          {
+            "deviceIdentifier": "09504000059118",
+            "carrierHRF": "(01)09504000059118(17)241231(10)AB123(21)XYZ456"
+          }
+        ],
+        "status": "active",
+        "type": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "14106009",
+              "display": "Cardiac pacemaker, device (physical object)"
+            }
+          ],
+          "text": "Cardiac pacemaker"
+        },
+        "patient": {
+          "reference": "Patient/123"
+        },
+        "distinctIdentifier": "D1234567890",
+        "manufactureDate": "2023-01-15",
+        "expirationDate": "2028-01-15",
+        "lotNumber": "LOT123456",
+        "serialNumber": "SN987654321"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Device/device-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:70542c9e-6fdd-5157-a909-c9eabedeb3d9",
+      "resource": {
+        "resourceType": "Goal",
+        "id": "goal-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-goal"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Goal: HbA1c below 7%</div>"
+        },
+        "lifecycleStatus": "active",
+        "description": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "43396009",
+              "display": "Hemoglobin A1c measurement"
+            }
+          ],
+          "text": "HbA1c below 7%"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "target": [
+          {
+            "dueDate": "2024-12-31"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Goal/goal-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:98feb6a0-4ed2-51f1-96a7-231c91cceac0",
+      "resource": {
+        "resourceType": "Immunization",
+        "id": "immunization-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-immunization"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Immunization: Influenza vaccine</div>"
+        },
+        "status": "completed",
+        "vaccineCode": {
+          "coding": [
+            {
+              "system": "http://hl7.org/fhir/sid/cvx",
+              "code": "197",
+              "display": "Influenza, high-dose, quadrivalent, PF"
+            }
+          ],
+          "text": "Influenza vaccine"
+        },
+        "patient": {
+          "reference": "Patient/123"
+        },
+        "occurrenceDateTime": "2024-01-15",
+        "primarySource": true,
+        "statusReason": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+              "code": "IMMUNE",
+              "display": "immunity"
+            }
+          ]
+        },
+        "reasonCode": [
+          {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "429060002",
+                "display": "Procedure to meet occupational requirement"
+              }
+            ]
+          }
+        ],
+        "reasonReference": [
+          {
+            "reference": "Condition/condition-problem-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Immunization/immunization-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:922b0707-1042-5da6-9af9-0cbc3b81ed62",
+      "resource": {
+        "resourceType": "MedicationRequest",
+        "id": "medicationrequest-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-medicationrequest"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">MedicationRequest: Metformin 500 MG</div>"
+        },
+        "status": "active",
+        "intent": "order",
+        "medicationCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+              "code": "860975",
+              "display": "24 HR metformin hydrochloride 500 MG Extended Release Oral Tablet"
+            }
+          ],
+          "text": "Metformin 500 MG"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "authoredOn": "2024-01-15",
+        "requester": {
+          "reference": "Practitioner/practitioner-1",
+          "display": "Dr. Sarah Jones"
+        },
+        "dosageInstruction": [
+          {
+            "text": "Take 1 tablet by mouth twice daily",
+            "timing": {
+              "repeat": {
+                "frequency": 2,
+                "period": 1,
+                "periodUnit": "d"
+              }
+            },
+            "doseAndRate": [
+              {
+                "doseQuantity": {
+                  "value": 500,
+                  "unit": "mg",
+                  "system": "http://unitsofmeasure.org",
+                  "code": "mg"
+                }
+              }
+            ]
+          }
+        ],
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/medicationrequest-category",
+                "code": "outpatient",
+                "display": "Outpatient"
+              }
+            ]
+          }
+        ],
+        "reportedBoolean": true,
+        "reasonCode": [
+          {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "36971009",
+                "display": "Sinusitis"
+              }
+            ]
+          }
+        ],
+        "reasonReference": [
+          {
+            "reference": "Condition/condition-encounter-1"
+          }
+        ],
+        "dispenseRequest": {
+          "numberOfRepeatsAllowed": 3,
+          "quantity": {
+            "value": 30,
+            "unit": "tablets",
+            "system": "http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm",
+            "code": "TAB"
+          },
+          "expectedSupplyDuration": {
+            "value": 30,
+            "unit": "days",
+            "system": "http://unitsofmeasure.org",
+            "code": "d"
+          }
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "MedicationRequest/medicationrequest-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:b9b4ccfc-5b1b-5fd1-ac08-2d33fc35affe",
+      "resource": {
+        "resourceType": "MedicationDispense",
+        "id": "medicationdispense-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-medicationdispense"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">MedicationDispense: Metformin 500 MG</div>"
+        },
+        "status": "completed",
+        "medicationCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+              "code": "860975",
+              "display": "24 HR metformin hydrochloride 500 MG Extended Release Oral Tablet"
+            }
+          ],
+          "text": "Metformin 500 MG"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "performer": [
+          {
+            "actor": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            }
+          }
+        ],
+        "authorizingPrescription": [
+          {
+            "reference": "MedicationRequest/medicationrequest-1"
+          }
+        ],
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+              "code": "FF",
+              "display": "First Fill"
+            }
+          ]
+        },
+        "quantity": {
+          "value": 60,
+          "unit": "tablets",
+          "system": "http://unitsofmeasure.org",
+          "code": "{tbl}"
+        },
+        "daysSupply": {
+          "value": 30,
+          "unit": "days",
+          "system": "http://unitsofmeasure.org",
+          "code": "d"
+        },
+        "whenHandedOver": "2024-01-15",
+        "dosageInstruction": [
+          {
+            "text": "Take 1 tablet by mouth daily",
+            "timing": {
+              "repeat": {
+                "frequency": 1,
+                "period": 1,
+                "periodUnit": "d"
+              }
+            },
+            "doseAndRate": [
+              {
+                "doseQuantity": {
+                  "value": 1,
+                  "unit": "tablet",
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-orderableDrugForm",
+                  "code": "TAB"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "MedicationDispense/medicationdispense-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:21ad140e-622d-5807-a3a0-181778f7f098",
+      "resource": {
+        "resourceType": "Procedure",
+        "id": "procedure-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-procedure"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Procedure: Coronary stent placement</div>"
+        },
+        "status": "completed",
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "36969009",
+              "display": "Placement of stent in coronary artery"
+            }
+          ],
+          "text": "Coronary stent placement"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "performedDateTime": "2024-01-15",
+        "performer": [
+          {
+            "actor": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            }
+          }
+        ],
+        "basedOn": [
+          {
+            "reference": "ServiceRequest/servicerequest-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Procedure/procedure-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:50a4c679-39b6-5679-9f3e-fbdcad834aa0",
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "id": "diagnosticreport-lab-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-diagnosticreport-lab"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DiagnosticReport: CBC Panel</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "LAB",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "58410-2",
+              "display": "CBC panel - Blood by Automated count"
+            }
+          ],
+          "text": "CBC Panel"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "issued": "2024-01-15T12:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1",
+            "display": "Dr. Sarah Jones"
+          }
+        ],
+        "result": [
+          {
+            "reference": "Observation/observation-lab-1",
+            "display": "Hemoglobin A1c"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DiagnosticReport/diagnosticreport-lab-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:8e94ae77-1fe8-5d1f-aebd-87abc1e9eeef",
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "id": "diagnosticreport-note-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-diagnosticreport-note"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DiagnosticReport: Chest X-ray</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://loinc.org",
+                "code": "LP29684-5",
+                "display": "Radiology"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "30746-2",
+              "display": "Portable XR Chest Views"
+            }
+          ],
+          "text": "Chest X-ray"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "issued": "2024-01-15T14:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1",
+            "display": "Dr. Sarah Jones"
+          }
+        ],
+        "presentedForm": [
+          {
+            "contentType": "text/plain",
+            "data": "Tm8gYWN1dGUgY2FyZGlvcHVsbW9uYXJ5IHByb2Nlc3MuIE5vcm1hbCBoZWFydCBzaXplLg=="
+          }
+        ],
+        "result": [
+          {
+            "reference": "Observation/observation-lab-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DiagnosticReport/diagnosticreport-note-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:b11a7f8b-8ef7-5d66-823d-75acf5504ffa",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Summary of episode note</div>"
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "34133-9",
+              "display": "Summary of episode note"
+            }
+          ],
+          "text": "Summary of episode note"
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1",
+            "display": "Dr. Sarah Jones"
+          }
+        ],
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        },
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "data": "UGF0aWVudCBwcmVzZW50ZWQgZm9yIHJvdXRpbmUgZm9sbG93LXVwLiBCUCAxMjgvODIuIEExYyA3LjIlLiBDb250aW51ZSBjdXJyZW50IG1lZGljYXRpb25zLg=="
+            },
+            "format": {
+              "system": "urn:oid:1.3.6.1.4.1.19376.1.2.3",
+              "code": "urn:ihe:pcc:xphr:2007",
+              "display": "Personal Health Records"
+            }
+          }
+        ],
+        "identifier": [
+          {
+            "system": "urn:oid:2.16.840.1.113883.19.5",
+            "value": "DOC-12345"
+          }
+        ],
+        "context": {
+          "encounter": [
+            {
+              "reference": "Encounter/encounter-1"
+            }
+          ],
+          "period": {
+            "start": "2024-01-15T10:00:00Z",
+            "end": "2024-01-15T11:00:00Z"
+          }
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:69c25135-316f-5204-8b24-26ea81d981ca",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-lab-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-lab"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Hemoglobin A1c: 7.2%</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "4548-4",
+              "display": "Hemoglobin A1c/Hemoglobin.total in Blood"
+            }
+          ],
+          "text": "Hemoglobin A1c"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 7.2,
+          "unit": "%",
+          "system": "http://unitsofmeasure.org",
+          "code": "%"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "specimen": {
+          "reference": "Specimen/specimen-1"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-lab-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:5a68365e-cde3-5430-9ada-8469ed81bbc3",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-bp-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-blood-pressure",
+            "http://hl7.org/fhir/StructureDefinition/bp"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Blood Pressure</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "85354-9",
+              "display": "Blood pressure panel with all children optional"
+            }
+          ],
+          "text": "Blood Pressure"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "component": [
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "8480-6",
+                  "display": "Systolic blood pressure"
+                }
+              ]
+            },
+            "valueQuantity": {
+              "value": 128,
+              "unit": "mmHg",
+              "system": "http://unitsofmeasure.org",
+              "code": "mm[Hg]"
+            }
+          },
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "8462-4",
+                  "display": "Diastolic blood pressure"
+                }
+              ]
+            },
+            "valueQuantity": {
+              "value": 82,
+              "unit": "mmHg",
+              "system": "http://unitsofmeasure.org",
+              "code": "mm[Hg]"
+            },
+            "dataAbsentReason": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/data-absent-reason",
+                  "code": "unknown",
+                  "display": "Unknown"
+                }
+              ]
+            }
+          }
+        ],
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-bp-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:2e00306c-5bc5-55fd-b5be-6b84bb79df27",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-hr-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-heart-rate",
+            "http://hl7.org/fhir/StructureDefinition/heartrate"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Heart Rate</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "8867-4",
+              "display": "Heart rate"
+            }
+          ],
+          "text": "Heart Rate"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 72,
+          "unit": "/min",
+          "system": "http://unitsofmeasure.org",
+          "code": "/min"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-hr-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:cf744ad9-cdae-5d4c-a020-c75de82e36f3",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-resp-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-respiratory-rate",
+            "http://hl7.org/fhir/StructureDefinition/resprate"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Respiratory Rate</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "9279-1",
+              "display": "Respiratory rate"
+            }
+          ],
+          "text": "Respiratory Rate"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 16,
+          "unit": "/min",
+          "system": "http://unitsofmeasure.org",
+          "code": "/min"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-resp-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:96532a00-db2b-596a-946b-5cc8091200ed",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-temp-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-body-temperature",
+            "http://hl7.org/fhir/StructureDefinition/bodytemp"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Body Temperature</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "8310-5",
+              "display": "Body temperature"
+            }
+          ],
+          "text": "Body Temperature"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 37.0,
+          "unit": "Cel",
+          "system": "http://unitsofmeasure.org",
+          "code": "Cel"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-temp-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:014c17ad-e48f-5c1c-86f9-07d852664587",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-height-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-body-height",
+            "http://hl7.org/fhir/StructureDefinition/bodyheight"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Body Height</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "8302-2",
+              "display": "Body height"
+            }
+          ],
+          "text": "Body Height"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 178,
+          "unit": "cm",
+          "system": "http://unitsofmeasure.org",
+          "code": "cm"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-height-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:e2eaf1bb-b82c-5c1e-a972-38c647b5ce8a",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-weight-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-body-weight",
+            "http://hl7.org/fhir/StructureDefinition/bodyweight"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Body Weight</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "29463-7",
+              "display": "Body weight"
+            }
+          ],
+          "text": "Body Weight"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 85,
+          "unit": "kg",
+          "system": "http://unitsofmeasure.org",
+          "code": "kg"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-weight-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:26cd46c4-0e7e-52fb-9eb6-8d75951892b8",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-bmi-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-bmi",
+            "http://hl7.org/fhir/StructureDefinition/bmi"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: BMI</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "39156-5",
+              "display": "Body mass index (BMI) [Ratio]"
+            }
+          ],
+          "text": "BMI"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 26.8,
+          "unit": "kg/m2",
+          "system": "http://unitsofmeasure.org",
+          "code": "kg/m2"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-bmi-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:e29e89d8-8599-50ce-9266-6ee7ffd85490",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-pulseox-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-pulse-oximetry",
+            "http://hl7.org/fhir/StructureDefinition/oxygensat"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Pulse Oximetry</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "59408-5",
+              "display": "Oxygen saturation in Arterial blood by Pulse oximetry"
+            },
+            {
+              "system": "http://loinc.org",
+              "code": "2708-6",
+              "display": "Oxygen saturation in Arterial blood"
+            }
+          ],
+          "text": "Pulse Oximetry"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 98,
+          "unit": "%",
+          "system": "http://unitsofmeasure.org",
+          "code": "%"
+        },
+        "component": [
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "3150-0",
+                  "display": "Inhaled oxygen concentration"
+                }
+              ]
+            },
+            "valueQuantity": {
+              "value": 28,
+              "unit": "%",
+              "system": "http://unitsofmeasure.org",
+              "code": "%"
+            }
+          },
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "3151-8",
+                  "display": "Inhaled oxygen flow rate"
+                }
+              ]
+            },
+            "valueQuantity": {
+              "value": 2,
+              "unit": "L/min",
+              "system": "http://unitsofmeasure.org",
+              "code": "L/min"
+            }
+          }
+        ],
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-pulseox-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:23e50262-53dd-5b50-b45c-680d2b9edc90",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-headcirc-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/head-occipital-frontal-circumference"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Head Occipital-frontal circumference 40 cm</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "9843-4",
+              "display": "Head Occipital-frontal circumference"
+            }
+          ],
+          "text": "Head Circumference"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 40,
+          "unit": "cm",
+          "system": "http://unitsofmeasure.org",
+          "code": "cm"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-headcirc-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:dd350d30-1698-5e91-a0e3-048edce9cf94",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-smoking-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-smokingstatus"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Smoking Status</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "social-history",
+                "display": "Social History"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "72166-2",
+              "display": "Tobacco smoking status"
+            }
+          ],
+          "text": "Smoking Status"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "266919005",
+              "display": "Never smoker"
+            }
+          ],
+          "text": "Never smoker"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-smoking-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:ef61250a-ce6e-5cd6-9d04-23fc3026d98f",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-sdoh-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-screening-assessment"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Food insecurity risk</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "social-history",
+                "display": "Social History"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "sdoh",
+                "display": "SDOH"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "88122-7",
+              "display": "Within the past 12 months we worried whether our food would run out before we got money to buy more"
+            }
+          ],
+          "text": "Food insecurity risk"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "LA28397-0",
+              "display": "Often true"
+            }
+          ],
+          "text": "Often true"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-sdoh-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:9e385c43-8abc-581f-b8ab-ecd6795ae37a",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-sexual-orientation-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-sexual-orientation"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Sexual Orientation</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "social-history",
+                "display": "Social History"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "76690-7",
+              "display": "Sexual orientation"
+            }
+          ],
+          "text": "Sexual Orientation"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/v3-NullFlavor",
+              "code": "ASKU",
+              "display": "asked but unknown"
+            }
+          ],
+          "text": "Asked but unknown"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-sexual-orientation-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:612f8081-83bf-5417-9ac8-9ff95c3b3401",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-pregnancy-status-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-pregnancystatus"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Pregnancy Status</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "social-history",
+                "display": "Social History"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "82810-3",
+              "display": "Pregnancy status"
+            }
+          ],
+          "text": "Pregnancy Status"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "60001007",
+              "display": "Not pregnant"
+            }
+          ],
+          "text": "Not pregnant"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-pregnancy-status-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:09836d58-760e-5c2f-81db-5c04938cdb5a",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-pregnancy-intent-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-pregnancyintent"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Pregnancy Intent</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "social-history",
+                "display": "Social History"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "86645-9",
+              "display": "Pregnancy intention in the next year - Reported"
+            }
+          ],
+          "text": "Pregnancy Intent"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "LA26683-5",
+              "display": "Not pregnant"
+            }
+          ],
+          "text": "Not pregnant"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-pregnancy-intent-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:9837331d-9f59-5e8a-a706-2eb476c16077",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-clinical-test-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-clinical-result"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">EKG: Normal sinus rhythm</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "exam",
+                "display": "Exam"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "11524-6",
+              "display": "EKG study"
+            }
+          ],
+          "text": "EKG"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueString": "Normal sinus rhythm",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "derivedFrom": [
+          {
+            "reference": "Observation/observation-lab-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-clinical-test-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:5ec060b8-e4e4-5d14-8b6c-4bcf0af534ef",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-dar-extension-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-lab"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Blood Glucose: not performed</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "2339-0",
+              "display": "Glucose [Mass/volume] in Blood"
+            }
+          ],
+          "text": "Blood Glucose"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "valueQuantity": {
+          "extension": [
+            {
+              "url": "http://hl7.org/fhir/StructureDefinition/data-absent-reason",
+              "valueCode": "not-performed"
+            }
+          ]
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-dar-extension-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:447cb47c-c822-535d-9f9f-12a50bb10cbf",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-dar-codeable-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-lab"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Urine Specific Gravity: unknown</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "5811-5",
+              "display": "Specific gravity of Urine by Test strip"
+            }
+          ],
+          "text": "Urine Specific Gravity"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "dataAbsentReason": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/data-absent-reason",
+              "code": "unknown",
+              "display": "Unknown"
+            }
+          ]
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-dar-codeable-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:8b800d4f-3f4e-5d01-bbbe-55959f274ac5",
+      "resource": {
+        "resourceType": "ServiceRequest",
+        "id": "servicerequest-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-servicerequest"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">ServiceRequest: CBC Panel</div>"
+        },
+        "status": "active",
+        "intent": "order",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "108252007",
+                "display": "Laboratory procedure"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "58410-2",
+              "display": "CBC panel - Blood by Automated count"
+            }
+          ],
+          "text": "CBC Panel"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "authoredOn": "2024-01-15",
+        "requester": {
+          "reference": "Practitioner/practitioner-1",
+          "display": "Dr. Sarah Jones"
+        },
+        "basedOn": [
+          {
+            "reference": "CarePlan/careplan-1",
+            "display": "Care plan"
+          }
+        ],
+        "occurrencePeriod": {
+          "start": "2024-01-15",
+          "end": "2024-02-15"
+        },
+        "reasonCode": [
+          {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "271737000",
+                "display": "Anemia"
+              }
+            ]
+          }
+        ],
+        "reasonReference": [
+          {
+            "reference": "Condition/condition-problem-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "ServiceRequest/servicerequest-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:2ab08e18-b78e-5663-914c-08445ed63a02",
+      "resource": {
+        "resourceType": "Specimen",
+        "id": "specimen-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-specimen"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Specimen: Venous blood</div>"
+        },
+        "type": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "122555007",
+              "display": "Venous blood specimen"
+            }
+          ],
+          "text": "Venous blood"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "collection": {
+          "collectedDateTime": "2024-01-15T10:00:00Z"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Specimen/specimen-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:16c1e15a-1ad9-5a46-9a6a-d50b771783d0",
+      "resource": {
+        "resourceType": "RelatedPerson",
+        "id": "relatedperson-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-relatedperson"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">RelatedPerson: Jane Smith (spouse)</div>"
+        },
+        "active": true,
+        "patient": {
+          "reference": "Patient/123"
+        },
+        "relationship": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode",
+                "code": "SPS",
+                "display": "spouse"
+              }
+            ]
+          }
+        ],
+        "name": [
+          {
+            "family": "Smith",
+            "given": [
+              "Jane"
+            ]
+          }
+        ],
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "555-555-5556",
+            "use": "home"
+          }
+        ],
+        "address": [
+          {
+            "line": [
+              "123 Main St"
+            ],
+            "city": "Anytown",
+            "state": "NY",
+            "postalCode": "12345"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "RelatedPerson/relatedperson-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:d00bf91b-5c26-5ad3-91eb-ef134da850c2",
+      "resource": {
+        "resourceType": "QuestionnaireResponse",
+        "id": "questionnaireresponse-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-questionnaireresponse"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">QuestionnaireResponse: Hunger Vital Sign</div>"
+        },
+        "questionnaire": "http://hl7.org/fhir/us/core/Questionnaire/hunger-vital-sign",
+        "status": "completed",
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "authored": "2024-01-15T10:00:00Z",
+        "author": {
+          "reference": "Practitioner/practitioner-1",
+          "display": "Dr. Sarah Jones"
+        },
+        "item": [
+          {
+            "linkId": "/88122-7",
+            "text": "Within the past 12 months we worried whether our food would run out before we got money to buy more",
+            "answer": [
+              {
+                "valueCoding": {
+                  "system": "http://loinc.org",
+                  "code": "LA28397-0",
+                  "display": "Often true"
+                }
+              }
+            ]
+          },
+          {
+            "linkId": "/88123-5",
+            "text": "Within the past 12 months the food we bought just didn't last and we didn't have money to get more",
+            "answer": [
+              {
+                "valueCoding": {
+                  "system": "http://loinc.org",
+                  "code": "LA28397-0",
+                  "display": "Often true"
+                }
+              }
+            ]
+          },
+          {
+            "linkId": "/severity-score",
+            "text": "Severity score",
+            "answer": [
+              {
+                "valueDecimal": 3.5
+              }
+            ]
+          },
+          {
+            "linkId": "/general-health",
+            "text": "General health status",
+            "answer": [
+              {
+                "valueString": "Patient reports good health"
+              }
+            ]
+          },
+          {
+            "linkId": "/nested-answer-item",
+            "text": "Follow-up question",
+            "answer": [
+              {
+                "valueBoolean": true,
+                "item": [
+                  {
+                    "linkId": "/nested-answer-item/detail",
+                    "text": "Please provide details",
+                    "answer": [
+                      {
+                        "valueString": "No additional concerns"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "linkId": "/group-item",
+            "text": "Assessment group",
+            "item": [
+              {
+                "linkId": "/group-item/sub-1",
+                "text": "Sub-question 1",
+                "answer": [
+                  {
+                    "valueInteger": 2
+                  }
+                ]
+              },
+              {
+                "linkId": "/group-item/sub-2",
+                "text": "Sub-question 2",
+                "answer": [
+                  {
+                    "valueString": "Moderate"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "identifier": {
+          "system": "urn:oid:2.16.840.1.113883.19.5",
+          "value": "QR-12345"
+        },
+        "_questionnaire": {
+          "extension": [
+            {
+              "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-extension-questionnaire-uri",
+              "valueUri": "http://hl7.org/fhir/us/core/Questionnaire/hunger-vital-sign"
+            },
+            {
+              "url": "http://hl7.org/fhir/StructureDefinition/display",
+              "valueString": "Hunger Vital Sign Questionnaire"
+            }
+          ]
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "QuestionnaireResponse/questionnaireresponse-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:2695a9b0-7f8d-5d84-9efb-829c44bc0393",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance record</div>"
+        },
+        "target": [
+          {
+            "reference": "Patient/123"
+          }
+        ],
+        "recorded": "2024-01-15T10:00:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:a685bb11-09af-5c83-a85a-16dc3bf0efe0",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-2",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance record</div>"
+        },
+        "target": [
+          {
+            "reference": "Encounter/encounter-1"
+          },
+          {
+            "reference": "Condition/condition-problem-1"
+          },
+          {
+            "reference": "Observation/observation-lab-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:30:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-2"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:c2505700-8611-5c5e-a6a1-75e050d5d9b2",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-functional-status-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-simple-observation"
+          ]
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              },
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "functional-status",
+                "display": "Functional Status"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "55758-7",
+              "display": "Patient Health Questionnaire 2 item (PHQ-2) total score [Reported]"
+            }
+          ],
+          "text": "Functional status assessment"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueInteger": 3,
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Functional status assessment - PHQ-2 score: 3</div>"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-functional-status-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:069f3b6f-f83a-531b-a244-d08da99077cd",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-occupation-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-occupation"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Occupation - Software Developers</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "social-history",
+                "display": "Social History"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "11341-5",
+              "display": "History of occupation"
+            }
+          ],
+          "text": "History of occupation"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "urn:oid:2.16.840.1.114222.4.5.327",
+              "code": "15-1252.00",
+              "display": "Software Developers"
+            }
+          ],
+          "text": "Software Developers"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "effectivePeriod": {
+          "start": "2020-01-01",
+          "end": "2024-12-31"
+        },
+        "component": [
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "86188-0",
+                  "display": "History of Occupation industry"
+                }
+              ]
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "urn:oid:2.16.840.1.114222.4.5.315",
+                  "code": "5112",
+                  "display": "Software publishers"
+                }
+              ],
+              "text": "Software publishers"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-occupation-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:d804c9e6-4e86-513f-9d44-fdd4a40ea57a",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-pediatric-wt-for-ht-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/pediatric-weight-for-height"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Pediatric Weight for Height - 65.0%</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "77606-2",
+              "display": "Weight-for-length Per age and sex"
+            }
+          ],
+          "text": "Weight-for-length Per age and sex"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 65.0,
+          "unit": "%",
+          "system": "http://unitsofmeasure.org",
+          "code": "%"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-pediatric-wt-for-ht-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:be74cb57-9c0a-5a50-8662-4e3d3844aeb6",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-pediatric-bmi-for-age-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/pediatric-bmi-for-age"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Pediatric BMI for Age - 72.0%</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "59576-9",
+              "display": "Body mass index (BMI) [Percentile] Per age and sex"
+            }
+          ],
+          "text": "Body mass index (BMI) [Percentile] Per age and sex"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 72.0,
+          "unit": "%",
+          "system": "http://unitsofmeasure.org",
+          "code": "%"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-pediatric-bmi-for-age-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:ce48ac92-77ba-51b9-ab48-16d2cd97dc77",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-consult-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "11488-4",
+              "display": "Consult note"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "url": "urn:uuid:e7ca4a10-e42e-54b0-afcb-74998760b042"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Consultation note</div>"
+        },
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-consult-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:734d14cf-0e8b-5b40-8e6a-6e2f86d31a1b",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-discharge-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "18842-5",
+              "display": "Discharge summary"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "url": "urn:uuid:af0555db-74ed-5bf9-a3f7-ee68b7a4c68a"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Discharge summary</div>"
+        },
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-discharge-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:fa10b281-4d4a-5cfb-87b3-90a122d0853b",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-hp-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "34117-2",
+              "display": "History and physical note"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "url": "urn:uuid:fa9fa1ed-c59e-596b-8568-496f9a0f2edf"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: History and physical note</div>"
+        },
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-hp-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:7c58fc99-7e66-5601-ba23-c2415cc53059",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-procedure-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "28570-0",
+              "display": "Procedure note"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "url": "urn:uuid:88206a18-6b98-521c-a509-d5941f820852"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Procedure note</div>"
+        },
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-procedure-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:dd9a929c-ec9e-5eb4-9641-0a7ca05e47a5",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-progress-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "11506-3",
+              "display": "Progress note"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "url": "urn:uuid:a8b171fe-497d-5d85-9d8f-0eeea1c14fbb"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Progress note</div>"
+        },
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-progress-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:288a6d4d-edcc-5d69-bc9a-1e05f5db2e75",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-imaging-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "18748-4",
+              "display": "Diagnostic imaging study"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "url": "urn:uuid:6520db65-9761-5045-85eb-20ad363b602b"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Diagnostic imaging study</div>"
+        },
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-imaging-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:6308f6be-aa84-554e-9d8a-ccd0de28954b",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-labreport-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "11502-2",
+              "display": "Laboratory report"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "url": "urn:uuid:346a4c30-4a90-50e5-ae8b-55adbf78325e"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Laboratory report</div>"
+        },
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-labreport-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:8de40ca7-0e7e-5df0-8303-b1f8d15bfda7",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "documentreference-pathology-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-documentreference"
+          ]
+        },
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "11526-1",
+              "display": "Pathology study"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "date": "2024-01-15T10:00:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "url": "urn:uuid:a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Pathology study</div>"
+        },
+        "custodian": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DocumentReference/documentreference-pathology-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:e77c6fcf-7ff9-54fa-ad0c-9d2603cf29a9",
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "id": "diagnosticreport-path-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-diagnosticreport-note"
+          ]
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://loinc.org",
+                "code": "LP7839-6",
+                "display": "Pathology"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "60568-3",
+              "display": "Pathology Synoptic report"
+            }
+          ],
+          "text": "Pathology Report"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "issued": "2024-01-15T10:30:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "presentedForm": [
+          {
+            "contentType": "text/plain",
+            "url": "urn:uuid:a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DiagnosticReport: Pathology Synoptic report</div>"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DiagnosticReport/diagnosticreport-path-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:0813f829-5905-5db3-a662-9f1b31ab7bb4",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-3",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "target": [
+          {
+            "reference": "Observation/observation-functional-status-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-consult-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-discharge-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-hp-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-procedure-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-progress-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-imaging-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-labreport-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-pathology-1"
+          },
+          {
+            "reference": "DiagnosticReport/diagnosticreport-path-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:30:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance record</div>"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-3"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:303f89fa-82fb-5c5a-b37b-c5c5a88fcd97",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-4",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "target": [
+          {
+            "reference": "AllergyIntolerance/allergyintolerance-1"
+          },
+          {
+            "reference": "CarePlan/careplan-1"
+          },
+          {
+            "reference": "CareTeam/careteam-1"
+          },
+          {
+            "reference": "Condition/condition-encounter-1"
+          },
+          {
+            "reference": "Condition/condition-health-concern-1"
+          },
+          {
+            "reference": "Coverage/coverage-1"
+          },
+          {
+            "reference": "Device/device-1"
+          },
+          {
+            "reference": "DiagnosticReport/diagnosticreport-lab-1"
+          },
+          {
+            "reference": "DiagnosticReport/diagnosticreport-note-1"
+          },
+          {
+            "reference": "DocumentReference/documentreference-1"
+          },
+          {
+            "reference": "Goal/goal-1"
+          },
+          {
+            "reference": "Immunization/immunization-1"
+          },
+          {
+            "reference": "MedicationDispense/medicationdispense-1"
+          },
+          {
+            "reference": "MedicationRequest/medicationrequest-1"
+          },
+          {
+            "reference": "Procedure/procedure-1"
+          },
+          {
+            "reference": "QuestionnaireResponse/questionnaireresponse-1"
+          },
+          {
+            "reference": "RelatedPerson/relatedperson-1"
+          },
+          {
+            "reference": "ServiceRequest/servicerequest-1"
+          },
+          {
+            "reference": "Specimen/specimen-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:30:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance record</div>"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-4"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:69b3d489-3b41-5315-b0bc-063472bb1131",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-5",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "target": [
+          {
+            "reference": "Observation/observation-bmi-1"
+          },
+          {
+            "reference": "Observation/observation-bp-1"
+          },
+          {
+            "reference": "Observation/observation-clinical-test-1"
+          },
+          {
+            "reference": "Observation/observation-dar-codeable-1"
+          },
+          {
+            "reference": "Observation/observation-dar-extension-1"
+          },
+          {
+            "reference": "Observation/observation-headcirc-1"
+          },
+          {
+            "reference": "Observation/observation-height-1"
+          },
+          {
+            "reference": "Observation/observation-hr-1"
+          },
+          {
+            "reference": "Observation/observation-pregnancy-intent-1"
+          },
+          {
+            "reference": "Observation/observation-pregnancy-status-1"
+          },
+          {
+            "reference": "Observation/observation-pulseox-1"
+          },
+          {
+            "reference": "Observation/observation-resp-1"
+          },
+          {
+            "reference": "Observation/observation-sdoh-1"
+          },
+          {
+            "reference": "Observation/observation-sexual-orientation-1"
+          },
+          {
+            "reference": "Observation/observation-smoking-1"
+          },
+          {
+            "reference": "Observation/observation-temp-1"
+          },
+          {
+            "reference": "Observation/observation-weight-1"
+          },
+          {
+            "reference": "Organization/organization-1"
+          },
+          {
+            "reference": "Practitioner/practitioner-1"
+          },
+          {
+            "reference": "PractitionerRole/practitionerrole-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:30:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ],
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance record</div>"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-5"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:8962b4fb-370a-53d2-972c-42e1dd85bcdc",
+      "resource": {
+        "resourceType": "Location",
+        "id": "location-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-location"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Anytown General Hospital</div>"
+        },
+        "status": "active",
+        "name": "Anytown General Hospital",
+        "type": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode",
+                "code": "HOSP",
+                "display": "Hospital"
+              }
+            ]
+          }
+        ],
+        "address": {
+          "line": [
+            "123 Main St"
+          ],
+          "city": "Anytown",
+          "state": "CA",
+          "postalCode": "90210"
+        },
+        "managingOrganization": {
+          "reference": "Organization/organization-1",
+          "display": "Anytown General Hospital"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Location/location-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-location-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance for Location</div>"
+        },
+        "target": [
+          {
+            "reference": "Location/location-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:00:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-location-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:76020fbe-5125-5f8c-aafa-2c99b8d281d3",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-6",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance record</div>"
+        },
+        "target": [
+          {
+            "reference": "Observation/observation-occupation-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:00:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-6"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:5f3d80af-128d-5fb4-9674-29539ba01d5f",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-7",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance record</div>"
+        },
+        "target": [
+          {
+            "reference": "Observation/observation-pediatric-wt-for-ht-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:00:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-7"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:6c8fa9c6-7daf-5f70-b8b2-b45a7191beee",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-8",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance record</div>"
+        },
+        "target": [
+          {
+            "reference": "Observation/observation-pediatric-bmi-for-age-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:00:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-8"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:4194762f-300f-5035-b5ca-5ecba8dc46e3",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-bp-dar-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-blood-pressure",
+            "http://hl7.org/fhir/StructureDefinition/bp"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Blood Pressure with systolic data absent</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "85354-9",
+              "display": "Blood pressure panel with all children optional"
+            }
+          ],
+          "text": "Blood Pressure"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-02-10T09:00:00Z",
+        "component": [
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "8480-6",
+                  "display": "Systolic blood pressure"
+                }
+              ]
+            },
+            "dataAbsentReason": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/data-absent-reason",
+                  "code": "unknown",
+                  "display": "Unknown"
+                }
+              ]
+            }
+          },
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "8462-4",
+                  "display": "Diastolic blood pressure"
+                }
+              ]
+            },
+            "valueQuantity": {
+              "value": 78,
+              "unit": "mmHg",
+              "system": "http://unitsofmeasure.org",
+              "code": "mm[Hg]"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-bp-dar-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:f9160389-b9e5-532f-97cd-24d2a2c8d6ba",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-lab-codeable-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-lab"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Urine Color: Yellow</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "5778-6",
+              "display": "Color of Urine"
+            }
+          ],
+          "text": "Color of Urine"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "371244009",
+              "display": "Yellow"
+            }
+          ]
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-lab-codeable-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:7042f471-2a2b-5a6f-b2fb-5703e73b241c",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-lab-string-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-lab"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Base excess: Unable to determine</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "11555-0",
+              "display": "Base excess in Blood by calculation"
+            }
+          ],
+          "text": "Base excess in Blood"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueString": "Unable to determine",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-lab-string-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:b68f1a84-3246-5e41-b9b6-b614152cce4b",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-simple-bool-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-simple-observation"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Race assessment: true</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "exam",
+                "display": "Exam"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "32624-9",
+              "display": "Race"
+            }
+          ],
+          "text": "Race"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueBoolean": true,
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-simple-bool-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:4fd76c62-f680-5ea2-bb6f-f44209cf9cac",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-clinical-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-clinical-result"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Albumin 4.2 g/dL</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "exam",
+                "display": "Exam"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "1751-7",
+              "display": "Albumin [Mass/volume] in Serum or Plasma"
+            }
+          ],
+          "text": "Albumin"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueQuantity": {
+          "value": 4.2,
+          "unit": "g/dL",
+          "system": "http://unitsofmeasure.org",
+          "code": "g/dL"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "hasMember": [
+          {
+            "reference": "Observation/observation-lab-1"
+          }
+        ],
+        "derivedFrom": [
+          {
+            "reference": "Observation/observation-lab-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-clinical-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:30a213eb-4d69-5a4c-a555-96879c72ceaf",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-screening-disability-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-screening-assessment"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Disability status screening</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "disability-status",
+                "display": "Disability Status"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "77594-0",
+              "display": "Total physical activity [IPAQ]"
+            }
+          ],
+          "text": "Total physical activity [IPAQ]"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "LA6568-5",
+              "display": "Not at all"
+            }
+          ],
+          "text": "Not at all"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-screening-disability-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:034619fa-ec5b-58d6-8d54-13f5fe802c07",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-screening-cognitive-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-screening-assessment"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Cognitive status screening</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "cognitive-status",
+                "display": "Cognitive Status"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "72106-8",
+              "display": "Total score [MMSE]"
+            }
+          ],
+          "text": "BIMS total score"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "valueInteger": 12
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-screening-cognitive-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:1ee009c2-49ff-5584-a6ab-149bd803d1a7",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-screening-codeable-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-screening-assessment"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Food insecurity screening: Often true</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "sdoh",
+                "display": "SDOH"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "88122-7",
+              "display": "Within the past 12 months we worried whether our food would run out before we got money to buy more"
+            }
+          ],
+          "text": "Food insecurity risk"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "LA28397-0",
+              "display": "Often true"
+            }
+          ],
+          "text": "Often true"
+        },
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-screening-codeable-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:c0299804-7831-5d2c-95e0-d2b6d79730ac",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-9",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance for new MustSupport observations</div>"
+        },
+        "target": [
+          {
+            "reference": "Observation/observation-bp-dar-1"
+          },
+          {
+            "reference": "Observation/observation-lab-codeable-1"
+          },
+          {
+            "reference": "Observation/observation-lab-string-1"
+          },
+          {
+            "reference": "Observation/observation-simple-bool-1"
+          },
+          {
+            "reference": "Observation/observation-clinical-1"
+          },
+          {
+            "reference": "Observation/observation-screening-disability-1"
+          },
+          {
+            "reference": "Observation/observation-screening-cognitive-1"
+          },
+          {
+            "reference": "Observation/observation-screening-codeable-1"
+          }
+        ],
+        "recorded": "2024-01-15T10:00:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-9"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-headcirc-percentile-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/head-occipital-frontal-circumference-percentile"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Observation: Head Occipital-frontal circumference Percentile - 55%</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "8289-1",
+              "display": "Head Occipital-frontal circumference Percentile"
+            }
+          ],
+          "text": "Head Occipital-frontal circumference Percentile"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "valueQuantity": {
+          "value": 55,
+          "unit": "%",
+          "system": "http://unitsofmeasure.org",
+          "code": "%"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-headcirc-percentile-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:b2c3d4e5-f6a7-8901-bcde-f12345678901",
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "id": "diagnosticreport-radiology-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-diagnosticreport-note"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DiagnosticReport: Portable XR Chest - No acute cardiopulmonary process</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://loinc.org",
+                "code": "LP29708-2",
+                "display": "Card"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "30746-2",
+              "display": "Portable XR Chest Views"
+            }
+          ],
+          "text": "Portable XR Chest Views"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "encounter": {
+          "reference": "Encounter/encounter-1"
+        },
+        "effectiveDateTime": "2024-03-15",
+        "issued": "2024-03-15T12:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "presentedForm": [
+          {
+            "contentType": "text/plain",
+            "data": "Tm8gYWN1dGUgY2FyZGlvcHVsbW9uYXJ5IHByb2Nlc3M="
+          }
+        ],
+        "conclusion": "No acute cardiopulmonary process"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "DiagnosticReport/diagnosticreport-radiology-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:d4e5f6a7-b8c9-0123-defa-234567890123",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "provenance-10",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-provenance"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Provenance for radiology report, head circumference percentile, and immunization period resources</div>"
+        },
+        "target": [
+          {
+            "reference": "DiagnosticReport/diagnosticreport-radiology-1"
+          },
+          {
+            "reference": "Observation/observation-headcirc-percentile-1"
+          }
+        ],
+        "recorded": "2024-03-15T12:00:00Z",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/practitioner-1",
+              "display": "Dr. Sarah Jones"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1"
+            }
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Provenance/provenance-10"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:observation-screening-quantity-1",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-screening-quantity-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-screening-assessment"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">PHQ-9 total score: 10</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "sdoh",
+                "display": "SDOH"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "44261-6",
+              "display": "Patient Health Questionnaire 9 item (PHQ-9) total score [Reported]"
+            }
+          ],
+          "text": "PHQ-9 total score"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "valueQuantity": {
+          "value": 10,
+          "unit": "{score}",
+          "system": "http://unitsofmeasure.org",
+          "code": "{score}"
+        }
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-screening-quantity-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:observation-screening-string-1",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-screening-string-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-screening-assessment"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Screening text answer</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "sdoh",
+                "display": "SDOH"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "93159-2",
+              "display": "How often do you feel lonely or isolated from those around you during assessment period [CMS Assessment]"
+            }
+          ],
+          "text": "How often do you feel lonely or isolated"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "valueString": "I have a steady place to live"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-screening-string-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:observation-screening-panel-1",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-screening-panel-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-screening-assessment"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Hunger Vital Sign screening panel</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "sdoh",
+                "display": "SDOH"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "88121-9",
+              "display": "Children's HealthWatch Hunger Vital Sign [HVS]"
+            }
+          ],
+          "text": "Hunger Vital Sign panel"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "hasMember": [
+          {
+            "reference": "Observation/observation-sdoh-1"
+          },
+          {
+            "reference": "Observation/observation-screening-codeable-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-screening-panel-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:observation-screening-derived-1",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "observation-screening-derived-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-observation-screening-assessment"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">Screening observation derived from questionnaire</div>"
+        },
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "survey",
+                "display": "Survey"
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-category",
+                "code": "sdoh",
+                "display": "SDOH"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "88124-3",
+              "display": "Food insecurity risk [HVS]"
+            }
+          ],
+          "text": "Food insecurity risk from questionnaire"
+        },
+        "subject": {
+          "reference": "Patient/123"
+        },
+        "effectiveDateTime": "2024-01-15T10:00:00Z",
+        "performer": [
+          {
+            "reference": "Practitioner/practitioner-1"
+          }
+        ],
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "LA19952-3",
+              "display": "At risk"
+            }
+          ],
+          "text": "At risk"
+        },
+        "derivedFrom": [
+          {
+            "reference": "QuestionnaireResponse/questionnaireresponse-1"
+          }
+        ]
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Observation/observation-screening-derived-1"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:endpoint-1",
+      "resource": {
+        "resourceType": "Endpoint",
+        "id": "endpoint-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-endpoint"
+          ]
+        },
+        "text": {
+          "status": "generated",
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">FHIR REST Endpoint</div>"
+        },
+        "status": "active",
+        "connectionType": {
+          "system": "http://terminology.hl7.org/CodeSystem/endpoint-connection-type",
+          "code": "hl7-fhir-rest"
+        },
+        "name": "FHIR REST Endpoint",
+        "payloadType": [
+          {
+            "coding": [
+              {
+                "system": "http://hl7.org/fhir/us/davinci-pdex-plan-net/CodeSystem/EndpointPayloadTypeCS",
+                "code": "NA"
+              }
+            ]
+          }
+        ],
+        "address": "https://fhir.local:3001/default/fhir"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Endpoint/endpoint-1"
+      }
+    }
+  ]
+}

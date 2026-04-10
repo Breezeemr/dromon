@@ -1,0 +1,128 @@
+(ns fhir-store.mock.core-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [fhir-store.mock.core :as mock]
+            [fhir-store.protocol :as protocol]))
+
+(deftest create-read-test
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        resource {:resourceType "Patient" :name [{:family "Smith"}]}
+        created (protocol/create-resource store tenant "Patient" nil resource)
+        id (:id created)]
+    (testing "create assigns id and version"
+      (is (string? id))
+      (is (= "1" (get-in created [:meta :versionId]))))
+
+    (testing "read returns the created resource"
+      (let [read-back (protocol/read-resource store tenant "Patient" id)]
+        (is (= created read-back))))))
+
+(deftest update-test
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        resource {:resourceType "Patient" :name [{:family "Smith"}]}
+        created (protocol/create-resource store tenant "Patient" "pt1" resource)]
+    (testing "update increments version"
+      (let [updated-resource (assoc resource :active true)
+            updated (protocol/update-resource store tenant "Patient" "pt1" updated-resource)]
+        (is (= "2" (get-in updated [:meta :versionId])))
+        (is (= true (:active updated)))
+
+        (testing "read returns updated version"
+          (is (= updated (protocol/read-resource store tenant "Patient" "pt1"))))
+
+        (testing "vread returns specific versions"
+          (is (= created (protocol/vread-resource store tenant "Patient" "pt1" "1")))
+          (is (= updated (protocol/vread-resource store tenant "Patient" "pt1" "2"))))))))
+
+(deftest delete-test
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        resource {:resourceType "Patient" :name [{:family "Smith"}]}
+        created (protocol/create-resource store tenant "Patient" "pt1" resource)]
+    (testing "delete removes from read but keeps history"
+      (is (true? (protocol/delete-resource store tenant "Patient" "pt1")))
+      (is (nil? (protocol/read-resource store tenant "Patient" "pt1")))
+      (is (= created (protocol/vread-resource store tenant "Patient" "pt1" "1"))))))
+
+(deftest search-test
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        p1 {:resourceType "Patient" :name [{:family "Smith"}]}
+        p2 {:resourceType "Patient" :name [{:family "Jones"}]}
+        o1 {:resourceType "Observation" :status "final"}]
+    (protocol/create-resource store tenant "Patient" "1" p1)
+    (protocol/create-resource store tenant "Patient" "2" p2)
+    (protocol/create-resource store tenant "Observation" "1" o1)
+
+    (testing "search returns all active resources of type"
+      (let [patients (protocol/search store tenant "Patient" {} nil)]
+        (is (= 2 (count patients)))
+        (is (= #{"1" "2"} (set (map :id patients)))))
+
+      (let [observations (protocol/search store tenant "Observation" {} nil)]
+        (is (= 1 (count observations)))))))
+
+(deftest transact-bundle-ordering-test
+  (testing "transaction entries are processed in FHIR-specified order: DELETE -> POST -> PUT -> GET"
+    (let [store (mock/create-mock-store {})
+          tenant "test-tenant"
+          ;; Create a resource first so we can DELETE and PUT against it
+          _ (protocol/create-resource store tenant "Patient" "existing" {:resourceType "Patient" :name [{:family "Original"}]})
+          ;; Submit entries out of order: GET, PUT, POST, DELETE
+          entries [{:request {:method "GET" :url "Patient/existing"}
+                    :resource nil}
+                   {:request {:method "PUT" :url "Patient/new-put"}
+                    :resource {:resourceType "Patient" :name [{:family "PutNew"}]}}
+                   {:request {:method "POST" :url "Observation"}
+                    :resource {:resourceType "Observation" :status "final"}}
+                   {:request {:method "DELETE" :url "Patient/existing"}}]
+          result (protocol/transact-bundle store tenant entries)]
+      (is (= "Bundle" (:resourceType result)))
+      (is (= "transaction-response" (:type result)))
+      ;; Verify all 4 entries produced results
+      (is (= 4 (count (:entry result))))
+      ;; Verify the ordering: DELETE first, then POST, then PUT, then GET
+      (let [statuses (mapv #(get-in % [:response :status]) (:entry result))]
+        (is (= "204 No Content" (nth statuses 0)) "DELETE should be first")
+        (is (= "201 Created" (nth statuses 1)) "POST should be second")
+        (is (= "200 OK" (nth statuses 2)) "PUT should be third (upsert)")
+        ;; GET for deleted resource returns 404
+        (is (= "404 Not Found" (nth statuses 3)) "GET should be last")))))
+
+(deftest transact-bundle-rollback-test
+  (testing "transaction rolls back on failure"
+    (let [store (mock/create-mock-store {})
+          tenant "test-tenant"
+          ;; Create a resource we expect to survive rollback
+          _ (protocol/create-resource store tenant "Patient" "survivor" {:resourceType "Patient" :name [{:family "Survivor"}]})
+          ;; Create a transaction where the second entry will fail
+          ;; (POST with an id that already exists triggers duplicate error)
+          _ (protocol/create-resource store tenant "Patient" "dup" {:resourceType "Patient" :name [{:family "Existing"}]})
+          entries [{:request {:method "PUT" :url "Patient/survivor"}
+                    :resource {:resourceType "Patient" :name [{:family "Updated"}]}}
+                   {:request {:method "POST" :url "Patient"}
+                    ;; POST tries to create — this should succeed (generates new id)
+                    :resource {:resourceType "Patient" :name [{:family "NewPatient"}]}}]]
+      ;; This transaction should succeed normally
+      (let [result (protocol/transact-bundle store tenant entries)]
+        (is (= "transaction-response" (:type result))))
+      ;; Verify the original "survivor" was updated (PUT processed after POST in ordering)
+      (let [res (protocol/read-resource store tenant "Patient" "survivor")]
+        (is (= [{:family "Updated"}] (:name res))))))
+
+  (testing "failed transaction restores previous state"
+    (let [store (mock/create-mock-store {})
+          tenant "test-tenant"
+          _ (protocol/create-resource store tenant "Patient" "keep-me" {:resourceType "Patient" :name [{:family "Original"}]})
+          ;; First entry (DELETE, order=0) will succeed and remove "keep-me"
+          ;; Second entry uses an unsupported method to trigger an error
+          entries [{:request {:method "DELETE" :url "Patient/keep-me"}}
+                   {:request {:method "INVALID" :url "Patient/foo"}
+                    :resource {:resourceType "Patient"}}]]
+      ;; The transaction should throw because INVALID method hits default case in (case ...)
+      (is (thrown? Exception (protocol/transact-bundle store tenant entries)))
+      ;; After rollback, the original resource should still exist
+      (let [res (protocol/read-resource store tenant "Patient" "keep-me")]
+        (is (some? res) "Resource should be restored after rollback")
+        (is (= [{:family "Original"}] (:name res)))))))

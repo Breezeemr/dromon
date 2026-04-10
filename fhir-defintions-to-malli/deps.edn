@@ -1,0 +1,21 @@
+{:paths ["src" "resources"]
+ :deps  {org.clojure/clojure   {:mvn/version "1.12.1"}
+         hato/hato             {:mvn/version "1.0.0"}
+         funcool/promesa       {:mvn/version "11.0.678"}
+         com.cnuernber/charred {:mvn/version "1.037"}
+         metosin/malli         {:mvn/version "0.20.0"}
+         net.cgrand/xforms     {:mvn/version "0.19.6"}
+         com.breezeehr/fhir-primitives {:local/root "../fhir-primitives"}}
+ :aliases
+ {:build {:deps       {io.github.seancorfield/build-clj
+                       {:git/tag "v0.9.2" :git/sha "9c9f0786"}}
+          :ns-default build}
+  :test  {:extra-paths ["test"]
+          :extra-deps  {org.clojure/test.check {:mvn/version "1.1.1"}
+                        io.github.cognitect-labs/test-runner
+                        {:git/tag "v0.5.1" :git/sha "dfb30dd6"}}}
+  :dev   {:extra-paths ["dev"]}
+  :generation-testing {:extra-paths ["dev"
+                                     "../fhir/malli/r4b/src"
+                                     "../fhir/malli/uscore8/src"]}
+  :run   {:main-opts ["-m" "com.breezeehr.main"]}}}

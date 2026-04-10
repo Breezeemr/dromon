@@ -1,0 +1,27 @@
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+        info.sunng/ring-jetty9-adapter {:mvn/version "0.39.2"}
+        metosin/reitit {:mvn/version "0.10.1"} ;; latest reitit
+        metosin/malli {:mvn/version "0.20.0"}       ;; latest malli
+        com.breezeehr/fhir-primitives {:local/root "../fhir-primitives"}
+        fhir-store/protocol {:local/root "../fhir-store-protocol"}
+        fhir-terminology/fhir-terminology {:local/root "../fhir-terminology"}
+        org.clojure/tools.logging {:mvn/version "1.3.1"}
+        com.taoensso/telemere {:mvn/version "1.2.1"}
+        com.taoensso/telemere-slf4j {:mvn/version "1.2.1"}
+        integrant/integrant {:mvn/version "1.0.1"}
+        buddy/buddy-auth {:mvn/version "3.0.323"}
+        buddy/buddy-sign {:mvn/version "3.6.1-359"}
+        buddy/buddy-core {:mvn/version "1.12.0-430"}
+        hato/hato {:mvn/version "1.0.0"}
+        metosin/jsonista {:mvn/version "0.3.14"}
+        fipp/fipp {:mvn/version "0.6.29"}}
+ :aliases
+ {:dev  {:extra-paths ["dev"]}
+  :test {:extra-paths ["test"]
+         :extra-deps  {org.clojure/test.check {:mvn/version "1.1.1"}
+                       lambdaisland/kaocha    {:mvn/version "1.91.1392"}
+                       fhir-store/mock {:local/root "../fhir-store-mock"}}
+         :main-opts   ["-m" "kaocha.runner"]
+         :jvm-opts    ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                       "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]}}}

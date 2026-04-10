@@ -1,0 +1,87 @@
+{:paths ["bb/src"]
+ :tasks
+ {setup
+  {:doc "Starts the local integration environment (Postgres, Kratos, Keto, Hydra) via Docker"
+   :requires ([server.docker-env :as env])
+   :task (env/start!)}
+
+  teardown
+  {:doc "Stops and removes the local integration environment"
+   :requires ([server.docker-env :as env])
+   :task (env/stop!)}
+
+  tls-setup
+  {:doc "Updates /etc/hosts to point fhir.local to 127.0.0.1 and generates a TLS dev certificate with mkcert."
+   :task (do
+           (let [domain "fhir.local"
+                 hosts-content (slurp "/etc/hosts")]
+             (if (clojure.string/includes? hosts-content domain)
+               (println "Domain" domain "already in /etc/hosts.")
+               (do
+                 (println "Adding" domain "to /etc/hosts (requires sudo)...")
+                 (shell "sudo" "sh" "-c" (str "echo '127.0.0.1 " domain "' >> /etc/hosts")))))
+           (if (.exists (clojure.java.io/file "fhir-server/dev-keystore.p12"))
+             (println "dev-keystore.p12 already exists, skipping mkcert.")
+             (do
+               (println "Generating dev certificate with mkcert...")
+               (shell "mkcert" "-install")
+               (shell "mkcert" "-pkcs12" "-p12-file" "fhir-server/dev-keystore.p12" "fhir.local")))
+           (let [caroot (clojure.string/trim (:out (shell {:out :string} "mkcert" "-CAROOT")))]
+             (println "Ensuring rootCA.pem is available for Docker containers...")
+             (clojure.java.io/copy (clojure.java.io/file caroot "rootCA.pem")
+                                   (clojure.java.io/file "inferno-test-kit/rootCA.pem"))))}
+
+  inferno-setup
+  {:doc "Clones the US Core Test Kit and runs its setup script to build docker images."
+   :requires ([clj-yaml.core :as yaml])
+   :task (do
+           (when-not (.exists (clojure.java.io/file "inferno-test-kit"))
+             (println "Cloning us-core-test-kit...")
+             (shell "git" "clone" "https://github.com/inferno-framework/us-core-test-kit" "inferno-test-kit"))
+           (println "Running inferno setup script...")
+           (shell {:dir "inferno-test-kit"} "./setup.sh")
+           (when (.exists (clojure.java.io/file "inferno-test-kit/data/redis/.keep"))
+             (println "Removing redis .keep file to allow permission fixes...")
+             (clojure.java.io/delete-file "inferno-test-kit/data/redis/.keep" true))
+           ;; Patch docker-compose files using YAML parsing
+           (println "Patching docker-compose files...")
+           (let [compose-file "inferno-test-kit/docker-compose.yml"
+                 compose      (yaml/parse-string (slurp compose-file))
+                 extra-hosts  ["host.docker.internal:host-gateway"
+                               "fhir.local:host-gateway"]
+                 ssl-env      ["SSL_CERT_FILE=/opt/inferno/rootCA.pem"]
+                 patch-svc    (fn [svc]
+                                (-> svc
+                                    (assoc :extra_hosts extra-hosts)
+                                    (update :volumes (fnil conj []) "./rootCA.pem:/opt/inferno/rootCA.pem")
+                                    (update :environment (fnil into []) ssl-env)))
+                 patched      (-> compose
+                                  (update-in [:services :inferno] patch-svc)
+                                  (update-in [:services :worker] patch-svc)
+                                  (assoc-in [:services :nginx :ports] ["8080:80"]))]
+             (spit compose-file (yaml/generate-string patched :dumper-options {:flow-style :block}))
+             (println "  docker-compose.yml patched."))
+           ;; Remap nginx port in background compose file too
+           (let [bg-file  "inferno-test-kit/docker-compose.background.yml"
+                 bg       (yaml/parse-string (slurp bg-file))
+                 patched  (assoc-in bg [:services :nginx :ports] ["8080:80"])]
+             (spit bg-file (yaml/generate-string patched :dumper-options {:flow-style :block}))
+             (println "  docker-compose.background.yml patched.")))}
+
+  inferno-run
+  {:doc "Runs the Inferno Test Kit suite locally"
+   :task (shell {:dir "inferno-test-kit"} "./run.sh")}
+
+  inferno-check
+  {:doc "Smoke-test: checks that Inferno containers are healthy and the FHIR server responds to /metadata. Fast (~5s), no full test run."
+   :requires ([server.inferno-runner :as runner])
+   :task (runner/check!)}
+
+  inferno-test
+  {:doc "Runs the Inferno CLI executor dynamically using Babashka."
+   :requires ([server.inferno-runner :as runner])
+   :task (runner/run-check!)}
+
+  inferno-down
+  {:doc "Stops the Inferno docker instances"
+   :task (shell {:dir "inferno-test-kit"} "docker" "compose" "down")}}}

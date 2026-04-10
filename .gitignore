@@ -1,0 +1,15 @@
+# Ignore clj-kondo cache
+**/.clj-kondo/.cache
+**/.idea/
+**/*.iml
+**/.vscode/
+**/.cpcache/
+**/.env*
+**/*.p12
+**/*.jks
+
+**/.nrepl-port
+inferno-test-kit/
+fhir/malli/
+target
+server.log

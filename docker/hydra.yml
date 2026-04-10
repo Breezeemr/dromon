@@ -1,0 +1,54 @@
+serve:
+  public:
+    cors:
+      enabled: true
+      allowed_origins:
+        - "*"
+      allowed_methods:
+        - POST
+        - GET
+        - PUT
+        - PATCH
+        - DELETE
+      allowed_headers:
+        - Authorization
+        - Content-Type
+  cookies:
+    same_site_mode: Lax
+  tls:
+    allow_termination_from:
+      - 127.0.0.1/32
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+
+ttl:
+  access_token: 4h
+
+strategies:
+  access_token: jwt
+
+urls:
+  self:
+    issuer: http://127.0.0.1:4444/
+    
+  consent: http://127.0.0.1:3000/consent
+  login: http://127.0.0.1:3000/login
+  logout: http://127.0.0.1:3000/logout
+
+secrets:
+  system:
+    - $HYDRA_SYSTEM_SECRET
+
+oidc:
+  subject_identifiers:
+    supported_types:
+      - pairwise
+      - public
+    pairwise:
+      salt: $HYDRA_OIDC_SALT
+
+log:
+  level: info
+  format: text
+  leak_sensitive_values: false

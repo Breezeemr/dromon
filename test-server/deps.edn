@@ -1,0 +1,28 @@
+{:paths ["src"]
+ :deps {fhir-store/server {:local/root "../fhir-server"}
+        fhir-terminology/fhir-terminology {:local/root "../fhir-terminology"}
+        integrant/integrant {:mvn/version "0.13.1"}
+        metosin/malli {:mvn/version "0.20.0"}}
+ :aliases
+ {;; --- FHIR store backends ---
+  :store/xtdb2 {:extra-deps {fhir-store/xtdb2 {:local/root "../fhir-store-xtdb2"}}}
+  :store/mock  {:extra-deps {fhir-store/mock  {:local/root "../fhir-store-mock"}}}
+
+  ;; --- FHIR malli schema packages ---
+  :malli/r4b             {:extra-deps {com.breezeehr/fhir-malli-r4b             {:local/root "../fhir/malli/r4b"}}}
+  :malli/xver            {:extra-deps {com.breezeehr/fhir-malli-xver            {:local/root "../fhir/malli/xver"}}}
+  :malli/fhir-extensions {:extra-deps {com.breezeehr/fhir-malli-fhir-extensions {:local/root "../fhir/malli/fhir-extensions"}}}
+  :malli/sdc             {:extra-deps {com.breezeehr/fhir-malli-sdc             {:local/root "../fhir/malli/sdc"}}}
+  :malli/uscore8         {:extra-deps {com.breezeehr/fhir-malli-uscore8         {:local/root "../fhir/malli/uscore8"}}}
+
+  :dev {:extra-paths ["dev" "../fhir-server/dev"]}
+  :test {:extra-paths ["test" "../fhir-server/test"]
+         :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
+                      lambdaisland/kaocha    {:mvn/version "1.91.1392"}
+                      fhir-store/mock        {:local/root "../fhir-store-mock"}
+                      fhir-store/xtdb2       {:local/root "../fhir-store-xtdb2"}
+                      com.breezeehr/fhir-malli-r4b     {:local/root "../fhir/malli/r4b"}
+                      com.breezeehr/fhir-malli-uscore8 {:local/root "../fhir/malli/uscore8"}}
+         :main-opts ["-m" "kaocha.runner"]
+         :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                    "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]}}}
