@@ -24,5 +24,6 @@
                       com.breezeehr/fhir-malli-r4b     {:local/root "../fhir/malli/r4b"}
                       com.breezeehr/fhir-malli-uscore8 {:local/root "../fhir/malli/uscore8"}}
          :main-opts ["-m" "kaocha.runner"]
-         :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+         :jvm-opts ["-Xmx6g"
+                    "--add-opens=java.base/java.nio=ALL-UNNAMED"
                     "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]}}}

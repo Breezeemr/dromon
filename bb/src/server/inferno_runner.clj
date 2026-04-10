@@ -314,6 +314,7 @@
 
   (println "Starting FHIR server...")
   (process ["clojure"
+            "-J-Xmx6g"
             "-J--add-opens=java.base/java.nio=ALL-UNNAMED"
             "-J--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
             "-J--enable-preview"

@@ -23,5 +23,6 @@
                        lambdaisland/kaocha    {:mvn/version "1.91.1392"}
                        fhir-store/mock {:local/root "../fhir-store-mock"}}
          :main-opts   ["-m" "kaocha.runner"]
-         :jvm-opts    ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+         :jvm-opts    ["-Xmx6g"
+                       "--add-opens=java.base/java.nio=ALL-UNNAMED"
                        "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]}}}
