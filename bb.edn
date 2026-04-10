@@ -94,9 +94,22 @@
 
   inferno-test
   {:doc "Runs the Inferno CLI executor dynamically using Babashka."
-   :depends [setup inferno-setup]
+   :depends [generate-uscore setup inferno-setup]
    :requires ([server.inferno-runner :as runner])
    :task (runner/run-check!)}
+
+  generate-uscore
+  {:doc "Generates Malli schema packages (r4b, xver, fhir-extensions, sdc, uscore8) from FHIR StructureDefinitions. Pass --force to regenerate when output already exists."
+   :task (let [force?     (some #{"--force"} *command-line-args*)
+               output-dir (clojure.java.io/file "fhir/malli/uscore8/src")]
+           (if (and (.exists output-dir) (not force?))
+             (println "fhir/malli/uscore8/src already exists -- skipping. Pass --force to regenerate.")
+             (do
+               (println "Ensuring target/staging/src exists...")
+               (.mkdirs (clojure.java.io/file "fhir-defintions-to-malli/target/staging/src"))
+               (println "Generating Malli schemas (this can take a few minutes)...")
+               (shell {:dir "fhir-defintions-to-malli"}
+                      "clj" "-X" "com.breezeehr.main/generate-uscore!"))))}
 
   inferno-down
   {:doc "Stops the Inferno docker instances"
