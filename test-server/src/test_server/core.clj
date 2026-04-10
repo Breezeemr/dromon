@@ -104,7 +104,24 @@
 (defn- env-keyword [k]
   (some-> (System/getenv k) keyword))
 
+(defn- assert-supported-jvm! []
+  ;; The server depends on java.util.concurrent.StructuredTaskScope$ShutdownOnFailure,
+  ;; which was a JEP-453 preview API present in JDK 21-24 and removed in JDK 25 when
+  ;; structured concurrency was finalized with a different class shape. Running under
+  ;; JDK 25+ produces a ClassNotFoundException a few seconds after Jetty starts, with
+  ;; a confusing trace far from the binding. Fail fast with a clear message instead.
+  (let [version-prop (System/getProperty "java.specification.version")
+        major        (try (Integer/parseInt version-prop) (catch Exception _ 0))]
+    (when (>= major 25)
+      (throw (ex-info (str "test-server requires Java 21-24. Detected Java "
+                           version-prop ". JDK 25 removed the preview "
+                           "java.util.concurrent.StructuredTaskScope$ShutdownOnFailure "
+                           "API that this server depends on. Set JAVA_HOME to a JDK 21 "
+                           "install (e.g. /usr/lib/jvm/java-21-openjdk-amd64) and retry.")
+                      {:java-specification-version version-prop})))))
+
 (defn -main [& args]
+  (assert-supported-jvm!)
   (logging/init-logging!)
   (let [first-arg (first args)
         opts {:store    (or (env-keyword "TEST_SERVER_STORE")   :xtdb2)
