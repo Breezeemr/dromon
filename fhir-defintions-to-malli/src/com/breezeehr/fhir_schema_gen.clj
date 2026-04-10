@@ -101,6 +101,15 @@
         extension? (some-> (:baseDefinition d) (str/ends-with? "/Extension"))]
     [kind-rank (if extension? 1 0)]))
 
+(defn- versioned-base?
+  "True if a baseDefinition URL carries an explicit FHIR version qualifier
+   (e.g. \"http://hl7.org/fhir/StructureDefinition/SubstanceSpecification|4.0.1\").
+   Such bases are intentionally pinned to a specific FHIR version, so when they
+   are unreachable in the loaded set it is expected (the type was renamed or
+   deprecated in the version we are building against), not a missing dependency."
+  [^String base]
+  (and base (pos? (.indexOf base "|"))))
+
 (defn dependency-order
   "Returns definitions sorted in dependency order (parents before children).
    Processes in waves: first all definitions whose baseDefinition is in `roots`,
@@ -108,7 +117,11 @@
    resources and extensions after non-extensions so that type dependencies are
    satisfied.
 
-   Throws an ExceptionInfo listing unreachable definitions when any are found.
+   Definitions whose baseDefinition carries an explicit version qualifier (e.g.
+   `|4.0.1`) and does not resolve are dropped silently -- they are intentionally
+   pinned cross-version mismatches, not missing dependencies.
+
+   For other unreachable definitions, throws an ExceptionInfo listing them.
    Pass `:skip-missing true` to instead print a warning and return only the
    reachable definitions."
   [definitions roots & {:keys [skip-missing]}]
@@ -126,24 +139,35 @@
                         (recur next-parents (into result wave-vec)))
                       result)))
         ordered-urls (into #{} (map :url) result)
-        missing      (into []
+        unreachable  (into []
                            (comp (remove #(contains? ordered-urls (:url %)))
                                  (map (fn [d]
                                         {:name (:name d)
                                          :url  (:url d)
                                          :baseDefinition (:baseDefinition d)})))
-                           definitions)]
-    (when (seq missing)
-      (let [msg (str (count missing) " StructureDefinition(s) have unreachable baseDefinition "
+                           definitions)
+        {pinned-mismatch true real-missing false}
+        (group-by (comp boolean versioned-base? :baseDefinition) unreachable)]
+    (when (seq real-missing)
+      (let [msg (str (count real-missing) " StructureDefinition(s) have unreachable baseDefinition "
                      "(not in roots or any reachable definition):\n"
                      (str/join "\n"
                                (map (fn [{:keys [name url baseDefinition]}]
                                       (str "  " name " (" url ")\n"
                                            "    base: " baseDefinition))
-                                    missing)))]
+                                    real-missing)))]
         (if skip-missing
           (println "WARNING:" msg)
-          (throw (ex-info msg {:missing missing})))))
+          (throw (ex-info msg {:missing real-missing})))))
+    (when (seq pinned-mismatch)
+      (println (count pinned-mismatch)
+               "StructureDefinition(s) skipped: baseDefinition pinned to a FHIR version not present in the loaded set"
+               "(e.g."
+               (-> pinned-mismatch first :name)
+               "->"
+               (-> pinned-mismatch first :baseDefinition)
+               (when (> (count pinned-mismatch) 1) (str "and " (dec (count pinned-mismatch)) " more"))
+               ")"))
     result))
 
 (defn plan
