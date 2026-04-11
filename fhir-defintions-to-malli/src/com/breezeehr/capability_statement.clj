@@ -51,18 +51,50 @@
         (map (fn [sp] (select-keys sp [:name :type :definition])))
         (:searchParam resource-entry)))
 
+(defn- find-base-search-params
+  "Find base FHIR SearchParameter definitions for a resource type by scanning
+   a SearchParameter directory on the filesystem. `search-param-dir` should be
+   a java.io.File pointing to the directory containing {ResourceType}_*.json files.
+   Returns a vector of {:name :type :definition} maps, or nil."
+  [^java.io.File search-param-dir resource-type]
+  (when (and search-param-dir (.isDirectory search-param-dir))
+    (let [prefix (str resource-type "_")]
+      (into []
+            (comp
+              (filter #(and (.isFile ^java.io.File %)
+                            (.startsWith (.getName ^java.io.File %) prefix)
+                            (.endsWith (.getName ^java.io.File %) ".json")))
+              (map (fn [^java.io.File f]
+                     (let [sp (charred/read-json (io/reader f) :key-fn keyword)]
+                       {:name       (:name sp)
+                        :type       (:type sp)
+                        :definition (:url sp)})))
+              (filter :name))
+            (.listFiles search-param-dir)))))
+
 (defn rest-resources
   "Extract REST resource entries from a CapabilityStatement.
-   Returns a seq of maps with :type, :supported-profiles (bare URLs), :interactions, :search-params."
-  [capability-statement]
+   Returns a seq of maps with :type, :supported-profiles (bare URLs), :interactions, :search-params.
+   When a resource declares search-type interaction but the CapabilityStatement
+   lists no searchParam entries, base FHIR R4B SearchParameter definitions are
+   injected from `search-param-dir` (a java.io.File) if provided."
+  [capability-statement & {:keys [search-param-dir]}]
   (for [rest-entry (:rest capability-statement)
         resource   (:resource rest-entry)]
-    {:type               (:type resource)
-     :supported-profiles (into []
-                               (map strip-version-suffix)
-                               (:supportedProfile resource))
-     :interactions       (extract-interactions resource)
-     :search-params      (extract-search-params resource)}))
+    (let [interactions  (extract-interactions resource)
+          search-params (extract-search-params resource)
+          search-params (if (and (empty? search-params)
+                                 search-param-dir
+                                 (some #{"search-type"} interactions))
+                          (or (find-base-search-params search-param-dir (:type resource))
+                              search-params)
+                          search-params)]
+      {:type               (:type resource)
+       :supported-profiles (into []
+                                 (map strip-version-suffix)
+                                 (:supportedProfile resource))
+       :interactions       interactions
+       :search-params      search-params})))
 
 ;; ---------------------------------------------------------------------------
 ;; Schema form generation
@@ -202,9 +234,9 @@
 
    Returns {:ok n :fail n :failures [...]}."
   [source ig-name ig-version profile-version base-fhir-version out-dir
-   & {:keys [schema-atom]}]
+   & {:keys [schema-atom search-param-dir]}]
   (let [cs        (read-capability-statement source)
-        resources (rest-resources cs)
+        resources (rest-resources cs :search-param-dir search-param-dir)
         results   (atom {:ok 0 :fail 0 :failures []})]
     (doseq [resource-entry resources]
       (try

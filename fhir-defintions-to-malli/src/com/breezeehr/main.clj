@@ -277,11 +277,13 @@
 
         ;; --- 6. CapabilityStatement ---
         _           (println "\n=== Step 6: US Core CapabilityStatement ===")
+        r4b-sp-dir  (io/file (str (str/join "/" r4b-pkg) "/resources/org/hl7/fhir/SearchParameter"))
         cap-result  (cs/generate-from-capability-statement!
                       (io/file "scratch/us-core/STU8.0.1/package/CapabilityStatement-us-core-server.json")
                       "us-core" "8.0.1" "8.0.1" "4.3.0"
                       (conj uscore-pkg "src")
-                      :schema-atom sa)
+                      :schema-atom sa
+                      :search-param-dir r4b-sp-dir)
 
         ;; --- 7. US Core SearchParameter resources ---
         _           (println "\n=== Step 7: Copy SearchParameter resources ===")
