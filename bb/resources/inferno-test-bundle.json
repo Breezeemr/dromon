@@ -1126,6 +1126,33 @@
       }
     },
     {
+      "fullUrl": "urn:uuid:medication-1",
+      "resource": {
+        "resourceType": "Medication",
+        "id": "medication-1",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/us/core/StructureDefinition/us-core-medication"
+          ]
+        },
+        "code": {
+          "coding": [
+            {
+              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+              "code": "860975",
+              "display": "24 HR metformin hydrochloride 500 MG Extended Release Oral Tablet"
+            }
+          ],
+          "text": "24 HR metformin hydrochloride 500 MG Extended Release Oral Tablet"
+        },
+        "status": "active"
+      },
+      "request": {
+        "method": "PUT",
+        "url": "Medication/medication-1"
+      }
+    },
+    {
       "fullUrl": "urn:uuid:922b0707-1042-5da6-9af9-0cbc3b81ed62",
       "resource": {
         "resourceType": "MedicationRequest",
@@ -1141,15 +1168,8 @@
         },
         "status": "active",
         "intent": "order",
-        "medicationCodeableConcept": {
-          "coding": [
-            {
-              "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
-              "code": "860975",
-              "display": "24 HR metformin hydrochloride 500 MG Extended Release Oral Tablet"
-            }
-          ],
-          "text": "Metformin 500 MG"
+        "medicationReference": {
+          "reference": "Medication/medication-1"
         },
         "subject": {
           "reference": "Patient/123"

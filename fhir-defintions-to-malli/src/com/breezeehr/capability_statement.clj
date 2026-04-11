@@ -53,42 +53,44 @@
 
 (defn- find-base-search-params
   "Find base FHIR SearchParameter definitions for a resource type by scanning
-   a SearchParameter directory on the filesystem. `search-param-dir` should be
-   a java.io.File pointing to the directory containing {ResourceType}_*.json files.
-   Returns a vector of {:name :type :definition} maps, or nil."
+   a SearchParameter directory. Matches files with {ResourceType}_ prefix and
+   shared SearchParameter files where the resource type is in the base array."
   [^java.io.File search-param-dir resource-type]
   (when (and search-param-dir (.isDirectory search-param-dir))
     (let [prefix (str resource-type "_")]
-      (into []
-            (comp
-              (filter #(and (.isFile ^java.io.File %)
-                            (.startsWith (.getName ^java.io.File %) prefix)
-                            (.endsWith (.getName ^java.io.File %) ".json")))
-              (map (fn [^java.io.File f]
-                     (let [sp (charred/read-json (io/reader f) :key-fn keyword)]
+      (->> (.listFiles search-param-dir)
+           (filter #(and (.isFile ^java.io.File %)
+                         (.endsWith (.getName ^java.io.File %) ".json")))
+           (keep (fn [^java.io.File f]
+                   (let [sp (charred/read-json (io/reader f) :key-fn keyword)]
+                     (when (and (:name sp)
+                                (or (.startsWith (.getName f) prefix)
+                                    (some #{resource-type} (:base sp))))
                        {:name       (:name sp)
                         :type       (:type sp)
-                        :definition (:url sp)})))
-              (filter :name))
-            (.listFiles search-param-dir)))))
+                        :definition (:url sp)}))))
+           vec))))
 
 (defn rest-resources
   "Extract REST resource entries from a CapabilityStatement.
    Returns a seq of maps with :type, :supported-profiles (bare URLs), :interactions, :search-params.
-   When a resource declares search-type interaction but the CapabilityStatement
-   lists no searchParam entries, base FHIR R4B SearchParameter definitions are
-   injected from `search-param-dir` (a java.io.File) if provided."
+   When a resource declares search-type interaction, base FHIR R4B SearchParameter
+   definitions from `search-param-dir` are always merged in. CapabilityStatement-
+   declared params take precedence by name over base params."
   [capability-statement & {:keys [search-param-dir]}]
   (for [rest-entry (:rest capability-statement)
         resource   (:resource rest-entry)]
     (let [interactions  (extract-interactions resource)
-          search-params (extract-search-params resource)
-          search-params (if (and (empty? search-params)
-                                 search-param-dir
-                                 (some #{"search-type"} interactions))
-                          (or (find-base-search-params search-param-dir (:type resource))
-                              search-params)
-                          search-params)]
+          cs-params     (extract-search-params resource)
+          search-params (if (and search-param-dir
+                                (some #{"search-type"} interactions))
+                          (let [base-params (find-base-search-params search-param-dir (:type resource))
+                                cs-names    (set (map :name cs-params))]
+                            ;; CapabilityStatement params take precedence
+                            (into cs-params
+                                  (remove #(cs-names (:name %)))
+                                  base-params))
+                          cs-params)]
       {:type               (:type resource)
        :supported-profiles (into []
                                  (map strip-version-suffix)
