@@ -757,6 +757,28 @@
 ;; $validate operation (FHIR R4 §3.1.0.11)
 ;; ---------------------------------------------------------------------------
 
+(def ^:private validator-cache
+  "Identity-keyed cache of compiled validators per cap-schema. cap-schema
+   values come from route data (fixed at router build time), so identity
+   equality is both correct and cheap."
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(def ^:private explainer-cache
+  "Identity-keyed cache of compiled explainers per cap-schema."
+  (java.util.concurrent.ConcurrentHashMap.))
+
+(defn- cached-validator [schema]
+  (or (.get validator-cache schema)
+      (let [v (m/validator schema)]
+        (.putIfAbsent validator-cache schema v)
+        (.get validator-cache schema))))
+
+(defn- cached-explainer [schema]
+  (or (.get explainer-cache schema)
+      (let [e (m/explainer schema)]
+        (.putIfAbsent explainer-cache schema e)
+        (.get explainer-cache schema))))
+
 (defn- malli-error->issue
   "Convert a single Malli error map into a FHIR OperationOutcome issue."
   [error]
@@ -797,23 +819,23 @@
                        :diagnostics (str "No validation schema available for " resource-type)}]}}
 
       :else
-      (let [explanation (m/explain cap-schema resource-body)]
-        (if (nil? explanation)
-          ;; Valid
+      (if ((cached-validator cap-schema) resource-body)
+        ;; Valid — fast path, no explainer walk
+        {:status 200
+         :body {:resourceType "OperationOutcome"
+                :issue [{:severity "information"
+                         :code "informational"
+                         :diagnostics "Resource is valid"}]}}
+        ;; Invalid — build the explanation only on the failure branch
+        (let [explanation ((cached-explainer cap-schema) resource-body)
+              issues (mapv malli-error->issue (:errors explanation))]
           {:status 200
            :body {:resourceType "OperationOutcome"
-                  :issue [{:severity "information"
-                           :code "informational"
-                           :diagnostics "Resource is valid"}]}}
-          ;; Invalid — convert each Malli error to a FHIR issue
-          (let [issues (mapv malli-error->issue (:errors explanation))]
-            {:status 200
-             :body {:resourceType "OperationOutcome"
-                    :issue (if (seq issues)
-                             issues
-                             [{:severity "error"
-                               :code "invalid"
-                               :diagnostics "Resource failed validation"}])}}))))))
+                  :issue (if (seq issues)
+                           issues
+                           [{:severity "error"
+                             :code "invalid"
+                             :diagnostics "Resource failed validation"}])}})))))
 
 ;; Non-resource handlers
 
