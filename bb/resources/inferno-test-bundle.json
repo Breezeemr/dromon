@@ -3578,6 +3578,7 @@
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Consultation note</div>"
         },
+        "context": {"period": {"start": "2024-01-15T10:00:00Z", "end": "2024-01-15T11:00:00Z"}},
         "custodian": {
           "reference": "Organization/organization-1",
           "display": "Anytown General Hospital"
@@ -3640,6 +3641,7 @@
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Discharge summary</div>"
         },
+        "context": {"period": {"start": "2024-01-15T10:00:00Z", "end": "2024-01-15T11:00:00Z"}},
         "custodian": {
           "reference": "Organization/organization-1",
           "display": "Anytown General Hospital"
@@ -3702,6 +3704,7 @@
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: History and physical note</div>"
         },
+        "context": {"period": {"start": "2024-01-15T10:00:00Z", "end": "2024-01-15T11:00:00Z"}},
         "custodian": {
           "reference": "Organization/organization-1",
           "display": "Anytown General Hospital"
@@ -3764,6 +3767,7 @@
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Procedure note</div>"
         },
+        "context": {"period": {"start": "2024-01-15T10:00:00Z", "end": "2024-01-15T11:00:00Z"}},
         "custodian": {
           "reference": "Organization/organization-1",
           "display": "Anytown General Hospital"
@@ -3826,6 +3830,7 @@
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Progress note</div>"
         },
+        "context": {"period": {"start": "2024-01-15T10:00:00Z", "end": "2024-01-15T11:00:00Z"}},
         "custodian": {
           "reference": "Organization/organization-1",
           "display": "Anytown General Hospital"
@@ -3888,6 +3893,7 @@
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Diagnostic imaging study</div>"
         },
+        "context": {"period": {"start": "2024-01-15T10:00:00Z", "end": "2024-01-15T11:00:00Z"}},
         "custodian": {
           "reference": "Organization/organization-1",
           "display": "Anytown General Hospital"
@@ -3950,6 +3956,7 @@
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Laboratory report</div>"
         },
+        "context": {"period": {"start": "2024-01-15T10:00:00Z", "end": "2024-01-15T11:00:00Z"}},
         "custodian": {
           "reference": "Organization/organization-1",
           "display": "Anytown General Hospital"
@@ -4012,6 +4019,7 @@
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">DocumentReference: Pathology study</div>"
         },
+        "context": {"period": {"start": "2024-01-15T10:00:00Z", "end": "2024-01-15T11:00:00Z"}},
         "custodian": {
           "reference": "Organization/organization-1",
           "display": "Anytown General Hospital"
