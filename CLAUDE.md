@@ -106,7 +106,7 @@ test-server --> fhir-server --> fhir-store-protocol (IFHIRStore)
             \-> fhir-store-xtdb2 (or fhir-store-mock) --/
             \-> fhir/malli/uscore8 (or other malli pkgs, alias-controlled)
 
-fhir-defintions-to-malli --> fhir-primitives --> malli-decimal
+fhir-defintions-to-malli --> fhir-primitives --> com.breezeehr/malli-decimal (external)
 ```
 
 `fhir-server` no longer has a static dependency on any malli schema

@@ -44,7 +44,6 @@ dromon/
   fhir-server/                  Core server (routing, handlers, auth, middleware)
   fhir-terminology/             FHIR terminology service support
   fhir-primitives/              FHIR primitive types & lazy refs for Malli
-  malli-decimal/                Arbitrary-precision decimal schema for Malli
   fhir-defintions-to-malli/     FHIR StructureDefinition -> Malli schema generator
   test-server/                  Runnable server, configurable store + schema package
 ```
@@ -56,7 +55,7 @@ test-server --> fhir-server --> fhir-store-protocol
             \-> fhir-store-xtdb2 (or fhir-store-mock) --/
             \-> fhir/malli/uscore8 (or other malli pkgs, alias-controlled)
 
-fhir-defintions-to-malli --> fhir-primitives --> malli-decimal
+fhir-defintions-to-malli --> fhir-primitives --> com.breezeehr/malli-decimal (external)
 ```
 
 ## Prerequisites
