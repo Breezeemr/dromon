@@ -9,23 +9,28 @@
   Telemere OpenTelemetry handler adopts the SAME SDK instance -- no
   reflection on private final fields, no second SDK.
 
-  We forward to every active capture (rather than thread-local
-  routing) because Telemere's OpenTelemetry handler buffers
-  `Span.end()` calls and emits them from a background timer thread
-  several seconds later, on a thread that has no relationship to the
-  request thread. Concurrent traced requests are rare in dev, and the
-  client-side tree builder ignores spans that don't link up.
+  Concurrency isolation. [[wrap-trace-tap]] is installed OUTSIDE the
+  telemere trace middleware so that by the time it drains the capture
+  queue, the outer `http/request` span has already ended and is
+  visible to the SimpleSpanProcessor. On entry it starts a short
+  sentinel span (`trace-tap/request-root`) and makes it current, so
+  that telemere's `http/request` span and all descendants inherit the
+  sentinel's trace id. After the handler returns and the buffer has
+  drained, the middleware filters the queue to spans matching the
+  sentinel's trace id only -- so concurrent traced requests each see
+  only their own span tree. The sentinel itself is omitted from the
+  serialized payload.
 
-  The Ring middleware [[wrap-trace-tap]] short-circuits when neither
-  the `X-Dromon-Trace` header nor the `_dromon-trace` query param are
-  present, so the steady-state hot path is one atom deref per span
-  emit (no captures registered means no work). When active, it
-  registers a fresh capture, waits for the buffered spans to drain
-  after the handler returns, and serializes them into a gzip+base64
-  `X-Dromon-Trace-Json` response header."
+  The Ring middleware short-circuits when neither the `X-Dromon-Trace`
+  header nor the `_dromon-trace` query param are present, so the
+  steady-state hot path is one atom deref per span emit (no captures
+  registered means no work)."
   (:require [jsonista.core :as json]
             [taoensso.telemere :as t])
-  (:import [io.opentelemetry.sdk.trace.export SpanExporter SimpleSpanProcessor]
+  (:import [io.opentelemetry.api.trace Span Tracer]
+           [io.opentelemetry.api.common Attributes]
+           [io.opentelemetry.context Context Scope]
+           [io.opentelemetry.sdk.trace.export SpanExporter SimpleSpanProcessor]
            [io.opentelemetry.sdk.trace.data SpanData]
            [io.opentelemetry.sdk.trace SdkTracerProviderBuilder]
            [io.opentelemetry.sdk.common CompletableResultCode]
@@ -98,6 +103,7 @@
   (= "1" (System/getenv "DROMON_DEV_TRACE_TAP")))
 
 (defonce ^:private initialized? (atom false))
+(defonce ^:private tracer_ (atom nil))
 
 (defn init!
   "Idempotently pre-builds an AutoConfigured OpenTelemetry SDK with our
@@ -126,6 +132,7 @@
             providers-var (resolve 'taoensso.telemere/otel-default-providers_)]
         (when providers-var
           (alter-var-root providers-var (constantly (delay providers))))
+        (reset! tracer_ (.get (.getTracerProvider sdk) "dromon.trace-tap"))
         (reset! initialized? true)
         (t/log! {:level :info :id ::initialized
                  :msg "Trace-tap initialized: SDK customizer attached"}))
@@ -157,11 +164,14 @@
       (.write gz (.getBytes s "UTF-8")))
     (.encodeToString (Base64/getEncoder) (.toByteArray baos))))
 
+(def ^:private sentinel-span-name "trace-tap/request-root")
+
 (defn- serialize-spans [capture trace-id overflow?]
   (let [spans (->> (seq (:queue capture))
                    (filter (fn [^SpanData sd]
-                             (or (nil? trace-id)
-                                 (= trace-id (.getTraceId sd)))))
+                             (and (or (nil? trace-id)
+                                      (= trace-id (.getTraceId sd)))
+                                  (not= sentinel-span-name (.getName sd)))))
                    (map span-data->map)
                    vec)
         payload {:spans spans
@@ -173,35 +183,61 @@
   `X-Dromon-Trace: 1` (or `?_dromon-trace=1`) is present, and emits them
   on the `X-Dromon-Trace-Json` response header as gzip+base64 JSON.
 
-  Place AFTER `wrap-otel-context` so the request-scoped span is already
-  active. Zero cost when the trace flag is absent."
+  Place OUTSIDE `wrap-telemere-trace` so that by the time the queue is
+  drained, the outer `http/request` span has already ended and is visible
+  to the SimpleSpanProcessor. On entry, starts a short sentinel span and
+  makes it current; telemere's `http/request` span and all descendants
+  become its children and share its trace id, which is used to filter
+  the drained queue for this request only. Zero cost when the trace flag
+  is absent."
   [handler]
   (fn [request]
     (if-not (trace-requested? request)
       (handler request)
       (let [capture (make-capturing-exporter)
             cap-key (str (java.util.UUID/randomUUID))
-            _ (swap! active-captures assoc cap-key capture)]
+            ^Tracer tracer @tracer_
+            ^Span sentinel (when tracer
+                             (-> (.spanBuilder tracer sentinel-span-name)
+                                 (.startSpan)))
+            trace-id (some-> sentinel (.getSpanContext) (.getTraceId))
+            ^Context ctx (when sentinel (.with (Context/current) sentinel))
+            ^Scope scope (when ctx (.makeCurrent ctx))]
+        (swap! active-captures assoc cap-key capture)
         (try
           (let [response (handler request)
+                _ (when scope (.close scope))
+                _ (when sentinel (.end sentinel))
                 ;; Telemere stages ended spans through TWO 3-second buffers
                 ;; (span-buffer1 -> span-buffer2 -> Span.end()), so a span
                 ;; ended just before a tick can take up to ~7s to actually
                 ;; reach the SimpleSpanProcessor. Poll for up to 9s and exit
-                ;; once the count stops growing for 300ms.
+                ;; once the count stops growing for 300ms AND an http/request
+                ;; span for our trace-id has arrived.
                 deadline (+ (System/currentTimeMillis) 9000)
+                http-root-seen? (fn []
+                                  (some (fn [^SpanData sd]
+                                          (and (= "http/request" (.getName sd))
+                                               (or (nil? trace-id)
+                                                   (= trace-id (.getTraceId sd)))))
+                                        (seq (:queue capture))))
                 _ (loop [last-count -1
                          stable-since 0]
                     (let [now (System/currentTimeMillis)
                           c (.get ^AtomicInteger (:count capture))]
                       (cond
                         (>= now deadline) nil
-                        (and (pos? c) (= c last-count) (>= (- now stable-since) 300)) nil
+                        (and (pos? c)
+                             (= c last-count)
+                             (>= (- now stable-since) 300)
+                             (http-root-seen?)) nil
                         :else (do (Thread/sleep 50)
                                   (recur c (if (= c last-count) stable-since now))))))
                 overflow? (.get ^AtomicBoolean (:overflow capture))
-                header-val (serialize-spans capture nil overflow?)]
+                header-val (serialize-spans capture trace-id overflow?)]
             (-> response
                 (update :headers (fnil assoc {}) "X-Dromon-Trace-Json" header-val)))
           (finally
-            (swap! active-captures dissoc cap-key)))))))
+            (swap! active-captures dissoc cap-key)
+            (when scope (try (.close scope) (catch Throwable _)))
+            (when sentinel (try (.end sentinel) (catch Throwable _)))))))))

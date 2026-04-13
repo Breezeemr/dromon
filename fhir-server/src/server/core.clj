@@ -169,10 +169,11 @@
     {:conflicts nil
      :data {:coercion fhir-coercion/coercion
             :muuntaja muuntaja-instance
-            :middleware (cond-> [middleware/wrap-telemere-trace
-                                 middleware/wrap-otel-context]
+            :middleware (cond-> []
                           trace-tap-mw (conj trace-tap-mw)
-                          true (into [wrap-head
+                          true (into [middleware/wrap-telemere-trace
+                                      middleware/wrap-otel-context
+                                      wrap-head
                          middleware/wrap-request-id
                          [middleware/wrap-cors cors-origins]
                          parameters/parameters-middleware
