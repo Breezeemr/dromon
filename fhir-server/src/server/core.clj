@@ -153,7 +153,10 @@
 
 (defn fhir-app
   [store schemas & {:keys [jwks-url keto-url terminology cors-allowed-origins]}]
-  (let [jwks-url (or jwks-url (System/getenv "JWKS_URL") "http://localhost:4444/.well-known/jwks.json")
+  (let [jwks-url (or jwks-url
+                     (System/getenv "JWKS_URL")
+                     (when-not (System/getenv "JWT_DEV_SECRET")
+                       "http://localhost:4444/.well-known/jwks.json"))
         keto-url (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
         cors-origins (parse-cors-origins
                        (or cors-allowed-origins
