@@ -40,8 +40,7 @@
 (defn- test-app
   "Build a ring app with the mock store and no auth middleware."
   [store]
-  (core/strip-trailing-slash
-   (ring/ring-handler
+  (ring/ring-handler
    (ring/router
     (routing/build-fhir-routes (test-schemas))
     {:conflicts nil
@@ -68,8 +67,10 @@
                         rrc/coerce-response-middleware
                         rrc/coerce-exceptions-middleware
                         [core/wrap-fhir-store store]]}})
-   (ring/create-default-handler
-    {:not-found (constantly {:status 404 :body {:error "Not Found"}})}))))
+   (some-fn
+    (ring/redirect-trailing-slash-handler {:method :strip})
+    (ring/create-default-handler
+     {:not-found (constantly {:status 404 :body {:error "Not Found"}})}))))
 
 (defn- json-body
   "Encode a value to a JSON input stream for a ring request body."
@@ -1109,21 +1110,23 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest root-transaction-accepts-trailing-slash
-  (testing "POST /{tenant}/fhir and POST /{tenant}/fhir/ resolve to the same handler"
+  (testing "POST /{tenant}/fhir succeeds and /{tenant}/fhir/ redirects to it"
     (let [bundle {:resourceType "Bundle"
                   :type         "transaction"
                   :entry        [{:fullUrl "urn:uuid:patient-1"
                                   :resource {:resourceType "Patient"
                                              :name [{:family "Trailing" :given ["Slash"]}]}
-                                  :request  {:method "POST" :url "Patient"}}]}]
-      (doseq [uri ["/default/fhir" "/default/fhir/"]]
-        (testing (str "uri=" uri)
-          (let [store (mock/create-mock-store {})
-                app   (test-app store)
-                resp  (app (request :post uri bundle))
-                body  (parse-body (:body resp))]
-            (is (= 200 (:status resp))
-                (str "POST to " uri " should succeed"))
-            (is (= "Bundle" (:resourceType body)))
-            (is (= "transaction-response" (:type body)))
-            (is (= 1 (count (:entry body))))))))))
+                                  :request  {:method "POST" :url "Patient"}}]}
+          store (mock/create-mock-store {})
+          app   (test-app store)]
+      (testing "no-slash form transacts directly"
+        (let [resp (app (request :post "/default/fhir" bundle))
+              body (parse-body (:body resp))]
+          (is (= 200 (:status resp)))
+          (is (= "Bundle" (:resourceType body)))
+          (is (= "transaction-response" (:type body)))
+          (is (= 1 (count (:entry body))))))
+      (testing "trailing-slash form 308-redirects to the no-slash form"
+        (let [resp (app (request :post "/default/fhir/" bundle))]
+          (is (= 308 (:status resp)))
+          (is (= "/default/fhir" (get-in resp [:headers "Location"]))))))))
