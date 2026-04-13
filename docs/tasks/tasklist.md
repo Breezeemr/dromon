@@ -8,11 +8,11 @@ Inferno current:  505 passed,  0 failed,   0 skipped, 0 errors
 
 ## Open tasks
 
-- [otel-bundle-entry-spans.md](otel-bundle-entry-spans.md) — `bundle/entry` spans promised by the OTel design are never emitted; transaction Bundles show only `bundle/transaction -> store/transact-bundle`. Add per-entry spans.
 - [trace-tap-concurrency-isolation.md](trace-tap-concurrency-isolation.md) — `bb trace` leaks spans across concurrent requests: under parallel load every response carries every in-flight trace. Also `http/request` root is missing from the serialized payload for `metadata`.
 
 ## Completed
 
+- [otel-bundle-entry-spans.md](otel-bundle-entry-spans.md) — Transaction Bundles now emit a `bundle/entry` span per entry under `bundle/transaction`, as a sibling of `store/transact-bundle`. Implemented in `server.handlers/transaction` by wrapping per-entry coercion in a `t/trace!` block tagged with `:index`, `:method`, `:resource-type`, and `:id`.
 - [fhir-root-trailing-slash-500.md](fhir-root-trailing-slash-500.md) — `POST /default/fhir/` (trailing slash) no longer 500s. Added a `strip-trailing-slash` wrapper in `server.core/fhir-app` that rewrites any non-root URI ending in `/` before the Reitit router sees it, so both `/default/fhir` and `/default/fhir/` reach the transaction handler. Unit test covers both forms against the mock store.
 
 - [otel-per-request-rendering.md](otel-per-request-rendering.md) — Dev-only per-request span capture and ASCII tree rendering via `bb trace`. Server-side `server.dev.trace-tap` middleware (opt-in via `DROMON_DEV_TRACE_TAP=1`) plus a `bb trace` babashka task.

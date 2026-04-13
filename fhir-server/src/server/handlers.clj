@@ -1168,12 +1168,7 @@
           body (:body-params req)
           resource-type (:resourceType body)
           bundle-type (:type body)
-          raw-entries (:entry body)
-          entries (mapv (fn [entry]
-                          (if (:resource entry)
-                            (update entry :resource #(coerce-resource-by-type decoders %))
-                            entry))
-                        raw-entries)]
+          raw-entries (:entry body)]
     (if (and (= resource-type "Bundle") (#{"transaction" "batch"} bundle-type))
       (if (= bundle-type "transaction")
         ;; Transaction: atomic — all succeed or all fail
@@ -1181,8 +1176,28 @@
           (let [res (t/trace!
                      {:id :bundle/transaction
                       :data {:tenant-id tenant-id
-                             :entry-count (count entries)}}
-                     (db/transact-bundle store tenant-id entries))]
+                             :entry-count (count raw-entries)}}
+                     (let [entries (mapv
+                                    (fn [idx entry]
+                                      (let [req-map (:request entry)
+                                            method (some-> (:method req-map) str/upper-case)
+                                            url (:url req-map)
+                                            parts (when url (str/split url #"/"))
+                                            entry-rt (first parts)
+                                            entry-id (second parts)]
+                                        (t/trace!
+                                         {:id :bundle/entry
+                                          :data {:index idx
+                                                 :method method
+                                                 :resource-type entry-rt
+                                                 :id entry-id}}
+                                         (if (:resource entry)
+                                           (update entry :resource
+                                                   #(coerce-resource-by-type decoders %))
+                                           entry))))
+                                    (range)
+                                    raw-entries)]
+                       (db/transact-bundle store tenant-id entries)))]
             {:status 200 :body res})
           (catch Exception e
             {:status 400
@@ -1258,7 +1273,12 @@
                                                     :issue [{:severity "error"
                                                              :code "exception"
                                                              :diagnostics (str "Entry failed: " (ex-message e))}]}}})))
-                        entries)]
+                        (mapv (fn [entry]
+                                (if (:resource entry)
+                                  (update entry :resource
+                                          #(coerce-resource-by-type decoders %))
+                                  entry))
+                              raw-entries))]
           {:status 200
            :body {:resourceType "Bundle"
                   :type "batch-response"
