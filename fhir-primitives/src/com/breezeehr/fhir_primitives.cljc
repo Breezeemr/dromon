@@ -118,6 +118,33 @@
 
 (def fhir-registry-options {:registry fhir-registry})
 
+(def ^:private fhir-lazy-ref-registry
+  "Base default-registry for `lazy-full-registry`. Overrides `:ref` with
+   `-lazy-ref-schema` so ref resolution is deferred via `m/-memoize` until
+   someone actually walks the compiled schema. That deferral is what
+   breaks the Element <-> Extension recursion during schema compilation:
+   without it, compiling Extension → Element → :ref Extension would
+   re-enter the provider before the outer cache entry exists."
+  (merge fhir-registry
+         {:ref (-lazy-ref-schema {})}))
+
+(defn lazy-full-registry
+  "Build a cached malli registry for a compiled FHIR capability schema.
+   `local-registry` is the per-file `{schema-name -> IntoSchema}` map
+   (possibly a merge of a base profile's registry with a derived one).
+   On first lookup of a name the provider resolves it via `local-registry`
+   and compiles it with the recursive registry passed in; the result is
+   cached in the `lazy-registry`'s atom. Subsequent `:ref` lookups hit the
+   cache and malli's `schema` treats already-compiled schemas as identity,
+   so Extension / Element / etc. are compiled a single time per `full-sch`
+   instance instead of once per :ref site."
+  [local-registry]
+  (mr/lazy-registry
+    fhir-lazy-ref-registry
+    (fn [name registry]
+      (when-let [hit (get local-registry name)]
+        (m/schema hit {:registry registry})))))
+
 (def external-registry
   "Alias for fhir-registry-options. Deprecated — use fhir-registry-options."
   fhir-registry-options)

@@ -198,16 +198,13 @@
         path          (resource-type->file-path ig-name ig-version resource-type base-dir)
         ;; Build registry merge form from all branch namespaces
         registry-syms (mapv #(symbol (str % "/registry")) ns-syms)
-        merged-registry-form `(~'malli.registry/composite-registry
-                                (~'malli.registry/registry (~'merge ~@registry-syms))
-                                (~'malli.registry/registry ~'fhir-registry))]
+        merged-registry-form `(~'lazy-full-registry (~'merge ~@registry-syms))]
     (Files/createDirectories (.getParent path) (make-array FileAttribute 0))
     (with-open [w (Files/newBufferedWriter path (make-array OpenOption 0))]
       (fipp (list 'ns ns-sym
                   (list* :require
                          '[malli.core :as m]
-                         '[malli.registry]
-                         '[com.breezeehr.fhir-primitives :refer [fhir-registry]]
+                         '[com.breezeehr.fhir-primitives :refer [lazy-full-registry]]
                          (sort ns-syms)))
             {:writer w})
       (.newLine w)

@@ -200,13 +200,11 @@
   (fipp (list 'ns (fdm/kw->ns-sym k)
               (into [:require
                      (if resource?
-                       '[com.breezeehr.fhir-primitives :refer [fhir-registry-options fhir-registry]]
+                       '[com.breezeehr.fhir-primitives :refer [fhir-registry-options lazy-full-registry]]
                        '[com.breezeehr.fhir-primitives :refer [fhir-registry-options]])
                      '[malli.core :as m]
                      '[malli.util :as mu]]
-                    (concat
-                     (when resource? ['[malli.registry]])
-                     extra-requires)))
+                    extra-requires))
         {:writer w}))
 
 (defn- compute-transitive-deps
@@ -357,10 +355,7 @@
                     {:writer w})
               (fipp (list 'def 'full-sch
                           `(m/schema ~'sch
-                                     {:registry
-                                      (malli.registry/composite-registry
-                                       (malli.registry/registry ~'registry)
-                                       (malli.registry/registry ~'fhir-registry))}))
+                                     {:registry (~'lazy-full-registry ~'registry)}))
                     {:writer w}))))))
     path))
 
