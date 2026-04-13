@@ -124,32 +124,37 @@
       {:status 200 :body res})))
 
 (defn update-resource
-  "Handler for PUT /[type]/:id RESTful interaction."
+  "Handler for PUT /[type]/:id RESTful interaction.
+   The store enforces optimistic concurrency atomically when :if-match is
+   supplied in opts; we no longer do a pre-read comparison here (TOCTOU)."
   [req]
   (let [store (:fhir/store req)
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
         id (-> req :path-params :id)
         resource-body (get-in req [:parameters :body])
-        body-id (:id resource-body)]
+        body-id (:id resource-body)
+        expected-version (parse-if-match req)]
     (if (and body-id (not= body-id id))
       {:status 400
        :body {:resourceType "OperationOutcome"
               :issue [{:severity "error"
                        :code "invalid"
                        :diagnostics (str "Resource id in body (" body-id ") does not match URL id (" id ")")}]}}
-      (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
-        (if-let [expected-version (parse-if-match req)]
-          (let [current-version (get-in existing [:meta :versionId])]
-            (if (not= expected-version current-version)
-              (precondition-failed-response resource-type id expected-version current-version)
-              (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
-                {:status 200 :body res})))
+      (if expected-version
+        ;; With If-Match: delegate entirely to the store. A missing/deleted
+        ;; resource, or a version mismatch, surfaces as 412 ex-info handled
+        ;; by wrap-fhir-exceptions.
+        (let [res (db/update-resource store tenant-id (keyword resource-type) id
+                                      resource-body {:if-match expected-version})]
+          {:status 200 :body res})
+        ;; Without If-Match: preserve the create-with-client-id upsert path
+        ;; for nonexistent resources. Existing resources take the normal
+        ;; update path.
+        (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
           (if existing
-            ;; Resource exists: update
             (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
               {:status 200 :body res})
-            ;; Resource doesn't exist: create with client-supplied ID (upsert)
             (let [res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
                   base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
                   vid (get-in res [:meta :versionId])]
@@ -166,23 +171,29 @@
         resource-type (:fhir/resource-type req)
         id (-> req :path-params :id)
         patch-ops (get-in req [:parameters :body])
+        expected-version (parse-if-match req)
         existing (db/read-resource store tenant-id (keyword resource-type) id)]
-    (if existing
-      (if-let [expected-version (parse-if-match req)]
-        (let [current-version (get-in existing [:meta :versionId])]
-          (if (not= expected-version current-version)
-            (precondition-failed-response resource-type id expected-version current-version)
-            (let [patched (json-patch/apply-patch existing patch-ops)
-                  result (db/update-resource store tenant-id (keyword resource-type) id patched)]
-              {:status 200 :body result})))
-        (let [patched (json-patch/apply-patch existing patch-ops)
-              result (db/update-resource store tenant-id (keyword resource-type) id patched)]
-          {:status 200 :body result}))
+    (cond
+      ;; Missing resource with If-Match: 412 regardless of whether the read
+      ;; above sees it; we're still inside the same request so it's fine to
+      ;; short-circuit here for the semantics.
+      (and expected-version (nil? existing))
+      (precondition-failed-response resource-type id expected-version nil)
+
+      (nil? existing)
       {:status 404
        :body {:resourceType "OperationOutcome"
               :issue [{:severity "error"
                        :code "not-found"
-                       :diagnostics (str resource-type "/" id " not found")}]}})))
+                       :diagnostics (str resource-type "/" id " not found")}]}}
+
+      :else
+      (let [patched (json-patch/apply-patch existing patch-ops)
+            opts (when expected-version {:if-match expected-version})
+            result (if opts
+                     (db/update-resource store tenant-id (keyword resource-type) id patched opts)
+                     (db/update-resource store tenant-id (keyword resource-type) id patched))]
+        {:status 200 :body result}))))
 
 (defn delete-resource
   "Handler for DELETE /[type]/:id RESTful interaction."
@@ -190,14 +201,12 @@
   (let [store (:fhir/store req)
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
-        id (-> req :path-params :id)]
-    (if-let [expected-version (parse-if-match req)]
-      (let [existing (db/read-resource store tenant-id (keyword resource-type) id)
-            current-version (get-in existing [:meta :versionId])]
-        (if (not= expected-version current-version)
-          (precondition-failed-response resource-type id expected-version current-version)
-          (do (db/delete-resource store tenant-id (keyword resource-type) id)
-              {:status 204 :body nil})))
+        id (-> req :path-params :id)
+        expected-version (parse-if-match req)]
+    (if expected-version
+      (do (db/delete-resource store tenant-id (keyword resource-type) id
+                              {:if-match expected-version})
+          {:status 204 :body nil})
       (do (db/delete-resource store tenant-id (keyword resource-type) id)
           {:status 204 :body nil}))))
 

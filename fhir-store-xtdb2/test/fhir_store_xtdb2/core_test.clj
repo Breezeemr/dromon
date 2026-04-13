@@ -71,6 +71,48 @@
         (finally
           (close-store-nodes! store))))))
 
+(defn- root-ex-data
+  "Walk the cause chain and return the first ex-data that carries :fhir/status.
+   Required because store-layer exceptions are wrapped by telemere `trace!`,
+   whose own ex-data hides the inner FHIR status."
+  [ex]
+  (loop [e ex]
+    (cond
+      (nil? e) nil
+      (some-> e ex-data :fhir/status) (ex-data e)
+      :else (recur (.getCause e)))))
+
+(deftest test-if-match-update
+  (testing "Store enforces :if-match atomically for update-resource"
+    (let [store (core-db/create-xtdb-store {})
+          tenant-id "tenant-ifmatch"
+          patient {:active true :name [{"family" "Doe"}]}]
+      (try
+        (db/create-resource store tenant-id :Patient "p1" patient)
+        (testing "matching if-match succeeds"
+          (let [res (db/update-resource store tenant-id :Patient "p1"
+                                        (assoc patient :active false)
+                                        {:if-match "1"})]
+            (is (= "2" (get-in res [:meta :versionId])))))
+        (testing "mismatched if-match -> 412"
+          (let [e (try
+                    (db/update-resource store tenant-id :Patient "p1"
+                                        (assoc patient :active true)
+                                        {:if-match "1"})
+                    nil
+                    (catch Throwable ex ex))]
+            (is (some? e))
+            (is (= 412 (:fhir/status (root-ex-data e))))))
+        (testing "if-match against nonexistent -> 412"
+          (let [e (try
+                    (db/update-resource store tenant-id :Patient "missing"
+                                        patient {:if-match "1"})
+                    nil
+                    (catch Throwable ex ex))]
+            (is (some? e))
+            (is (= 412 (:fhir/status (root-ex-data e))))))
+        (finally (close-store-nodes! store))))))
+
 (deftest test-transact-transaction
   (testing "Can transact a FHIR Bundle of type transaction (atomic)"
     (let [store (core-db/create-xtdb-store {})

@@ -46,8 +46,19 @@
   (create-resource [this tenant-id resource-type id resource])
   (read-resource [this tenant-id resource-type id])
   (vread-resource [this tenant-id resource-type id vid])
-  (update-resource [this tenant-id resource-type id resource])
-  (delete-resource [this tenant-id resource-type id])
+  (update-resource
+    [this tenant-id resource-type id resource]
+    [this tenant-id resource-type id resource opts]
+    "Update (or conditional upsert) a resource. `opts` may contain:
+     - :if-match <expected-vid> — enforces an atomic optimistic-concurrency
+       check. On version mismatch, implementations throw ex-info with
+       `{:fhir/status 412 :fhir/code \"conflict\" :expected :actual}`.
+       A missing resource combined with :if-match is also a 412.")
+  (delete-resource
+    [this tenant-id resource-type id]
+    [this tenant-id resource-type id opts]
+    "Delete a resource. `opts` may contain :if-match for optimistic
+     concurrency; semantics match update-resource.")
   (search [this tenant-id resource-type params search-registry])
   (history [this tenant-id resource-type id])
   (history-type [this tenant-id resource-type params]

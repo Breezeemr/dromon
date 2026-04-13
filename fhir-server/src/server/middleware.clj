@@ -30,6 +30,18 @@
      :headers {"Content-Type" "application/fhir+json;charset=utf-8"}
      :body (java.io.ByteArrayInputStream. bytes)}))
 
+(defn- find-fhir-status-ex
+  "Walks the ex-info cause chain looking for the first ex-data carrying a
+   `:fhir/status`. Required because store-layer exceptions can be wrapped by
+   instrumentation (e.g. telemere `trace!` signals) whose top-level ex-data
+   does not include the FHIR status we want to surface."
+  [e]
+  (loop [x e]
+    (cond
+      (nil? x) nil
+      (some-> x ex-data :fhir/status) x
+      :else (recur (.getCause x)))))
+
 (defn wrap-fhir-exceptions
   "Middleware that catches exceptions and formats them into FHIR OperationOutcomes."
   [handler]
@@ -38,7 +50,9 @@
       (handler request)
       (catch clojure.lang.ExceptionInfo e
         (let [data (ex-data e)
-              msg (ex-message e)]
+              fhir-ex (find-fhir-status-ex e)
+              fhir-data (some-> fhir-ex ex-data)
+              msg (or (some-> fhir-ex ex-message) (ex-message e))]
           (log/warn e "FHIR Request Exception")
           (cond
             (= (:type data) :reitit.coercion/request-coercion)
@@ -47,8 +61,8 @@
             (= (:type data) :reitit.coercion/response-coercion)
             (error-response 500 "fatal" "exception" (str "Response validation failed: " (pr-str (:errors data))))
 
-            (:fhir/status data)
-            (error-response (:fhir/status data) "error" (:fhir/code data "processing") msg)
+            fhir-data
+            (error-response (:fhir/status fhir-data) "error" (:fhir/code fhir-data "processing") msg)
 
             :else
             (error-response 400 "error" "processing" msg))))

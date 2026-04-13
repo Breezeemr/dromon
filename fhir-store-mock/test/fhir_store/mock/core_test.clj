@@ -45,6 +45,49 @@
       (is (nil? (protocol/read-resource store tenant "Patient" "pt1")))
       (is (= created (protocol/vread-resource store tenant "Patient" "pt1" "1"))))))
 
+(deftest if-match-update-test
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        res {:resourceType "Patient" :name [{:family "Smith"}]}
+        _ (protocol/create-resource store tenant "Patient" "pt1" res)]
+    (testing "update with matching :if-match succeeds"
+      (let [updated (protocol/update-resource store tenant "Patient" "pt1"
+                                               (assoc res :active true)
+                                               {:if-match "1"})]
+        (is (= "2" (get-in updated [:meta :versionId])))))
+    (testing "update with mismatched :if-match throws 412"
+      (let [e (try
+                (protocol/update-resource store tenant "Patient" "pt1"
+                                          (assoc res :active false)
+                                          {:if-match "99"})
+                nil
+                (catch clojure.lang.ExceptionInfo ex ex))]
+        (is (some? e))
+        (is (= 412 (:fhir/status (ex-data e))))))
+    (testing "update with :if-match against nonexistent throws 412"
+      (let [e (try
+                (protocol/update-resource store tenant "Patient" "missing"
+                                          res {:if-match "1"})
+                nil
+                (catch clojure.lang.ExceptionInfo ex ex))]
+        (is (some? e))
+        (is (= 412 (:fhir/status (ex-data e))))))))
+
+(deftest if-match-delete-test
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        res {:resourceType "Patient" :name [{:family "Smith"}]}
+        _ (protocol/create-resource store tenant "Patient" "pt1" res)]
+    (testing "delete with mismatched :if-match throws 412"
+      (let [e (try
+                (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "99"})
+                nil
+                (catch clojure.lang.ExceptionInfo ex ex))]
+        (is (some? e))
+        (is (= 412 (:fhir/status (ex-data e))))))
+    (testing "delete with matching :if-match succeeds"
+      (is (true? (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "1"}))))))
+
 (deftest search-test
   (let [store (mock/create-mock-store {})
         tenant "test-tenant"

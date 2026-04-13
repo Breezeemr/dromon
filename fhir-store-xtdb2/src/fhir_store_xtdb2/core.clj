@@ -646,44 +646,89 @@
        (xtdb->fhir (first results) read-decoders))))
 
   (update-resource [this tenant-id resource-type id resource]
+    (fp/update-resource this tenant-id resource-type id resource nil))
+
+  (update-resource [this tenant-id resource-type id resource opts]
     (t/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [node (get-or-create-node this tenant-id)
            rt-name (name resource-type)
+           if-match (:if-match opts)
            current (current-version node resource-type id)
-           new-version (next-version current)
+           _ (when (and if-match (nil? current))
+               (throw (ex-info "Version conflict: resource does not exist"
+                               {:fhir/status 412 :fhir/code "conflict"
+                                :expected if-match :actual nil})))
+           _ (when (and if-match current (not= if-match current))
+               (throw (ex-info "Version conflict"
+                               {:fhir/status 412 :fhir/code "conflict"
+                                :expected if-match :actual current})))
+           ;; When :if-match is supplied, use it as the expected value in the
+           ;; ASSERT guard so that the concurrency check is performed atomically
+           ;; by the transactor rather than based on our earlier read.
+           expected-vid (or if-match current)
+           new-version (next-version expected-vid)
            [sql args] (extract-and-build-sql resource-type id resource storage-encoders
                                              :version new-version)
-           assert-op (if current
+           assert-op (if expected-vid
                        [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
                                      rt-name)
-                        [id current]]
+                        [id expected-vid]]
                        [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
                                      rt-name)
                         [id]])]
        (try
          (xt/execute-tx node [assert-op [:sql sql args]])
          (catch Exception e
-           (throw (ex-info (str "Conflict: " (ex-message e))
-                           {:fhir/status 409 :fhir/code "conflict"}
-                           e))))
+           (if if-match
+             (throw (ex-info (str "Version conflict: " (ex-message e))
+                             {:fhir/status 412 :fhir/code "conflict"
+                              :expected if-match}
+                             e))
+             (throw (ex-info (str "Conflict: " (ex-message e))
+                             {:fhir/status 409 :fhir/code "conflict"}
+                             e)))))
        (-> resource
            (assoc :id id)
            (assoc-in [:meta :versionId] new-version)))))
 
   (delete-resource [this tenant-id resource-type id]
+    (fp/delete-resource this tenant-id resource-type id nil))
+
+  (delete-resource [this tenant-id resource-type id opts]
     (t/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [node (get-or-create-node this tenant-id)
-           sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))]
+           rt-name (name resource-type)
+           if-match (:if-match opts)
+           current (when if-match (current-version node resource-type id))
+           _ (when (and if-match (nil? current))
+               (throw (ex-info "Version conflict: resource does not exist"
+                               {:fhir/status 412 :fhir/code "conflict"
+                                :expected if-match :actual nil})))
+           _ (when (and if-match (not= if-match current))
+               (throw (ex-info "Version conflict"
+                               {:fhir/status 412 :fhir/code "conflict"
+                                :expected if-match :actual current})))
+           assert-op (when if-match
+                       [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
+                                     rt-name)
+                        [id if-match]])
+           delete-op [:sql (format "DELETE FROM %s WHERE _id = ?" rt-name) [id]]
+           tx-ops (if assert-op [assert-op delete-op] [delete-op])]
        (try
-         (xt/execute-tx node [[:sql sql [id]]])
+         (xt/execute-tx node tx-ops)
          (catch Exception e
-           (throw (ex-info (str "Conflict: " (ex-message e))
-                           {:fhir/status 409 :fhir/code "conflict"}
-                           e))))
+           (if if-match
+             (throw (ex-info (str "Version conflict: " (ex-message e))
+                             {:fhir/status 412 :fhir/code "conflict"
+                              :expected if-match}
+                             e))
+             (throw (ex-info (str "Conflict: " (ex-message e))
+                             {:fhir/status 409 :fhir/code "conflict"}
+                             e)))))
        nil)))
 
   (resource-deleted? [this tenant-id resource-type id]
@@ -923,7 +968,11 @@
                       parts (when url (str/split url #"/"))
                       resource-type (first parts)
                       id (second parts)
-                      resource (:resource entry)]
+                      resource (:resource entry)
+                      raw-if-match (or (:ifMatch req-map) (get req-map "ifMatch"))
+                      entry-if-match (when raw-if-match
+                                       (or (second (re-find #"W/\"(.+)\"" raw-if-match))
+                                           raw-if-match))]
                   (case method
                     "POST"
                     (let [new-id (str (java.util.UUID/randomUUID))
@@ -937,7 +986,10 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "PUT"
-                    (let [res (fp/update-resource this tenant-id (keyword resource-type) id resource)
+                    (let [res (if entry-if-match
+                                (fp/update-resource this tenant-id (keyword resource-type) id resource
+                                                    {:if-match entry-if-match})
+                                (fp/update-resource this tenant-id (keyword resource-type) id resource))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -946,7 +998,10 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "DELETE"
-                    (do (fp/delete-resource this tenant-id (keyword resource-type) id)
+                    (do (if entry-if-match
+                          (fp/delete-resource this tenant-id (keyword resource-type) id
+                                              {:if-match entry-if-match})
+                          (fp/delete-resource this tenant-id (keyword resource-type) id))
                         {:response {:status "204 No Content"}})
 
                     "GET"

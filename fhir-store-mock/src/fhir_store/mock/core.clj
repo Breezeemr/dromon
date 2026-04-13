@@ -114,36 +114,75 @@
         (get-in record [:history vid])
         nil)))
 
-  (update-resource [_ tenant-id resource-type id resource]
-    (let [s @state
-          existing (get-in s [tenant-id resource-type id])
-          vid (if existing
-                (str (inc (Long/parseLong (:current existing))))
-                "1")
-          meta-info {:versionId vid
-                     :lastUpdated (java.time.Instant/now)}
-          resource-with-meta (-> resource
-                                 (update :meta merge meta-info)
-                                 (assoc :id id))
-          record {:history (assoc (or (:history existing) {}) vid resource-with-meta)
-                  :current vid
-                  :resource resource-with-meta
-                  :deleted? false}]
-      (swap! state assoc-in [tenant-id resource-type id] record)
-      resource-with-meta))
+  (update-resource [this tenant-id resource-type id resource]
+    (protocol/update-resource this tenant-id resource-type id resource nil))
 
-  (delete-resource [_ tenant-id resource-type id]
-    (let [s @state
-          existing (get-in s [tenant-id resource-type id])]
-      (if (and existing (not (:deleted? existing)))
-        (let [vid (str (inc (Long/parseLong (:current existing))))
-              record (assoc existing
-                            :current vid
-                            :deleted? true
-                            :resource nil)]
-          (swap! state assoc-in [tenant-id resource-type id] record)
-          true)
-        false)))
+  (update-resource [_ tenant-id resource-type id resource opts]
+    (let [expected (:if-match opts)
+          result (atom nil)
+          swap-fn (fn [existing]
+                    (let [active? (and existing (not (:deleted? existing)))
+                          current-vid (when existing (:current existing))]
+                      (when (and expected (not active?))
+                        (throw (ex-info "Version conflict"
+                                        {:fhir/status 412
+                                         :fhir/code "conflict"
+                                         :expected expected
+                                         :actual nil})))
+                      (when (and expected active? (not= expected current-vid))
+                        (throw (ex-info "Version conflict"
+                                        {:fhir/status 412
+                                         :fhir/code "conflict"
+                                         :expected expected
+                                         :actual current-vid})))
+                      (let [vid (if current-vid
+                                  (str (inc (Long/parseLong current-vid)))
+                                  "1")
+                            meta-info {:versionId vid
+                                       :lastUpdated (java.time.Instant/now)}
+                            resource-with-meta (-> resource
+                                                   (update :meta merge meta-info)
+                                                   (assoc :id id))
+                            record {:history (assoc (or (:history existing) {}) vid resource-with-meta)
+                                    :current vid
+                                    :resource resource-with-meta
+                                    :deleted? false}]
+                        (reset! result resource-with-meta)
+                        record)))]
+      (swap! state update-in [tenant-id resource-type id] swap-fn)
+      @result))
+
+  (delete-resource [this tenant-id resource-type id]
+    (protocol/delete-resource this tenant-id resource-type id nil))
+
+  (delete-resource [_ tenant-id resource-type id opts]
+    (let [expected (:if-match opts)
+          result (atom false)
+          swap-fn (fn [existing]
+                    (let [active? (and existing (not (:deleted? existing)))
+                          current-vid (when existing (:current existing))]
+                      (when (and expected (not active?))
+                        (throw (ex-info "Version conflict"
+                                        {:fhir/status 412
+                                         :fhir/code "conflict"
+                                         :expected expected
+                                         :actual nil})))
+                      (when (and expected active? (not= expected current-vid))
+                        (throw (ex-info "Version conflict"
+                                        {:fhir/status 412
+                                         :fhir/code "conflict"
+                                         :expected expected
+                                         :actual current-vid})))
+                      (if active?
+                        (let [vid (str (inc (Long/parseLong current-vid)))]
+                          (reset! result true)
+                          (assoc existing
+                                 :current vid
+                                 :deleted? true
+                                 :resource nil))
+                        existing)))]
+      (swap! state update-in [tenant-id resource-type id] swap-fn)
+      @result))
 
   (resource-deleted? [_ tenant-id resource-type id]
     (let [s @state
@@ -272,7 +311,11 @@
                       method (some-> (:method req) str/upper-case)
                       url (:url req)
                       [type id] (when url (str/split url #"/"))
-                      resource (:resource entry)]
+                      resource (:resource entry)
+                      raw-if-match (or (:ifMatch req) (get req "ifMatch"))
+                      entry-if-match (when raw-if-match
+                                       (or (second (re-find #"W/\"(.+)\"" raw-if-match))
+                                           raw-if-match))]
                   (case method
                     "POST"
                     (let [res (protocol/create-resource this tenant-id type nil resource)
@@ -285,7 +328,10 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "PUT"
-                    (let [res (protocol/update-resource this tenant-id type id resource)
+                    (let [res (if entry-if-match
+                                (protocol/update-resource this tenant-id type id resource
+                                                          {:if-match entry-if-match})
+                                (protocol/update-resource this tenant-id type id resource))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -294,7 +340,10 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "DELETE"
-                    (do (protocol/delete-resource this tenant-id type id)
+                    (do (if entry-if-match
+                          (protocol/delete-resource this tenant-id type id
+                                                    {:if-match entry-if-match})
+                          (protocol/delete-resource this tenant-id type id))
                         {:response {:status "204 No Content"}})
 
                     "GET"
