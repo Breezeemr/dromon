@@ -336,7 +336,10 @@
 
   (println "Starting FHIR server...")
   (let [profile?  (= "1" (System/getenv "DROMON_PERF_PROFILE"))
-        heap-flag (str "-J-Xmx" (or (System/getenv "DROMON_PERF_HEAP") (if profile? "12g" "6g")))
+        heap-size (or (System/getenv "DROMON_PERF_HEAP") "6g")
+        heap-flags [(str "-J-Xmx" heap-size)
+                    (str "-J-Xms" heap-size)
+                    "-J-XX:+AlwaysPreTouch"]
         perf-dir  (-> (io/file "perf-analysis") .getAbsoluteFile .getPath)
         _         (when profile? (.mkdirs (io/file perf-dir)))
         jfr-flag  (when profile?
@@ -344,17 +347,17 @@
                          perf-dir "/inferno.jfr,settings=profile,dumponexit=true,maxsize=500M"))
         gc-flag   (when profile?
                     (str "-J-Xlog:gc*:file=" perf-dir "/gc.log:time,uptime:filecount=5,filesize=20M"))
-        base-args ["clojure"
-                   heap-flag
-                   "-J--add-opens=java.base/java.nio=ALL-UNNAMED"
-                   "-J--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
-                   "-J--enable-preview"]
+        base-args (into ["clojure"]
+                        (concat heap-flags
+                                ["-J--add-opens=java.base/java.nio=ALL-UNNAMED"
+                                 "-J--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
+                                 "-J--enable-preview"]))
         cmd       (-> base-args
                       (cond-> jfr-flag (conj jfr-flag))
                       (cond-> gc-flag  (conj gc-flag))
                       (into ["-X:test" "test-server.core/-main" ":port" "3000" ":ssl-port" "3001"]))]
     (when profile?
-      (println "DROMON_PERF_PROFILE=1 -- launching with JFR + GC log, heap" heap-flag)
+      (println "DROMON_PERF_PROFILE=1 -- launching with JFR + GC log, heap" heap-size)
       (println "  JFR:" (str perf-dir "/inferno.jfr"))
       (println "  GC log:" (str perf-dir "/gc.log")))
     (process cmd
