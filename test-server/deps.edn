@@ -2,7 +2,7 @@
  :deps {fhir-store/server {:local/root "../fhir-server"}
         fhir-terminology/fhir-terminology {:local/root "../fhir-terminology"}
         integrant/integrant {:mvn/version "0.13.1"}
-        metosin/malli {:mvn/version "0.20.0"}}
+        metosin/malli {:mvn/version "0.20.1"}}
  :aliases
  {;; --- FHIR store backends ---
   :store/xtdb2 {:extra-deps {fhir-store/xtdb2 {:local/root "../fhir-store-xtdb2"}}}

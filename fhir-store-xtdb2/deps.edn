@@ -5,7 +5,7 @@
         com.taoensso/telemere {:mvn/version "1.2.1"}
         fhir-store/protocol {:local/root "../fhir-store-protocol"}
         com.breezeehr/fhir-primitives {:local/root "../fhir-primitives"}
-        metosin/malli {:mvn/version "0.20.0"}
+        metosin/malli {:mvn/version "0.20.1"}
         integrant/integrant {:mvn/version "0.13.1"}}
  :aliases
  {:test {:extra-paths ["test"]

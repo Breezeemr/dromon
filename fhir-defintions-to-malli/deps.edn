@@ -3,7 +3,7 @@
          hato/hato             {:mvn/version "1.0.0"}
          funcool/promesa       {:mvn/version "11.0.678"}
          com.cnuernber/charred {:mvn/version "1.037"}
-         metosin/malli         {:mvn/version "0.20.0"}
+         metosin/malli         {:mvn/version "0.20.1"}
          net.cgrand/xforms     {:mvn/version "0.19.6"}
          com.breezeehr/fhir-primitives {:local/root "../fhir-primitives"}}
  :aliases

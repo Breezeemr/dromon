@@ -2,7 +2,7 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.4"}
         info.sunng/ring-jetty9-adapter {:mvn/version "0.39.2"}
         metosin/reitit {:mvn/version "0.10.1"} ;; latest reitit
-        metosin/malli {:mvn/version "0.20.0"}       ;; latest malli
+        metosin/malli {:mvn/version "0.20.1"}       ;; latest malli
         com.breezeehr/fhir-primitives {:local/root "../fhir-primitives"}
         fhir-store/protocol {:local/root "../fhir-store-protocol"}
         fhir-terminology/fhir-terminology {:local/root "../fhir-terminology"}
