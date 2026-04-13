@@ -32,6 +32,20 @@
                       :fhir-store/xtdb2-store {:node             (ig/ref :fhir-store/xtdb2-node)
                                                :resource/schemas (ig/ref :fhir/schemas)}}
            :store-ref (ig/ref :fhir-store/xtdb2-store)}
+   ;; Persistent local-disk XTDB v2 node. Writes log + storage under
+   ;; `test-server/xtdb-data/` (relative to the test-server working dir).
+   ;; Override the base dir with env var XTDB_DATA_DIR. Each tenant creates
+   ;; its own node pointed at the same config; for multi-tenant persistent
+   ;; runs you must template the path per tenant. Inferno uses a single
+   ;; `default` tenant so one path is fine.
+   :xtdb2-disk {:requires '[fhir-store-xtdb2.core]
+                :extra    {:fhir-store/xtdb2-node
+                           (let [base (or (System/getenv "XTDB_DATA_DIR") "xtdb-data")]
+                             {:log     [:local {:path (str base "/log")}]
+                              :storage [:local {:path (str base "/storage")}]})
+                           :fhir-store/xtdb2-store {:node             (ig/ref :fhir-store/xtdb2-node)
+                                                    :resource/schemas (ig/ref :fhir/schemas)}}
+                :store-ref (ig/ref :fhir-store/xtdb2-store)}
    :mock  {:requires '[fhir-store.mock.sys]
            :extra    {:fhir-store/mock {}}
            :store-ref (ig/ref :fhir-store/mock)}})

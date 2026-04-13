@@ -13,6 +13,13 @@ inferno-test-kit/
 fhir/malli/
 target
 server.log
+test-server/xtdb-data/
+perf-analysis/inferno.jfr
+perf-analysis/gc.log*
+perf-analysis/mem-samples.csv
+perf-analysis/sampler.log
+perf-analysis/run.out
+perf-analysis/latency.txt
 
 # Downloaded FHIR definition packages live here; keep the directory but
 # ignore everything inside it except the .keep marker.

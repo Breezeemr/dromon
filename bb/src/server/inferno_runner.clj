@@ -121,6 +121,28 @@
           (println "Failed to grant" relation "permission for" obj ":" (:body resp))
           (System/exit 1))))))
 
+(defn warmup-store!
+  "Issue a single authenticated read against the `default` tenant before any
+   timed write. This forces lazy backend init (per-tenant XTDB node start,
+   Datomic peer connection, JIT/plan compile of the read path) so the first
+   real PUT/POST in the test isn't billed for cold-start cost. Both backends
+   get the same warmup so the comparison stays fair."
+  [token]
+  (println "Warming up FHIR store (cold-path init)...")
+  (let [t0   (System/nanoTime)
+        resp (try
+               (curl/get "https://fhir.local:3001/default/fhir/Patient?_count=1"
+                         {:headers   {"Authorization" (str "Bearer " token)}
+                          :timeout   30000
+                          :throw     false
+                          :insecure? true})
+               (catch Exception e {:status 500 :body (.getMessage e)}))
+        ms   (/ (- (System/nanoTime) t0) 1e6)]
+    (printf "  warmup GET /Patient?_count=1 -> %s in %.0f ms%n" (:status resp) ms)
+    (when-not (#{200 404} (:status resp))
+      (println "Warmup body:" (:body resp))
+      (System/exit 1))))
+
 (defn insert-patient [token]
   (println "Inserting test Patient...")
   (let [patient-body {:resourceType "Patient"
@@ -313,17 +335,34 @@
   (io/delete-file "server.log" true)
 
   (println "Starting FHIR server...")
-  (process ["clojure"
-            "-J-Xmx6g"
-            "-J--add-opens=java.base/java.nio=ALL-UNNAMED"
-            "-J--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
-            "-J--enable-preview"
-            "-X:test" "test-server.core/-main" ":port" "3000" ":ssl-port" "3001"]
-           {:dir "test-server"
+  (let [profile?  (= "1" (System/getenv "DROMON_PERF_PROFILE"))
+        heap-flag (str "-J-Xmx" (or (System/getenv "DROMON_PERF_HEAP") (if profile? "12g" "6g")))
+        perf-dir  (-> (io/file "perf-analysis") .getAbsoluteFile .getPath)
+        _         (when profile? (.mkdirs (io/file perf-dir)))
+        jfr-flag  (when profile?
+                    (str "-J-XX:StartFlightRecording=name=inferno,filename="
+                         perf-dir "/inferno.jfr,settings=profile,dumponexit=true,maxsize=500M"))
+        gc-flag   (when profile?
+                    (str "-J-Xlog:gc*:file=" perf-dir "/gc.log:time,uptime:filecount=5,filesize=20M"))
+        base-args ["clojure"
+                   heap-flag
+                   "-J--add-opens=java.base/java.nio=ALL-UNNAMED"
+                   "-J--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
+                   "-J--enable-preview"]
+        cmd       (-> base-args
+                      (cond-> jfr-flag (conj jfr-flag))
+                      (cond-> gc-flag  (conj gc-flag))
+                      (into ["-X:test" "test-server.core/-main" ":port" "3000" ":ssl-port" "3001"]))]
+    (when profile?
+      (println "DROMON_PERF_PROFILE=1 -- launching with JFR + GC log, heap" heap-flag)
+      (println "  JFR:" (str perf-dir "/inferno.jfr"))
+      (println "  GC log:" (str perf-dir "/gc.log")))
+    (process cmd
+             {:dir "test-server"
             :out (io/file "server.log")
             :err :out
             :extra-env {"JAVA_HOME" "/usr/lib/jvm/java-21-openjdk-amd64"
-                        "PATH" (str "/usr/lib/jvm/java-21-openjdk-amd64/bin:" (System/getenv "PATH"))}})
+                        "PATH" (str "/usr/lib/jvm/java-21-openjdk-amd64/bin:" (System/getenv "PATH"))}}))
 
   (wait-for-server 30)
 
@@ -334,6 +373,7 @@
 
     (println "Client ID:" client-id)
     (grant-keto-permissions client-id)
+    (warmup-store! token)
     (insert-patient token)
     (insert-test-data token)
     (run-inferno-tests token)
