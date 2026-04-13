@@ -4,9 +4,13 @@ Ordered by: prerequisites first, then easy -> hard within each tier.
 Spec reference: https://hl7.org/fhir/R4/http.html
 
 Inferno baseline: 391 passed, 12 failed, ~101 skipped, 0 errors
-Inferno current:  504 passed,  0 failed,   0 skipped, 0 errors
+Inferno current:  505 passed,  0 failed,   0 skipped, 0 errors
 
 ## Open tasks
+
+- [otel-bundle-entry-spans.md](otel-bundle-entry-spans.md) — `bundle/entry` spans promised by the OTel design are never emitted; transaction Bundles show only `bundle/transaction -> store/transact-bundle`. Add per-entry spans.
+- [trace-tap-concurrency-isolation.md](trace-tap-concurrency-isolation.md) — `bb trace` leaks spans across concurrent requests: under parallel load every response carries every in-flight trace. Also `http/request` root is missing from the serialized payload for `metadata`.
+- [fhir-root-trailing-slash-500.md](fhir-root-trailing-slash-500.md) — `POST /default/fhir/` (trailing slash) returns HTTP 500 (`No implementation of write-body-to-stream`); no-slash form works. Routing / response-shape bug, unrelated to OTel.
 
 ## Completed
 

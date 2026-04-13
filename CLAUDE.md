@@ -59,7 +59,7 @@ cd test-server && \
   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
   OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
   TEST_SERVER_STORE=xtdb2-disk \
-  clj -M:otel:store/xtdb2:malli/uscore8 -X test-server.core/-main
+  clj -X:otel:store/xtdb2:malli/uscore8 test-server.core/-main
 # Browse traces at http://localhost:16686 (service: dromon-fhir-server).
 # Tear down with: bb teardown (removes the jaeger container too).
 ```
@@ -79,7 +79,7 @@ DROMON_OTEL=1 DROMON_DEV_TRACE_TAP=1 \
   OTEL_TRACES_EXPORTER=otlp \
   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
   OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
-  clj -M:otel:store/xtdb2:malli/uscore8 -X test-server.core/-main
+  clj -X:otel:store/xtdb2:malli/uscore8 test-server.core/-main
 
 # From the dromon repo root, in another terminal:
 bb trace -s http://localhost:8080/default/fhir/metadata
