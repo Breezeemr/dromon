@@ -767,12 +767,12 @@
           results (into [] (xt/q node (into [query] where-params)))]
       (mapv #(xtdb->fhir % read-decoders) results))))
 
-  (transact-bundle [this tenant-id entries]
+  (transact-transaction [this tenant-id entries]
     ;; Pre-compute entry metadata (method, resource-type, id) for use in both
     ;; building tx-ops and constructing the response afterward.
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
     (t/trace!
-     {:id :store/transact-bundle
+     {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
     (let [node (get-or-create-node this tenant-id)
           entry-metas (->> (mapv (fn [entry]
@@ -846,7 +846,82 @@
                                                last-mod (assoc :lastModified (str last-mod))
                                                (= method "POST") (assoc :location (str "/" tenant-id "/fhir/" resource-type "/" id "/_history/" vid)))}
                             res (assoc :resource res)))))
-                    entry-metas)}))))
+                    entry-metas)})))
+
+  (transact-bundle [this tenant-id entries]
+    ;; Batch semantics: each entry is processed independently via the
+    ;; single-resource CRUD methods on this store. Per-entry failures
+    ;; are captured as OperationOutcome responses and do NOT affect
+    ;; other entries. Returns a batch-response Bundle in input order.
+    (t/trace!
+     {:id :store/transact-bundle
+      :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
+     (let [results
+           (mapv
+            (fn [entry]
+              (try
+                (let [req-map (:request entry)
+                      method (some-> (:method req-map) str/upper-case)
+                      url (:url req-map)
+                      parts (when url (str/split url #"/"))
+                      resource-type (first parts)
+                      id (second parts)
+                      resource (:resource entry)]
+                  (case method
+                    "POST"
+                    (let [new-id (str (java.util.UUID/randomUUID))
+                          res (fp/create-resource this tenant-id (keyword resource-type) new-id resource)
+                          vid (get-in res [:meta :versionId])
+                          last-mod (str (get-in res [:meta :lastUpdated]))]
+                      {:resource res
+                       :response (cond-> {:status "201 Created"}
+                                   vid (assoc :etag (str "W/\"" vid "\"")
+                                              :location (str "/" tenant-id "/fhir/" resource-type "/" (:id res) "/_history/" vid))
+                                   last-mod (assoc :lastModified last-mod))})
+
+                    "PUT"
+                    (let [res (fp/update-resource this tenant-id (keyword resource-type) id resource)
+                          vid (get-in res [:meta :versionId])
+                          last-mod (str (get-in res [:meta :lastUpdated]))]
+                      {:resource res
+                       :response (cond-> {:status "200 OK"}
+                                   vid (assoc :etag (str "W/\"" vid "\""))
+                                   last-mod (assoc :lastModified last-mod))})
+
+                    "DELETE"
+                    (do (fp/delete-resource this tenant-id (keyword resource-type) id)
+                        {:response {:status "204 No Content"}})
+
+                    "GET"
+                    (let [res (fp/read-resource this tenant-id (keyword resource-type) id)]
+                      (if res
+                        (let [vid (get-in res [:meta :versionId])
+                              last-mod (str (get-in res [:meta :lastUpdated]))]
+                          {:resource res
+                           :response (cond-> {:status "200 OK"}
+                                       vid (assoc :etag (str "W/\"" vid "\""))
+                                       last-mod (assoc :lastModified last-mod))})
+                        {:response {:status "404 Not Found"
+                                    :outcome {:resourceType "OperationOutcome"
+                                              :issue [{:severity "error"
+                                                       :code "not-found"
+                                                       :diagnostics (str resource-type "/" id " not found")}]}}}))
+
+                    {:response {:status "400 Bad Request"
+                                :outcome {:resourceType "OperationOutcome"
+                                          :issue [{:severity "error"
+                                                   :code "invalid"
+                                                   :diagnostics (str "Unsupported method: " method)}]}}}))
+                (catch Exception e
+                  {:response {:status "400 Bad Request"
+                              :outcome {:resourceType "OperationOutcome"
+                                        :issue [{:severity "error"
+                                                 :code "exception"
+                                                 :diagnostics (str "Entry failed: " (ex-message e))}]}}})))
+            entries)]
+       {:resourceType "Bundle"
+        :type "batch-response"
+        :entry results}))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
   ;; In a real XTDB implementation, we'd query for codes using XTDB

@@ -63,7 +63,7 @@
       (let [observations (protocol/search store tenant "Observation" {} nil)]
         (is (= 1 (count observations)))))))
 
-(deftest transact-bundle-ordering-test
+(deftest transact-transaction-ordering-test
   (testing "transaction entries are processed in FHIR-specified order: DELETE -> POST -> PUT -> GET"
     (let [store (mock/create-mock-store {})
           tenant "test-tenant"
@@ -77,7 +77,7 @@
                    {:request {:method "POST" :url "Observation"}
                     :resource {:resourceType "Observation" :status "final"}}
                    {:request {:method "DELETE" :url "Patient/existing"}}]
-          result (protocol/transact-bundle store tenant entries)]
+          result (protocol/transact-transaction store tenant entries)]
       (is (= "Bundle" (:resourceType result)))
       (is (= "transaction-response" (:type result)))
       ;; Verify all 4 entries produced results
@@ -90,7 +90,7 @@
         ;; GET for deleted resource returns 404
         (is (= "404 Not Found" (nth statuses 3)) "GET should be last")))))
 
-(deftest transact-bundle-rollback-test
+(deftest transact-transaction-rollback-test
   (testing "transaction rolls back on failure"
     (let [store (mock/create-mock-store {})
           tenant "test-tenant"
@@ -105,7 +105,7 @@
                     ;; POST tries to create — this should succeed (generates new id)
                     :resource {:resourceType "Patient" :name [{:family "NewPatient"}]}}]]
       ;; This transaction should succeed normally
-      (let [result (protocol/transact-bundle store tenant entries)]
+      (let [result (protocol/transact-transaction store tenant entries)]
         (is (= "transaction-response" (:type result))))
       ;; Verify the original "survivor" was updated (PUT processed after POST in ordering)
       (let [res (protocol/read-resource store tenant "Patient" "survivor")]
@@ -121,8 +121,33 @@
                    {:request {:method "INVALID" :url "Patient/foo"}
                     :resource {:resourceType "Patient"}}]]
       ;; The transaction should throw because INVALID method hits default case in (case ...)
-      (is (thrown? Exception (protocol/transact-bundle store tenant entries)))
+      (is (thrown? Exception (protocol/transact-transaction store tenant entries)))
       ;; After rollback, the original resource should still exist
       (let [res (protocol/read-resource store tenant "Patient" "keep-me")]
         (is (some? res) "Resource should be restored after rollback")
         (is (= [{:family "Original"}] (:name res)))))))
+
+(deftest transact-bundle-batch-test
+  (testing "batch processes entries independently; per-entry failures do not affect others"
+    (let [store (mock/create-mock-store {})
+          tenant "batch-tenant"
+          _ (protocol/create-resource store tenant "Patient" "alive" {:resourceType "Patient" :name [{:family "Alive"}]})
+          entries [{:request {:method "POST" :url "Patient"}
+                    :resource {:resourceType "Patient" :name [{:family "Fresh"}]}}
+                   {:request {:method "GET" :url "Patient/alive"}}
+                   {:request {:method "GET" :url "Patient/missing"}}
+                   {:request {:method "BOGUS" :url "Patient/x"}}]
+          result (protocol/transact-bundle store tenant entries)]
+      (is (= "Bundle" (:resourceType result)))
+      (is (= "batch-response" (:type result)))
+      (is (= 4 (count (:entry result))) "result preserves input order")
+      (let [[post get-ok get-missing bogus] (:entry result)]
+        (is (= "201 Created" (get-in post [:response :status])))
+        (is (some? (:resource post)))
+        (is (= "200 OK" (get-in get-ok [:response :status])))
+        (is (= "alive" (get-in get-ok [:resource :id])))
+        (is (= "404 Not Found" (get-in get-missing [:response :status])))
+        (is (= "400 Bad Request" (get-in bogus [:response :status]))))
+      (testing "successful entries actually landed; failed ones did not roll back others"
+        (let [all (protocol/search store tenant "Patient" {} nil)]
+          (is (>= (count all) 2) "alive + newly posted patient exist"))))))

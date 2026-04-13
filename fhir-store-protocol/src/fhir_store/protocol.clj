@@ -54,7 +54,16 @@
     "Returns all versions of all resources of a given type.")
   (count-resources [this tenant-id resource-type params search-registry]
     "Returns the total count of resources matching the search params.")
-  (transact-bundle [this tenant-id entries])
+  (transact-transaction [this tenant-id entries]
+    "Atomic FHIR `transaction` Bundle semantics (HL7 FHIR §3.1.0.11.2):
+     all entries succeed or all fail as a single database transaction.
+     Any failure propagates as an exception that rolls back the whole
+     transaction; there is no per-entry error handling.")
+  (transact-bundle [this tenant-id entries]
+    "FHIR `batch` Bundle semantics: each entry is processed
+     independently. Per-entry failures do NOT affect other entries.
+     Returns a Bundle of type `batch-response` whose :entry vector
+     reports the status of each input entry in the original order.")
   (resource-deleted? [this tenant-id resource-type id]
     "Returns true if the resource was previously created and then deleted,
      false if it exists or was never created."))

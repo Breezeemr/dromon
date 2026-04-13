@@ -71,8 +71,8 @@
         (finally
           (close-store-nodes! store))))))
 
-(deftest test-transact-bundle
-  (testing "Can transact a FHIR Bundle of type batch/transaction"
+(deftest test-transact-transaction
+  (testing "Can transact a FHIR Bundle of type transaction (atomic)"
     (let [store (core-db/create-xtdb-store {})
           tenant-id "tenant-tx"
           ;; Create a bundle with a POST, PUT, and DELETE
@@ -93,7 +93,7 @@
         (is (some? (db/read-resource store tenant-id :Patient "tx-del")))
 
         ;; Transact!
-        (let [response (db/transact-bundle store tenant-id (:entry test-bundle))]
+        (let [response (db/transact-transaction store tenant-id (:entry test-bundle))]
           (is (= "Bundle" (:resourceType response)))
           (is (= "transaction-response" (:type response)))
           (is (= 3 (count (:entry response))))
@@ -175,5 +175,32 @@
                                  {"discharge-disposition" "home"} enc-reg)]
           (is (= 1 (count results)))
           (is (= "enc1" (:id (first results)))))
+        (finally
+          (close-store-nodes! store))))))
+
+(deftest test-transact-bundle-batch
+  (testing "Batch bundle: per-entry success/failure, no rollback between entries"
+    (let [store (core-db/create-xtdb-store {})
+          tenant-id "tenant-batch"]
+      (try
+        (db/create-resource store tenant-id :Patient "alive" {:resourceType "Patient" :active true})
+        (let [entries [{:request {:method "POST" :url "Patient"}
+                        :resource {:resourceType "Patient" :name [{"family" "Batchy"}]}}
+                       {:request {:method "GET" :url "Patient/alive"}}
+                       {:request {:method "GET" :url "Patient/does-not-exist"}}
+                       {:request {:method "BOGUS" :url "Patient/x"}}]
+              result (db/transact-bundle store tenant-id entries)]
+          (is (= "Bundle" (:resourceType result)))
+          (is (= "batch-response" (:type result)))
+          (is (= 4 (count (:entry result))) "result preserves input order")
+          (let [[post get-ok get-missing bogus] (:entry result)]
+            (is (= "201 Created" (get-in post [:response :status])))
+            (is (some? (:resource post)))
+            (is (= "200 OK" (get-in get-ok [:response :status])))
+            (is (= "alive" (get-in get-ok [:resource :id])))
+            (is (= "404 Not Found" (get-in get-missing [:response :status])))
+            (is (= "400 Bad Request" (get-in bogus [:response :status]))))
+          (testing "alive entry was untouched despite a sibling failing"
+            (is (some? (db/read-resource store tenant-id :Patient "alive")))))
         (finally
           (close-store-nodes! store))))))

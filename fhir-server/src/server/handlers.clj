@@ -1161,6 +1161,32 @@
                   (update-in [:parameters :body] (partial decode-contained-only decoders))))]
       (handler req'))))
 
+(defn- decode-bundle-entries
+  "Walks Bundle entries and decodes each entry's :resource (if any) using
+   the per-resourceType cap-schema decoder map. Emits a per-entry
+   `:bundle/entry` telemere span scoped only to the decode work."
+  [decoders raw-entries]
+  (mapv
+   (fn [idx entry]
+     (let [req-map (:request entry)
+           method (some-> (:method req-map) str/upper-case)
+           url (:url req-map)
+           parts (when url (str/split url #"/"))
+           entry-rt (first parts)
+           entry-id (second parts)]
+       (t/trace!
+        {:id :bundle/entry
+         :data {:index idx
+                :method method
+                :resource-type entry-rt
+                :id entry-id}}
+        (if (:resource entry)
+          (update entry :resource
+                  #(coerce-resource-by-type decoders %))
+          entry))))
+   (range)
+   raw-entries))
+
 (defn transaction [decoders]
   (fn [req]
     (let [store (:fhir/store req)
@@ -1169,122 +1195,31 @@
           resource-type (:resourceType body)
           bundle-type (:type body)
           raw-entries (:entry body)]
-    (if (and (= resource-type "Bundle") (#{"transaction" "batch"} bundle-type))
-      (if (= bundle-type "transaction")
-        ;; Transaction: atomic — all succeed or all fail
-        (try
-          (let [res (t/trace!
-                     {:id :bundle/transaction
-                      :data {:tenant-id tenant-id
-                             :entry-count (count raw-entries)}}
-                     (let [entries (mapv
-                                    (fn [idx entry]
-                                      (let [req-map (:request entry)
-                                            method (some-> (:method req-map) str/upper-case)
-                                            url (:url req-map)
-                                            parts (when url (str/split url #"/"))
-                                            entry-rt (first parts)
-                                            entry-id (second parts)]
-                                        (t/trace!
-                                         {:id :bundle/entry
-                                          :data {:index idx
-                                                 :method method
-                                                 :resource-type entry-rt
-                                                 :id entry-id}}
-                                         (if (:resource entry)
-                                           (update entry :resource
-                                                   #(coerce-resource-by-type decoders %))
-                                           entry))))
-                                    (range)
-                                    raw-entries)]
-                       (db/transact-bundle store tenant-id entries)))]
-            {:status 200 :body res})
-          (catch Exception e
-            {:status 400
-             :body {:resourceType "OperationOutcome"
-                    :issue [{:severity "error"
-                             :code "transient"
-                             :diagnostics (str "Transaction failed: " (ex-message e))}]}}))
-        ;; Batch: process each entry independently — each succeeds or fails on its own
-        (let [results (mapv
-                        (fn [entry]
-                          (try
-                            (let [req-map (:request entry)
-                                  method (some-> (:method req-map) str/upper-case)
-                                  url (:url req-map)
-                                  parts (when url (str/split url #"/"))
-                                  resource-type (first parts)
-                                  id (second parts)
-                                  resource (:resource entry)]
-                              (t/trace!
-                               {:id :bundle/entry
-                                :data {:method method
-                                       :resource-type resource-type
-                                       :id id}}
-                              (case method
-                                "POST"
-                                (let [new-id (str (java.util.UUID/randomUUID))
-                                      res (db/create-resource store tenant-id (keyword resource-type) new-id resource)
-                                      vid (get-in res [:meta :versionId])
-                                      last-mod (str (get-in res [:meta :lastUpdated]))]
-                                  {:resource res
-                                   :response (cond-> {:status "201 Created"}
-                                               vid (assoc :etag (str "W/\"" vid "\"")
-                                                          :location (str "/" tenant-id "/fhir/" resource-type "/" (:id res) "/_history/" vid))
-                                               last-mod (assoc :lastModified last-mod))})
-
-                                "PUT"
-                                (let [res (db/update-resource store tenant-id (keyword resource-type) id resource)
-                                      vid (get-in res [:meta :versionId])
-                                      last-mod (str (get-in res [:meta :lastUpdated]))]
-                                  {:resource res
-                                   :response (cond-> {:status "200 OK"}
-                                               vid (assoc :etag (str "W/\"" vid "\""))
-                                               last-mod (assoc :lastModified last-mod))})
-
-                                "DELETE"
-                                (do (db/delete-resource store tenant-id (keyword resource-type) id)
-                                    {:response {:status "204 No Content"}})
-
-                                "GET"
-                                (let [res (db/read-resource store tenant-id (keyword resource-type) id)]
-                                  (if res
-                                    (let [vid (get-in res [:meta :versionId])
-                                          last-mod (str (get-in res [:meta :lastUpdated]))]
-                                      {:resource res
-                                       :response (cond-> {:status "200 OK"}
-                                                   vid (assoc :etag (str "W/\"" vid "\""))
-                                                   last-mod (assoc :lastModified last-mod))})
-                                    {:response {:status "404 Not Found"
-                                                :outcome {:resourceType "OperationOutcome"
-                                                          :issue [{:severity "error"
-                                                                   :code "not-found"
-                                                                   :diagnostics (str resource-type "/" id " not found")}]}}}))
-
-                                ;; Unknown method
-                                {:response {:status "400 Bad Request"
-                                            :outcome {:resourceType "OperationOutcome"
-                                                      :issue [{:severity "error"
-                                                               :code "invalid"
-                                                               :diagnostics (str "Unsupported method: " method)}]}}})))
-                            (catch Exception e
-                              {:response {:status "400 Bad Request"
-                                          :outcome {:resourceType "OperationOutcome"
-                                                    :issue [{:severity "error"
-                                                             :code "exception"
-                                                             :diagnostics (str "Entry failed: " (ex-message e))}]}}})))
-                        (mapv (fn [entry]
-                                (if (:resource entry)
-                                  (update entry :resource
-                                          #(coerce-resource-by-type decoders %))
-                                  entry))
-                              raw-entries))]
-          {:status 200
-           :body {:resourceType "Bundle"
-                  :type "batch-response"
-                  :entry results}}))
-      {:status 400
-       :body {:resourceType "OperationOutcome"
-              :issue [{:severity "error"
-                       :code "invalid"
-                       :diagnostics "Expected a Bundle of type transaction or batch"}]}}))))
+      (if (and (= resource-type "Bundle") (#{"transaction" "batch"} bundle-type))
+        (if (= bundle-type "transaction")
+          ;; Transaction: atomic — all succeed or all fail
+          (try
+            (let [entries (t/trace!
+                           {:id :bundle/transaction
+                            :data {:tenant-id tenant-id
+                                   :entry-count (count raw-entries)}}
+                           (decode-bundle-entries decoders raw-entries))
+                  res (db/transact-transaction store tenant-id entries)]
+              {:status 200 :body res})
+            (catch Exception e
+              {:status 400
+               :body {:resourceType "OperationOutcome"
+                      :issue [{:severity "error"
+                               :code "transient"
+                               :diagnostics (str "Transaction failed: " (ex-message e))}]}}))
+          ;; Batch: each entry independent. Decode entries (with per-entry
+          ;; spans), then hand off to the store's batch impl which emits
+          ;; :store/transact-bundle around its work.
+          (let [entries (decode-bundle-entries decoders raw-entries)
+                res (db/transact-bundle store tenant-id entries)]
+            {:status 200 :body res}))
+        {:status 400
+         :body {:resourceType "OperationOutcome"
+                :issue [{:severity "error"
+                         :code "invalid"
+                         :diagnostics "Expected a Bundle of type transaction or batch"}]}}))))

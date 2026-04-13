@@ -207,55 +207,126 @@
           records (vals (get-in s [tenant-id resource-type]))]
       (mapcat (fn [record] (vals (:history record))) records)))
 
-  (transact-bundle [this tenant-id entries]
+  (transact-transaction [this tenant-id entries]
     ;; Atomic transaction: snapshot state for rollback on failure.
-    ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE → POST → PUT/PATCH → GET/HEAD
+    ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
     (t/trace!
-     {:id :store/transact-bundle
+     {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
      (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
-          snapshot @state]
-      (try
-        (let [results (mapv (fn [entry]
-                              (let [req (:request entry)
-                                    method (:method req)
-                                    url (:url req)
-                                    resource (:resource entry)
-                                    [type id] (str/split url #"/")]
-                                (case method
-                                  "POST" (let [res (protocol/create-resource this tenant-id type nil resource)
+           snapshot @state]
+       (try
+         (let [results (mapv (fn [entry]
+                               (let [req (:request entry)
+                                     method (:method req)
+                                     url (:url req)
+                                     resource (:resource entry)
+                                     [type id] (str/split url #"/")]
+                                 (case method
+                                   "POST" (let [res (protocol/create-resource this tenant-id type nil resource)
+                                                vid (get-in res [:meta :versionId])
+                                                last-mod (str (get-in res [:meta :lastUpdated]))]
+                                            {:resource res
+                                             :response {:status "201 Created"
+                                                        :location (str type "/" (:id res) "/_history/" vid)
+                                                        :etag (str "W/\"" vid "\"")
+                                                        :lastModified last-mod}})
+                                   "PUT" (let [res (protocol/update-resource this tenant-id type id resource)
                                                vid (get-in res [:meta :versionId])
                                                last-mod (str (get-in res [:meta :lastUpdated]))]
                                            {:resource res
-                                            :response {:status "201 Created"
-                                                       :location (str type "/" (:id res) "/_history/" vid)
+                                            :response {:status "200 OK"
                                                        :etag (str "W/\"" vid "\"")
                                                        :lastModified last-mod}})
-                                  "PUT" (let [res (protocol/update-resource this tenant-id type id resource)
-                                              vid (get-in res [:meta :versionId])
-                                              last-mod (str (get-in res [:meta :lastUpdated]))]
-                                          {:resource res
-                                           :response {:status "200 OK"
-                                                      :etag (str "W/\"" vid "\"")
-                                                      :lastModified last-mod}})
-                                  "DELETE" (do (protocol/delete-resource this tenant-id type id)
-                                               {:response {:status "204 No Content"}})
-                                  "GET" (let [res (protocol/read-resource this tenant-id type id)]
-                                          (if res
-                                            (let [vid (get-in res [:meta :versionId])
-                                                  last-mod (str (get-in res [:meta :lastUpdated]))]
-                                              {:resource res
-                                               :response {:status "200 OK"
-                                                          :etag (when vid (str "W/\"" vid "\""))
-                                                          :lastModified last-mod}})
-                                            {:response {:status "404 Not Found"}})))))
-                            ordered)]
-          {:resourceType "Bundle"
-           :type "transaction-response"
-           :entry results})
-        (catch Exception e
-          (reset! state snapshot)
-          (throw e)))))))
+                                   "DELETE" (do (protocol/delete-resource this tenant-id type id)
+                                                {:response {:status "204 No Content"}})
+                                   "GET" (let [res (protocol/read-resource this tenant-id type id)]
+                                           (if res
+                                             (let [vid (get-in res [:meta :versionId])
+                                                   last-mod (str (get-in res [:meta :lastUpdated]))]
+                                               {:resource res
+                                                :response {:status "200 OK"
+                                                           :etag (when vid (str "W/\"" vid "\""))
+                                                           :lastModified last-mod}})
+                                             {:response {:status "404 Not Found"}})))))
+                             ordered)]
+           {:resourceType "Bundle"
+            :type "transaction-response"
+            :entry results})
+         (catch Exception e
+           (reset! state snapshot)
+           (throw e))))))
+
+  (transact-bundle [this tenant-id entries]
+    ;; Batch semantics: each entry is processed independently; per-entry
+    ;; failures do NOT roll back other entries. Returns a batch-response
+    ;; Bundle reporting per-entry status in input order.
+    (t/trace!
+     {:id :store/transact-bundle
+      :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
+     (let [results
+           (mapv
+            (fn [entry]
+              (try
+                (let [req (:request entry)
+                      method (some-> (:method req) str/upper-case)
+                      url (:url req)
+                      [type id] (when url (str/split url #"/"))
+                      resource (:resource entry)]
+                  (case method
+                    "POST"
+                    (let [res (protocol/create-resource this tenant-id type nil resource)
+                          vid (get-in res [:meta :versionId])
+                          last-mod (str (get-in res [:meta :lastUpdated]))]
+                      {:resource res
+                       :response (cond-> {:status "201 Created"}
+                                   vid (assoc :etag (str "W/\"" vid "\"")
+                                              :location (str type "/" (:id res) "/_history/" vid))
+                                   last-mod (assoc :lastModified last-mod))})
+
+                    "PUT"
+                    (let [res (protocol/update-resource this tenant-id type id resource)
+                          vid (get-in res [:meta :versionId])
+                          last-mod (str (get-in res [:meta :lastUpdated]))]
+                      {:resource res
+                       :response (cond-> {:status "200 OK"}
+                                   vid (assoc :etag (str "W/\"" vid "\""))
+                                   last-mod (assoc :lastModified last-mod))})
+
+                    "DELETE"
+                    (do (protocol/delete-resource this tenant-id type id)
+                        {:response {:status "204 No Content"}})
+
+                    "GET"
+                    (let [res (protocol/read-resource this tenant-id type id)]
+                      (if res
+                        (let [vid (get-in res [:meta :versionId])
+                              last-mod (str (get-in res [:meta :lastUpdated]))]
+                          {:resource res
+                           :response (cond-> {:status "200 OK"}
+                                       vid (assoc :etag (str "W/\"" vid "\""))
+                                       last-mod (assoc :lastModified last-mod))})
+                        {:response {:status "404 Not Found"
+                                    :outcome {:resourceType "OperationOutcome"
+                                              :issue [{:severity "error"
+                                                       :code "not-found"
+                                                       :diagnostics (str type "/" id " not found")}]}}}))
+
+                    {:response {:status "400 Bad Request"
+                                :outcome {:resourceType "OperationOutcome"
+                                          :issue [{:severity "error"
+                                                   :code "invalid"
+                                                   :diagnostics (str "Unsupported method: " method)}]}}}))
+                (catch Exception e
+                  {:response {:status "400 Bad Request"
+                              :outcome {:resourceType "OperationOutcome"
+                                        :issue [{:severity "error"
+                                                 :code "exception"
+                                                 :diagnostics (str "Entry failed: " (ex-message e))}]}}})))
+            entries)]
+       {:resourceType "Bundle"
+        :type "batch-response"
+        :entry results}))))
 
 (defn- mock-valueset-expand [store tenant-id _params id]
   ;; Mock an expansion logic
