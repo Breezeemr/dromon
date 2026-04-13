@@ -1,16 +1,16 @@
 {:paths ["bb/src"]
  :tasks
  {setup
-  {:doc "Starts the local integration environment (Postgres, Kratos, Keto, Hydra) via Docker"
+  {:doc "Starts the local integration environment (Postgres, Keto, Hydra) via Docker"
    :requires ([server.docker-env :as env])
-   :task (if (every? env/container-running? ["ory-pg" "kratos" "keto" "hydra"])
+   :task (if (every? env/container-running? ["ory-pg" "keto" "hydra"])
            (println "Integration environment already running -- skipping setup.")
            (env/start!))}
 
   teardown
   {:doc "Stops and removes the local integration environment"
    :requires ([server.docker-env :as env])
-   :task (if (not-any? env/container-exists? ["ory-pg" "kratos" "keto" "hydra"])
+   :task (if (not-any? env/container-exists? ["ory-pg" "keto" "hydra"])
            (println "No integration containers found -- nothing to tear down.")
            (env/stop!))}
 

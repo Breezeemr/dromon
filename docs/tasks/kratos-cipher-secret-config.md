@@ -158,3 +158,7 @@ would have caught the kratos bug originally.
 - Ory Kratos env-var mapping:
   https://www.ory.sh/docs/ecosystem/configuring (look for the section
   on "Environment variables")
+
+## Status
+
+Complete
