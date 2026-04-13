@@ -40,7 +40,8 @@
 (defn- test-app
   "Build a ring app with the mock store and no auth middleware."
   [store]
-  (ring/ring-handler
+  (core/strip-trailing-slash
+   (ring/ring-handler
    (ring/router
     (routing/build-fhir-routes (test-schemas))
     {:conflicts nil
@@ -68,7 +69,7 @@
                         rrc/coerce-exceptions-middleware
                         [core/wrap-fhir-store store]]}})
    (ring/create-default-handler
-    {:not-found (constantly {:status 404 :body {:error "Not Found"}})})))
+    {:not-found (constantly {:status 404 :body {:error "Not Found"}})}))))
 
 (defn- json-body
   "Encode a value to a JSON input stream for a ring request body."
@@ -1102,3 +1103,27 @@
           "race (promoted on storage) is demoted back to the extension array on read")
       (is (not (contains? get-body :race))
           "promoted :race field should not leak into the response"))))
+
+;; ---------------------------------------------------------------------------
+;; Root transaction endpoint trailing-slash normalization
+;; ---------------------------------------------------------------------------
+
+(deftest root-transaction-accepts-trailing-slash
+  (testing "POST /{tenant}/fhir and POST /{tenant}/fhir/ resolve to the same handler"
+    (let [bundle {:resourceType "Bundle"
+                  :type         "transaction"
+                  :entry        [{:fullUrl "urn:uuid:patient-1"
+                                  :resource {:resourceType "Patient"
+                                             :name [{:family "Trailing" :given ["Slash"]}]}
+                                  :request  {:method "POST" :url "Patient"}}]}]
+      (doseq [uri ["/default/fhir" "/default/fhir/"]]
+        (testing (str "uri=" uri)
+          (let [store (mock/create-mock-store {})
+                app   (test-app store)
+                resp  (app (request :post uri bundle))
+                body  (parse-body (:body resp))]
+            (is (= 200 (:status resp))
+                (str "POST to " uri " should succeed"))
+            (is (= "Bundle" (:resourceType body)))
+            (is (= "transaction-response" (:type body)))
+            (is (= 1 (count (:entry body))))))))))

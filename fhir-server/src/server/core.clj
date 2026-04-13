@@ -151,6 +151,23 @@
                         (set (map str/trim (str/split origins #","))))
     :else nil))
 
+(defn strip-trailing-slash
+  "Normalizes request URIs by removing any trailing slash (except for the
+   root URI \"/\") before the Reitit router sees them. Without this,
+   requests like `POST /default/fhir/` fall through to the default
+   not-found handler, which bypasses muuntaja and returns a raw map that
+   Jetty cannot serialize. The rewrite is transparent to clients — no
+   redirect is issued."
+  [handler]
+  (fn [request]
+    (let [uri (:uri request)]
+      (if (and (string? uri)
+               (> (count uri) 1)
+               (str/ends-with? uri "/"))
+        (let [trimmed (subs uri 0 (dec (count uri)))]
+          (handler (assoc request :uri trimmed)))
+        (handler request)))))
+
 (defn fhir-app
   [store schemas & {:keys [jwks-url keto-url terminology cors-allowed-origins]}]
   (let [jwks-url (or jwks-url (System/getenv "JWKS_URL") "http://localhost:4444/.well-known/jwks.json")
@@ -163,7 +180,8 @@
         trace-tap-mw (when (= "1" (System/getenv "DROMON_DEV_TRACE_TAP"))
                        (some-> (requiring-resolve 'server.dev.trace-tap/wrap-trace-tap)
                                deref))]
-  (ring/ring-handler
+  (strip-trailing-slash
+   (ring/ring-handler
    (ring/router
     (routing/build-fhir-routes schemas)
     {:conflicts nil
@@ -200,7 +218,7 @@
                              :body {:resourceType "OperationOutcome"
                                     :issue [{:severity "error"
                                              :code "not-found"
-                                             :diagnostics "Resource or endpoint not found"}]}})}))))
+                                             :diagnostics "Resource or endpoint not found"}]}})})))))
 
 
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
