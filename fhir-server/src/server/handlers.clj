@@ -1151,15 +1151,15 @@
   [handler decoders]
   (fn [req]
     (let [resource-type (or (:fhir/resource-type req)
-                            (get-in req [:parameters :body :resourceType]))]
-      (t/trace!
-       {:id :fhir/decode
-        :data {:resource-type resource-type}}
-       (let [req (cond-> req
-                   (and (get-in req [:parameters :body])
-                        (seq (get-in req [:parameters :body :contained])))
-                   (update-in [:parameters :body] (partial decode-contained-only decoders)))]
-         (handler req))))))
+                            (get-in req [:parameters :body :resourceType]))
+          req' (t/trace!
+                {:id :fhir/decode
+                 :data {:resource-type resource-type}}
+                (cond-> req
+                  (and (get-in req [:parameters :body])
+                       (seq (get-in req [:parameters :body :contained])))
+                  (update-in [:parameters :body] (partial decode-contained-only decoders))))]
+      (handler req'))))
 
 (defn transaction [decoders]
   (fn [req]
