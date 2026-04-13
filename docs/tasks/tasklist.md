@@ -8,6 +8,7 @@ Inferno current:  505 passed,  0 failed,   0 skipped, 0 errors
 
 ## Open tasks
 
+- [xtdb2-transact-transaction-test-order.md](xtdb2-transact-transaction-test-order.md) — `test-transact-transaction` in `fhir-store-xtdb2` has 7 pre-existing assertion failures: the test asserts input-order responses but the store reorders entries per FHIR §3.1.0.11.2. Fix the assertions (or, alternatively, have the store emit input-order responses).
 
 ## Completed
 
