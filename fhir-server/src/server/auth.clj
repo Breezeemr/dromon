@@ -90,20 +90,20 @@
                                                                                :code "login"
                                                                                :diagnostics "Invalid or missing token"}]}})})
                   (token/jws-backend {:secret secret
-                                      :options {:alg :hs256}}))
-        authed (auth-mw/wrap-authentication handler backend)]
+                                      :options {:alg :hs256}}))]
     (fn [request]
       (let [auth-header (get-in request [:headers "authorization"])
             token (when (and auth-header (.startsWith ^String auth-header "Bearer "))
                     (subs auth-header 7))
             kid (try
                   (when token (:kid (jwt/decode-header token)))
-                  (catch Exception _ nil))]
-        (t/trace!
-         {:id :auth/jwt.verify
-          :data {:kid kid
-                 :has-token (some? token)}}
-         (authed request))))))
+                  (catch Exception _ nil))
+            request' (t/trace!
+                      {:id :auth/jwt.verify
+                       :data {:kid kid
+                              :has-token (some? token)}}
+                      (auth-mw/authentication-request request backend))]
+        (handler request')))))
 
 (defn- extract-identity [request]
   ;; buddy-auth will populate :identity in the request map if validation passes

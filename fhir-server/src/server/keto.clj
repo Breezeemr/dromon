@@ -81,24 +81,24 @@
                        :else "system")]
 
           (log/info "Keto authz -> subject:" subject-id "relation:" relation "object:" object "uri:" uri)
-          (t/trace!
-           {:id :authz/keto.check
-            :data {:subject-id subject-id
-                   :namespace "fhir"
-                   :relation relation
-                   :object object
-                   :fhir-type fhir-type}}
           (if (not subject-id)
             {:status 403
              :body {:resourceType "OperationOutcome"
                     :issue [{:severity "error"
                              :code "forbidden"
                              :diagnostics "Missing subject in identity; cannot authorize."}]}}
-
-            (if (authorized? keto-url "fhir" fhir-type resource-id relation subject-id)
-              (handler request)
-              {:status 403
-               :body {:resourceType "OperationOutcome"
-                      :issue [{:severity "error"
-                               :code "forbidden"
-                               :diagnostics (format "Subject %s is not allowed to %s %s" subject-id relation object)}]}}))))))))
+            (let [allowed? (t/trace!
+                            {:id :authz/keto.check
+                             :data {:subject-id subject-id
+                                    :namespace "fhir"
+                                    :relation relation
+                                    :object object
+                                    :fhir-type fhir-type}}
+                            (authorized? keto-url "fhir" fhir-type resource-id relation subject-id))]
+              (if allowed?
+                (handler request)
+                {:status 403
+                 :body {:resourceType "OperationOutcome"
+                        :issue [{:severity "error"
+                                 :code "forbidden"
+                                 :diagnostics (format "Subject %s is not allowed to %s %s" subject-id relation object)}]}}))))))))
