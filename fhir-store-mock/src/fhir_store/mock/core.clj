@@ -1,6 +1,7 @@
 (ns fhir-store.mock.core
   (:require [clojure.string :as str]
-            [fhir-store.protocol :as protocol]))
+            [fhir-store.protocol :as protocol]
+            [taoensso.telemere :as t]))
 
 (defn- method-order
   "Returns sort key for FHIR transaction entry processing order per §3.1.0.11.2:
@@ -209,7 +210,10 @@
   (transact-bundle [this tenant-id entries]
     ;; Atomic transaction: snapshot state for rollback on failure.
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE → POST → PUT/PATCH → GET/HEAD
-    (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
+    (t/trace!
+     {:id :store/transact-bundle
+      :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
+     (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
           snapshot @state]
       (try
         (let [results (mapv (fn [entry]
@@ -251,7 +255,7 @@
            :entry results})
         (catch Exception e
           (reset! state snapshot)
-          (throw e))))))
+          (throw e)))))))
 
 (defn- mock-valueset-expand [store tenant-id _params id]
   ;; Mock an expansion logic
