@@ -9,6 +9,9 @@ Inferno current:  505 passed,  0 failed,   0 skipped, 0 errors
 ## Open tasks
 
 - [xtdb2-transact-transaction-test-order.md](xtdb2-transact-transaction-test-order.md) — `test-transact-transaction` in `fhir-store-xtdb2` has 7 pre-existing assertion failures: the test asserts input-order responses but the store reorders entries per FHIR §3.1.0.11.2. Fix the assertions (or, alternatively, have the store emit input-order responses).
+- [conditional-create-if-none-match-star.md](conditional-create-if-none-match-star.md) — `PUT /{type}/{id}` with `If-None-Match: *` is not honoured (FHIR R4 §2.38.1). Should create only if no row with that id exists; today it silently upserts. Plumb `:if-none-match :wildcard` through the opts map and have each store `ASSERT NOT EXISTS` / cas-on-nil.
+- [conditional-create-if-none-exist-race.md](conditional-create-if-none-exist-race.md) — `POST` with `If-None-Exist` is TOCTOU-racy: search-then-create in the handler, so two concurrent conditional creates can both see zero matches and both insert. Needs a per-tenant/type lock or post-create verify-and-rollback.
+- [conditional-search-criteria-races.md](conditional-search-criteria-races.md) — Conditional update/delete/patch via URL search criteria (`PUT/DELETE/PATCH /{type}?...`) are all TOCTOU-racy: the search and the subsequent write are not atomic. Fix by auto-propagating the matched row's `versionId` as an implicit `If-Match` into the store call, plus a lock for the phantom-create branch of conditional-update.
 
 ## Completed
 
