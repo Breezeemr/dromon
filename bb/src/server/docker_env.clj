@@ -35,7 +35,8 @@
     (when (container-exists? "ory-pg")
       (println "ory-pg exists but is stopped — removing and recreating...")
       (shell "docker" "rm" "-f" "ory-pg"))
-    (shell "docker" "run" "-d" "--name" "ory-pg" "--network" network-name 
+    (shell "docker" "run" "-d" "--name" "ory-pg" "--network" network-name
+           "--memory" "512m" "--memory-swap" "512m" "--cpus" "1.0"
            "-v" (str pwd "/docker/init-db.sql:/docker-entrypoint-initdb.d/init.sql")
            "-e" "POSTGRES_USER=ory"
            "-e" (str "POSTGRES_PASSWORD=" pg-password)
@@ -71,7 +72,8 @@
       (when (container-exists? "kratos")
         (println "kratos exists but is stopped — removing and recreating...")
         (shell "docker" "rm" "-f" "kratos"))
-      (shell "docker" "run" "-d" "--name" "kratos" "--network" network-name 
+      (shell "docker" "run" "-d" "--name" "kratos" "--network" network-name
+             "--memory" "256m" "--memory-swap" "256m" "--cpus" "0.5"
              "-p" "4433:4433" "-p" "4434:4434"
              "-v" (str pwd "/docker/kratos.yml:/etc/config/kratos/kratos.yml")
              "-v" (str pwd "/docker/identity.schema.json:/etc/config/kratos/identity.schema.json")
@@ -90,7 +92,8 @@
       (when (container-exists? "keto")
         (println "keto exists but is stopped — removing and recreating...")
         (shell "docker" "rm" "-f" "keto"))
-      (shell "docker" "run" "-d" "--name" "keto" "--network" network-name 
+      (shell "docker" "run" "-d" "--name" "keto" "--network" network-name
+             "--memory" "256m" "--memory-swap" "256m" "--cpus" "1.0"
              "-p" "4466:4466" "-p" "4467:4467"
              "-v" (str pwd "/docker/keto.yml:/etc/config/keto/keto.yml")
              "-v" (str pwd "/docker/namespaces.ts:/etc/config/keto/namespaces.ts")
@@ -108,7 +111,8 @@
       (when (container-exists? "hydra")
         (println "hydra exists but is stopped — removing and recreating...")
         (shell "docker" "rm" "-f" "hydra"))
-      (shell "docker" "run" "-d" "--name" "hydra" "--network" network-name 
+      (shell "docker" "run" "-d" "--name" "hydra" "--network" network-name
+             "--memory" "256m" "--memory-swap" "256m" "--cpus" "0.5"
              "-p" "4444:4444" "-p" "4445:4445"
              "-v" (str pwd "/docker/hydra.yml:/etc/config/hydra/hydra.yml")
              "-e" (str "DSN=" pg-dsn-base "hydra?sslmode=disable")
