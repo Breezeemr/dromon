@@ -204,3 +204,30 @@
             (is (some? (db/read-resource store tenant-id :Patient "alive")))))
         (finally
           (close-store-nodes! store))))))
+
+(deftest test-versionid-monotonic
+  (testing "Server-managed integer-monotonic versionIds on create/update/read"
+    (let [store (core-db/create-xtdb-store {})
+          tenant-id "tenant-ver"
+          patient {:resourceType "Patient" :active true :name [{"family" "Ver"}]}]
+      (try
+        (let [created (db/create-resource store tenant-id :Patient "vp1" patient)]
+          (is (= "1" (get-in created [:meta :versionId]))
+              "create-resource returns versionId '1'"))
+
+        (let [read1 (db/read-resource store tenant-id :Patient "vp1")]
+          (is (= "1" (get-in read1 [:meta :versionId]))
+              "read after create exposes versionId '1'"))
+
+        (let [updated (db/update-resource store tenant-id :Patient "vp1"
+                                          (assoc patient :active false))]
+          (is (= "2" (get-in updated [:meta :versionId]))
+              "update-resource returns bumped versionId '2'"))
+
+        (let [read2 (db/read-resource store tenant-id :Patient "vp1")]
+          (is (= "2" (get-in read2 [:meta :versionId]))
+              "read after update exposes versionId '2'")
+          (is (= false (:active read2))
+              "read after update returns the updated payload"))
+        (finally
+          (close-store-nodes! store))))))

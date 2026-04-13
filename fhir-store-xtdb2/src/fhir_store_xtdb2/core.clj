@@ -64,17 +64,47 @@
 (defn- extract-and-build-sql
   "Takes a resource map and resource-type, builds a parameterized SQL INSERT for XTDB.
    Uses the precompiled malli encoder for the resource type, falling back to the
-   :default encoder (built from :map) for types without a specific schema."
-  [resource-type id resource-map storage-encoders]
+   :default encoder (built from :map) for types without a specific schema.
+   Optional kwargs:
+     :version — the monotonic version string to inject as the \"fhir_version\" column."
+  [resource-type id resource-map storage-encoders & {:keys [version]}]
   (let [rt-name (name resource-type)
         encode-fn (get storage-encoders rt-name (get storage-encoders :default))
-        doc (-> (encode-fn resource-map) (assoc :_id id))
+        doc (cond-> (encode-fn resource-map)
+              true    (assoc :_id id)
+              version (assoc :fhir_version version))
         cols (keys doc)
         col-names (str/join ", " (map #(format "\"%s\"" (name %)) cols))
         placeholders (str/join ", " (repeat (count cols) "?"))
         sql (format "INSERT INTO %s (%s) VALUES (%s)" (name resource-type) col-names placeholders)
         args (mapv doc cols)]
     [sql args]))
+
+(defn- current-version
+  "Reads the current fhir_version column for a resource row. Returns the version
+   string or nil if no row exists."
+  [node resource-type id]
+  (let [query (format "SELECT fhir_version FROM %s WHERE _id = ?" (name resource-type))
+        row (first (xt/q node [query id]))]
+    (when row
+      (when-let [v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
+        (str v)))))
+
+(defn- next-version
+  "Computes the next version string from a current version (or nil for first)."
+  [current]
+  (if (and current (not (str/blank? current)))
+    (if-let [n (parse-long current)]
+      (str (inc n))
+      "1")
+    "1"))
+
+(defn- inject-meta
+  "Injects :meta :versionId and :meta :lastUpdated onto a decoded FHIR resource."
+  [result version system-from]
+  (cond-> result
+    version     (assoc-in [:meta :versionId] (str version))
+    system-from (assoc-in [:meta :lastUpdated] (str system-from))))
 
 (defn- parse-date-prefix
   "Parses a FHIR date search value into [prefix date-string].
@@ -496,21 +526,25 @@
 (defn- xtdb->fhir
   "Converts an XTDB query result row back to a FHIR resource map.
    Uses the precompiled malli decoder for the resource type, falling back to the
-   :default decoder (built from :map) for types without a specific schema."
+   :default decoder (built from :map) for types without a specific schema.
+   Captures the server-managed fhir_version column and xt/system_from so they can
+   be injected back as :meta :versionId / :meta :lastUpdated after decoding."
   [record read-decoders]
   (when record
     (let [id (or (:xt/id record) (:_id record))
+          version (or (:fhir-version record) (:fhir_version record) (get record "fhir_version"))
+          system-from (or (:xt/system_from record) (:xt/system-from record) (get record "_system_from"))
           stripped (-> record
-                       (dissoc :xt/id :_id :xt/system_from :xt/system_to
+                       (dissoc :xt/id :_id :fhir_version :fhir-version
+                               :xt/system_from :xt/system_to :xt/system-from :xt/system-to
                                :xt/valid_from :xt/valid_to
                                :fhir_source :fhir-source)
                        (set/rename-keys {:resourcetype :resourceType}))
           rt (:resourceType stripped)
           decode-fn (get read-decoders rt (get read-decoders :default))
-          base (decode-fn stripped)]
-      (if id
-        (assoc base :id (str id))
-        base))))
+          base (decode-fn stripped)
+          with-id (if id (assoc base :id (str id)) base)]
+      (inject-meta with-id version system-from))))
 
 (defn- parse-sort-param
   "Parses a FHIR _sort parameter string into a vector of {:field :dir} maps.
@@ -585,9 +619,13 @@
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [node (get-or-create-node this tenant-id)
-           [sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
+           version "1"
+           [sql args] (extract-and-build-sql resource-type id resource storage-encoders
+                                             :version version)]
        (xt/execute-tx node [[:sql sql args]])
-       (assoc resource :id id))))
+       (-> resource
+           (assoc :id id)
+           (assoc-in [:meta :versionId] version)))))
 
   (read-resource [this tenant-id resource-type id]
     (t/trace!
@@ -612,14 +650,27 @@
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [node (get-or-create-node this tenant-id)
-           [sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
+           rt-name (name resource-type)
+           current (current-version node resource-type id)
+           new-version (next-version current)
+           [sql args] (extract-and-build-sql resource-type id resource storage-encoders
+                                             :version new-version)
+           assert-op (if current
+                       [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
+                                     rt-name)
+                        [id current]]
+                       [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
+                                     rt-name)
+                        [id]])]
        (try
-         (xt/execute-tx node [[:sql sql args]])
+         (xt/execute-tx node [assert-op [:sql sql args]])
          (catch Exception e
            (throw (ex-info (str "Conflict: " (ex-message e))
                            {:fhir/status 409 :fhir/code "conflict"}
                            e))))
-       resource)))
+       (-> resource
+           (assoc :id id)
+           (assoc-in [:meta :versionId] new-version)))))
 
   (delete-resource [this tenant-id resource-type id]
     (t/trace!
@@ -803,10 +854,16 @@
           tx-ops (vec (mapcat (fn [{:keys [method resource-type id resource]}]
                                 (case method
                                   "POST"
-                                  (let [[sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
+                                  (let [[sql args] (extract-and-build-sql
+                                                    resource-type id resource storage-encoders
+                                                    :version "1")]
                                     [[:sql sql args]])
                                   "PUT"
-                                  (let [[sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
+                                  (let [current (current-version node resource-type id)
+                                        new-version (next-version current)
+                                        [sql args] (extract-and-build-sql
+                                                    resource-type id resource storage-encoders
+                                                    :version new-version)]
                                     [[:sql sql args]])
                                   "DELETE"
                                   (let [sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))]
