@@ -1,7 +1,8 @@
 (ns server.keto
   (:require [hato.client :as hc]
             [clojure.tools.logging :as log]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [taoensso.telemere :as t]))
 
 ;; Default Keto read API URL. In production this should come from configuration.
 (def ^:private default-keto-url "http://localhost:4466")
@@ -80,6 +81,13 @@
                        :else "system")]
 
           (log/info "Keto authz -> subject:" subject-id "relation:" relation "object:" object "uri:" uri)
+          (t/trace!
+           {:id :authz/keto.check
+            :data {:subject-id subject-id
+                   :namespace "fhir"
+                   :relation relation
+                   :object object
+                   :fhir-type fhir-type}}
           (if (not subject-id)
             {:status 403
              :body {:resourceType "OperationOutcome"
@@ -93,4 +101,4 @@
                :body {:resourceType "OperationOutcome"
                       :issue [{:severity "error"
                                :code "forbidden"
-                               :diagnostics (format "Subject %s is not allowed to %s %s" subject-id relation object)}]}})))))))
+                               :diagnostics (format "Subject %s is not allowed to %s %s" subject-id relation object)}]}}))))))))

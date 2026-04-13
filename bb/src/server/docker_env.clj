@@ -7,6 +7,9 @@
 (def pg-password (or (System/getenv "POSTGRES_PASSWORD") "secret"))
 (def pg-dsn-base (str "postgres://ory:" pg-password "@ory-pg:5432/"))
 
+(defn- otel-enabled? []
+  (= "1" (System/getenv "DROMON_OTEL")))
+
 (defn container-running? [name]
   "Returns true only if the container exists AND is currently running.
    A stopped container returns false, triggering re-creation in start!."
@@ -118,11 +121,27 @@
            "docker.io/oryd/hydra:v2.2.0" "serve" "all" "-c" "/etc/config/hydra/hydra.yml" "--dev")
     (assert-container-up! "hydra"))
 
+  ;; Jaeger all-in-one (only when DROMON_OTEL=1). Provides OTLP ingest on
+  ;; 4317 (gRPC) / 4318 (HTTP) and a UI on 16686. In-memory storage; dev only.
+  (when (otel-enabled?)
+    (println "Starting Jaeger all-in-one for OpenTelemetry...")
+    (when-not (container-running? "jaeger")
+      (when (container-exists? "jaeger")
+        (println "jaeger exists but is stopped — removing and recreating...")
+        (shell "docker" "rm" "-f" "jaeger"))
+      (shell "docker" "run" "-d" "--name" "jaeger" "--network" network-name
+             "--memory" "256m" "--memory-swap" "256m" "--cpus" "0.5"
+             "-e" "COLLECTOR_OTLP_ENABLED=true"
+             "-p" "4317:4317" "-p" "4318:4318" "-p" "16686:16686"
+             "docker.io/jaegertracing/all-in-one:1.57")
+      (assert-container-up! "jaeger"))
+    (println "Jaeger UI available at http://localhost:16686"))
+
   (println "Environment started successfully!"))
 
 (defn stop! []
   (println "Stopping local integration environment...")
-  (doseq [c ["keto" "hydra" "ory-pg"]]
+  (doseq [c ["jaeger" "keto" "hydra" "ory-pg"]]
     (when (container-exists? c)
       (println "Removing container" c)
       (shell "docker" "rm" "-f" c)))

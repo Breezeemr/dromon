@@ -561,64 +561,85 @@
   (let [nodes (:nodes store)
         tid (str tenant-id)]
     (or (get @nodes tid)
-        (let [new-node (xtn/start-node (:node-config store))]
-          ;; swap! may race - if another thread already added this tenant,
-          ;; we close the node we just created and use the existing one.
-          (let [existing (get (swap! nodes (fn [m]
-                                             (if (contains? m tid)
-                                               m
-                                               (assoc m tid new-node))))
-                              tid)]
-            (if (identical? existing new-node)
-              new-node
-              (do (.close new-node)
-                  existing)))))))
+        (t/trace!
+         {:id :store/node.start
+          :data {:tenant-id tid}}
+         (let [new-node (xtn/start-node (:node-config store))]
+           ;; swap! may race - if another thread already added this tenant,
+           ;; we close the node we just created and use the existing one.
+           (let [existing (get (swap! nodes (fn [m]
+                                              (if (contains? m tid)
+                                                m
+                                                (assoc m tid new-node))))
+                               tid)]
+             (if (identical? existing new-node)
+               new-node
+               (do (.close new-node)
+                   existing))))))))
 
 (defrecord XTDBStore [nodes node-config storage-encoders read-decoders]
   IFHIRStore
 
   (create-resource [this tenant-id resource-type id resource]
-    (let [node (get-or-create-node this tenant-id)
-          [sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
-      (xt/execute-tx node [[:sql sql args]])
-      (assoc resource :id id)))
+    (t/trace!
+     {:id :store/create
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [node (get-or-create-node this tenant-id)
+           [sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
+       (xt/execute-tx node [[:sql sql args]])
+       (assoc resource :id id))))
 
   (read-resource [this tenant-id resource-type id]
-    (let [node (get-or-create-node this tenant-id)
-          query (format "SELECT * FROM %s WHERE _id = ?" (name resource-type))
-          results (into [] (xt/q node [query id]))]
-      (xtdb->fhir (first results) read-decoders)))
+    (t/trace!
+     {:id :store/read
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [node (get-or-create-node this tenant-id)
+           query (format "SELECT * FROM %s WHERE _id = ?" (name resource-type))
+           results (into [] (xt/q node [query id]))]
+       (xtdb->fhir (first results) read-decoders))))
 
   (vread-resource [this tenant-id resource-type id vid]
-    (let [node (get-or-create-node this tenant-id)
-          query (format "SELECT * FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (name resource-type))
-          results (into [] (xt/q node [query vid id]))]
-      (xtdb->fhir (first results) read-decoders)))
+    (t/trace!
+     {:id :store/vread
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id :vid vid}}
+     (let [node (get-or-create-node this tenant-id)
+           query (format "SELECT * FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (name resource-type))
+           results (into [] (xt/q node [query vid id]))]
+       (xtdb->fhir (first results) read-decoders))))
 
   (update-resource [this tenant-id resource-type id resource]
-    (let [node (get-or-create-node this tenant-id)
-          [sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
-      (try
-        (xt/execute-tx node [[:sql sql args]])
-        (catch Exception e
-          (throw (ex-info (str "Conflict: " (ex-message e))
-                          {:fhir/status 409 :fhir/code "conflict"}
-                          e))))
-      resource))
+    (t/trace!
+     {:id :store/update
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [node (get-or-create-node this tenant-id)
+           [sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
+       (try
+         (xt/execute-tx node [[:sql sql args]])
+         (catch Exception e
+           (throw (ex-info (str "Conflict: " (ex-message e))
+                           {:fhir/status 409 :fhir/code "conflict"}
+                           e))))
+       resource)))
 
   (delete-resource [this tenant-id resource-type id]
-    (let [node (get-or-create-node this tenant-id)
-          sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))]
-      (try
-        (xt/execute-tx node [[:sql sql [id]]])
-        (catch Exception e
-          (throw (ex-info (str "Conflict: " (ex-message e))
-                          {:fhir/status 409 :fhir/code "conflict"}
-                          e))))
-      nil))
+    (t/trace!
+     {:id :store/delete
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [node (get-or-create-node this tenant-id)
+           sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))]
+       (try
+         (xt/execute-tx node [[:sql sql [id]]])
+         (catch Exception e
+           (throw (ex-info (str "Conflict: " (ex-message e))
+                           {:fhir/status 409 :fhir/code "conflict"}
+                           e))))
+       nil)))
 
   (resource-deleted? [this tenant-id resource-type id]
     ;; A resource is "deleted" if it has history (existed in the past) but no current row
+    (t/trace!
+     {:id :store/resource-deleted?
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
     (let [node (get-or-create-node this tenant-id)
           current-query (format "SELECT _id FROM %s WHERE _id = ?" (name resource-type))
           current-results (into [] (xt/q node [current-query id]))]
@@ -627,9 +648,12 @@
         ;; Check if it ever existed using system_time history
         (let [history-query (format "SELECT _id FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (name resource-type))
               history-results (into [] (xt/q node [history-query id]))]
-          (boolean (seq history-results))))))
+          (boolean (seq history-results)))))))
 
   (search [this tenant-id resource-type params search-registry]
+    (t/trace!
+     {:id :store/search
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
     (let [node (get-or-create-node this tenant-id)
           ;; Extract standard FHIR pagination params, default 50 items per page
           ;; Support both string keys (from ring query-params) and keyword keys
@@ -679,9 +703,12 @@
                      :data {:resource-type (name resource-type)
                             :params filter-params
                             :error (.getMessage e)}})
-          []))))
+          [])))))
 
   (count-resources [this tenant-id resource-type params search-registry]
+    (t/trace!
+     {:id :store/count
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
     (let [node (get-or-create-node this tenant-id)
           result-params #{"_count" "_skip" "_offset" "_sort" "_include" "_revinclude"
                           "_total" "_elements" "_contained" "_containedType"
@@ -711,14 +738,20 @@
                      :data {:resource-type (name resource-type)
                             :params filter-params
                             :error (.getMessage e)}})
-          0))))
+          0)))))
 
   (history [this tenant-id resource-type id]
-    (let [node (get-or-create-node this tenant-id)
-          query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (name resource-type))]
-      (mapv #(xtdb->fhir % read-decoders) (xt/q node [query id]))))
+    (t/trace!
+     {:id :store/history
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [node (get-or-create-node this tenant-id)
+           query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (name resource-type))]
+       (mapv #(xtdb->fhir % read-decoders) (xt/q node [query id])))))
 
   (history-type [this tenant-id resource-type params]
+    (t/trace!
+     {:id :store/history-type
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
     (let [node (get-or-create-node this tenant-id)
           raw-count (or (get params :_count) (get params "_count") "50")
           limit (if (string? raw-count) (parse-long raw-count) raw-count)
@@ -732,12 +765,15 @@
           query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT %d"
                         (name resource-type) where-clause limit)
           results (into [] (xt/q node (into [query] where-params)))]
-      (mapv #(xtdb->fhir % read-decoders) results)))
+      (mapv #(xtdb->fhir % read-decoders) results))))
 
   (transact-bundle [this tenant-id entries]
     ;; Pre-compute entry metadata (method, resource-type, id) for use in both
     ;; building tx-ops and constructing the response afterward.
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
+    (t/trace!
+     {:id :store/transact-bundle
+      :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
     (let [node (get-or-create-node this tenant-id)
           entry-metas (->> (mapv (fn [entry]
                                    (let [{:keys [request resource fullUrl]} entry
@@ -810,7 +846,7 @@
                                                last-mod (assoc :lastModified (str last-mod))
                                                (= method "POST") (assoc :location (str "/" tenant-id "/fhir/" resource-type "/" id "/_history/" vid)))}
                             res (assoc :resource res)))))
-                    entry-metas)})))
+                    entry-metas)}))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
   ;; In a real XTDB implementation, we'd query for codes using XTDB

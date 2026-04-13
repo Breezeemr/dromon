@@ -4,7 +4,8 @@
             [buddy.sign.jwt :as jwt]
             [buddy.core.keys :as bkeys]
             [hato.client :as hc]
-            [clojure.tools.logging :as log]))
+            [clojure.tools.logging :as log]
+            [taoensso.telemere :as t]))
 
 (def ^:private dev-secret
   (when-let [s (System/getenv "JWT_DEV_SECRET")]
@@ -89,9 +90,20 @@
                                                                                :code "login"
                                                                                :diagnostics "Invalid or missing token"}]}})})
                   (token/jws-backend {:secret secret
-                                      :options {:alg :hs256}}))]
-    (-> handler
-        (auth-mw/wrap-authentication backend))))
+                                      :options {:alg :hs256}}))
+        authed (auth-mw/wrap-authentication handler backend)]
+    (fn [request]
+      (let [auth-header (get-in request [:headers "authorization"])
+            token (when (and auth-header (.startsWith ^String auth-header "Bearer "))
+                    (subs auth-header 7))
+            kid (try
+                  (when token (:kid (jwt/decode-header token)))
+                  (catch Exception _ nil))]
+        (t/trace!
+         {:id :auth/jwt.verify
+          :data {:kid kid
+                 :has-token (some? token)}}
+         (authed request))))))
 
 (defn- extract-identity [request]
   ;; buddy-auth will populate :identity in the request map if validation passes

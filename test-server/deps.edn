@@ -4,7 +4,14 @@
         integrant/integrant {:mvn/version "0.13.1"}
         metosin/malli {:mvn/version "0.20.1"}}
  :aliases
- {;; --- FHIR store backends ---
+ {;; --- OpenTelemetry (opt-in via -M:otel) ---
+  ;; Pulls the OTel SDK + OTLP exporter onto the classpath so Telemere's
+  ;; open-telemetry handler can boot. Default classpath stays lean.
+  :otel {:extra-deps {io.opentelemetry/opentelemetry-sdk                        {:mvn/version "1.43.0"}
+                      io.opentelemetry/opentelemetry-exporter-otlp              {:mvn/version "1.43.0"}
+                      io.opentelemetry/opentelemetry-sdk-extension-autoconfigure {:mvn/version "1.43.0"}}}
+
+  ;; --- FHIR store backends ---
   :store/xtdb2 {:extra-deps {fhir-store/xtdb2 {:local/root "../fhir-store-xtdb2"}}}
   :store/mock  {:extra-deps {fhir-store/mock  {:local/root "../fhir-store-mock"}}}
 

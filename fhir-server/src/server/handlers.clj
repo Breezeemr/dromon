@@ -5,7 +5,8 @@
             [malli.transform :as mt]
             [clojure.string :as str]
             [com.breezeehr.fhir-json-transform :as fjt]
-            [server.json-patch :as json-patch]))
+            [server.json-patch :as json-patch]
+            [taoensso.telemere :as t]))
 
 (defn- gone-response [resource-type id]
   {:status 410
@@ -1149,11 +1150,16 @@
    dispatching."
   [handler decoders]
   (fn [req]
-    (let [req (cond-> req
-                (and (get-in req [:parameters :body])
-                     (seq (get-in req [:parameters :body :contained])))
-                (update-in [:parameters :body] (partial decode-contained-only decoders)))]
-      (handler req))))
+    (let [resource-type (or (:fhir/resource-type req)
+                            (get-in req [:parameters :body :resourceType]))]
+      (t/trace!
+       {:id :fhir/decode
+        :data {:resource-type resource-type}}
+       (let [req (cond-> req
+                   (and (get-in req [:parameters :body])
+                        (seq (get-in req [:parameters :body :contained])))
+                   (update-in [:parameters :body] (partial decode-contained-only decoders)))]
+         (handler req))))))
 
 (defn transaction [decoders]
   (fn [req]
@@ -1172,7 +1178,11 @@
       (if (= bundle-type "transaction")
         ;; Transaction: atomic — all succeed or all fail
         (try
-          (let [res (db/transact-bundle store tenant-id entries)]
+          (let [res (t/trace!
+                     {:id :bundle/transaction
+                      :data {:tenant-id tenant-id
+                             :entry-count (count entries)}}
+                     (db/transact-bundle store tenant-id entries))]
             {:status 200 :body res})
           (catch Exception e
             {:status 400
@@ -1191,6 +1201,11 @@
                                   resource-type (first parts)
                                   id (second parts)
                                   resource (:resource entry)]
+                              (t/trace!
+                               {:id :bundle/entry
+                                :data {:method method
+                                       :resource-type resource-type
+                                       :id id}}
                               (case method
                                 "POST"
                                 (let [new-id (str (java.util.UUID/randomUUID))
@@ -1236,7 +1251,7 @@
                                             :outcome {:resourceType "OperationOutcome"
                                                       :issue [{:severity "error"
                                                                :code "invalid"
-                                                               :diagnostics (str "Unsupported method: " method)}]}}}))
+                                                               :diagnostics (str "Unsupported method: " method)}]}}})))
                             (catch Exception e
                               {:response {:status "400 Bad Request"
                                           :outcome {:resourceType "OperationOutcome"

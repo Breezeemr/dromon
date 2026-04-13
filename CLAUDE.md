@@ -45,6 +45,25 @@ bb inferno-down    # stops Inferno containers
 bb teardown        # stops Ory containers
 ```
 
+### Run with OpenTelemetry tracing (Jaeger UI)
+```bash
+# Start the dev stack with Jaeger all-in-one alongside Ory.
+DROMON_OTEL=1 bb setup
+# Boot the test-server with the :otel alias so the OTel SDK + OTLP exporter
+# are on the classpath. Telemere's open-telemetry handler installs itself
+# automatically when DROMON_OTEL=1 is set.
+cd test-server && \
+  DROMON_OTEL=1 \
+  OTEL_SERVICE_NAME=dromon-fhir-server \
+  OTEL_TRACES_EXPORTER=otlp \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+  OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  TEST_SERVER_STORE=xtdb2-disk \
+  clj -M:otel:store/xtdb2:malli/uscore8 -X test-server.core/-main
+# Browse traces at http://localhost:16686 (service: dromon-fhir-server).
+# Tear down with: bb teardown (removes the jaeger container too).
+```
+
 ### Babashka tasks (run from repo root)
 `bb setup` / `bb teardown` -- Ory auth infrastructure
 `bb inferno-check` -- smoke test (containers + server health)

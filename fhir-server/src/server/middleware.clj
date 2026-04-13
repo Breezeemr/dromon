@@ -2,7 +2,8 @@
   (:require [clojure.string :as str]
             [clojure.tools.logging :as log]
             [jsonista.core :as json]
-            [taoensso.telemere :as t])
+            [taoensso.telemere :as t]
+            [fhir-store.protocol :as fp])
   (:import [com.fasterxml.jackson.databind ObjectMapper SerializationFeature]
            [java.time Instant ZonedDateTime ZoneOffset]
            [java.time.format DateTimeFormatter]))
@@ -74,6 +75,16 @@
                            :status status
                            :duration-ms duration-ms}})
          response)))))
+
+(defn wrap-otel-context
+  "Activates the current OpenTelemetry context on the request thread for the
+   duration of the downstream handler call, so XTDB v2's native OTel spans
+   (and any other OTel-instrumented library) attach as children of the
+   current Telemere span. No-op when the OpenTelemetry SDK is not present."
+  [handler]
+  (fn [request]
+    (fp/with-otel-context
+      (handler request))))
 
 (defn wrap-request-id
   "Middleware that adds X-Request-Id to responses. Echoes client's value or generates a UUID."

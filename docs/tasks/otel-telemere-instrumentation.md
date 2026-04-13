@@ -160,3 +160,37 @@ is the global one so XTDB picks it up at node start.
 - `datomic-test-server/perf-analysis/REPORT.md` — latency baseline the span
   tree should match
 - Telemere OTel handler: `taoensso.telemere.open-telemetry` in Telemere 1.2.1
+
+## Status
+
+Complete. Implemented in branch `otel`:
+
+- Jaeger all-in-one container added to `bb/src/server/docker_env.clj`, guarded
+  by `DROMON_OTEL=1`, with the same memory/cpu caps as the Ory containers.
+- `:otel` alias on `fhir-server/deps.edn` and `test-server/deps.edn` pulling
+  `io.opentelemetry/opentelemetry-sdk` 1.43.0, the OTLP exporter, and the
+  autoconfigure SPI.
+- `server.logging/init-logging!` installs Telemere's OpenTelemetry handler
+  via `requiring-resolve` when `DROMON_OTEL=1`; default path stays untouched.
+- `t/trace!` blocks added at: `wrap-keto-authorization` (`:authz/keto.check`),
+  `wrap-jwt-auth` (`:auth/jwt.verify`), `wrap-decode-contained`
+  (`:fhir/decode`), every `XTDBStore` protocol method (`:store/{op}`),
+  `get-or-create-node` (`:store/node.start`), and bundle entry / transaction
+  processing in `server.handlers/transaction` (`:bundle/entry`,
+  `:bundle/transaction`).
+- `with-otel-context` macro in `fhir-store-protocol` reflects on
+  `io.opentelemetry.context.Context` so the protocol module stays free of a
+  hard OTel SDK dependency. `server.middleware/wrap-otel-context` uses it to
+  activate the current context for the downstream pipeline.
+- `dromon/CLAUDE.md` documents the OTel dev workflow under
+  **Build & Run Commands**.
+
+Validation:
+
+- OTel-off: `bb inferno-test` -> 505 passed / 0 failed.
+- OTel-on: `bb setup` started Jaeger; the test-server booted with
+  `clj -X:otel:store/xtdb2:malli/uscore8 test-server.core/-main`. After two
+  curl calls (`metadata`, `Patient/123`) Jaeger returned 5 traces under
+  service `dromon-fhir-server`, including `http/request` traces with child
+  spans `auth/jwt.verify` and `authz/keto.check`, plus `store/create` spans
+  from the SearchParameter seeder.

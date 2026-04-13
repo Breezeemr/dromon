@@ -17,7 +17,12 @@
         metosin/jsonista {:mvn/version "0.3.14"}
         fipp/fipp {:mvn/version "0.6.29"}}
  :aliases
- {:dev  {:extra-paths ["dev"]}
+ {;; OpenTelemetry SDK + OTLP exporter. Opt-in via -M:otel so the default
+  ;; classpath stays lean. Versions track Telemere 1.2.1's expected SDK.
+  :otel {:extra-deps {io.opentelemetry/opentelemetry-sdk                        {:mvn/version "1.43.0"}
+                      io.opentelemetry/opentelemetry-exporter-otlp              {:mvn/version "1.43.0"}
+                      io.opentelemetry/opentelemetry-sdk-extension-autoconfigure {:mvn/version "1.43.0"}}}
+  :dev  {:extra-paths ["dev"]}
   :test {:extra-paths ["test"]
          :extra-deps  {org.clojure/test.check {:mvn/version "1.1.1"}
                        lambdaisland/kaocha    {:mvn/version "1.91.1392"}

@@ -1,5 +1,47 @@
 (ns fhir-store.protocol)
 
+;; Reflective lookup for the OpenTelemetry Context class. We avoid a hard
+;; compile-time dependency on the OTel SDK so this module stays free of
+;; OpenTelemetry jars when tracing is disabled. When the SDK is on the
+;; classpath (DROMON_OTEL=1 path), `Context.makeCurrent()` is invoked via
+;; reflection, ensuring that XTDB v2's native spans nest under whatever
+;; span is currently active in the request thread.
+(def ^:private otel-context-class
+  (delay
+    (try
+      (Class/forName "io.opentelemetry.context.Context")
+      (catch Throwable _ nil))))
+
+(defn otel-available?
+  "True when the OpenTelemetry SDK is on the classpath."
+  []
+  (some? @otel-context-class))
+
+(defn ^java.lang.AutoCloseable open-current-otel-scope!
+  "Returns an AutoCloseable scope for the current OpenTelemetry context, or
+   nil if the SDK is not loaded. Use inside a with-open or try/finally so the
+   scope is always closed."
+  []
+  (when-let [klass @otel-context-class]
+    (try
+      (let [current (.invoke (.getMethod klass "current" (into-array Class []))
+                             nil (into-array Object []))]
+        (.invoke (.getMethod klass "makeCurrent" (into-array Class []))
+                 current (into-array Object [])))
+      (catch Throwable _ nil))))
+
+(defmacro with-otel-context
+  "Evaluates body with the current OpenTelemetry context made active for the
+   thread, so downstream OTel-instrumented libraries (XTDB v2, etc.) see this
+   span as their parent. No-op when the OpenTelemetry SDK is not on the
+   classpath."
+  [& body]
+  `(let [^java.lang.AutoCloseable scope# (open-current-otel-scope!)]
+     (try
+       ~@body
+       (finally
+         (when scope# (.close scope#))))))
+
 (defprotocol IFHIRStore
   (create-resource [this tenant-id resource-type id resource])
   (read-resource [this tenant-id resource-type id])

@@ -165,6 +165,7 @@
      :data {:coercion fhir-coercion/coercion
             :muuntaja muuntaja-instance
             :middleware [middleware/wrap-telemere-trace
+                         middleware/wrap-otel-context
                          wrap-head
                          middleware/wrap-request-id
                          [middleware/wrap-cors cors-origins]

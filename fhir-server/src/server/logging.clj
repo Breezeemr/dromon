@@ -105,6 +105,27 @@
                                  cleaned-signal))]
     (with-out-str (fipp/pprint without-nils))))
 
+(defn- otel-enabled? []
+  (= "1" (System/getenv "DROMON_OTEL")))
+
+(defn- init-otel-handler!
+  "When DROMON_OTEL=1, requires Telemere's OpenTelemetry namespace and
+   installs its handler. Uses requiring-resolve so the OTel SDK does not
+   load on the default dev path."
+  []
+  (try
+    (let [add (requiring-resolve 'taoensso.telemere.open-telemetry/handler:open-telemetry)]
+      (if add
+        (do (t/add-handler! :open-telemetry (add))
+            (t/log! {:level :info :id ::otel-handler-installed
+                     :msg "Telemere OpenTelemetry handler installed"}))
+        (t/log! {:level :warn :id ::otel-handler-missing
+                 :msg "taoensso.telemere.open-telemetry/handler:open-telemetry not found; OTel disabled"})))
+    (catch Throwable t
+      (t/log! {:level :error :id ::otel-handler-failed
+               :msg (str "Failed to install Telemere OpenTelemetry handler: " (ex-message t))
+               :error t}))))
+
 (defn init-logging! []
   ;; Force tools.logging to use Telemere directly
   (require 'taoensso.telemere.tools-logging)
@@ -146,4 +167,7 @@
                           :gcp-json (assoc file-config :output-fn gcp-json-output-fn)
                           :fipp-edn (assoc file-config :output-fn fipp-edn-output-fn)
                           file-config)]
-          (t/add-handler! :file (t/handler:file (dissoc file-opts :format))))))))
+          (t/add-handler! :file (t/handler:file (dissoc file-opts :format))))))
+
+    (when (otel-enabled?)
+      (init-otel-handler!))))
