@@ -165,6 +165,42 @@
 ;; history-instance
 ;; ---------------------------------------------------------------------------
 
+;; ---------------------------------------------------------------------------
+;; conditional create (If-None-Exist)
+;; ---------------------------------------------------------------------------
+
+(deftest conditional-create-serializes-concurrent-requests
+  (testing "N concurrent POSTs with the same If-None-Exist produce exactly one 201"
+    (let [store (make-store)
+          n 20
+          body  {:resourceType "Patient"
+                 :identifier [{:value "abc"}]
+                 :name [{:family "Concurrent"}]}
+          start (java.util.concurrent.CountDownLatch. 1)
+          tasks (repeatedly n
+                  (fn []
+                    (fn []
+                      (.await start)
+                      (handlers/create-resource
+                        (base-request store
+                                      :body body
+                                      :headers {"if-none-exist" "identifier=abc"})))))
+          pool  (java.util.concurrent.Executors/newFixedThreadPool n)
+          futures (mapv #(.submit pool ^Callable %) tasks)]
+      (.countDown start)
+      (let [responses (mapv #(.get ^java.util.concurrent.Future %) futures)
+            statuses  (mapv :status responses)
+            n-201 (count (filter #{201} statuses))
+            n-200 (count (filter #{200} statuses))]
+        (.shutdown pool)
+        (is (= 1 n-201) (str "expected exactly one 201, got statuses: " statuses))
+        (is (= (dec n) n-200) (str "expected " (dec n) " 200s, got statuses: " statuses))
+        (is (= n (+ n-201 n-200)))
+        ;; Confirm the store actually holds a single Patient with identifier=abc.
+        (let [search-resp (handlers/search-type
+                            (base-request store :params {"identifier" "abc"}))]
+          (is (= 1 (count (get-in search-resp [:body :entry])))))))))
+
 (deftest history-instance-returns-bundle-with-entries
   (let [store  (make-store)
         create (create-patient! store)

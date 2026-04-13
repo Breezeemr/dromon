@@ -284,6 +284,35 @@
                [k (or v "")])))
       (str/split qs #"&"))))
 
+;; Per-(tenant, resource-type, normalized-search) named locks for conditional
+;; create. Conditional create (POST + If-None-Exist) is otherwise TOCTOU-racy:
+;; the search and the subsequent insert are not atomic, so two concurrent
+;; requests with the same If-None-Exist can both observe zero matches and both
+;; insert. Serializing on a stable key closes that window. Plain POSTs do not
+;; touch this map.
+(def ^:private conditional-create-locks (atom {}))
+
+(defn- normalize-search-params
+  "Stable serialization of search params so equivalent queries hash to the
+   same lock key. Sorts entries by key name."
+  [params]
+  (->> params
+       (map (fn [[k v]] [(name k) (str v)]))
+       (sort-by first)
+       vec))
+
+(defn- conditional-create-lock
+  "Return (and intern) the lock object for this conditional-create key."
+  [tenant-id resource-type normalized-params]
+  (let [k [tenant-id resource-type normalized-params]]
+    (or (get @conditional-create-locks k)
+        (-> (swap! conditional-create-locks
+                   (fn [m]
+                     (if (contains? m k)
+                       m
+                       (assoc m k (Object.)))))
+            (get k)))))
+
 (defn- do-create
   "Perform the actual resource creation, returning a 201 response."
   [store tenant-id resource-type resource-body]
@@ -306,25 +335,30 @@
         if-none-exist (get-in req [:headers "if-none-exist"])
         search-registry (:fhir/search-registry req)]
     (if if-none-exist
-      ;; Conditional create: search first
+      ;; Conditional create: serialize search+create on a per-tenant,
+      ;; per-type, per-search-param-set lock to close the TOCTOU window
+      ;; described in FHIR R4 §3.1.0.8.1.
       (let [search-params (parse-query-string if-none-exist)
-            results (db/search store tenant-id (keyword resource-type)
-                               (assoc search-params :_count 2 :_skip 0)
-                               search-registry)
-            match-count (count results)]
-        (cond
-          (zero? match-count)
-          (do-create store tenant-id resource-type resource-body)
+            normalized (normalize-search-params search-params)
+            lock (conditional-create-lock tenant-id resource-type normalized)]
+        (locking lock
+          (let [results (db/search store tenant-id (keyword resource-type)
+                                   (assoc search-params :_count 2 :_skip 0)
+                                   search-registry)
+                match-count (count results)]
+            (cond
+              (zero? match-count)
+              (do-create store tenant-id resource-type resource-body)
 
-          (= 1 match-count)
-          {:status 200 :body (first results)}
+              (= 1 match-count)
+              {:status 200 :body (first results)}
 
-          :else
-          {:status 412
-           :body {:resourceType "OperationOutcome"
-                  :issue [{:severity "error"
-                           :code "duplicate"
-                           :diagnostics "Conditional create found multiple matches"}]}}))
+              :else
+              {:status 412
+               :body {:resourceType "OperationOutcome"
+                      :issue [{:severity "error"
+                               :code "duplicate"
+                               :diagnostics "Conditional create found multiple matches"}]}}))))
       ;; No If-None-Exist: create normally
       (do-create store tenant-id resource-type resource-body))))
 
