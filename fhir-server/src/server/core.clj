@@ -157,16 +157,22 @@
         keto-url (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
         cors-origins (parse-cors-origins
                        (or cors-allowed-origins
-                           (System/getenv "CORS_ALLOWED_ORIGINS")))]
+                           (System/getenv "CORS_ALLOWED_ORIGINS")))
+        ;; Dev-only per-request span capture. Only loaded when env is set,
+        ;; so the OTel SDK is not required on the default classpath.
+        trace-tap-mw (when (= "1" (System/getenv "DROMON_DEV_TRACE_TAP"))
+                       (some-> (requiring-resolve 'server.dev.trace-tap/wrap-trace-tap)
+                               deref))]
   (ring/ring-handler
    (ring/router
     (routing/build-fhir-routes schemas)
     {:conflicts nil
      :data {:coercion fhir-coercion/coercion
             :muuntaja muuntaja-instance
-            :middleware [middleware/wrap-telemere-trace
-                         middleware/wrap-otel-context
-                         wrap-head
+            :middleware (cond-> [middleware/wrap-telemere-trace
+                                 middleware/wrap-otel-context]
+                          trace-tap-mw (conj trace-tap-mw)
+                          true (into [wrap-head
                          middleware/wrap-request-id
                          [middleware/wrap-cors cors-origins]
                          parameters/parameters-middleware
@@ -188,7 +194,7 @@
                          [wrap-fhir-store store]
                          [wrap-terminology terminology]
                          [auth/wrap-jwt-auth {:jwks-url jwks-url}]
-                         [keto/wrap-keto-authorization {:keto-url keto-url}]]}})
+                         [keto/wrap-keto-authorization {:keto-url keto-url}]]))}})
    (ring/create-default-handler
     {:not-found (constantly {:status 404
                              :body {:resourceType "OperationOutcome"

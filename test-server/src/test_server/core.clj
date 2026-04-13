@@ -136,6 +136,12 @@
 
 (defn -main [& args]
   (assert-supported-jvm!)
+  ;; Dev-only trace-tap must initialize BEFORE the logging/OTel handler so it
+  ;; can install its SimpleSpanProcessor on the SDK that Telemere will adopt.
+  (when (= "1" (System/getenv "DROMON_DEV_TRACE_TAP"))
+    (when-let [init! (try (requiring-resolve 'server.dev.trace-tap/init!)
+                          (catch Throwable _ nil))]
+      (init!)))
   (logging/init-logging!)
   (let [first-arg (first args)
         opts {:store    (or (env-keyword "TEST_SERVER_STORE")   :xtdb2)

@@ -123,4 +123,9 @@
   {:doc "Stops the Inferno docker instances"
    :task (if (.exists (clojure.java.io/file "inferno-test-kit/docker-compose.yml"))
            (shell {:dir "inferno-test-kit"} "docker" "compose" "down")
-           (println "inferno-test-kit not present -- nothing to stop."))}}}
+           (println "inferno-test-kit not present -- nothing to stop."))}
+
+  trace
+  {:doc "Wraps curl with X-Dromon-Trace: 1 and renders the captured span tree on stderr. Body passes through to stdout."
+   :requires ([server.trace-cli :as tc])
+   :task (apply tc/-main *command-line-args*)}}}

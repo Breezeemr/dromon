@@ -64,6 +64,35 @@ cd test-server && \
 # Tear down with: bb teardown (removes the jaeger container too).
 ```
 
+### Dev Utilities
+
+#### Per-request span capture (`bb trace`)
+Dev-only middleware that captures every OTel span emitted while serving a
+single request and returns the span tree inline with the response, so you
+can iterate without leaving the terminal. Disabled unless explicitly
+opted into.
+
+```bash
+# Start the test-server with both OTel and the trace-tap enabled.
+DROMON_OTEL=1 DROMON_DEV_TRACE_TAP=1 \
+  OTEL_SERVICE_NAME=dromon-fhir-server \
+  OTEL_TRACES_EXPORTER=otlp \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+  OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  clj -M:otel:store/xtdb2:malli/uscore8 -X test-server.core/-main
+
+# From the dromon repo root, in another terminal:
+bb trace -s http://localhost:8080/default/fhir/metadata
+# stderr: ASCII span tree (http/request -> children)
+# stdout: the metadata JSON, ready to pipe to jq
+```
+
+The middleware short-circuits when neither `X-Dromon-Trace: 1` nor
+`?_dromon-trace=1` are present, so steady-state requests are not affected.
+Captured spans are gzip+base64 encoded into the `X-Dromon-Trace-Json`
+response header. `bb trace` decodes the header, builds the parent/child
+tree, and prints it to stderr; the body flows through to stdout.
+
 ### Babashka tasks (run from repo root)
 `bb setup` / `bb teardown` -- Ory auth infrastructure
 `bb inferno-check` -- smoke test (containers + server health)

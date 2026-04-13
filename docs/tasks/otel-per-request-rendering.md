@@ -106,3 +106,7 @@ to ASCII-render. Widths auto-scale to terminal columns via `tput cols`.
 - [otel-telemere-instrumentation.md](otel-telemere-instrumentation.md) — prerequisite
 - `io.opentelemetry.sdk.trace.export.SimpleSpanProcessor` — sync forwarder
 - `io.opentelemetry.sdk.trace.export.SpanExporter` — interface to implement
+
+## Status
+
+Complete
