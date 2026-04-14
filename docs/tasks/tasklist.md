@@ -11,6 +11,21 @@ Inferno current:  505 passed,  0 failed,   0 skipped, 0 errors
 - [conditional-create-if-none-match-star.md](conditional-create-if-none-match-star.md) — `PUT /{type}/{id}` with `If-None-Match: *` is not honoured (FHIR R4 §2.38.1). Should create only if no row with that id exists; today it silently upserts. Plumb `:if-none-match :wildcard` through the opts map and have each store `ASSERT NOT EXISTS` / cas-on-nil.
 - [conditional-search-criteria-races.md](conditional-search-criteria-races.md) — Conditional update/delete/patch via URL search criteria (`PUT/DELETE/PATCH /{type}?...`) are all TOCTOU-racy: the search and the subsequent write are not atomic. Fix by auto-propagating the matched row's `versionId` as an implicit `If-Match` into the store call, plus a lock for the phantom-create branch of conditional-update.
 
+### Tenant lifecycle (new protocol surface)
+
+Adds `create-tenant` / `delete-tenant` / `warmup-tenant` to `IFHIRStore` and implements them on all three backends. Primary motivation: shift cold-start cost (XTDB v2 `store/node.start` ~2 493 ms; datomic schema-transact ~290 ms) out of the first real `http/request` and into an explicit warmup span at application boot. Also unblocks clean tenant teardown for tests and multi-tenant provisioning. See the OTel comparison analysis for the evidence.
+
+1. [fhir-store-tenant-lifecycle-protocol.md](fhir-store-tenant-lifecycle-protocol.md) — **[prerequisite]** Adds the three methods to `fhir-store-protocol/src/fhir_store/protocol.clj` with docstrings, opts shapes (`:if-exists :error/:ignore/:replace`, `:if-absent :error/:ignore`, `:close-storage?`, `:resource-types`), and a call-site migration plan (inferno runner warmup, test-server seeder, integration test helpers).
+2. [fhir-store-xtdb2-tenant-lifecycle.md](fhir-store-xtdb2-tenant-lifecycle.md) — Implements the three methods on `XTDBStore`, delegating to the existing `get-or-create-node` helper. Handles `xtdb2-disk` storage cleanup via per-tenant directory deletion.
+3. `fhir-store-datomic/docs/tasks/35-tenant-lifecycle.md` — Implements the three methods on `DatomicStore`, delegating to `ensure-tenant-conn!` and refactoring the existing `:fhir-store/datomic-store` halt-key to iterate via the new `delete-tenant`. **Lives in the fhir-store-datomic repo**, not this dromon repo.
+4. [fhir-store-mock-tenant-lifecycle.md](fhir-store-mock-tenant-lifecycle.md) — Trivial atom-swap implementations on `MockStore`. Warmup is a near-no-op (just ensures the tenant key exists).
+
+Dependency: (1) must land first; (2), (3), (4) can land in parallel after.
+
+### OTel coverage
+
+- `fhir-store-datomic/docs/tasks/34-otel-instrumentation.md` — Wrap every `IFHIRStore` method on `DatomicStore` in a `t/trace!` block mirroring the fhir-store-xtdb2 pattern. Today the datomic backend has zero `store/*` spans in Jaeger (vs xtdb2's `store/search` / `store/create` / `store/read` / `store/node.start` / `store/transact-transaction`), so no per-layer perf comparison is possible. **Lives in the fhir-store-datomic repo**, not this dromon repo.
+
 ## Completed
 
 - [xtdb2-transact-transaction-test-order.md](xtdb2-transact-transaction-test-order.md) — Updated the seven `test-transact-transaction` assertions in `fhir-store-xtdb2/test/fhir_store_xtdb2/core_test.clj` to match the processed response order (DELETE -> POST -> PUT/PATCH -> GET/HEAD) that the xtdb2 store emits per FHIR §3.1.0.11.2. Option 1 fix: no store behavior changed. `clj -M:test` is now 6/6 with 51 assertions, and `bb inferno-test` is still 505/505.

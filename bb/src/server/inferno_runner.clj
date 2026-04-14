@@ -336,6 +336,7 @@
 
   (println "Starting FHIR server...")
   (let [profile?  (= "1" (System/getenv "DROMON_PERF_PROFILE"))
+        otel?     (= "1" (System/getenv "DROMON_OTEL"))
         heap-size (or (System/getenv "DROMON_PERF_HEAP") "6g")
         heap-flags [(str "-J-Xmx" heap-size)
                     (str "-J-Xms" heap-size)
@@ -352,20 +353,36 @@
                                 ["-J--add-opens=java.base/java.nio=ALL-UNNAMED"
                                  "-J--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
                                  "-J--enable-preview"]))
+        ;; Append :otel to the alias chain when DROMON_OTEL=1 so the OTel
+        ;; SDK + OTLP exporter land on the classpath alongside the :test
+        ;; deps that include the xtdb2 store and uscore8 schemas.
+        alias-str (if otel? "-X:otel:test" "-X:test")
         cmd       (-> base-args
                       (cond-> jfr-flag (conj jfr-flag))
                       (cond-> gc-flag  (conj gc-flag))
-                      (into ["-X:test" "test-server.core/-main" ":port" "3000" ":ssl-port" "3001"]))]
+                      (into [alias-str "test-server.core/-main" ":port" "3000" ":ssl-port" "3001"]))
+        otel-env  (when otel?
+                    {"DROMON_OTEL" "1"
+                     "OTEL_SERVICE_NAME" "dromon-fhir-server"
+                     "OTEL_TRACES_EXPORTER" "otlp"
+                     "OTEL_EXPORTER_OTLP_ENDPOINT" "http://localhost:4318"
+                     "OTEL_EXPORTER_OTLP_PROTOCOL" "http/protobuf"
+                     ;; Batch span processor tuned for a short test run.
+                     "OTEL_BSP_SCHEDULE_DELAY" "500"
+                     "OTEL_BSP_EXPORT_TIMEOUT" "5000"})]
     (when profile?
       (println "DROMON_PERF_PROFILE=1 -- launching with JFR + GC log, heap" heap-size)
       (println "  JFR:" (str perf-dir "/inferno.jfr"))
       (println "  GC log:" (str perf-dir "/gc.log")))
+    (when otel?
+      (println "DROMON_OTEL=1 -- launching with OTel SDK, OTLP exporter to http://localhost:4318"))
     (process cmd
              {:dir "test-server"
             :out (io/file "server.log")
             :err :out
-            :extra-env {"JAVA_HOME" "/usr/lib/jvm/java-21-openjdk-amd64"
-                        "PATH" (str "/usr/lib/jvm/java-21-openjdk-amd64/bin:" (System/getenv "PATH"))}}))
+            :extra-env (merge {"JAVA_HOME" "/usr/lib/jvm/java-21-openjdk-amd64"
+                               "PATH" (str "/usr/lib/jvm/java-21-openjdk-amd64/bin:" (System/getenv "PATH"))}
+                              otel-env)}))
 
   (wait-for-server 30)
 
