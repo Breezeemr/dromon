@@ -8,12 +8,12 @@ Inferno current:  505 passed,  0 failed,   0 skipped, 0 errors
 
 ## Open tasks
 
-- [xtdb2-transact-transaction-test-order.md](xtdb2-transact-transaction-test-order.md) — `test-transact-transaction` in `fhir-store-xtdb2` has 7 pre-existing assertion failures: the test asserts input-order responses but the store reorders entries per FHIR §3.1.0.11.2. Fix the assertions (or, alternatively, have the store emit input-order responses).
 - [conditional-create-if-none-match-star.md](conditional-create-if-none-match-star.md) — `PUT /{type}/{id}` with `If-None-Match: *` is not honoured (FHIR R4 §2.38.1). Should create only if no row with that id exists; today it silently upserts. Plumb `:if-none-match :wildcard` through the opts map and have each store `ASSERT NOT EXISTS` / cas-on-nil.
 - [conditional-search-criteria-races.md](conditional-search-criteria-races.md) — Conditional update/delete/patch via URL search criteria (`PUT/DELETE/PATCH /{type}?...`) are all TOCTOU-racy: the search and the subsequent write are not atomic. Fix by auto-propagating the matched row's `versionId` as an implicit `If-Match` into the store call, plus a lock for the phantom-create branch of conditional-update.
 
 ## Completed
 
+- [xtdb2-transact-transaction-test-order.md](xtdb2-transact-transaction-test-order.md) — Updated the seven `test-transact-transaction` assertions in `fhir-store-xtdb2/test/fhir_store_xtdb2/core_test.clj` to match the processed response order (DELETE -> POST -> PUT/PATCH -> GET/HEAD) that the xtdb2 store emits per FHIR §3.1.0.11.2. Option 1 fix: no store behavior changed. `clj -M:test` is now 6/6 with 51 assertions, and `bb inferno-test` is still 505/505.
 - [conditional-create-if-none-exist-race.md](conditional-create-if-none-exist-race.md) — `server.handlers/create-resource` now serializes the conditional-create path on a per-(tenant, resource-type, normalized-search-params) in-memory lock (Option B), closing the TOCTOU window between search and insert. Plain POSTs are unaffected. Covered by a new `handlers-test` case that fires 20 parallel conditional POSTs and asserts exactly one 201 plus nineteen 200s.
 
 - [trace-tap-concurrency-isolation.md](trace-tap-concurrency-isolation.md) — `wrap-trace-tap` now sits outside `wrap-telemere-trace` and opens a short sentinel `trace-tap/request-root` span on entry to capture a trace id. After the handler returns, the drained queue is filtered to spans matching that id, so concurrent `bb trace` callers each see only their own span tree; the outer `http/request` span is included in the serialized payload. Validated with 5 parallel `bb trace` calls plus 3 background Patient searches: each response carries exactly 2 spans (`http/request` + `auth/jwt.verify`) with a distinct trace id.

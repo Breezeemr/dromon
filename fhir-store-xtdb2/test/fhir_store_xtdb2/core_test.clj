@@ -140,21 +140,26 @@
           (is (= "transaction-response" (:type response)))
           (is (= 3 (count (:entry response))))
 
-          ;; First POST -> 201 Created with location and etag
-          (let [post-entry (-> response :entry first)]
+          ;; Entries are returned in processed order per FHIR §3.1.0.11.2:
+          ;; DELETE -> POST -> PUT/PATCH -> GET/HEAD.
+          ;; Input order was POST, PUT, DELETE, so the response is
+          ;; DELETE, POST, PUT.
+
+          ;; First DELETE -> 204 No Content
+          (is (= "204 No Content" (-> response :entry first :response :status)))
+
+          ;; Second POST -> 201 Created with location and etag
+          (let [post-entry (-> response :entry second)]
             (is (= "201 Created" (-> post-entry :response :status)))
             (is (some? (-> post-entry :response :location)))
             (is (string? (-> post-entry :response :etag)))
             (is (some? (-> post-entry :resource))))
 
-          ;; Second PUT -> 200 OK with etag
-          (let [put-entry (-> response :entry second)]
+          ;; Third PUT -> 200 OK with etag
+          (let [put-entry (-> response :entry last)]
             (is (= "200 OK" (-> put-entry :response :status)))
             (is (some? (-> put-entry :response :etag)))
-            (is (some? (-> put-entry :resource))))
-
-          ;; Third DELETE -> 204 No Content
-          (is (= "204 No Content" (-> response :entry last :response :status))))
+            (is (some? (-> put-entry :resource)))))
 
         ;; Verify results in DB
         (println "Verifying Bundle Results...")
