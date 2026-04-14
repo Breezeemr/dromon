@@ -702,9 +702,27 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [node (get-or-create-node this tenant-id)
            version "1"
-           [sql args] (extract-and-build-sql resource-type id resource storage-encoders
-                                             :version version)]
-       (xt/execute-tx node [[:sql sql args]])
+           rt-name (name resource-type)
+           [sql args] (t/trace!
+                       {:id :store/create.sql-encode
+                        :data {:resource-type rt-name :id id}}
+                       (extract-and-build-sql resource-type id resource storage-encoders
+                                              :version version))
+           ;; ASSERT NOT EXISTS rejects duplicate POSTs as part of the same
+           ;; transactor round-trip — no separate pre-read needed. A failure
+           ;; surfaces as a 409 Conflict at the handler layer.
+           assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" rt-name)
+                      [id]]]
+       (try
+         (t/trace!
+          {:id :store/create.execute-tx
+           :data {:resource-type rt-name :id id}}
+          (xt/execute-tx node [assert-op [:sql sql args]]))
+         (catch Exception e
+           (throw (ex-info (str "Resource already exists: " rt-name "/" id)
+                           {:fhir/status 409 :fhir/code "conflict"
+                            :resource-type rt-name :id id}
+                           e))))
        (-> resource
            (assoc :id id)
            (assoc-in [:meta :versionId] version)))))
