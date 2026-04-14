@@ -90,6 +90,47 @@
       (when-let [v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
         (str v)))))
 
+(defn- current-versions-bulk
+  "Bulk variant of current-version: takes a collection of ids for a single
+   resource type and returns a map of id -> version string for rows that
+   exist. Missing ids are absent from the map. Used by transact-transaction
+   to avoid N sequential round-trips when building PUT version numbers."
+  [node resource-type ids]
+  (let [ids (distinct ids)]
+    (if (empty? ids)
+      {}
+      (let [placeholders (str/join ", " (repeat (count ids) "?"))
+            query (format "SELECT _id, fhir_version FROM %s WHERE _id IN (%s)"
+                          (name resource-type) placeholders)
+            rows (xt/q node (into [query] ids))]
+        (into {}
+              (keep (fn [row]
+                      (let [rid (or (:xt/id row) (:_id row) (get row "_id"))
+                            v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
+                        (when (and rid v) [(str rid) (str v)]))))
+              rows)))))
+
+(declare xtdb->fhir)
+
+(defn- bulk-read-by-ids
+  "Bulk SELECT * WHERE _id IN (...) for a single resource type. Returns a
+   map of id -> decoded FHIR resource. Used by transact-transaction to
+   avoid N post-commit round-trips when building the transaction response."
+  [node read-decoders resource-type ids]
+  (let [ids (distinct ids)]
+    (if (empty? ids)
+      {}
+      (let [placeholders (str/join ", " (repeat (count ids) "?"))
+            query (format "SELECT * FROM %s WHERE _id IN (%s)"
+                          (name resource-type) placeholders)
+            rows (xt/q node (into [query] ids))]
+        (into {}
+              (keep (fn [row]
+                      (let [res (xtdb->fhir row read-decoders)]
+                        (when-let [rid (:id res)]
+                          [(str rid) res]))))
+              rows)))))
+
 (defn- next-version
   "Computes the next version string from a current version (or nil for first)."
   [current]
@@ -912,84 +953,139 @@
      {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
     (let [node (get-or-create-node this tenant-id)
-          entry-metas (->> (mapv (fn [entry]
-                                   (let [{:keys [request resource fullUrl]} entry
-                                         method (str/upper-case (:method request))
-                                         url (:url request)
-                                         parts (str/split url #"/")
-                                         resource-type (first parts)
-                                         id (or (second parts)
-                                                (if (and fullUrl (str/starts-with? fullUrl "urn:uuid:"))
-                                                  (subs fullUrl 9)
-                                                  (str (java.util.UUID/randomUUID))))]
-                                     {:method method
-                                      :resource-type resource-type
-                                      :id id
-                                      :fullUrl fullUrl
-                                      :resource resource}))
-                                 entries)
-                           (sort-by #(method-order (:method %)))
-                           vec)
-          ;; Build urn:uuid: -> ResourceType/id mapping and resolve references
-          urn-mapping (build-urn-uuid-mapping entry-metas)
-          entry-metas (mapv (fn [em]
-                              (if (:resource em)
-                                (update em :resource resolve-urn-uuid-references urn-mapping)
-                                em))
-                            entry-metas)
-          tx-ops (vec (mapcat (fn [{:keys [method resource-type id resource]}]
-                                (case method
-                                  "POST"
-                                  (let [[sql args] (extract-and-build-sql
-                                                    resource-type id resource storage-encoders
-                                                    :version "1")]
-                                    [[:sql sql args]])
-                                  "PUT"
-                                  (let [current (current-version node resource-type id)
-                                        new-version (next-version current)
-                                        [sql args] (extract-and-build-sql
-                                                    resource-type id resource storage-encoders
-                                                    :version new-version)]
-                                    [[:sql sql args]])
-                                  "DELETE"
-                                  (let [sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))]
-                                    [[:sql sql [id]]])
-                                  []))
-                              entry-metas))]
-      (xt/execute-tx node tx-ops)
-      ;; Read back resources to build rich per-entry responses
-      {:resourceType "Bundle"
-       :type "transaction-response"
-       :entry (mapv (fn [{:keys [method resource-type id]}]
-                      (case method
-                        "DELETE"
-                        {:response {:status "204 No Content"}}
+          entry-metas
+          (t/trace!
+           {:id :store/transact-transaction.build-tx
+            :data {:entry-count (count entries)}}
+           (let [metas (->> (mapv (fn [entry]
+                                    (let [{:keys [request resource fullUrl]} entry
+                                          method (str/upper-case (:method request))
+                                          url (:url request)
+                                          parts (str/split url #"/")
+                                          resource-type (first parts)
+                                          id (or (second parts)
+                                                 (if (and fullUrl (str/starts-with? fullUrl "urn:uuid:"))
+                                                   (subs fullUrl 9)
+                                                   (str (java.util.UUID/randomUUID))))]
+                                      {:method method
+                                       :resource-type resource-type
+                                       :id id
+                                       :fullUrl fullUrl
+                                       :resource resource}))
+                                  entries)
+                            (sort-by #(method-order (:method %)))
+                            vec)
+                 urn-mapping (build-urn-uuid-mapping metas)]
+             (mapv (fn [em]
+                     (if (:resource em)
+                       (update em :resource resolve-urn-uuid-references urn-mapping)
+                       em))
+                   metas)))
+          ;; Bulk-fetch current versions for every PUT in one query per
+          ;; distinct resource type, replacing N sequential round-trips.
+          put-versions-by-type
+          (t/trace!
+           {:id :store/transact-transaction.current-versions
+            :data {:entry-count (count entry-metas)}}
+           (reduce (fn [acc [rt metas]]
+                     (assoc acc rt (current-versions-bulk node rt (map :id metas))))
+                   {}
+                   (group-by :resource-type
+                             (filter #(= "PUT" (:method %)) entry-metas))))
+          last-updated (java.time.Instant/now)
+          ;; Single pass over entry-metas: emit tx-ops AND the per-entry
+          ;; response metadata (new version, final resource with :id+:meta
+          ;; populated). This lets the response builder assemble the Bundle
+          ;; without a post-commit round-trip.
+          {:keys [tx-ops entry-results]}
+          (t/trace!
+           {:id :store/transact-transaction.sql-encode
+            :data {:entry-count (count entry-metas)}}
+           (reduce (fn [acc {:keys [method resource-type id resource] :as em}]
+                     (case method
+                       "POST"
+                       (let [vid "1"
+                             [sql args] (extract-and-build-sql
+                                          resource-type id resource storage-encoders
+                                          :version vid)
+                             final (-> resource
+                                       (assoc :id id)
+                                       (assoc-in [:meta :versionId] vid)
+                                       (assoc-in [:meta :lastUpdated] last-updated))]
+                         (-> acc
+                             (update :tx-ops conj [:sql sql args])
+                             (update :entry-results conj (assoc em :resource final :vid vid))))
+                       "PUT"
+                       (let [current (get-in put-versions-by-type [resource-type id])
+                             vid (next-version current)
+                             [sql args] (extract-and-build-sql
+                                          resource-type id resource storage-encoders
+                                          :version vid)
+                             final (-> resource
+                                       (assoc :id id)
+                                       (assoc-in [:meta :versionId] vid)
+                                       (assoc-in [:meta :lastUpdated] last-updated))]
+                         (-> acc
+                             (update :tx-ops conj [:sql sql args])
+                             (update :entry-results conj (assoc em :resource final :vid vid))))
+                       "DELETE"
+                       (let [sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))]
+                         (-> acc
+                             (update :tx-ops conj [:sql sql [id]])
+                             (update :entry-results conj em)))
+                       ;; GET / HEAD inside a transaction: we still have to
+                       ;; read the resource to satisfy the response. Defer
+                       ;; these to the read-back phase by leaving :resource
+                       ;; nil on entry-results.
+                       (update acc :entry-results conj em)))
+                   {:tx-ops [] :entry-results []}
+                   entry-metas))]
+      (t/trace!
+       {:id :store/transact-transaction.execute-tx
+        :data {:op-count (count tx-ops)}}
+       (xt/execute-tx node tx-ops))
+      ;; Build the response. Writes return from in-memory metadata (no
+      ;; round-trips). GET/HEAD entries, if any, still need a read — batched
+      ;; per resource-type to avoid N sequential SELECTs.
+      (t/trace!
+       {:id :store/transact-transaction.build-response
+        :data {:entry-count (count entry-results)}}
+       (let [read-needed (filter (fn [{:keys [method]}]
+                                   (contains? #{"GET" "HEAD"} method))
+                                 entry-results)
+             rows-by-type-id
+             (reduce (fn [acc [rt metas]]
+                       (assoc acc rt (bulk-read-by-ids node read-decoders rt
+                                                       (map :id metas))))
+                     {}
+                     (group-by :resource-type read-needed))
+             last-mod-str (str last-updated)]
+         {:resourceType "Bundle"
+          :type "transaction-response"
+          :entry (mapv (fn [{:keys [method resource-type id resource vid]}]
+                         (case method
+                           "DELETE"
+                           {:response {:status "204 No Content"}}
 
-                        ("GET" "HEAD")
-                        (let [query (format "SELECT * FROM %s WHERE _id = ?" resource-type)
-                              results (into [] (xt/q node [query id]))
-                              res (xtdb->fhir (first results) read-decoders)
-                              vid (get-in res [:meta :versionId])
-                              last-mod (get-in res [:meta :lastUpdated])]
-                          (if res
-                            (cond-> {:response (cond-> {:status "200 OK"}
-                                                 vid (assoc :etag (str "W/\"" vid "\""))
-                                                 last-mod (assoc :lastModified (str last-mod)))}
-                              (= method "GET") (assoc :resource res))
-                            {:response {:status "404 Not Found"}}))
+                           ("GET" "HEAD")
+                           (let [res (get-in rows-by-type-id [resource-type id])
+                                 rvid (get-in res [:meta :versionId])
+                                 rlm (get-in res [:meta :lastUpdated])]
+                             (if res
+                               (cond-> {:response (cond-> {:status "200 OK"}
+                                                    rvid (assoc :etag (str "W/\"" rvid "\""))
+                                                    rlm (assoc :lastModified (str rlm)))}
+                                 (= method "GET") (assoc :resource res))
+                               {:response {:status "404 Not Found"}}))
 
-                        ;; POST and PUT: read back the resource
-                        (let [query (format "SELECT * FROM %s WHERE _id = ?" resource-type)
-                              results (into [] (xt/q node [query id]))
-                              res (xtdb->fhir (first results) read-decoders)
-                              vid (get-in res [:meta :versionId])
-                              last-mod (get-in res [:meta :lastUpdated])]
-                          (cond-> {:response (cond-> {:status (if (= method "POST") "201 Created" "200 OK")}
-                                               vid (assoc :etag (str "W/\"" vid "\""))
-                                               last-mod (assoc :lastModified (str last-mod))
-                                               (= method "POST") (assoc :location (str "/" tenant-id "/fhir/" resource-type "/" id "/_history/" vid)))}
-                            res (assoc :resource res)))))
-                    entry-metas)})))
+                           ;; POST and PUT: build directly from the
+                           ;; sql-encode phase's precomputed metadata.
+                           (cond-> {:response (cond-> {:status (if (= method "POST") "201 Created" "200 OK")}
+                                                vid (assoc :etag (str "W/\"" vid "\""))
+                                                last-mod-str (assoc :lastModified last-mod-str)
+                                                (= method "POST") (assoc :location (str "/" tenant-id "/fhir/" resource-type "/" id "/_history/" vid)))}
+                             resource (assoc :resource resource))))
+                       entry-results)})))))
 
   (transact-bundle [this tenant-id entries]
     ;; Batch semantics: each entry is processed independently via the
