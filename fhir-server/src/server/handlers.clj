@@ -1195,14 +1195,21 @@
   (fn [req]
     (let [resource-type (or (:fhir/resource-type req)
                             (get-in req [:parameters :body :resourceType]))
-          req' (t/trace!
-                {:id :fhir/decode
-                 :data {:resource-type resource-type}}
-                (cond-> req
-                  (and (get-in req [:parameters :body])
-                       (seq (get-in req [:parameters :body :contained])))
-                  (update-in [:parameters :body] (partial decode-contained-only decoders))))]
-      (handler req'))))
+          ;; Capture the decoded request via a volatile and return a
+          ;; constant from the trace body so Telemere's :run-val never
+          ;; holds a ring request (which carries :reitit.core/match and
+          ;; :fhir/store, both of which can OOM pr-str fallback).
+          decoded (volatile! nil)
+          _ (t/trace!
+              {:id :fhir/decode
+               :data {:resource-type resource-type}}
+              (do (vreset! decoded
+                           (cond-> req
+                             (and (get-in req [:parameters :body])
+                                  (seq (get-in req [:parameters :body :contained])))
+                             (update-in [:parameters :body] (partial decode-contained-only decoders))))
+                  ::ok))]
+      (handler @decoded))))
 
 (defn- decode-bundle-entries
   "Walks Bundle entries and decodes each entry's :resource (if any) using
