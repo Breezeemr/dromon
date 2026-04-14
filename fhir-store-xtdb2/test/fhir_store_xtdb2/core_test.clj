@@ -278,3 +278,119 @@
               "read after update returns the updated payload"))
         (finally
           (close-store-nodes! store))))))
+
+(defn- delete-recursive!
+  [^java.io.File f]
+  (when (.exists f)
+    (when (.isDirectory f)
+      (doseq [c (.listFiles f)] (delete-recursive! c)))
+    (.delete f)))
+
+(deftest test-create-tenant-basic
+  (testing "create-tenant makes the tenant queryable"
+    (let [store (core-db/create-xtdb-store {})]
+      (try
+        (db/create-tenant store "t1")
+        (is (nil? (db/read-resource store "t1" :Patient "nope"))
+            "read against a freshly-created tenant returns nil, not an error")
+        (finally (close-store-nodes! store))))))
+
+(deftest test-create-tenant-conflict
+  (testing "create-tenant twice with defaults throws 409"
+    (let [store (core-db/create-xtdb-store {})]
+      (try
+        (db/create-tenant store "t1")
+        (let [e (try (db/create-tenant store "t1") nil
+                     (catch Throwable ex ex))]
+          (is (some? e))
+          (is (= 409 (:fhir/status (root-ex-data e)))))
+        (finally (close-store-nodes! store))))))
+
+(deftest test-create-tenant-if-exists-ignore
+  (testing "create-tenant with :if-exists :ignore is a no-op"
+    (let [store (core-db/create-xtdb-store {})]
+      (try
+        (db/create-tenant store "t1")
+        (db/create-resource store "t1" :Patient "p1" {:active true})
+        (db/create-tenant store "t1" {:if-exists :ignore})
+        (is (some? (db/read-resource store "t1" :Patient "p1"))
+            "prior resource still present after :ignore recreate")
+        (finally (close-store-nodes! store))))))
+
+(deftest test-create-tenant-if-exists-replace
+  (testing "create-tenant with :if-exists :replace drops prior data"
+    (let [store (core-db/create-xtdb-store {})]
+      (try
+        (db/create-tenant store "t1")
+        (db/create-resource store "t1" :Patient "p1" {:active true})
+        (is (some? (db/read-resource store "t1" :Patient "p1")))
+        (db/create-tenant store "t1" {:if-exists :replace})
+        (is (nil? (db/read-resource store "t1" :Patient "p1"))
+            "prior resource gone after :replace")
+        (finally (close-store-nodes! store))))))
+
+(deftest test-delete-tenant-clears-data
+  (testing "delete-tenant removes resources"
+    (let [store (core-db/create-xtdb-store {})]
+      (try
+        (db/create-tenant store "t1")
+        (db/create-resource store "t1" :Patient "p1" {:active true})
+        (db/delete-tenant store "t1")
+        (db/create-tenant store "t1")
+        (let [results (db/search store "t1" :Patient {} nil)]
+          (is (empty? results)
+              "search on recreated tenant returns empty"))
+        (finally (close-store-nodes! store))))))
+
+(deftest test-delete-tenant-if-absent-ignore
+  (testing "delete-tenant with :if-absent :ignore on missing tenant is a no-op"
+    (let [store (core-db/create-xtdb-store {})]
+      (try
+        (is (nil? (db/delete-tenant store "does-not-exist"
+                                    {:if-absent :ignore})))
+        (finally (close-store-nodes! store))))))
+
+(deftest test-delete-tenant-missing-throws
+  (testing "delete-tenant with defaults on missing tenant throws 404"
+    (let [store (core-db/create-xtdb-store {})]
+      (try
+        (let [e (try (db/delete-tenant store "nope") nil
+                     (catch Throwable ex ex))]
+          (is (some? e))
+          (is (= 404 (:fhir/status (root-ex-data e)))))
+        (finally (close-store-nodes! store))))))
+
+(deftest test-delete-tenant-close-storage
+  (testing "delete-tenant with :close-storage? true removes on-disk files"
+    (let [base (java.nio.file.Files/createTempDirectory
+                 "dromon-xtdb2-tenant-"
+                 (into-array java.nio.file.attribute.FileAttribute []))
+          base-str (.toString base)
+          log-path (str base-str "/log")
+          storage-path (str base-str "/storage")
+          store (core-db/create-xtdb-store
+                  {:node-config {:log [:local {:path log-path}]
+                                 :storage [:local {:path storage-path}]}})]
+      (try
+        (db/create-tenant store "t1")
+        (is (.exists (java.io.File. log-path))
+            "log directory created on tenant start")
+        (is (.exists (java.io.File. storage-path))
+            "storage directory created on tenant start")
+        (db/delete-tenant store "t1" {:close-storage? true})
+        (is (not (.exists (java.io.File. log-path)))
+            "log directory removed")
+        (is (not (.exists (java.io.File. storage-path)))
+            "storage directory removed")
+        (finally
+          (close-store-nodes! store)
+          (delete-recursive! (java.io.File. base-str)))))))
+
+(deftest test-warmup-tenant-idempotent
+  (testing "warmup-tenant is idempotent on a fresh in-memory store"
+    (let [store (core-db/create-xtdb-store {})]
+      (try
+        (db/warmup-tenant store "t1")
+        (db/warmup-tenant store "t1")
+        (is (nil? (db/read-resource store "t1" :Patient "nope")))
+        (finally (close-store-nodes! store))))))

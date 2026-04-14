@@ -611,6 +611,47 @@
                (do (.close new-node)
                    existing))))))))
 
+(defn- persistent-backend?
+  "True when the node-config targets persistent storage (i.e. has a
+   :log or :storage entry). The empty map used for in-memory xtdb2
+   nodes returns false."
+  [cfg]
+  (or (some? (:log cfg)) (some? (:storage cfg))))
+
+;; NOTE: `test-server.core/store-presets :xtdb2-disk` does NOT template
+;; its :log / :storage paths per tenant, so in the current single-tenant
+;; (`default`) setup calling `delete-tenant-storage!` wipes the one and
+;; only tenant's storage. A true multi-tenant disk deployment must
+;; template per-tenant paths before relying on `:close-storage? true`.
+(defn- delete-tenant-storage!
+  "For each of :log / :storage whose value is shaped `[:local {:path p}]`,
+   recursively delete the on-disk directory. Missing paths are ignored.
+   In-memory configs (no :log / :storage) are a no-op."
+  [store _tid]
+  (let [cfg (:node-config store)
+        paths (keep (fn [k]
+                      (let [v (get cfg k)]
+                        (when (and (vector? v)
+                                   (= :local (first v))
+                                   (map? (second v)))
+                          (:path (second v)))))
+                    [:log :storage])]
+    (doseq [p paths]
+      (let [root (java.io.File. ^String (str p))]
+        (when (.exists root)
+          ;; Post-order walk so directory entries are removed before
+          ;; the directory itself.
+          (let [path (.toPath root)]
+            (with-open [stream (java.nio.file.Files/walk
+                                 path
+                                 (into-array java.nio.file.FileVisitOption []))]
+              (let [files (into [] (.toArray (.sorted stream
+                                                      (java.util.Comparator/reverseOrder))))]
+                (doseq [^java.nio.file.Path fp files]
+                  (try
+                    (java.nio.file.Files/deleteIfExists fp)
+                    (catch Throwable _ nil)))))))))))
+
 (defrecord XTDBStore [nodes node-config storage-encoders read-decoders]
   IFHIRStore
 
@@ -1033,7 +1074,77 @@
             entries)]
        {:resourceType "Bundle"
         :type "batch-response"
-        :entry results}))))
+        :entry results})))
+
+  (create-tenant [this tenant-id]
+    (fp/create-tenant this tenant-id nil))
+  (create-tenant [this tenant-id opts]
+    (t/trace!
+     {:id :store/create-tenant
+      :data {:tenant-id (str tenant-id) :opts opts}}
+     (let [tid       (str tenant-id)
+           if-exists (get opts :if-exists :error)
+           existing  (contains? @(:nodes this) tid)]
+       (cond
+         (and existing (= :error if-exists))
+         (throw (ex-info "Tenant already exists"
+                         {:fhir/status 409 :fhir/code "conflict"
+                          :tenant-id tid}))
+
+         (and existing (= :ignore if-exists))
+         nil
+
+         (and existing (= :replace if-exists))
+         (do (fp/delete-tenant this tid {:if-absent :ignore
+                                         :close-storage? true})
+             (get-or-create-node this tid)
+             nil)
+
+         :else
+         (do (get-or-create-node this tid)
+             nil)))))
+
+  (delete-tenant [this tenant-id]
+    (fp/delete-tenant this tenant-id nil))
+  (delete-tenant [this tenant-id opts]
+    (t/trace!
+     {:id :store/delete-tenant
+      :data {:tenant-id (str tenant-id) :opts opts}}
+     (let [tid       (str tenant-id)
+           if-absent (get opts :if-absent :error)
+           close?    (get opts :close-storage? false)
+           existing  (get @(:nodes this) tid)]
+       (cond
+         (and (nil? existing) (= :error if-absent))
+         (throw (ex-info "Tenant not found"
+                         {:fhir/status 404 :fhir/code "not-found"
+                          :tenant-id tid}))
+
+         (some? existing)
+         (do
+           (try (.close ^java.lang.AutoCloseable existing)
+                (catch Throwable _ nil))
+           (swap! (:nodes this) dissoc tid)
+           (when (and close? (persistent-backend? (:node-config this)))
+             (delete-tenant-storage! this tid))
+           nil)
+
+         :else nil))))
+
+  (warmup-tenant [this tenant-id]
+    (fp/warmup-tenant this tenant-id nil))
+  (warmup-tenant [this tenant-id opts]
+    (t/trace!
+     {:id :store/warmup-tenant
+      :data {:tenant-id (str tenant-id)}}
+     (let [tid (str tenant-id)
+           rts (or (:resource-types opts) #{:Patient})]
+       (get-or-create-node this tid)
+       (doseq [rt rts]
+         (try
+           (fp/search this tid rt {"_count" "1"} {})
+           (catch Throwable _ nil)))
+       nil))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
   ;; In a real XTDB implementation, we'd query for codes using XTDB

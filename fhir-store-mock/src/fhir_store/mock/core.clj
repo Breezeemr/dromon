@@ -375,7 +375,57 @@
             entries)]
        {:resourceType "Bundle"
         :type "batch-response"
-        :entry results}))))
+        :entry results})))
+
+  (create-tenant [this tenant-id]
+    (protocol/create-tenant this tenant-id nil))
+
+  (create-tenant [_ tenant-id opts]
+    (let [tid       (str tenant-id)
+          if-exists (get opts :if-exists :error)]
+      (swap! state
+             (fn [s]
+               (let [exists? (contains? s tid)]
+                 (cond
+                   (and exists? (= :error if-exists))
+                   (throw (ex-info "Tenant already exists"
+                                   {:fhir/status 409 :fhir/code "conflict"
+                                    :tenant-id tid}))
+
+                   (and exists? (= :replace if-exists))
+                   (assoc s tid {})
+
+                   exists?
+                   s
+
+                   :else
+                   (assoc s tid {})))))
+      nil))
+
+  (delete-tenant [this tenant-id]
+    (protocol/delete-tenant this tenant-id nil))
+
+  (delete-tenant [_ tenant-id opts]
+    (let [tid       (str tenant-id)
+          if-absent (get opts :if-absent :error)]
+      (swap! state
+             (fn [s]
+               (cond
+                 (and (not (contains? s tid)) (= :error if-absent))
+                 (throw (ex-info "Tenant not found"
+                                 {:fhir/status 404 :fhir/code "not-found"
+                                  :tenant-id tid}))
+                 :else (dissoc s tid))))
+      nil))
+
+  (warmup-tenant [this tenant-id]
+    (protocol/warmup-tenant this tenant-id nil))
+
+  (warmup-tenant [_ tenant-id _opts]
+    ;; Mock has no cold state worth warming. Ensure the tenant key
+    ;; exists so subsequent searches do not 404, then return.
+    (swap! state update (str tenant-id) (fnil identity {}))
+    nil))
 
 (defn- mock-valueset-expand [store tenant-id _params id]
   ;; Mock an expansion logic

@@ -94,10 +94,19 @@
                            :key-password  (or (System/getenv "KEYSTORE_PASSWORD") "changeit")
                            :store         store-ref
                            :schemas       (ig/ref :fhir/schemas)
-                           :terminology   (ig/ref :fhir-terminology/cached)}}
+                           :terminology   (ig/ref :fhir-terminology/cached)
+                           ;; Force integrant to init the seeder (which creates
+                           ;; and warms the default tenant) before Jetty starts
+                           ;; accepting traffic, so the first real request is
+                           ;; never billed for per-tenant cold-start cost.
+                           :seeded        (ig/ref :test-server/seeder)}}
            extra)))
 
 (defmethod ig/init-key :test-server/seeder [_ {:keys [store]}]
+  (println "Provisioning default tenant...")
+  (db/create-tenant store "default" {:if-exists :ignore})
+  (println "Warming up default tenant (cold-path init)...")
+  (db/warmup-tenant store "default")
   (println "Seeding SearchParameters...")
   (doseq [p sp/search-parameters]
     (db/create-resource store "default" :SearchParameter (:id p) p))

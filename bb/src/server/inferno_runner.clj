@@ -121,27 +121,13 @@
           (println "Failed to grant" relation "permission for" obj ":" (:body resp))
           (System/exit 1))))))
 
-(defn warmup-store!
-  "Issue a single authenticated read against the `default` tenant before any
-   timed write. This forces lazy backend init (per-tenant XTDB node start,
-   Datomic peer connection, JIT/plan compile of the read path) so the first
-   real PUT/POST in the test isn't billed for cold-start cost. Both backends
-   get the same warmup so the comparison stays fair."
-  [token]
-  (println "Warming up FHIR store (cold-path init)...")
-  (let [t0   (System/nanoTime)
-        resp (try
-               (curl/get "https://fhir.local:3001/default/fhir/Patient?_count=1"
-                         {:headers   {"Authorization" (str "Bearer " token)}
-                          :timeout   30000
-                          :throw     false
-                          :insecure? true})
-               (catch Exception e {:status 500 :body (.getMessage e)}))
-        ms   (/ (- (System/nanoTime) t0) 1e6)]
-    (printf "  warmup GET /Patient?_count=1 -> %s in %.0f ms%n" (:status resp) ms)
-    (when-not (#{200 404} (:status resp))
-      (println "Warmup body:" (:body resp))
-      (System/exit 1))))
+;; Store warmup used to happen here via an authenticated `GET /Patient?_count=1`
+;; to force per-tenant cold-start (XTDB node start, Datomic peer connect, JIT of
+;; the read path). That is now handled in-process by `test-server/seeder`, which
+;; calls `(db/create-tenant store "default" {:if-exists :ignore})` and
+;; `(db/warmup-tenant store "default")` before Jetty starts accepting traffic.
+;; By the time `wait-for-server` sees a 200 on `/metadata`, the default tenant
+;; is already warm, so the runner has nothing left to do here.
 
 (defn insert-patient [token]
   (println "Inserting test Patient...")
@@ -393,7 +379,6 @@
 
     (println "Client ID:" client-id)
     (grant-keto-permissions client-id)
-    (warmup-store! token)
     (insert-patient token)
     (insert-test-data token)
     (run-inferno-tests token)

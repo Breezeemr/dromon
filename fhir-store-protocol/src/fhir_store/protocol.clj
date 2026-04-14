@@ -77,7 +77,65 @@
      reports the status of each input entry in the original order.")
   (resource-deleted? [this tenant-id resource-type id]
     "Returns true if the resource was previously created and then deleted,
-     false if it exists or was never created."))
+     false if it exists or was never created.")
+  (create-tenant
+    [this tenant-id]
+    [this tenant-id opts]
+    "Eagerly create whatever backing state a tenant needs: the per-tenant
+     XTDB node, the Datomic database and connection, the mock store's
+     state entry, etc. Schema transacts should run here so the first
+     resource call is pure I/O against an already-warm backend.
+
+     `opts` may contain:
+     - :if-exists — one of :error (default), :ignore, :replace.
+       :error throws ex-info {:fhir/status 409 :fhir/code \"conflict\"}
+       when the tenant already has any state. :ignore is a no-op if
+       the tenant already exists. :replace is equivalent to calling
+       delete-tenant immediately followed by create-tenant.
+
+     Returns nil. Safe to call concurrently for the same tenant; the
+     first caller wins and losers see an atomic no-op.")
+  (delete-tenant
+    [this tenant-id]
+    [this tenant-id opts]
+    "Remove all per-tenant state. After this call, reads and searches
+     against the tenant behave as if the tenant was never created.
+     Implementations must release any OS resources held open for the
+     tenant (Datomic connection, XTDB node, file handles, JDBC pool).
+
+     `opts` may contain:
+     - :if-absent — one of :error (default), :ignore. :ignore is a
+       no-op when the tenant has no state.
+     - :close-storage? — boolean, default false. When true and the
+       backend has persistent storage (datomic :dev/:peer, XTDB
+       `xtdb2-disk`), also drop the underlying database/file storage,
+       not just the in-process handle. In-memory backends ignore this.
+
+     Returns nil.")
+  (warmup-tenant
+    [this tenant-id]
+    [this tenant-id opts]
+    "Prime caches, classloaders, JIT, and any lazy per-tenant init
+     without actually mutating data. Intended to be idempotent and safe
+     to call on a tenant that already has data — unlike create-tenant,
+     which treats an existing tenant as a conflict by default.
+
+     Implementations should issue a representative no-op query against
+     the tenant that exercises the same code path a real request would
+     take (e.g. a 0-result search against a known-small resource type).
+     This forces the read-side classloader to load the decoder, the
+     query engine to plan/cache the query shape, and the backend to
+     resolve any lazy per-tenant resources.
+
+     `opts` may contain:
+     - :resource-types — a collection of resource type keywords to
+       exercise. Default is #{:Patient} which is enough to prime the
+       common hot paths.
+
+     Returns nil. Never throws on a missing tenant; instead, creates
+     the tenant as a side effect and then runs the warmup. This mirrors
+     the current `get-or-create-node` / `ensure-tenant-conn!` laziness
+     but makes it explicit and callable at application boot."))
 
 (defn create-store
   "Creates an IFHIRStore implementation. `impl-fn` is a function that takes

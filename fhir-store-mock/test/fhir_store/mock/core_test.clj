@@ -194,3 +194,71 @@
       (testing "successful entries actually landed; failed ones did not roll back others"
         (let [all (protocol/search store tenant "Patient" {} nil)]
           (is (>= (count all) 2) "alive + newly posted patient exist"))))))
+
+(deftest create-tenant-test
+  (testing "create-tenant then search returns empty vector"
+    (let [store (mock/create-mock-store {})]
+      (protocol/create-tenant store "tid")
+      (is (= [] (protocol/search store "tid" "Patient" {} nil)))))
+
+  (testing "create-tenant twice with defaults throws 409"
+    (let [store (mock/create-mock-store {})]
+      (protocol/create-tenant store "tid")
+      (let [e (try
+                (protocol/create-tenant store "tid")
+                nil
+                (catch clojure.lang.ExceptionInfo ex ex))]
+        (is (some? e))
+        (is (= 409 (:fhir/status (ex-data e)))))))
+
+  (testing "create-tenant twice with :if-exists :ignore preserves data"
+    (let [store (mock/create-mock-store {})]
+      (protocol/create-tenant store "tid")
+      (protocol/create-resource store "tid" "Patient" "p1"
+                                {:resourceType "Patient" :name [{:family "Keep"}]})
+      (protocol/create-tenant store "tid" {:if-exists :ignore})
+      (is (some? (protocol/read-resource store "tid" "Patient" "p1")))))
+
+  (testing "create-tenant with :if-exists :replace wipes prior data"
+    (let [store (mock/create-mock-store {})]
+      (protocol/create-tenant store "tid")
+      (protocol/create-resource store "tid" "Patient" "p1"
+                                {:resourceType "Patient" :name [{:family "Gone"}]})
+      (protocol/create-tenant store "tid" {:if-exists :replace})
+      (is (nil? (protocol/read-resource store "tid" "Patient" "p1"))))))
+
+(deftest delete-tenant-test
+  (testing "delete-tenant then read-resource returns nil"
+    (let [store (mock/create-mock-store {})]
+      (protocol/create-tenant store "tid")
+      (protocol/create-resource store "tid" "Patient" "p1"
+                                {:resourceType "Patient" :name [{:family "X"}]})
+      (protocol/delete-tenant store "tid")
+      (is (nil? (protocol/read-resource store "tid" "Patient" "p1")))))
+
+  (testing "delete-tenant with :if-absent :ignore on missing tenant is a no-op"
+    (let [store (mock/create-mock-store {})]
+      (is (nil? (protocol/delete-tenant store "missing" {:if-absent :ignore})))))
+
+  (testing "delete-tenant with defaults on missing tenant throws 404"
+    (let [store (mock/create-mock-store {})
+          e (try
+              (protocol/delete-tenant store "missing")
+              nil
+              (catch clojure.lang.ExceptionInfo ex ex))]
+      (is (some? e))
+      (is (= 404 (:fhir/status (ex-data e)))))))
+
+(deftest warmup-tenant-test
+  (testing "warmup-tenant on a new store creates the tenant key"
+    (let [store (mock/create-mock-store {})]
+      (protocol/warmup-tenant store "tid")
+      (is (contains? @(:state store) "tid"))))
+
+  (testing "warmup-tenant preserves prior data"
+    (let [store (mock/create-mock-store {})]
+      (protocol/create-tenant store "tid")
+      (protocol/create-resource store "tid" "Patient" "p1"
+                                {:resourceType "Patient" :name [{:family "Keep"}]})
+      (protocol/warmup-tenant store "tid")
+      (is (some? (protocol/read-resource store "tid" "Patient" "p1"))))))
