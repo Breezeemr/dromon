@@ -61,18 +61,33 @@
 (json-gen/add-encoder YearMonth (fn [d jg] (.writeString jg (str d))))
 
 
+(defn ^:no-doc encode-resource-doc
+  "Runs the malli storage encoder for the given resource type and returns the
+   raw XTDB document map (pre-SQL-serialization) with :_id and :fhir_version
+   injected. Used by both the SQL INSERT builder and the put-docs path —
+   the put-docs path renames :_id → :xt/id before handing the doc to XTDB."
+  [resource-type id resource-map storage-encoders & {:keys [version]}]
+  (let [rt-name (name resource-type)
+        encode-fn (get storage-encoders rt-name (get storage-encoders :default))]
+    (cond-> (encode-fn resource-map)
+      true    (assoc :_id id)
+      version (assoc :fhir_version version))))
+
+(defn ^:no-doc doc->put-doc
+  "Rewrites a storage doc (as produced by encode-resource-doc) into the shape
+   [:put-docs table doc] expects: :_id becomes :xt/id. All other keys pass
+   through unchanged so the column types match the SQL path byte-for-byte."
+  [doc]
+  (-> doc
+      (dissoc :_id)
+      (assoc :xt/id (:_id doc))))
+
 (defn- extract-and-build-sql
   "Takes a resource map and resource-type, builds a parameterized SQL INSERT for XTDB.
-   Uses the precompiled malli encoder for the resource type, falling back to the
-   :default encoder (built from :map) for types without a specific schema.
    Optional kwargs:
      :version — the monotonic version string to inject as the \"fhir_version\" column."
   [resource-type id resource-map storage-encoders & {:keys [version]}]
-  (let [rt-name (name resource-type)
-        encode-fn (get storage-encoders rt-name (get storage-encoders :default))
-        doc (cond-> (encode-fn resource-map)
-              true    (assoc :_id id)
-              version (assoc :fhir_version version))
+  (let [doc (encode-resource-doc resource-type id resource-map storage-encoders :version version)
         cols (keys doc)
         col-names (str/join ", " (map #(format "\"%s\"" (name %)) cols))
         placeholders (str/join ", " (repeat (count cols) "?"))
@@ -80,7 +95,7 @@
         args (mapv doc cols)]
     [sql args]))
 
-(defn- current-version
+(defn ^:no-doc current-version
   "Reads the current fhir_version column for a resource row. Returns the version
    string or nil if no row exists."
   [node resource-type id]
@@ -112,6 +127,13 @@
 
 (declare xtdb->fhir)
 
+;; Forward declarations for the optional XTQL pathway. Defined in
+;; fhir-store-xtdb2.query-xtql, which requires this ns. Under :query-mode :xtql
+;; the protocol methods dispatch to these; under :sql (default) they are unused.
+(declare read-xtql vread-xtql deleted?-xtql history-xtql history-type-xtql
+         search-xtql count-resources-xtql
+         create-xtql update-xtql delete-xtql transact-transaction-xtql)
+
 (defn- bulk-read-by-ids
   "Bulk SELECT * WHERE _id IN (...) for a single resource type. Returns a
    map of id -> decoded FHIR resource. Used by transact-transaction to
@@ -131,7 +153,7 @@
                           [(str rid) res]))))
               rows)))))
 
-(defn- next-version
+(defn ^:no-doc next-version
   "Computes the next version string from a current version (or nil for first)."
   [current]
   (if (and current (not (str/blank? current)))
@@ -564,7 +586,7 @@
           ;; No registry entry: fallback to direct column match
           :else
           [(format "\"%s\" = ?" pname) [v-str]])))))
-(defn- xtdb->fhir
+(defn ^:no-doc xtdb->fhir
   "Converts an XTDB query result row back to a FHIR resource map.
    Uses the precompiled malli decoder for the resource type, falling back to the
    :default decoder (built from :map) for types without a specific schema.
@@ -693,57 +715,230 @@
                     (java.nio.file.Files/deleteIfExists fp)
                     (catch Throwable _ nil)))))))))))
 
-(defrecord XTDBStore [nodes node-config storage-encoders read-decoders]
+;; ---------------------------------------------------------------------------
+;; Simple-read SQL impls. Extracted from the protocol method bodies so the
+;; dispatcher in XTDBStore can route to these under :query-mode :sql and to
+;; the XTQL siblings (fhir-store-xtdb2.query-xtql) under :query-mode :xtql.
+;; ---------------------------------------------------------------------------
+
+(defn- read-sql [node resource-type id read-decoders]
+  (let [query (format "SELECT * FROM %s WHERE _id = ?" (name resource-type))
+        results (into [] (xt/q node [query id]))]
+    (xtdb->fhir (first results) read-decoders)))
+
+(defn- vread-sql [node resource-type id vid read-decoders]
+  (let [query (format "SELECT * FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (name resource-type))
+        results (into [] (xt/q node [query vid id]))]
+    (xtdb->fhir (first results) read-decoders)))
+
+(defn- deleted?-sql [node resource-type id]
+  (let [rt-name (name resource-type)
+        current-query (format "SELECT _id FROM %s WHERE _id = ?" rt-name)
+        current-results (into [] (xt/q node [current-query id]))]
+    (if (seq current-results)
+      false
+      (let [history-query (format "SELECT _id FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" rt-name)
+            history-results (into [] (xt/q node [history-query id]))]
+        (boolean (seq history-results))))))
+
+(defn- history-sql [node resource-type id read-decoders]
+  (let [query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (name resource-type))]
+    (mapv #(xtdb->fhir % read-decoders) (xt/q node [query id]))))
+
+(def ^:private ^:no-doc result-params
+  #{"_count" "_skip" "_offset" "_sort" "_include" "_revinclude"
+    "_total" "_elements" "_contained" "_containedType"
+    "_summary" "_format" "_pretty"})
+
+(defn ^:no-doc prepare-search-args
+  "Parses a FHIR search params map into the inputs both the SQL and XTQL
+   pathways need: the filtering subset, parsed sort-specs, limit, offset."
+  [params search-registry]
+  (let [raw-count (or (get params :_count) (get params "_count") "50")
+        raw-skip (or (get params :_skip) (get params "_skip") "0")
+        limit (if (string? raw-count) (parse-long raw-count) raw-count)
+        offset (if (string? raw-skip) (parse-long raw-skip) raw-skip)
+        raw-sort (or (get params :_sort) (get params "_sort"))
+        sort-specs (parse-sort-param raw-sort)
+        filter-params (into {}
+                            (remove (fn [[k _]] (contains? result-params (name k))))
+                            params)]
+    {:filter-params filter-params
+     :sort-specs sort-specs
+     :search-registry search-registry
+     :limit limit
+     :offset offset}))
+
+(defn- search-sql
+  [node resource-type {:keys [filter-params sort-specs search-registry limit offset]} read-decoders]
+  (let [order-by (build-order-by-clause sort-specs search-registry)]
+    (if (empty? filter-params)
+      (let [query (format "SELECT * FROM %s%s LIMIT %d OFFSET %d"
+                          (name resource-type) (or order-by "") limit offset)]
+        (mapv #(xtdb->fhir % read-decoders) (xt/q node query)))
+      (let [cols (keys filter-params)
+            conditions (map (fn [k]
+                              (build-condition k (get filter-params k)
+                                               (get search-registry (name k))))
+                            cols)
+            where-clause (str/join " AND " (map first conditions))
+            all-params (into [] (mapcat second) conditions)
+            query (format "SELECT * FROM %s WHERE %s%s LIMIT %d OFFSET %d"
+                          (name resource-type) where-clause (or order-by "") limit offset)]
+        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [query] all-params)))))))
+
+(defn- count-sql
+  [node resource-type {:keys [filter-params search-registry]}]
+  (let [[query-str all-params]
+        (if (empty? filter-params)
+          [(format "SELECT COUNT(*) AS cnt FROM %s" (name resource-type)) []]
+          (let [cols (keys filter-params)
+                conditions (map (fn [k]
+                                  (build-condition k (get filter-params k)
+                                                   (get search-registry (name k))))
+                                cols)
+                where-clause (str/join " AND " (map first conditions))
+                p (into [] (mapcat second) conditions)]
+            [(format "SELECT COUNT(*) AS cnt FROM %s WHERE %s"
+                     (name resource-type) where-clause) p]))
+        result (first (xt/q node (into [query-str] all-params)))]
+    (or (:cnt result) 0)))
+
+;; ---------------------------------------------------------------------------
+;; Write-side SQL impls.
+;; ---------------------------------------------------------------------------
+
+(defn- create-sql [node resource-type id resource storage-encoders]
+  (let [version "1"
+        rt-name (name resource-type)
+        [sql args] (extract-and-build-sql resource-type id resource storage-encoders
+                                          :version version)
+        assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" rt-name)
+                   [id]]]
+    (try
+      (xt/execute-tx node [assert-op [:sql sql args]])
+      (catch Exception e
+        (throw (ex-info (str "Resource already exists: " rt-name "/" id)
+                        {:fhir/status 409 :fhir/code "conflict"
+                         :resource-type rt-name :id id}
+                        e))))
+    (-> resource
+        (assoc :id id)
+        (assoc-in [:meta :versionId] version))))
+
+(defn- update-sql [node resource-type id resource opts storage-encoders]
+  (let [rt-name (name resource-type)
+        if-match (:if-match opts)
+        current (current-version node resource-type id)
+        _ (when (and if-match (nil? current))
+            (throw (ex-info "Version conflict: resource does not exist"
+                            {:fhir/status 412 :fhir/code "conflict"
+                             :expected if-match :actual nil})))
+        _ (when (and if-match current (not= if-match current))
+            (throw (ex-info "Version conflict"
+                            {:fhir/status 412 :fhir/code "conflict"
+                             :expected if-match :actual current})))
+        expected-vid (or if-match current)
+        new-version (next-version expected-vid)
+        [sql args] (extract-and-build-sql resource-type id resource storage-encoders
+                                          :version new-version)
+        assert-op (if expected-vid
+                    [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
+                                  rt-name)
+                     [id expected-vid]]
+                    [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
+                                  rt-name)
+                     [id]])]
+    (try
+      (xt/execute-tx node [assert-op [:sql sql args]])
+      (catch Exception e
+        (if if-match
+          (throw (ex-info (str "Version conflict: " (ex-message e))
+                          {:fhir/status 412 :fhir/code "conflict"
+                           :expected if-match}
+                          e))
+          (throw (ex-info (str "Conflict: " (ex-message e))
+                          {:fhir/status 409 :fhir/code "conflict"}
+                          e)))))
+    (-> resource
+        (assoc :id id)
+        (assoc-in [:meta :versionId] new-version))))
+
+(defn- delete-sql [node resource-type id opts]
+  (let [rt-name (name resource-type)
+        if-match (:if-match opts)
+        current (when if-match (current-version node resource-type id))
+        _ (when (and if-match (nil? current))
+            (throw (ex-info "Version conflict: resource does not exist"
+                            {:fhir/status 412 :fhir/code "conflict"
+                             :expected if-match :actual nil})))
+        _ (when (and if-match (not= if-match current))
+            (throw (ex-info "Version conflict"
+                            {:fhir/status 412 :fhir/code "conflict"
+                             :expected if-match :actual current})))
+        assert-op (when if-match
+                    [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
+                                  rt-name)
+                     [id if-match]])
+        delete-op [:sql (format "DELETE FROM %s WHERE _id = ?" rt-name) [id]]
+        tx-ops (if assert-op [assert-op delete-op] [delete-op])]
+    (try
+      (xt/execute-tx node tx-ops)
+      (catch Exception e
+        (if if-match
+          (throw (ex-info (str "Version conflict: " (ex-message e))
+                          {:fhir/status 412 :fhir/code "conflict"
+                           :expected if-match}
+                          e))
+          (throw (ex-info (str "Conflict: " (ex-message e))
+                          {:fhir/status 409 :fhir/code "conflict"}
+                          e)))))
+    nil))
+
+(defn- history-type-sql [node resource-type params read-decoders]
+  (let [raw-count (or (get params :_count) (get params "_count") "50")
+        limit (if (string? raw-count) (parse-long raw-count) raw-count)
+        since (or (get params :_since) (get params "_since"))
+        at (or (get params :_at) (get params "_at"))
+        [where-clause where-params]
+        (cond
+          since [" WHERE _system_from > TIMESTAMP ?" [since]]
+          at    [" WHERE _system_from <= TIMESTAMP ?" [at]]
+          :else ["" []])
+        query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT %d"
+                      (name resource-type) where-clause limit)
+        results (into [] (xt/q node (into [query] where-params)))]
+    (mapv #(xtdb->fhir % read-decoders) results)))
+
+(defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode]
   IFHIRStore
 
   (create-resource [this tenant-id resource-type id resource]
     (t/trace!
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)
-           version "1"
-           rt-name (name resource-type)
-           [sql args] (t/trace!
-                       {:id :store/create.sql-encode
-                        :data {:resource-type rt-name :id id}}
-                       (extract-and-build-sql resource-type id resource storage-encoders
-                                              :version version))
-           ;; ASSERT NOT EXISTS rejects duplicate POSTs as part of the same
-           ;; transactor round-trip — no separate pre-read needed. A failure
-           ;; surfaces as a 409 Conflict at the handler layer.
-           assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" rt-name)
-                      [id]]]
-       (try
-         (t/trace!
-          {:id :store/create.execute-tx
-           :data {:resource-type rt-name :id id}}
-          (xt/execute-tx node [assert-op [:sql sql args]]))
-         (catch Exception e
-           (throw (ex-info (str "Resource already exists: " rt-name "/" id)
-                           {:fhir/status 409 :fhir/code "conflict"
-                            :resource-type rt-name :id id}
-                           e))))
-       (-> resource
-           (assoc :id id)
-           (assoc-in [:meta :versionId] version)))))
+     (let [node (get-or-create-node this tenant-id)]
+       (case query-mode
+         :xtql (create-xtql node resource-type id resource storage-encoders)
+         (create-sql  node resource-type id resource storage-encoders)))))
 
   (read-resource [this tenant-id resource-type id]
     (t/trace!
      {:id :store/read
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)
-           query (format "SELECT * FROM %s WHERE _id = ?" (name resource-type))
-           results (into [] (xt/q node [query id]))]
-       (xtdb->fhir (first results) read-decoders))))
+     (let [node (get-or-create-node this tenant-id)]
+       (case query-mode
+         :xtql (read-xtql node resource-type id read-decoders)
+         (read-sql node resource-type id read-decoders)))))
 
   (vread-resource [this tenant-id resource-type id vid]
     (t/trace!
      {:id :store/vread
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id :vid vid}}
-     (let [node (get-or-create-node this tenant-id)
-           query (format "SELECT * FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (name resource-type))
-           results (into [] (xt/q node [query vid id]))]
-       (xtdb->fhir (first results) read-decoders))))
+     (let [node (get-or-create-node this tenant-id)]
+       (case query-mode
+         :xtql (vread-xtql node resource-type id vid read-decoders)
+         (vread-sql node resource-type id vid read-decoders)))))
 
   (update-resource [this tenant-id resource-type id resource]
     (fp/update-resource this tenant-id resource-type id resource nil))
@@ -752,46 +947,10 @@
     (t/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)
-           rt-name (name resource-type)
-           if-match (:if-match opts)
-           current (current-version node resource-type id)
-           _ (when (and if-match (nil? current))
-               (throw (ex-info "Version conflict: resource does not exist"
-                               {:fhir/status 412 :fhir/code "conflict"
-                                :expected if-match :actual nil})))
-           _ (when (and if-match current (not= if-match current))
-               (throw (ex-info "Version conflict"
-                               {:fhir/status 412 :fhir/code "conflict"
-                                :expected if-match :actual current})))
-           ;; When :if-match is supplied, use it as the expected value in the
-           ;; ASSERT guard so that the concurrency check is performed atomically
-           ;; by the transactor rather than based on our earlier read.
-           expected-vid (or if-match current)
-           new-version (next-version expected-vid)
-           [sql args] (extract-and-build-sql resource-type id resource storage-encoders
-                                             :version new-version)
-           assert-op (if expected-vid
-                       [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                     rt-name)
-                        [id expected-vid]]
-                       [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
-                                     rt-name)
-                        [id]])]
-       (try
-         (xt/execute-tx node [assert-op [:sql sql args]])
-         (catch Exception e
-           (if if-match
-             (throw (ex-info (str "Version conflict: " (ex-message e))
-                             {:fhir/status 412 :fhir/code "conflict"
-                              :expected if-match}
-                             e))
-             (throw (ex-info (str "Conflict: " (ex-message e))
-                             {:fhir/status 409 :fhir/code "conflict"}
-                             e)))))
-       (-> resource
-           (assoc :id id)
-           (assoc-in [:meta :versionId] new-version)))))
+     (let [node (get-or-create-node this tenant-id)]
+       (case query-mode
+         :xtql (update-xtql node resource-type id resource opts storage-encoders)
+         (update-sql  node resource-type id resource opts storage-encoders)))))
 
   (delete-resource [this tenant-id resource-type id]
     (fp/delete-resource this tenant-id resource-type id nil))
@@ -800,139 +959,59 @@
     (t/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)
-           rt-name (name resource-type)
-           if-match (:if-match opts)
-           current (when if-match (current-version node resource-type id))
-           _ (when (and if-match (nil? current))
-               (throw (ex-info "Version conflict: resource does not exist"
-                               {:fhir/status 412 :fhir/code "conflict"
-                                :expected if-match :actual nil})))
-           _ (when (and if-match (not= if-match current))
-               (throw (ex-info "Version conflict"
-                               {:fhir/status 412 :fhir/code "conflict"
-                                :expected if-match :actual current})))
-           assert-op (when if-match
-                       [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                     rt-name)
-                        [id if-match]])
-           delete-op [:sql (format "DELETE FROM %s WHERE _id = ?" rt-name) [id]]
-           tx-ops (if assert-op [assert-op delete-op] [delete-op])]
-       (try
-         (xt/execute-tx node tx-ops)
-         (catch Exception e
-           (if if-match
-             (throw (ex-info (str "Version conflict: " (ex-message e))
-                             {:fhir/status 412 :fhir/code "conflict"
-                              :expected if-match}
-                             e))
-             (throw (ex-info (str "Conflict: " (ex-message e))
-                             {:fhir/status 409 :fhir/code "conflict"}
-                             e)))))
-       nil)))
+     (let [node (get-or-create-node this tenant-id)]
+       (case query-mode
+         :xtql (delete-xtql node resource-type id opts)
+         (delete-sql  node resource-type id opts)))))
 
   (resource-deleted? [this tenant-id resource-type id]
     ;; A resource is "deleted" if it has history (existed in the past) but no current row
     (t/trace!
      {:id :store/resource-deleted?
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-    (let [node (get-or-create-node this tenant-id)
-          current-query (format "SELECT _id FROM %s WHERE _id = ?" (name resource-type))
-          current-results (into [] (xt/q node [current-query id]))]
-      (if (seq current-results)
-        false ;; Resource currently exists, not deleted
-        ;; Check if it ever existed using system_time history
-        (let [history-query (format "SELECT _id FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (name resource-type))
-              history-results (into [] (xt/q node [history-query id]))]
-          (boolean (seq history-results)))))))
+     (let [node (get-or-create-node this tenant-id)]
+       (case query-mode
+         :xtql (deleted?-xtql node resource-type id)
+         (deleted?-sql node resource-type id)))))
 
   (search [this tenant-id resource-type params search-registry]
     (t/trace!
      {:id :store/search
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-    (let [node (get-or-create-node this tenant-id)
-          ;; Extract standard FHIR pagination params, default 50 items per page
-          ;; Support both string keys (from ring query-params) and keyword keys
-          raw-count (or (get params :_count) (get params "_count") "50")
-          raw-skip (or (get params :_skip) (get params "_skip") "0")
-          limit (if (string? raw-count) (parse-long raw-count) raw-count)
-          offset (if (string? raw-skip) (parse-long raw-skip) raw-skip)
-
-          ;; Parse _sort parameter for ORDER BY clause
-          raw-sort (or (get params :_sort) (get params "_sort"))
-          sort-specs (parse-sort-param raw-sort)
-          order-by (build-order-by-clause sort-specs search-registry)
-
-          ;; Remove FHIR result parameters from filter criteria.
-          ;; These control result formatting/pagination, not search filtering.
-          ;; Note: _id, _lastUpdated, _tag, _profile, _security etc. ARE search params
-          ;; and must be kept.
-          result-params #{"_count" "_skip" "_offset" "_sort" "_include" "_revinclude"
-                          "_total" "_elements" "_contained" "_containedType"
-                          "_summary" "_format" "_pretty"}
-          filter-params (into {}
-                              (remove (fn [[k _]]
-                                        (contains? result-params (name k))))
-                              params)]
-
-      (try
-        (if (empty? filter-params)
-          (let [query (format "SELECT * FROM %s%s LIMIT %d OFFSET %d"
-                              (name resource-type) (or order-by "") limit offset)]
-            (mapv #(xtdb->fhir % read-decoders) (xt/q node query)))
-          (let [cols (keys filter-params)
-                conditions (map (fn [k]
-                                  (build-condition k (get filter-params k)
-                                                   (get search-registry (name k))))
-                                cols)
-                where-clause (str/join " AND " (map first conditions))
-                all-params (into [] (mapcat second) conditions)
-                query (format "SELECT * FROM %s WHERE %s%s LIMIT %d OFFSET %d"
-                              (name resource-type) where-clause (or order-by "") limit offset)]
-            (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [query] all-params)))))
-        (catch Exception e
-          ;; Search failures should never yield HTTP 500. Per FHIR spec, unsupported
-          ;; or broken search params return empty results. Common causes: table/column
-          ;; not found, struct field access failures, type mismatches in XTDB SQL.
-          (t/event! ::search-query-failed
-                    {:level :warn
-                     :data {:resource-type (name resource-type)
-                            :params filter-params
-                            :error (.getMessage e)}})
-          [])))))
+     (let [node (get-or-create-node this tenant-id)
+           args (prepare-search-args params search-registry)
+           sql-thunk #(search-sql node resource-type args read-decoders)]
+       (try
+         (case query-mode
+           :xtql (search-xtql node resource-type args read-decoders sql-thunk)
+           (sql-thunk))
+         (catch Exception e
+           ;; Search failures should never yield HTTP 500. Per FHIR spec, unsupported
+           ;; or broken search params return empty results. Common causes: table/column
+           ;; not found, struct field access failures, type mismatches in XTDB SQL.
+           (t/event! ::search-query-failed
+                     {:level :warn
+                      :data {:resource-type (name resource-type)
+                             :params (:filter-params args)
+                             :error (.getMessage e)}})
+           [])))))
 
   (count-resources [this tenant-id resource-type params search-registry]
     (t/trace!
      {:id :store/count
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-    (let [node (get-or-create-node this tenant-id)
-          result-params #{"_count" "_skip" "_offset" "_sort" "_include" "_revinclude"
-                          "_total" "_elements" "_contained" "_containedType"
-                          "_summary" "_format" "_pretty"}
-          filter-params (into {}
-                              (remove (fn [[k _]]
-                                        (contains? result-params (name k))))
-                              params)]
+     (let [node (get-or-create-node this tenant-id)
+           args (prepare-search-args params search-registry)
+           sql-thunk #(count-sql node resource-type args)]
       (try
-        (let [[query-str all-params]
-              (if (empty? filter-params)
-                [(format "SELECT COUNT(*) AS cnt FROM %s" (name resource-type)) []]
-                (let [cols (keys filter-params)
-                      conditions (map (fn [k]
-                                        (build-condition k (get filter-params k)
-                                                         (get search-registry (name k))))
-                                      cols)
-                      where-clause (str/join " AND " (map first conditions))
-                      params (into [] (mapcat second) conditions)]
-                  [(format "SELECT COUNT(*) AS cnt FROM %s WHERE %s"
-                           (name resource-type) where-clause) params]))
-              result (first (xt/q node (into [query-str] all-params)))]
-          (or (:cnt result) 0))
+        (case query-mode
+          :xtql (count-resources-xtql node resource-type args sql-thunk)
+          (sql-thunk))
         (catch Exception e
           (t/event! ::count-query-failed
                     {:level :warn
                      :data {:resource-type (name resource-type)
-                            :params filter-params
+                            :params (:filter-params args)
                             :error (.getMessage e)}})
           0)))))
 
@@ -940,28 +1019,19 @@
     (t/trace!
      {:id :store/history
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)
-           query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (name resource-type))]
-       (mapv #(xtdb->fhir % read-decoders) (xt/q node [query id])))))
+     (let [node (get-or-create-node this tenant-id)]
+       (case query-mode
+         :xtql (history-xtql node resource-type id read-decoders)
+         (history-sql node resource-type id read-decoders)))))
 
   (history-type [this tenant-id resource-type params]
     (t/trace!
      {:id :store/history-type
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-    (let [node (get-or-create-node this tenant-id)
-          raw-count (or (get params :_count) (get params "_count") "50")
-          limit (if (string? raw-count) (parse-long raw-count) raw-count)
-          since (or (get params :_since) (get params "_since"))
-          at (or (get params :_at) (get params "_at"))
-          [where-clause where-params]
-          (cond
-            since [" WHERE _system_from > TIMESTAMP ?" [since]]
-            at    [" WHERE _system_from <= TIMESTAMP ?" [at]]
-            :else ["" []])
-          query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT %d"
-                        (name resource-type) where-clause limit)
-          results (into [] (xt/q node (into [query] where-params)))]
-      (mapv #(xtdb->fhir % read-decoders) results))))
+     (let [node (get-or-create-node this tenant-id)]
+       (case query-mode
+         :xtql (history-type-xtql node resource-type params read-decoders)
+         (history-type-sql node resource-type params read-decoders)))))
 
   (transact-transaction [this tenant-id entries]
     ;; Pre-compute entry metadata (method, resource-type, id) for use in both
@@ -1015,42 +1085,59 @@
           ;; response metadata (new version, final resource with :id+:meta
           ;; populated). This lets the response builder assemble the Bundle
           ;; without a post-commit round-trip.
+          ;; Per-entry write-op emitter. The SQL pathway emits
+          ;; [:sql insert-stmt args] / [:sql delete-stmt args] — the XTQL
+          ;; pathway emits [:put-docs table doc] / [:delete-docs table id],
+          ;; bypassing the INSERT planner entirely. execute-tx accepts both
+          ;; shapes (and a mix with [:sql ASSERT ...]) in one atomic call.
+          xtql-mode? (= query-mode :xtql)
+          emit-write-op
+          (fn [{:keys [method resource-type id resource] :as _em} vid]
+            (case method
+              ("POST" "PUT")
+              (if xtql-mode?
+                [:put-docs (keyword resource-type)
+                 (doc->put-doc
+                  (encode-resource-doc resource-type id resource storage-encoders
+                                       :version vid))]
+                (let [[sql args] (extract-and-build-sql
+                                   resource-type id resource storage-encoders
+                                   :version vid)]
+                  [:sql sql args]))
+              "DELETE"
+              (if xtql-mode?
+                [:delete-docs (keyword resource-type) id]
+                [:sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))
+                 [id]])))
           {:keys [tx-ops entry-results]}
           (t/trace!
            {:id :store/transact-transaction.sql-encode
-            :data {:entry-count (count entry-metas)}}
-           (reduce (fn [acc {:keys [method resource-type id resource] :as em}]
+            :data {:entry-count (count entry-metas) :query-mode query-mode}}
+           (reduce (fn [acc {:keys [method resource-type id] :as em}]
                      (case method
                        "POST"
                        (let [vid "1"
-                             [sql args] (extract-and-build-sql
-                                          resource-type id resource storage-encoders
-                                          :version vid)
-                             final (-> resource
+                             final (-> (:resource em)
                                        (assoc :id id)
                                        (assoc-in [:meta :versionId] vid)
                                        (assoc-in [:meta :lastUpdated] last-updated))]
                          (-> acc
-                             (update :tx-ops conj [:sql sql args])
+                             (update :tx-ops conj (emit-write-op em vid))
                              (update :entry-results conj (assoc em :resource final :vid vid))))
                        "PUT"
                        (let [current (get-in put-versions-by-type [resource-type id])
                              vid (next-version current)
-                             [sql args] (extract-and-build-sql
-                                          resource-type id resource storage-encoders
-                                          :version vid)
-                             final (-> resource
+                             final (-> (:resource em)
                                        (assoc :id id)
                                        (assoc-in [:meta :versionId] vid)
                                        (assoc-in [:meta :lastUpdated] last-updated))]
                          (-> acc
-                             (update :tx-ops conj [:sql sql args])
+                             (update :tx-ops conj (emit-write-op em vid))
                              (update :entry-results conj (assoc em :resource final :vid vid))))
                        "DELETE"
-                       (let [sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))]
-                         (-> acc
-                             (update :tx-ops conj [:sql sql [id]])
-                             (update :entry-results conj em)))
+                       (-> acc
+                           (update :tx-ops conj (emit-write-op em nil))
+                           (update :entry-results conj em))
                        ;; GET / HEAD inside a transaction: we still have to
                        ;; read the resource to satisfy the response. Defer
                        ;; these to the read-back phase by leaving :resource
@@ -1291,11 +1378,17 @@
   "Creates an XTDB implementation of IFHIRStore with per-tenant node isolation.
    Config map keys:
    - :resource/schemas  — compiled malli schemas for all resource types (optional)
-   - :node-config       — XTDB node configuration (default: {} for in-memory)"
-  [{:keys [resource/schemas node-config] :or {node-config {} schemas []}}]
+   - :node-config       — XTDB node configuration (default: {} for in-memory)
+   - :query-mode        — pathway for reads and writes. :sql (default) uses
+     dynamic SQL + INSERT/DELETE. :xtql uses XTQL reads and put-docs/delete-docs
+     writes, with [:sql ASSERT ...] retained for optimistic concurrency."
+  [{:keys [resource/schemas node-config query-mode]
+    :or {node-config {} schemas [] query-mode :sql}}]
+  (assert (contains? #{:sql :xtql} query-mode)
+          (str "query-mode must be :sql or :xtql, got " query-mode))
   (let [storage-encoders (xf/build-storage-encoders schemas)
         read-decoders    (xf/build-read-decoders schemas)
-        store (->XTDBStore (atom {}) node-config storage-encoders read-decoders)]
+        store (->XTDBStore (atom {}) node-config storage-encoders read-decoders query-mode)]
     (assoc store :operations {:valueset-expand xtdb-valueset-expand
                               :valueset-lookup xtdb-valueset-lookup})))
 
@@ -1308,9 +1401,12 @@
   ;; No-op: nodes are managed by the store now
   nil)
 
-(defmethod ig/init-key :fhir-store/xtdb2-store [_ {:keys [node resource/schemas]}]
-  (println "Starting XTDB2 FHIR Store (per-tenant node isolation)")
-  (create-xtdb-store {:resource/schemas schemas :node-config node}))
+(defmethod ig/init-key :fhir-store/xtdb2-store [_ {:keys [node resource/schemas query-mode]}]
+  (println "Starting XTDB2 FHIR Store (per-tenant node isolation)"
+           (str "[query-mode=" (or query-mode :sql) "]"))
+  (create-xtdb-store {:resource/schemas schemas
+                      :node-config node
+                      :query-mode (or query-mode :sql)}))
 
 (defmethod ig/halt-key! :fhir-store/xtdb2-store [_ store]
   (println "Stopping XTDB2 FHIR Store - closing all tenant nodes")
@@ -1322,3 +1418,15 @@
         (catch Exception e
           (println (str "  Warning: error closing node for tenant " tenant-id ": " (.getMessage e))))))
     (reset! nodes {})))
+
+;; Load the optional XTQL pathway. query-xtql requires this ns, so we can't
+;; require it at the top — this bottom-of-file load, plus the alter-var-root
+;; block below, binds the forward-declared Vars (read-xtql, vread-xtql, ...)
+;; to the implementations in fhir-store-xtdb2.query-xtql.
+(require 'fhir-store-xtdb2.query-xtql)
+
+(doseq [sym '[read-xtql vread-xtql deleted?-xtql history-xtql history-type-xtql
+              search-xtql count-resources-xtql
+              create-xtql update-xtql delete-xtql transact-transaction-xtql]]
+  (when-let [impl (resolve (symbol "fhir-store-xtdb2.query-xtql" (name sym)))]
+    (intern 'fhir-store-xtdb2.core sym @impl)))
