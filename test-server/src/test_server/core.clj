@@ -107,9 +107,14 @@
   (db/create-tenant store "default" {:if-exists :ignore})
   (println "Warming up default tenant (cold-path init)...")
   (db/warmup-tenant store "default")
-  (println "Seeding SearchParameters...")
-  (doseq [p sp/search-parameters]
-    (db/create-resource store "default" :SearchParameter (:id p) p))
+  (println "Seeding" (count sp/search-parameters) "SearchParameters in one transaction...")
+  ;; Batched into a single transact-transaction so the per-tx fixed cost is
+  ;; paid once instead of N times. See docs/proposals/xtdb2-create-per-tx-floor.md.
+  (let [entries (mapv (fn [p]
+                        {:request  {:method "PUT" :url (str "SearchParameter/" (:id p))}
+                         :resource p})
+                      sp/search-parameters)]
+    (db/transact-transaction store "default" entries))
   true)
 
 (defonce system (atom nil))
