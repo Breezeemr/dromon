@@ -31,8 +31,20 @@
                {} data)
     (safe-for-json data)))
 
+(defn- ns->source-file
+  "Derives the canonical Clojure source path for an ns symbol, e.g.
+   fhir-store-datomic.core -> fhir_store_datomic/core.clj. Used to fill
+   GCP's sourceLocation.file; Telemere's signal only carries `:ns` +
+   `:coords [line col]`, not the file path."
+  [ns]
+  (when ns
+    (let [s (str ns)]
+      (str (-> s (.replace \- \_) (.replace \. \/)) ".clj"))))
+
 (defn gcp-json-output-fn [signal]
-  (let [{:keys [level id msg_ error inst file line ns data ctx]} signal
+  (let [{:keys [level id msg_ error inst ns coords data ctx]} signal
+        [line _col] coords
+        file (ns->source-file ns)
         severity (case level
                    :trace "DEBUG"
                    :debug "DEBUG"
@@ -68,9 +80,10 @@
                          :time (some-> inst str)
                          :message full-message
                          :logging.googleapis.com/sourceLocation
-                         {:file file
-                          :line (str line)
-                          :function ns}}
+                         (cond-> {}
+                           file (assoc :file file)
+                           line (assoc :line (str line))
+                           ns   (assoc :function (str ns)))}
                   gcp-trace (assoc :logging.googleapis.com/trace gcp-trace)
                   gcp-span-id (assoc :logging.googleapis.com/spanId gcp-span-id)
                   (some? gcp-trace-sampled) (assoc :logging.googleapis.com/trace_sampled gcp-trace-sampled)
