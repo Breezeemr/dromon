@@ -108,16 +108,36 @@
 ;; Schema form generation
 ;; ---------------------------------------------------------------------------
 
+(def ^:private merge-all-cap
+  "Upper bound on the supportedProfile count for which we emit the
+   `:all` merged branch. `mu/merge` walks FHIR profile maps recursively
+   and stack-overflows on lists much larger than this. Resources with
+   more supportedProfiles get only singleton branches; their dispatch
+   falls back to the first claimed profile when meta.profile lists
+   multiple."
+  4)
+
 (defn- profile-dispatch-form
-  "Generate the dispatch function form for a :multi schema.
-   Dispatches on the first entry in meta.profile that matches a known profile URL,
-   falling back to :default."
-  [profile-urls]
+  "Generate the dispatch function form for the capability's `:multi`.
+
+   Behavior:
+   - 0 known profiles in `meta.profile` -> `:default`
+   - exactly 1 known profile          -> that profile URL (singleton branch)
+   - 2+ known profiles:
+       * when the resource has a `:all` merged branch (its supportedProfile
+         count is <= `merge-all-cap`) -> `:all`
+       * otherwise -> the first claimed profile (best-effort single-branch
+         validation)"
+  [profile-urls all-branch?]
   (let [url-set (set profile-urls)]
     `(fn [~'m]
-       (let [~'profiles (get-in ~'m [:meta :profile])]
-         (or (some ~url-set ~'profiles)
-             :default)))))
+       (let [~'matched (distinct (filter ~url-set (get-in ~'m [:meta :profile])))]
+         (case (count ~'matched)
+           0 :default
+           1 (first ~'matched)
+           ~(if all-branch?
+              :all
+              `(first ~'matched)))))))
 
 (defn- resolve-profile-kw
   "Resolve a profile URL to its schema keyword by looking up the type name
@@ -128,25 +148,47 @@
     (when schema-atom
       (first (filter #(= (fdm/kw->type-name %) type-name) (keys @schema-atom))))))
 
+(defn- merged-all-form
+  "Returns a Clojure form that, when evaluated, yields a single malli
+   schema that a multi-profile resource must satisfy. We model this as
+   an `:and` over the per-profile schemas rather than a true
+   `mu/merge`: malli's deep merge walks every nested field and
+   stack-overflows on FHIR schemas because the lazy ref registry can
+   recurse without bound. `:and` short-circuits at validation time and
+   doesn't walk schemas eagerly, so it gives us the same effective
+   guarantee (`m/validate` returns true iff every profile validates)
+   while staying tractable.
+
+   Returns nil when fewer than two profiles are present, or when the
+   profile count exceeds `merge-all-cap` -- in either case no `:all`
+   branch is emitted."
+  [profile-syms]
+  (let [n (count profile-syms)]
+    (when (and (>= n 2) (<= n merge-all-cap))
+      `[:and ~@profile-syms])))
+
 (defn- resource-cap-data-form
   "Build the capability data map for a single REST resource entry.
 
    Shape of the emitted map:
      {:resourceType  \"Patient\"
-      :dispatch      (fn [m] ...)            ; matches the old :multi prop
+      :dispatch      (fn [m] ...)
       :interactions  [...]
       :search-params [...]
       :branches      [[profile-url-1 schema-sym-1]
                       [profile-url-2 schema-sym-2]
                       ...
-                      [:default      base-schema-sym]]}
+                      [:all      <mu/merge form>]   ; only when N >= 2
+                      [:default  base-schema-sym]]}
 
-   `:branches` is an ordered vector of `[dispatch-value schema]` pairs --
-   profiles first (in the CapabilityStatement's declared order), then
-   `:default` last. Consumers that want a map can `(into {} branches)`;
-   consumers that care about ordering (catalog merging in
-   `fhir-store-datomic`, the variants list in a malli `:multi`) walk
-   the vector as-is.
+   `:branches` is an ordered vector of `[dispatch-value schema]` pairs.
+   The dispatch returns either a single profile URL (singleton branch),
+   `:all` (when the resource claims 2+ supported profiles -- the
+   merged-all branch), or `:default` (when no supported profile is
+   claimed in `meta.profile`).
+
+   Consumers that want a map can `(into {} branches)`; consumers that
+   care about iteration order walk the vector as-is.
 
    `schema-atom` is consulted first to resolve profile URLs to their actual
    generated keywords (handles cross-IG version differences)."
@@ -158,14 +200,17 @@
                                 :when kw]
                             [url (fdm/kw->sch-sym kw)]))
         profile-urls    (mapv first profile-entries)
+        profile-syms    (mapv second profile-entries)
+        all-form        (merged-all-form profile-syms)
         base-url        (str "http://hl7.org/fhir/StructureDefinition/" type)
         base-kw         (resolve-profile-kw base-url schema-atom base-fhir-version)
         branches        (cond-> profile-entries
-                          base-kw (conj [:default (fdm/kw->sch-sym base-kw)]))]
+                          all-form (conj [:all all-form])
+                          base-kw  (conj [:default (fdm/kw->sch-sym base-kw)]))]
     (when-not base-kw
       (println "WARN: base resource schema not found for" type))
     {:resourceType  type
-     :dispatch      (profile-dispatch-form profile-urls)
+     :dispatch      (profile-dispatch-form profile-urls (some? all-form))
      :interactions  interactions
      :search-params search-params
      :branches      branches}))
@@ -217,7 +262,14 @@
                       `resource-cap-data-form`) with the registry attached
                       as `:registry`, so any consumer that derefs the Var
                       has everything needed to compile a malli schema or
-                      to mu/merge profiles by URL."
+                      to compose profiles by URL.
+
+   The `:all` branch (when emitted) is an `[:and ...]` over the
+   per-profile schemas -- a value-time conjunction rather than a
+   schema-time deep merge. This avoids `mu/merge`'s unbounded
+   recursion through FHIR's lazy ref graph while preserving validation
+   semantics: a value claims all listed profiles iff it satisfies
+   each independently."
   [ig-name ig-version resource-entry schema-atom profile-version base-fhir-version base-dir]
   (let [resource-type (:type resource-entry)
         ns-sym        (capability-ns-sym ig-name ig-version resource-type)
