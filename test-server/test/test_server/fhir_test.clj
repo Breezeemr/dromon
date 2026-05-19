@@ -31,11 +31,11 @@
 (defn- test-schemas
   "Minimal schemas for testing — Patient and Observation with basic interactions."
   []
-  [(core/capability-schema->server-schema cap-observation/full-sch)
-   (core/capability-schema->server-schema cap-patient/full-sch)
-   (core/capability-schema->server-schema cap-organization/full-sch)
-   (core/capability-schema->server-schema cap-provenance/full-sch)
-   (core/capability-schema->server-schema cap-condition/full-sch)])
+  [(core/capability-schema->server-schema cap-observation/capability)
+   (core/capability-schema->server-schema cap-patient/capability)
+   (core/capability-schema->server-schema cap-organization/capability)
+   (core/capability-schema->server-schema cap-provenance/capability)
+   (core/capability-schema->server-schema cap-condition/capability)])
 
 (defn- test-app
   "Build a ring app with the mock store and no auth middleware."

@@ -36,38 +36,51 @@
             [org.hl7.fhir.StructureDefinition.SearchParameter.v4-3-0 :as search-parameter]))
 
 (def schemas
-  [["AllergyIntolerance" cap-allergy-intolerance/full-sch]
-   ["CarePlan" cap-care-plan/full-sch]
-   ["CareTeam" cap-care-team/full-sch]
-   ["Condition" cap-condition/full-sch]
-   ["Coverage" cap-coverage/full-sch]
-   ["Device" cap-device/full-sch]
-   ["DiagnosticReport" cap-diagnostic-report/full-sch]
-   ["DocumentReference" cap-document-reference/full-sch]
-   ["Encounter" cap-encounter/full-sch]
-   ["Endpoint" cap-endpoint/full-sch]
-   ["Goal" cap-goal/full-sch]
-   ["HealthcareService" cap-healthcare-service/full-sch]
-   ["Immunization" cap-immunization/full-sch]
-   ["Location" cap-location/full-sch]
-   ["Media" cap-media/full-sch]
-   ["Medication" cap-medication/full-sch]
-   ["MedicationDispense" cap-medication-dispense/full-sch]
-   ["MedicationRequest" cap-medication-request/full-sch]
-   ["Observation" cap-observation/full-sch]
-   ["Organization" cap-organization/full-sch]
-   ["Patient" cap-patient/full-sch]
-   ["Practitioner" cap-practitioner/full-sch]
-   ["PractitionerRole" cap-practitioner-role/full-sch]
-   ["Procedure" cap-procedure/full-sch]
-   ["Provenance" cap-provenance/full-sch]
-   ["ValueSet" cap-valueset/full-sch]
-   ["QuestionnaireResponse" cap-questionnaire-response/full-sch]
-   ["RelatedPerson" cap-related-person/full-sch]
-   ["ServiceRequest" cap-service-request/full-sch]
-   ["Specimen" cap-specimen/full-sch]
+  [["AllergyIntolerance" cap-allergy-intolerance/capability]
+   ["CarePlan" cap-care-plan/capability]
+   ["CareTeam" cap-care-team/capability]
+   ["Condition" cap-condition/capability]
+   ["Coverage" cap-coverage/capability]
+   ["Device" cap-device/capability]
+   ["DiagnosticReport" cap-diagnostic-report/capability]
+   ["DocumentReference" cap-document-reference/capability]
+   ["Encounter" cap-encounter/capability]
+   ["Endpoint" cap-endpoint/capability]
+   ["Goal" cap-goal/capability]
+   ["HealthcareService" cap-healthcare-service/capability]
+   ["Immunization" cap-immunization/capability]
+   ["Location" cap-location/capability]
+   ["Media" cap-media/capability]
+   ["Medication" cap-medication/capability]
+   ["MedicationDispense" cap-medication-dispense/capability]
+   ["MedicationRequest" cap-medication-request/capability]
+   ["Observation" cap-observation/capability]
+   ["Organization" cap-organization/capability]
+   ["Patient" cap-patient/capability]
+   ["Practitioner" cap-practitioner/capability]
+   ["PractitionerRole" cap-practitioner-role/capability]
+   ["Procedure" cap-procedure/capability]
+   ["Provenance" cap-provenance/capability]
+   ["ValueSet" cap-valueset/capability]
+   ["QuestionnaireResponse" cap-questionnaire-response/capability]
+   ["RelatedPerson" cap-related-person/capability]
+   ["ServiceRequest" cap-service-request/capability]
+   ["Specimen" cap-specimen/capability]
    ["Questionnaire" questionnaire-r4b/full-sch]
    ["SearchParameter" search-parameter/full-sch]])
+
+(defn- ->validator-schema
+  "Coerces a generated capability spec into a malli schema. The regenerated
+   capability namespaces export a Clojure data map instead of a compiled
+   `:multi`; for those we build the `:multi` via
+   `server.core/cap-data->multi-schema` (the same path the runtime uses).
+   Pre-compiled malli schemas (base FHIR resources like Questionnaire,
+   SearchParameter) pass through unchanged."
+  [spec]
+  (if (and (map? spec) (contains? spec :branches))
+    ((requiring-resolve 'server.core/cap-data->multi-schema)
+     spec (:registry spec))
+    spec))
 
 (defn try-compile-validator
   "Try to compile a Malli validator for the given schema within timeout-ms.
@@ -78,7 +91,7 @@
                  (fn []
                    (try
                      (let [start (System/nanoTime)
-                           _validator (m/validator schema)
+                           _validator (m/validator (->validator-schema schema))
                            elapsed (/ (- (System/nanoTime) start) 1e6)]
                        (deliver result {:name schema-name :status :ok :time-ms elapsed}))
                      (catch Exception e

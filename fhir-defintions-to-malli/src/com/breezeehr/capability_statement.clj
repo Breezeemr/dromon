@@ -1,8 +1,14 @@
 (ns com.breezeehr.capability-statement
   "Reads a FHIR CapabilityStatement from an implementation guide and generates
-   a namespace per REST resource. Each namespace contains a malli :multi schema
-   that dispatches on meta.profile, with one branch per supportedProfile and a
-   :default branch for the base resource type."
+   a namespace per REST resource. Each namespace contains a Clojure data map
+   that carries the same properties a :multi schema would have plus a
+   `:branches` map from `meta.profile` URL -> generated malli schema Var.
+
+   The generated `sch` is a plain map, not a malli schema. Consumers that
+   need a compiled malli schema (e.g. fhir-server routing) can build one
+   on the fly via `server.core/capability-schema->server-schema`; consumers
+   that want to merge the profiles claimed in `meta.profile`
+   (e.g. clean-slate2) walk `:branches` directly."
   (:require [charred.api :as charred]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -122,34 +128,47 @@
     (when schema-atom
       (first (filter #(= (fdm/kw->type-name %) type-name) (keys @schema-atom))))))
 
-(defn- resource-multi-form
-  "Build the :multi schema form for a single REST resource entry.
-   Each supportedProfile becomes a branch keyed by its canonical URL.
-   The :default branch references the base FHIR resource type.
+(defn- resource-cap-data-form
+  "Build the capability data map for a single REST resource entry.
+
+   Shape of the emitted map:
+     {:resourceType  \"Patient\"
+      :dispatch      (fn [m] ...)            ; matches the old :multi prop
+      :interactions  [...]
+      :search-params [...]
+      :branches      [[profile-url-1 schema-sym-1]
+                      [profile-url-2 schema-sym-2]
+                      ...
+                      [:default      base-schema-sym]]}
+
+   `:branches` is an ordered vector of `[dispatch-value schema]` pairs --
+   profiles first (in the CapabilityStatement's declared order), then
+   `:default` last. Consumers that want a map can `(into {} branches)`;
+   consumers that care about ordering (catalog merging in
+   `fhir-store-datomic`, the variants list in a malli `:multi`) walk
+   the vector as-is.
 
    `schema-atom` is consulted first to resolve profile URLs to their actual
    generated keywords (handles cross-IG version differences)."
   [{:keys [type supported-profiles interactions search-params]}
    schema-atom profile-version base-fhir-version]
-  (let [profile-entries (for [url supported-profiles
-                              :let [kw (resolve-profile-kw url schema-atom profile-version)]
-                              :when kw]
-                          [url (fdm/kw->sch-sym kw)])
+  (let [profile-entries (vec
+                          (for [url supported-profiles
+                                :let [kw (resolve-profile-kw url schema-atom profile-version)]
+                                :when kw]
+                            [url (fdm/kw->sch-sym kw)]))
         profile-urls    (mapv first profile-entries)
         base-url        (str "http://hl7.org/fhir/StructureDefinition/" type)
         base-kw         (resolve-profile-kw base-url schema-atom base-fhir-version)
-        meta-map        {:dispatch      (profile-dispatch-form profile-urls)
-                         :resourceType  type
-                         :interactions  interactions
-                         :search-params search-params}]
+        branches        (cond-> profile-entries
+                          base-kw (conj [:default (fdm/kw->sch-sym base-kw)]))]
     (when-not base-kw
       (println "WARN: base resource schema not found for" type))
-    (into [:multi meta-map]
-          (concat
-           (for [[url sch-sym] profile-entries]
-             [url sch-sym])
-           (when base-kw
-             [[:default (fdm/kw->sch-sym base-kw)]])))))
+    {:resourceType  type
+     :dispatch      (profile-dispatch-form profile-urls)
+     :interactions  interactions
+     :search-params search-params
+     :branches      branches}))
 
 ;; ---------------------------------------------------------------------------
 ;; Namespace emission
@@ -189,30 +208,37 @@
                                         (str (last segments) ".cljc"))))))
 
 (defn- write-resource-schema!
-  "Write a single resource :multi schema file."
+  "Write a single resource capability namespace.
+
+   The file defines:
+     - `registry`   — the lazy-full malli registry built from all branch
+                      namespaces' registries.
+     - `capability` — the capability data map (see
+                      `resource-cap-data-form`) with the registry attached
+                      as `:registry`, so any consumer that derefs the Var
+                      has everything needed to compile a malli schema or
+                      to mu/merge profiles by URL."
   [ig-name ig-version resource-entry schema-atom profile-version base-fhir-version base-dir]
   (let [resource-type (:type resource-entry)
         ns-sym        (capability-ns-sym ig-name ig-version resource-type)
         ns-syms       (collect-profile-ns-syms resource-entry schema-atom profile-version base-fhir-version)
-        multi-form    (resource-multi-form resource-entry schema-atom profile-version base-fhir-version)
+        cap-data      (resource-cap-data-form resource-entry schema-atom profile-version base-fhir-version)
         path          (resource-type->file-path ig-name ig-version resource-type base-dir)
         ;; Build registry merge form from all branch namespaces
         registry-syms (mapv #(symbol (str % "/registry")) ns-syms)
-        merged-registry-form `(~'lazy-full-registry (~'merge ~@registry-syms))]
+        merged-registry-form `(~'lazy-full-registry (~'merge ~@registry-syms))
+        cap-data-with-reg (assoc cap-data :registry 'registry)]
     (Files/createDirectories (.getParent path) (make-array FileAttribute 0))
     (with-open [w (Files/newBufferedWriter path (make-array OpenOption 0))]
       (fipp (list 'ns ns-sym
                   (list* :require
-                         '[malli.core :as m]
                          '[com.breezeehr.fhir-primitives :refer [lazy-full-registry]]
                          (sort ns-syms)))
             {:writer w})
       (.newLine w)
-      (fipp (list 'def 'sch multi-form) {:writer w})
+      (fipp (list 'def 'registry merged-registry-form) {:writer w})
       (.newLine w)
-      (fipp (list 'def 'full-sch
-                  (list 'malli.core/schema 'sch {:registry merged-registry-form}))
-            {:writer w}))
+      (fipp (list 'def 'capability cap-data-with-reg) {:writer w}))
     path))
 
 ;; ---------------------------------------------------------------------------

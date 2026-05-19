@@ -66,38 +66,78 @@
                "$lookup" {:get  'server.handlers/valueset-lookup
                            :post 'server.handlers/valueset-lookup}}})
 
+(defn cap-data->multi-schema
+  "Compile the capability data map (as emitted by
+   `com.breezeehr.capability-statement/resource-cap-data-form`) into a
+   malli `:multi` schema. The `:branches` map becomes the `:multi` branch
+   list; `:dispatch`/`:resourceType`/`:interactions`/`:search-params`
+   move to the `:multi` properties so existing readers of
+   `(m/properties cap-schema)` keep working.
+
+   When `registry` is non-nil it is attached to the compiled schema."
+  [{:keys [resourceType dispatch interactions search-params branches]} registry]
+  (let [multi-vec (into [:multi
+                         {:dispatch      dispatch
+                          :resourceType  resourceType
+                          :interactions  interactions
+                          :search-params search-params}]
+                        branches)]
+    (if registry
+      (m/schema multi-vec {:registry registry})
+      (m/schema multi-vec))))
+
+(defn- cap-data?
+  "True when `x` looks like the capability data map produced by the
+   regenerated capability namespaces (rather than a pre-compiled malli
+   `:multi` schema)."
+  [x]
+  (and (map? x)
+       (contains? x :branches)
+       (contains? x :resourceType)))
+
 (defn capability-schema->server-schema
-  "Convert a generated capability schema into a :map schema with the metadata
-   format expected by routing.clj.
-   `cap-sch-vec` is the raw :multi vector (used for extracting metadata).
-   `cap-compiled` is the pre-compiled malli schema (used for encoding/decoding)."
-  [cap-compiled]
-  (let [resource-type (:resourceType cap-compiled)
-        props         (m/properties  cap-compiled)
-        interactions  (:interactions props [])
-        search-params (:search-params props [])
-        search-registry (sr/build-resource-registry search-params cap-compiled)
-        interaction-map (into {}
-                          (map (fn [i]
-                                 (let [kw (keyword i)]
-                                   (if (= kw :search-type)
-                                     [kw {:search-parameters search-params}]
-                                     [kw {}]))))
-                          interactions)
-        conditional-keys (cond-> []
-                         (contains? interaction-map :update) (conj :conditional-update)
-                         (contains? interaction-map :delete) (conj :conditional-delete)
-                         (contains? interaction-map :patch)  (conj :conditional-patch))
-        handlers      (select-keys default-handlers (into (keys interaction-map) conditional-keys))
-        operations    (get resource-operations resource-type {})]
-    (mu/update-properties cap-compiled
-                          into
-                          {:fhir/interactions   interaction-map
-                           :fhir/handlers       handlers
-                           :fhir/operations     operations
-                           :fhir/search-registry search-registry
-                           :xtdb/collection     (:resourceType cap-compiled)
-                           :fhir/cap-schema     cap-compiled})))
+  "Convert a generated capability schema (data map or pre-compiled malli
+   :multi) into a malli schema whose properties carry the metadata that
+   `routing.clj` expects.
+
+   When `cap-or-data` is the capability data map produced by the
+   regenerated capability namespaces, this compiles the `:multi` first.
+   The registry is read off the data map's `:registry` key when not
+   supplied explicitly. Pre-compiled malli schemas are accepted for
+   backward compatibility."
+  ([cap-or-data]
+   (capability-schema->server-schema cap-or-data nil))
+  ([cap-or-data registry]
+   (let [registry     (or registry (when (cap-data? cap-or-data) (:registry cap-or-data)))
+         cap-compiled (if (cap-data? cap-or-data)
+                        (cap-data->multi-schema cap-or-data registry)
+                        cap-or-data)
+         resource-type   (:resourceType cap-compiled)
+         props           (m/properties  cap-compiled)
+         interactions    (:interactions props [])
+         search-params   (:search-params props [])
+         search-registry (sr/build-resource-registry search-params cap-compiled)
+         interaction-map (into {}
+                           (map (fn [i]
+                                  (let [kw (keyword i)]
+                                    (if (= kw :search-type)
+                                      [kw {:search-parameters search-params}]
+                                      [kw {}]))))
+                           interactions)
+         conditional-keys (cond-> []
+                            (contains? interaction-map :update) (conj :conditional-update)
+                            (contains? interaction-map :delete) (conj :conditional-delete)
+                            (contains? interaction-map :patch)  (conj :conditional-patch))
+         handlers        (select-keys default-handlers (into (keys interaction-map) conditional-keys))
+         operations      (get resource-operations resource-type {})]
+     (mu/update-properties cap-compiled
+                           into
+                           {:fhir/interactions    interaction-map
+                            :fhir/handlers        handlers
+                            :fhir/operations      operations
+                            :fhir/search-registry search-registry
+                            :xtdb/collection      resource-type
+                            :fhir/cap-schema      cap-compiled}))))
 
 (defn- resolve-sym
   "requiring-resolve a fully qualified symbol, throwing if not found."
@@ -107,20 +147,36 @@
   (or (requiring-resolve sym)
       (throw (ex-info "Could not resolve schema var" {:sym sym}))))
 
+(defn- sibling-registry-var
+  "Return the value of a `registry` Var in the same namespace as `schema-sym`,
+   or nil if there isn't one. Capability namespaces emit a sibling
+   `registry` Var with the composite registry needed to compile a `:multi`
+   built from the data map's branches."
+  [schema-sym]
+  (when-let [v (some-> (resolve (symbol (namespace schema-sym) "registry"))
+                       deref)]
+    v))
+
 (defn resolve-schema
   "Resolve a single schema spec into a server-ready capability schema.
    A spec is either:
-   - a fully qualified symbol naming a Var holding a compiled malli capability
-     schema (e.g. `us-core.capability.v8-0-1.Patient/full-sch`); OR
-   - a map `{:schema <fq-sym> :interactions [..]}` where :interactions, when
-     provided, is merged into the schema's properties before conversion."
+   - a fully qualified symbol naming a Var holding either the new
+     capability data map (e.g. `us-core.capability.v8-0-1.Patient/capability`
+     (named `capability`) or a pre-compiled malli `:multi` schema
+     (legacy/base-resource Vars); OR
+   - a map `{:schema <fq-sym> :interactions [..]}` where :interactions,
+     when provided, override the schema-declared interactions before
+     conversion."
   [spec]
   (let [{:keys [schema interactions]} (if (map? spec) spec {:schema spec})
-        compiled @(resolve-sym schema)
-        compiled (if interactions
-                   (mu/update-properties compiled into {:interactions interactions})
-                   compiled)]
-    (capability-schema->server-schema compiled)))
+        resolved @(resolve-sym schema)
+        registry (when (cap-data? resolved) (sibling-registry-var schema))
+        resolved (if interactions
+                   (if (cap-data? resolved)
+                     (assoc resolved :interactions interactions)
+                     (mu/update-properties resolved into {:interactions interactions}))
+                   resolved)]
+    (capability-schema->server-schema resolved registry)))
 
 (defn resolve-schemas
   "Resolve a collection of schema specs (see [[resolve-schema]]) into the
