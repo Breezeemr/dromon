@@ -12,6 +12,7 @@
    of backends present on the classpath."
   (:require [server.core :as fhir-server]
             [server.logging :as logging]
+            [clojure.edn :as edn]
             [integrant.core :as ig]
             [fhir-terminology.tx-proxy]
             [fhir-terminology.cache]
@@ -22,13 +23,24 @@
 ;; Config selection
 ;; ---------------------------------------------------------------------------
 
+(defn- env-node-config
+  "Optional XTDB node-config overlay parsed from the XTDB_NODE_CONFIG env var
+   (an EDN map, e.g. `{:indexer {:flush-duration \"PT1H\"} :compactor {:threads 1}}`).
+   Merged into the active store preset's node config so config variants can be
+   swept without code changes. Returns {} when unset, reproducing XTDB defaults.
+   Only keys XTDB recognizes take effect; unknown keys are logged and ignored."
+  []
+  (if-let [s (System/getenv "XTDB_NODE_CONFIG")]
+    (edn/read-string s)
+    {}))
+
 (def ^:private store-presets
   "Map of store-name -> integrant config fragment that constructs an
    IFHIRStore under the key `:test-server/store`. Each fragment is
    merged into the system config; the namespaces it references are
    loaded lazily via `require` in `load-store-ns!` before init."
   {:xtdb2 {:requires '[fhir-store-xtdb2.core]
-           :extra    {:fhir-store/xtdb2-node  {}
+           :extra    {:fhir-store/xtdb2-node  (env-node-config)
                       :fhir-store/xtdb2-store {:node             (ig/ref :fhir-store/xtdb2-node)
                                                :resource/schemas (ig/ref :fhir/schemas)}}
            :store-ref (ig/ref :fhir-store/xtdb2-store)}
@@ -41,8 +53,9 @@
    :xtdb2-disk {:requires '[fhir-store-xtdb2.core]
                 :extra    {:fhir-store/xtdb2-node
                            (let [base (or (System/getenv "XTDB_DATA_DIR") "xtdb-data")]
-                             {:log     [:local {:path (str base "/log")}]
-                              :storage [:local {:path (str base "/storage")}]})
+                             (merge {:log     [:local {:path (str base "/log")}]
+                                     :storage [:local {:path (str base "/storage")}]}
+                                    (env-node-config)))
                            :fhir-store/xtdb2-store {:node             (ig/ref :fhir-store/xtdb2-node)
                                                     :resource/schemas (ig/ref :fhir/schemas)}}
                 :store-ref (ig/ref :fhir-store/xtdb2-store)}
