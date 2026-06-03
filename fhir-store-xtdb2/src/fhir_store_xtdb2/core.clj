@@ -1,6 +1,7 @@
 (ns fhir-store-xtdb2.core
   (:require [xtdb.api :as xt]
             [xtdb.node :as xtn]
+            [next.jdbc :as jdbc]
             [clojure.string :as str]
             [clojure.set :as set]
             [clojure.walk :as walk]
@@ -11,7 +12,8 @@
             [fhir-store.protocol :as fp :refer [IFHIRStore]]
             [fhir-store-xtdb2.datetime :as dt]
             [fhir-store-xtdb2.transform :as xf])
-  (:import [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime LocalTime Year YearMonth]))
+  (:import [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime LocalTime Year YearMonth]
+           [com.zaxxer.hikari HikariConfig HikariDataSource]))
 
 (defn- method-order
   "Returns sort key for FHIR transaction entry processing order per §3.1.0.11.2:
@@ -651,9 +653,37 @@
       (when (seq clauses)
         (str " ORDER BY " (str/join ", " clauses))))))
 
-(defn- get-or-create-node
-  "Returns the XTDB node for the given tenant-id, creating one if it doesn't exist.
-   Uses compare-and-set semantics via swap! to handle concurrent creation safely."
+(def ^:private default-pool-opts
+  "Defaults for the per-tenant HikariCP connection pool. xt/q and xt/execute-tx
+   open a fresh pgwire JDBC connection per call when handed the node; reusing
+   pooled connections eliminates that per-request session churn. A bounded pool
+   caps concurrent pgwire sessions while virtual threads cheaply park on borrow.
+   min-idle is modest (the win is connection reuse up to max-size, not pre-warming);
+   raise it per deployment if first-request cold-open latency matters."
+  {:max-size 24 :min-idle 4 :connection-timeout-ms 10000})
+
+(defn- make-pool
+  "Builds a HikariCP pool over the XTDB node (which is a javax.sql.DataSource)."
+  ^HikariDataSource [^javax.sql.DataSource node tenant-id pool-opts]
+  (let [{:keys [max-size min-idle connection-timeout-ms]} (merge default-pool-opts pool-opts)
+        cfg (doto (HikariConfig.)
+              (.setDataSource node)
+              (.setMaximumPoolSize (int max-size))
+              (.setMinimumIdle (int min-idle))
+              (.setConnectionTimeout (long connection-timeout-ms))
+              (.setPoolName (str "xtdb-" tenant-id)))]
+    (HikariDataSource. cfg)))
+
+(defn- close-entry!
+  "Closes a tenant entry's pool then its node, swallowing errors."
+  [{:keys [node pool]}]
+  (when pool (try (.close ^HikariDataSource pool) (catch Throwable _ nil)))
+  (when node (try (.close ^java.lang.AutoCloseable node) (catch Throwable _ nil))))
+
+(defn- get-or-create-entry
+  "Returns {:node node :pool HikariDataSource} for the tenant, creating both if
+   absent. compare-and-set via swap! handles concurrent creation; the loser of a
+   race closes the pool+node it created and uses the winner's entry."
   [store tenant-id]
   (let [nodes (:nodes store)
         tid (str tenant-id)]
@@ -661,18 +691,24 @@
         (t/trace!
          {:id :store/node.start
           :data {:tenant-id tid}}
-         (let [new-node (xtn/start-node (:node-config store))]
-           ;; swap! may race - if another thread already added this tenant,
-           ;; we close the node we just created and use the existing one.
-           (let [existing (get (swap! nodes (fn [m]
-                                              (if (contains? m tid)
-                                                m
-                                                (assoc m tid new-node))))
-                               tid)]
-             (if (identical? existing new-node)
-               new-node
-               (do (.close new-node)
-                   existing))))))))
+         (let [new-node (xtn/start-node (:node-config store))
+               new-pool (make-pool new-node tid (:pool-opts store))
+               new-entry {:node new-node :pool new-pool}
+               existing (get (swap! nodes (fn [m]
+                                            (if (contains? m tid)
+                                              m
+                                              (assoc m tid new-entry))))
+                             tid)]
+           (if (identical? existing new-entry)
+             new-entry
+             (do (close-entry! new-entry)
+                 existing)))))))
+
+(defn- get-or-create-node
+  "Back-compat accessor returning just the node, for callers that don't borrow a
+   pooled connection (tenant lifecycle, valueset stubs, XTQL pathway)."
+  [store tenant-id]
+  (:node (get-or-create-entry store tenant-id)))
 
 (defn- persistent-backend?
   "True when the node-config targets persistent storage (i.e. has a
@@ -910,35 +946,38 @@
         results (into [] (xt/q node (into [query] where-params)))]
     (mapv #(xtdb->fhir % read-decoders) results)))
 
-(defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode]
+(defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode pool-opts]
   IFHIRStore
 
   (create-resource [this tenant-id resource-type id resource]
     (t/trace!
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)]
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
          :xtql (create-xtql node resource-type id resource storage-encoders)
-         (create-sql  node resource-type id resource storage-encoders)))))
+         (with-open [conn (jdbc/get-connection pool)]
+           (create-sql conn resource-type id resource storage-encoders))))))
 
   (read-resource [this tenant-id resource-type id]
     (t/trace!
      {:id :store/read
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)]
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
          :xtql (read-xtql node resource-type id read-decoders)
-         (read-sql node resource-type id read-decoders)))))
+         (with-open [conn (jdbc/get-connection pool)]
+           (read-sql conn resource-type id read-decoders))))))
 
   (vread-resource [this tenant-id resource-type id vid]
     (t/trace!
      {:id :store/vread
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id :vid vid}}
-     (let [node (get-or-create-node this tenant-id)]
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
          :xtql (vread-xtql node resource-type id vid read-decoders)
-         (vread-sql node resource-type id vid read-decoders)))))
+         (with-open [conn (jdbc/get-connection pool)]
+           (vread-sql conn resource-type id vid read-decoders))))))
 
   (update-resource [this tenant-id resource-type id resource]
     (fp/update-resource this tenant-id resource-type id resource nil))
@@ -947,10 +986,11 @@
     (t/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)]
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
          :xtql (update-xtql node resource-type id resource opts storage-encoders)
-         (update-sql  node resource-type id resource opts storage-encoders)))))
+         (with-open [conn (jdbc/get-connection pool)]
+           (update-sql conn resource-type id resource opts storage-encoders))))))
 
   (delete-resource [this tenant-id resource-type id]
     (fp/delete-resource this tenant-id resource-type id nil))
@@ -959,32 +999,36 @@
     (t/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)]
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
          :xtql (delete-xtql node resource-type id opts)
-         (delete-sql  node resource-type id opts)))))
+         (with-open [conn (jdbc/get-connection pool)]
+           (delete-sql conn resource-type id opts))))))
 
   (resource-deleted? [this tenant-id resource-type id]
     ;; A resource is "deleted" if it has history (existed in the past) but no current row
     (t/trace!
      {:id :store/resource-deleted?
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)]
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
          :xtql (deleted?-xtql node resource-type id)
-         (deleted?-sql node resource-type id)))))
+         (with-open [conn (jdbc/get-connection pool)]
+           (deleted?-sql conn resource-type id))))))
 
   (search [this tenant-id resource-type params search-registry]
     (t/trace!
      {:id :store/search
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [node (get-or-create-node this tenant-id)
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)
            args (prepare-search-args params search-registry)
+           ;; node-based thunk: only used as the XTQL pathway's SQL fallback.
            sql-thunk #(search-sql node resource-type args read-decoders)]
        (try
          (case query-mode
            :xtql (search-xtql node resource-type args read-decoders sql-thunk)
-           (sql-thunk))
+           (with-open [conn (jdbc/get-connection pool)]
+             (search-sql conn resource-type args read-decoders)))
          (catch Exception e
            ;; Search failures should never yield HTTP 500. Per FHIR spec, unsupported
            ;; or broken search params return empty results. Common causes: table/column
@@ -1000,13 +1044,15 @@
     (t/trace!
      {:id :store/count
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [node (get-or-create-node this tenant-id)
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)
            args (prepare-search-args params search-registry)
+           ;; node-based thunk: only used as the XTQL pathway's SQL fallback.
            sql-thunk #(count-sql node resource-type args)]
       (try
         (case query-mode
           :xtql (count-resources-xtql node resource-type args sql-thunk)
-          (sql-thunk))
+          (with-open [conn (jdbc/get-connection pool)]
+            (count-sql conn resource-type args)))
         (catch Exception e
           (t/event! ::count-query-failed
                     {:level :warn
@@ -1019,19 +1065,21 @@
     (t/trace!
      {:id :store/history
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [node (get-or-create-node this tenant-id)]
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
          :xtql (history-xtql node resource-type id read-decoders)
-         (history-sql node resource-type id read-decoders)))))
+         (with-open [conn (jdbc/get-connection pool)]
+           (history-sql conn resource-type id read-decoders))))))
 
   (history-type [this tenant-id resource-type params]
     (t/trace!
      {:id :store/history-type
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [node (get-or-create-node this tenant-id)]
+     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
          :xtql (history-type-xtql node resource-type params read-decoders)
-         (history-type-sql node resource-type params read-decoders)))))
+         (with-open [conn (jdbc/get-connection pool)]
+           (history-type-sql conn resource-type params read-decoders))))))
 
   (transact-transaction [this tenant-id entries]
     ;; Pre-compute entry metadata (method, resource-type, id) for use in both
@@ -1040,7 +1088,9 @@
     (t/trace!
      {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
-    (let [node (get-or-create-node this tenant-id)
+    (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+     (with-open [conn (jdbc/get-connection pool)]
+      (let [node conn
           entry-metas
           (t/trace!
            {:id :store/transact-transaction.build-tx
@@ -1190,7 +1240,7 @@
                                                 last-mod-str (assoc :lastModified last-mod-str)
                                                 (= method "POST") (assoc :location (str "/" tenant-id "/fhir/" resource-type "/" id "/_history/" vid)))}
                              resource (assoc :resource resource))))
-                       entry-results)})))))
+                       entry-results)})))))))
 
   (transact-bundle [this tenant-id entries]
     ;; Batch semantics: each entry is processed independently via the
@@ -1323,8 +1373,7 @@
 
          (some? existing)
          (do
-           (try (.close ^java.lang.AutoCloseable existing)
-                (catch Throwable _ nil))
+           (close-entry! existing)
            (swap! (:nodes this) dissoc tid)
            (when (and close? (persistent-backend? (:node-config this)))
              (delete-tenant-storage! this tid))
@@ -1381,14 +1430,17 @@
    - :node-config       — XTDB node configuration (default: {} for in-memory)
    - :query-mode        — pathway for reads and writes. :sql (default) uses
      dynamic SQL + INSERT/DELETE. :xtql uses XTQL reads and put-docs/delete-docs
-     writes, with [:sql ASSERT ...] retained for optimistic concurrency."
-  [{:keys [resource/schemas node-config query-mode]
-    :or {node-config {} schemas [] query-mode :sql}}]
+     writes, with [:sql ASSERT ...] retained for optimistic concurrency.
+   - :pool-opts         — per-tenant HikariCP connection-pool overrides
+     (:max-size, :min-idle, :connection-timeout-ms); see default-pool-opts."
+  [{:keys [resource/schemas node-config query-mode pool-opts]
+    :or {node-config {} schemas [] query-mode :sql pool-opts {}}}]
   (assert (contains? #{:sql :xtql} query-mode)
           (str "query-mode must be :sql or :xtql, got " query-mode))
   (let [storage-encoders (xf/build-storage-encoders schemas)
         read-decoders    (xf/build-read-decoders schemas)
-        store (->XTDBStore (atom {}) node-config storage-encoders read-decoders query-mode)]
+        store (->XTDBStore (atom {}) node-config storage-encoders read-decoders query-mode
+                           (or pool-opts {}))]
     (assoc store :operations {:valueset-expand xtdb-valueset-expand
                               :valueset-lookup xtdb-valueset-lookup})))
 
@@ -1401,22 +1453,23 @@
   ;; No-op: nodes are managed by the store now
   nil)
 
-(defmethod ig/init-key :fhir-store/xtdb2-store [_ {:keys [node resource/schemas query-mode]}]
+(defmethod ig/init-key :fhir-store/xtdb2-store [_ {:keys [node resource/schemas query-mode pool-opts]}]
   (println "Starting XTDB2 FHIR Store (per-tenant node isolation)"
            (str "[query-mode=" (or query-mode :sql) "]"))
   (create-xtdb-store {:resource/schemas schemas
                       :node-config node
-                      :query-mode (or query-mode :sql)}))
+                      :query-mode (or query-mode :sql)
+                      :pool-opts pool-opts}))
 
 (defmethod ig/halt-key! :fhir-store/xtdb2-store [_ store]
-  (println "Stopping XTDB2 FHIR Store - closing all tenant nodes")
+  (println "Stopping XTDB2 FHIR Store - closing all tenant pools + nodes")
   (when-let [nodes (:nodes store)]
-    (doseq [[tenant-id node] @nodes]
-      (println (str "  Closing node for tenant: " tenant-id))
+    (doseq [[tenant-id entry] @nodes]
+      (println (str "  Closing pool + node for tenant: " tenant-id))
       (try
-        (.close node)
+        (close-entry! entry)
         (catch Exception e
-          (println (str "  Warning: error closing node for tenant " tenant-id ": " (.getMessage e))))))
+          (println (str "  Warning: error closing tenant " tenant-id ": " (.getMessage e))))))
     (reset! nodes {})))
 
 ;; Load the optional XTQL pathway. query-xtql requires this ns, so we can't

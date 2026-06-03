@@ -135,6 +135,6 @@
         (println (format "- %s: %d" reason n)))
       (println "(none)"))
     (println)
-    (doseq [[_ node] @(:nodes sql)]  (.close node))
-    (doseq [[_ node] @(:nodes xtql)] (.close node))
+    (doseq [[_ {:keys [node pool]}] @(:nodes sql)]  (when pool (.close pool)) (.close node))
+    (doseq [[_ {:keys [node pool]}] @(:nodes xtql)] (when pool (.close pool)) (.close node))
     (shutdown-agents)))

@@ -7,7 +7,8 @@
             [fhir-store.protocol :as db]))
 
 (defn- close-store-nodes! [store]
-  (doseq [[_ node] @(:nodes store)]
+  (doseq [[_ {:keys [node pool]}] @(:nodes store)]
+    (when pool (.close pool))
     (.close node))
   (reset! (:nodes store) {}))
 

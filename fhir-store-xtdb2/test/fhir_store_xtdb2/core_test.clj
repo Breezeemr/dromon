@@ -7,9 +7,10 @@
             [fhir-store.protocol :as db]))
 
 (defn- close-store-nodes!
-  "Closes all tenant nodes in a store's nodes atom."
+  "Closes all tenant pools + nodes in a store's nodes atom."
   [store]
-  (doseq [[_ node] @(:nodes store)]
+  (doseq [[_ {:keys [node pool]}] @(:nodes store)]
+    (when pool (.close pool))
     (.close node))
   (reset! (:nodes store) {}))
 
