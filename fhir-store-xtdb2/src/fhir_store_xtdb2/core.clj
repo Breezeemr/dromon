@@ -116,10 +116,11 @@
   (let [ids (distinct ids)]
     (if (empty? ids)
       {}
-      (let [placeholders (str/join ", " (repeat (count ids) "?"))
-            query (format "SELECT _id, fhir_version FROM %s WHERE _id IN (%s)"
-                          (name resource-type) placeholders)
-            rows (xt/q node (into [query] ids))]
+      ;; = ANY(?) with a single array param keeps the SQL text stable regardless
+      ;; of id count, so it hits XTDB's plan cache instead of recompiling per size.
+      (let [query (format "SELECT _id, fhir_version FROM %s WHERE _id = ANY(?)"
+                          (name resource-type))
+            rows (xt/q node [query (vec ids)])]
         (into {}
               (keep (fn [row]
                       (let [rid (or (:xt/id row) (:_id row) (get row "_id"))
@@ -144,10 +145,9 @@
   (let [ids (distinct ids)]
     (if (empty? ids)
       {}
-      (let [placeholders (str/join ", " (repeat (count ids) "?"))
-            query (format "SELECT * FROM %s WHERE _id IN (%s)"
-                          (name resource-type) placeholders)
-            rows (xt/q node (into [query] ids))]
+      (let [query (format "SELECT * FROM %s WHERE _id = ANY(?)"
+                          (name resource-type))
+            rows (xt/q node [query (vec ids)])]
         (into {}
               (keep (fn [row]
                       (let [res (xtdb->fhir row read-decoders)]
@@ -807,11 +807,13 @@
 
 (defn- search-sql
   [node resource-type {:keys [filter-params sort-specs search-registry limit offset]} read-decoders]
+  ;; LIMIT/OFFSET are bound as params (not inlined) so the SQL text is stable
+  ;; across pages — repeated searches of a given shape hit XTDB's plan cache.
   (let [order-by (build-order-by-clause sort-specs search-registry)]
     (if (empty? filter-params)
-      (let [query (format "SELECT * FROM %s%s LIMIT %d OFFSET %d"
-                          (name resource-type) (or order-by "") limit offset)]
-        (mapv #(xtdb->fhir % read-decoders) (xt/q node query)))
+      (let [query (format "SELECT * FROM %s%s LIMIT ? OFFSET ?"
+                          (name resource-type) (or order-by ""))]
+        (mapv #(xtdb->fhir % read-decoders) (xt/q node [query limit offset])))
       (let [cols (keys filter-params)
             conditions (map (fn [k]
                               (build-condition k (get filter-params k)
@@ -819,9 +821,9 @@
                             cols)
             where-clause (str/join " AND " (map first conditions))
             all-params (into [] (mapcat second) conditions)
-            query (format "SELECT * FROM %s WHERE %s%s LIMIT %d OFFSET %d"
-                          (name resource-type) where-clause (or order-by "") limit offset)]
-        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [query] all-params)))))))
+            query (format "SELECT * FROM %s WHERE %s%s LIMIT ? OFFSET ?"
+                          (name resource-type) where-clause (or order-by ""))]
+        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [query] (conj all-params limit offset))))))))
 
 (defn- count-sql
   [node resource-type {:keys [filter-params search-registry]}]
@@ -941,9 +943,9 @@
           since [" WHERE _system_from > TIMESTAMP ?" [since]]
           at    [" WHERE _system_from <= TIMESTAMP ?" [at]]
           :else ["" []])
-        query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT %d"
-                      (name resource-type) where-clause limit)
-        results (into [] (xt/q node (into [query] where-params)))]
+        query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT ?"
+                      (name resource-type) where-clause)
+        results (into [] (xt/q node (into [query] (conj where-params limit))))]
     (mapv #(xtdb->fhir % read-decoders) results)))
 
 (defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode pool-opts]
