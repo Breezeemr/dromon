@@ -22,14 +22,21 @@
 ;;  instant         | OffsetDateTime   | TIMESTAMP WITH TIMEZONE   | ✓
 ;;  instant         | Instant          | TIMESTAMP WITH TIMEZONE   | ✓
 ;;  time            | LocalTime        | TIME                      | ✓
-;;  dateTime        | Year             | —                         | ✗
-;;  dateTime        | YearMonth        | —                         | ✗
+;;  date/dateTime   | Year             | string ("1993")           | ✓ (value only)
+;;  date/dateTime   | YearMonth        | string ("1993-07")        | ✓ (value only)
 ;; ---------------------------------------------------------------------------
 
 (defn fhir->xtdb
   "Convert a FHIR date/time value to its XTDB-compatible type.
    Returns the value unchanged if already a supported type.
-   Throws ex-info for types XTDB cannot represent (Year, YearMonth)."
+
+   Partial-precision FHIR dates (Year, YearMonth) have no XTDB DATE/TIMESTAMP
+   equivalent, so they are stored in their canonical FHIR string form (\"1993\",
+   \"1993-07\"). The malli read-decoder (which runs the precision-aware
+   fhir-json-transformer) parses them back to Year/YearMonth, so the value
+   round-trips losslessly; only native date-range search on those rows is
+   unavailable (FHIR partial-date search bounds are handled separately, see
+   parse-search-date)."
   [value]
   (condp instance? value
     ;; Supported types — pass through unchanged to XTDB
@@ -44,20 +51,9 @@
     ;; LocalDateTime has no timezone — promote to UTC offset for XTDB TIMESTAMP WITH TIMEZONE
     LocalDateTime   (.atOffset ^LocalDateTime value java.time.ZoneOffset/UTC)
 
-    ;; Unsupported partial-precision types
-    Year            (throw (ex-info (str "FHIR dateTime with year-only precision is not supported by XTDB. "
-                                        "Value: " value)
-                                   {:type :fhir-store-xtdb2/unsupported-datetime
-                                    :fhir-primitive "dateTime"
-                                    :java-type "Year"
-                                    :value (str value)}))
-
-    YearMonth       (throw (ex-info (str "FHIR dateTime with year-month precision is not supported by XTDB. "
-                                        "Value: " value)
-                                   {:type :fhir-store-xtdb2/unsupported-datetime
-                                    :fhir-primitive "dateTime"
-                                    :java-type "YearMonth"
-                                    :value (str value)}))
+    ;; Partial precision — store the canonical FHIR string; read-decode restores it
+    Year            (str value)
+    YearMonth       (str value)
 
     ;; Non-temporal values (strings, numbers, maps, etc.) — pass through
     value))
@@ -138,11 +134,9 @@
       (instance? YearMonth value)))
 
 (defn validate-temporal
-  "Validates that a FHIR temporal value can be stored in XTDB.
-   Returns the value if valid, throws if unsupported (Year, YearMonth)."
+  "Returns the value; all FHIR temporal precisions are storable (partial-precision
+   Year/YearMonth are stored as canonical FHIR strings, see fhir->xtdb)."
   [value]
-  (when (fhir-temporal? value)
-    (fhir->xtdb value))
   value)
 
 ;; ---------------------------------------------------------------------------

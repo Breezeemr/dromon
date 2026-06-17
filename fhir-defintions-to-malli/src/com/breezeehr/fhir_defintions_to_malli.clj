@@ -262,7 +262,10 @@
 (def fhir-primitives
   {"string"       [:string {:fhir/primitive "string"}]
    "markdown"     [:string {:fhir/primitive "markdown"}]
-   "date"         [:time/local-date {:fhir/primitive "date"}]
+   ;; FHIR date/dateTime allow partial precision (YYYY, YYYY-MM). The :or branches
+   ;; are ordered shortest-precision-first so decode resolves year -> year-month ->
+   ;; date (-> dateTime), preserving the original precision as Year/YearMonth/etc.
+   "date"         [:or {:fhir/primitive "date"} :time/year :time/year-month :time/local-date]
    "url"          [:string {:fhir/primitive "url"}]
    "integer"      [:int {:fhir/primitive "integer"}]
    "base64Binary" [:string {:fhir/primitive "base64Binary"}]
@@ -276,7 +279,7 @@
    "oid"          [:string {:fhir/primitive "oid"}]
    "boolean"      [:boolean {:fhir/primitive "boolean"}]
    "time"         [:time/local-time {:fhir/primitive "time"}]
-   "dateTime"     [:or {:fhir/primitive "dateTime"} :time/offset-date-time :time/local-date :time/instant]
+   "dateTime"     [:or {:fhir/primitive "dateTime"} :time/year :time/year-month :time/local-date :time/offset-date-time :time/instant]
    "uri"          [:string {:fhir/primitive "uri"}]
    "decimal"      [:decimal {:fhir/primitive "decimal"}]
    "positiveInt"  [:int {:fhir/primitive "positiveInt" :min 1}]})
