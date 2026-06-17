@@ -4,7 +4,22 @@
             [malli.experimental.time :as met]
             [malli.util :as mu]
             [com.breezeehr.malli-decimal :as md]
-            #?@(:cljs [[goog.object]])))
+            #?@(:cljs [[goog.object]
+                       ["@js-joda/core" :as js-joda]]))
+  #?(:clj (:import (java.time Year YearMonth))))
+
+#?(:cljs (def ^:private Year (.-Year js-joda)))
+#?(:cljs (def ^:private YearMonth (.-YearMonth js-joda)))
+
+(def precision-time-schemas
+  "Partial-precision FHIR temporal schemas not provided by malli's time module:
+   :time/year (gYear, e.g. \"1993\") and :time/year-month (gYearMonth, \"1993-07\").
+   FHIR date/dateTime allow these partial precisions; they decode to
+   java.time.Year / YearMonth so the precision survives (see fhir-json-transform)."
+  {:time/year       (m/-simple-schema {:type :time/year
+                                       :pred #(instance? Year %)})
+   :time/year-month (m/-simple-schema {:type :time/year-month
+                                       :pred #(instance? YearMonth %)})})
 
 
 
@@ -106,6 +121,7 @@
                     (m/default-schemas)
                     (mu/schemas)
                     (met/schemas)
+                    precision-time-schemas
                     md/decimal-schemas
                     lazy-ref))
 

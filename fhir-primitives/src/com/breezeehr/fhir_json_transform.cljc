@@ -15,7 +15,41 @@
      (m/encode schema clj-value  (fhir-json-transformer))"
   (:require [malli.core :as m]
             [malli.transform :as mt]
-            [malli.experimental.time.transform :as mett]))
+            [malli.experimental.time.transform :as mett]
+            #?@(:cljs [["@js-joda/core" :as js-joda]]))
+  #?(:clj (:import (java.time Year YearMonth))))
+
+#?(:cljs (def ^:private Year (.-Year js-joda)))
+#?(:cljs (def ^:private YearMonth (.-YearMonth js-joda)))
+
+;; ---------------------------------------------------------------------------
+;; Partial-precision temporal decode/encode (gYear / gYearMonth)
+;; ---------------------------------------------------------------------------
+
+(defn- safe-parse
+  "String -> temporal via f; returns the input unchanged on parse failure so a
+   malli :or branch falls through to the next precision (mirrors malli's -safe)."
+  [f]
+  (fn [x]
+    (if (string? x)
+      (try (f x) (catch #?(:clj Exception :cljs :default) _ x))
+      x)))
+
+(def ^:private year-decoder       (safe-parse #(Year/parse %)))
+(def ^:private year-month-decoder (safe-parse #(YearMonth/parse %)))
+
+(defn- precision-time-transformer
+  "Adds decoders/encoders for the partial-precision FHIR temporal schemas
+   :time/year and :time/year-month, which malli's time module does not provide.
+   Composed alongside mett/time-transformer so an :or of date precisions resolves
+   year -> year-month -> date -> dateTime."
+  []
+  (mt/transformer
+    {:name     :time-precision
+     :decoders {:time/year       year-decoder
+                :time/year-month year-month-decoder}
+     :encoders {:time/year       str
+                :time/year-month str}}))
 
 ;; ---------------------------------------------------------------------------
 ;; Shared helpers
@@ -134,6 +168,7 @@
   (mt/transformer
     (mt/json-transformer)
     (mett/time-transformer)
+    (precision-time-transformer)
     {:name :fhir-extensions
      :decoders {:map {:compile fhir-extension-decoder}}
      :encoders {:map {:compile fhir-extension-encoder}}}))
