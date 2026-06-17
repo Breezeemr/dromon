@@ -14,7 +14,17 @@
  ;; Arrow stack and the Datomic peer at the same time (matches how the inferno
  ;; perf comparison sequences them).
  {:xtdb
-  {:extra-deps {fhir-store/xtdb2 {:local/root "../fhir-store-xtdb2"}}
+  ;; Pin the netty family to 4.1.x. xtdb-core 2.2.0-beta1 pulls netty 4.2.9,
+  ;; but Arrow 19's netty allocator is incompatible with netty 4.2
+  ;; (io.netty.buffer.EmptyByteBuf/memoryAddress throws), which crashes the
+  ;; xtdb2 store at init. 4.1.132 keeps Arrow's allocator working.
+  {:extra-deps {fhir-store/xtdb2 {:local/root "../fhir-store-xtdb2"}
+                io.netty/netty-buffer    {:mvn/version "4.1.132.Final"}
+                io.netty/netty-common    {:mvn/version "4.1.132.Final"}
+                io.netty/netty-handler   {:mvn/version "4.1.132.Final"}
+                io.netty/netty-transport {:mvn/version "4.1.132.Final"}
+                io.netty/netty-resolver  {:mvn/version "4.1.132.Final"}
+                io.netty/netty-codec     {:mvn/version "4.1.132.Final"}}
    :jvm-opts ["-Xmx28g"
               "--add-opens=java.base/java.nio=ALL-UNNAMED"
               "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"

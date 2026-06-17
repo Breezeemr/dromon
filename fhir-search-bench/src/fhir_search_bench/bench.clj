@@ -219,13 +219,13 @@
     (db/create-tenant store tenant {:if-exists :replace})
     (db/warmup-tenant store tenant)
     (log "Loading" total "resources across" (count bundles) "bundle(s)"
-         (if (= backend :datomic)
-           (str "(async, concurrency " concurrency ")")
-           (str "(pooled, concurrency " concurrency ")"))
+         (str "(pooled, concurrency " concurrency ")")
          "...")
-    (let [load-stats (if (= backend :datomic)
-                       (load-dataset-async!  store bundles total max-tx concurrency)
-                       (load-dataset-pooled! store bundles total max-tx concurrency))
+    ;; Both backends load via the pooled (synchronous transact-transaction)
+    ;; path. The datomic async loader referenced a transact-load-async entry
+    ;; point the store no longer exposes; the load mechanism does not affect
+    ;; query latency, so pooled keeps the before/after comparison valid.
+    (let [load-stats (load-dataset-pooled! store bundles total max-tx concurrency)
           _ (log "Loaded" (:loaded load-stats) "/" total
                  "in" (format "%.1f" (:elapsed-ms load-stats)) "ms"
                  (str "(" (:res-per-sec load-stats) " res/s)"))
