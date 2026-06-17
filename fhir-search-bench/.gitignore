@@ -1,0 +1,7 @@
+# Synthea distribution jar and generated output (large, regenerable).
+/synthea-with-dependencies.jar
+/synthea-output/
+# Per-backend on-disk store data and bench results.
+/data/
+/target/
+.cpcache/

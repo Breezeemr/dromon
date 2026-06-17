@@ -1,0 +1,25 @@
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+        ;; Brings in fhir-server (server.core, search-registry) transitively and
+        ;; the canonical uscore8 schema spec vector (test-server.schemas.uscore8).
+        test-server/test-server {:local/root "../test-server"}
+        ;; The generated Malli schema packages the capability specs resolve to.
+        com.breezeehr/fhir-malli-uscore8 {:local/root "../fhir/malli/uscore8"}
+        com.breezeehr/fhir-malli-r4b     {:local/root "../fhir/malli/r4b"}
+        metosin/jsonista {:mvn/version "0.3.14"}}
+
+ :aliases
+ ;; The two backends are mutually exclusive on the classpath. Run the bench once
+ ;; per backend with the matching alias so a single JVM never loads both the XTDB
+ ;; Arrow stack and the Datomic peer at the same time (matches how the inferno
+ ;; perf comparison sequences them).
+ {:xtdb
+  {:extra-deps {fhir-store/xtdb2 {:local/root "../fhir-store-xtdb2"}}
+   :jvm-opts ["-Xmx28g"
+              "--add-opens=java.base/java.nio=ALL-UNNAMED"
+              "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
+              "--enable-preview"]}
+
+  :datomic
+  {:extra-deps {fhir-store/datomic {:local/root "../../fhir-store-datomic"}}
+   :jvm-opts ["-Xmx28g"]}}}

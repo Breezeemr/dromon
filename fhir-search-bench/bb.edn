@@ -1,0 +1,27 @@
+{:tasks
+ {:requires ([babashka.process :as p])
+
+  synthea
+  {:doc "Download Synthea (once) and generate the synthetic dataset. Pass :population N to change size."
+   :task (apply shell "clojure" "-X" "fhir-search-bench.synthea/generate" *command-line-args*)}
+
+  transactor
+  {:doc "Start the local Datomic dev transactor (needed for the datomic backend). Runs in the foreground; Ctrl-C to stop."
+   :task (shell {:dir "../../local-datomic/datomic-pro"}
+                "bin/transactor" "config/samples/dev-transactor-template.properties")}
+
+  bench-xtdb
+  {:doc "Run the benchmark against the xtdb2 backend."
+   :task (apply shell {:extra-env {"JAVA_HOME" "/usr/lib/jvm/java-21-openjdk-amd64"}}
+                "clojure" "-X:xtdb" "fhir-search-bench.bench/run" ":backend" ":xtdb2"
+                *command-line-args*)}
+
+  bench-datomic
+  {:doc "Run the benchmark against the datomic backend (transactor must be running)."
+   :task (apply shell {:extra-env {"JAVA_HOME" "/usr/lib/jvm/java-21-openjdk-amd64"}}
+                "clojure" "-X:datomic" "fhir-search-bench.bench/run" ":backend" ":datomic"
+                *command-line-args*)}
+
+  report
+  {:doc "Aggregate both per-backend results into target/REPORT.md."
+   :task (shell "clojure" "-X" "fhir-search-bench.bench/report")}}}
