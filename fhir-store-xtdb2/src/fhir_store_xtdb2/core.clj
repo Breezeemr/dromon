@@ -366,6 +366,68 @@
       ;; eq/default: skip period matching to avoid false positives with Inferno
       nil)))
 
+(defn- parse-quantity-value
+  "Parses a FHIR quantity search value into {:prefix p :value BigDecimal
+   :system s :code c}. Format: [prefix]number[|system|code], e.g. \"ge50\" or
+   \"5.4|http://unitsofmeasure.org|mg\". The prefix set matches the date
+   prefixes. Returns :value nil when the numeric part cannot be parsed."
+  [value-str]
+  (let [[prefix rest-str] (parse-date-prefix value-str)
+        parts (str/split rest-str #"\|" -1)
+        number (first parts)
+        system (when (>= (count parts) 2) (nth parts 1))
+        code (when (>= (count parts) 3) (nth parts 2))]
+    {:prefix prefix
+     :value (try (BigDecimal. (str/trim number)) (catch Exception _ nil))
+     :system (when (and system (not (str/blank? system))) system)
+     :code (when (and code (not (str/blank? code))) code)}))
+
+(defn- build-quantity-col-condition
+  "Builds a parameterized SQL condition for a single quantity-type column.
+   Returns [sql-fragment params-vector] or nil. Compares the nested Quantity
+   .value numerically with the FHIR prefix (eq/ne/gt/lt/ge/le/sa/eb/ap; ap is
+   +/-10%); an optional |system|code constrains the unit. Columns without a
+   numeric value (e.g. valueSampledData) still emit a .value comparison, which
+   simply matches nothing for those rows."
+  [col value-str]
+  (let [col-name (:col col)
+        {:keys [prefix value system code]} (parse-quantity-value value-str)]
+    (when value
+      (let [val-expr (format "(\"%s\").\"value\"" col-name)
+            sys-expr (format "(\"%s\").\"system\"" col-name)
+            code-expr (format "(\"%s\").\"code\"" col-name)
+            value-cond (case prefix
+                         "eq" [(format "%s = ?" val-expr) [value]]
+                         "ne" [(format "%s <> ?" val-expr) [value]]
+                         ("gt" "sa") [(format "%s > ?" val-expr) [value]]
+                         "ge" [(format "%s >= ?" val-expr) [value]]
+                         ("lt" "eb") [(format "%s < ?" val-expr) [value]]
+                         "le" [(format "%s <= ?" val-expr) [value]]
+                         "ap" [(format "(%s >= ? AND %s <= ?)" val-expr val-expr)
+                               [(.multiply value 0.9M) (.multiply value 1.1M)]]
+                         [(format "%s = ?" val-expr) [value]])
+            conds (cond-> [value-cond]
+                    system (conj [(format "%s = ?" sys-expr) [system]])
+                    code   (conj [(format "%s = ?" code-expr) [code]]))]
+        (if (= 1 (count conds))
+          (first conds)
+          [(str "(" (str/join " AND " (map first conds)) ")")
+           (into [] (mapcat second) conds)])))))
+
+(defn- build-quantity-condition
+  "Builds a parameterized SQL condition for a quantity search parameter across
+   its columns (OR), using the raw value string (the number is the first
+   pipe-segment, so this must run before the token-style system|code split).
+   Returns [sql-fragment params-vector] or nil."
+  [search-param value-str]
+  (let [col-conds (keep #(build-quantity-col-condition % value-str)
+                        (:columns search-param))]
+    (when (seq col-conds)
+      (if (= 1 (count col-conds))
+        (first col-conds)
+        [(str "(" (str/join " OR " (map first col-conds)) ")")
+         (into [] (mapcat second) col-conds)]))))
+
 (defn- build-date-col-condition
   "Builds parameterized SQL for a single date-type column.
    Returns [sql-fragment params-vector] or nil."
@@ -578,6 +640,13 @@
           ;; Special case: _id is always direct equality
           (= pname "_id")
           ["_id = ?" [v-str]]
+
+          ;; Quantity: the number is the first pipe-segment (number|system|code),
+          ;; so parse from the raw single value rather than the token-style
+          ;; system|code split above.
+          (and search-param (= "quantity" (:type search-param)))
+          (or (build-quantity-condition search-param param-str)
+              [(format "\"%s\" = ?" pname) [v-str]])
 
           ;; Use registry metadata when available
           search-param
