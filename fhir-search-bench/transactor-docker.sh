@@ -13,7 +13,7 @@ set -uo pipefail
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATOMIC_DIR="$BENCH_DIR/../../local-datomic/datomic-pro"
-IMAGE="${DATOMIC_TRANSACTOR_IMAGE:-localhost/datomic-fhir-transactor:hasch-1.0.7556}"
+IMAGE="${DATOMIC_TRANSACTOR_IMAGE:-localhost/datomic-fhir-transactor:hasch-1.0.7622}"
 CMD="${CONTAINER_CMD:-podman}"
 NAME="fhir-bench-transactor"
 DATA_DIR="$DATOMIC_DIR/data-fhir-bench"
