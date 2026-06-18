@@ -12,8 +12,9 @@
 
      clojure -X fhir-search-bench.bench/report
 
-   The datomic run needs the local Datomic transactor listening on 4334; the
-   xtdb run writes its on-disk node under data/xtdb2/."
+   The datomic run needs the dockerized Datomic transactor listening on 4337
+   (started by run-datomic.sh / `bb transactor`); the xtdb run writes its on-disk
+   node under data/xtdb2/."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
@@ -56,7 +57,7 @@
     (let [create (requiring-resolve 'fhir-store-datomic.core/create-datomic-store)]
       (create {:resource/schemas @schema/schemas
                :storage          :dev
-               :base-uri         "datomic:dev://localhost:4334"
+               :base-uri         "datomic:dev://localhost:4337"
                :db-prefix        "fhirbench"
                :close-on-halt?   false}))))
 
