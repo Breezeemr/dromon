@@ -226,6 +226,63 @@
         (finally
           (close-store-nodes! store))))))
 
+(deftest test-search-value-quantity
+  (testing "value-quantity applies the FHIR prefix numerically against the
+            nested Quantity .value, with an optional |system|code unit filter."
+    (let [obs-schema (m/schema [:map {:resourceType "Observation"}
+                                [:resourceType :string]
+                                [:status :string]
+                                [:code [:map
+                                        [:coding [:sequential
+                                                  [:map
+                                                   [:system :string]
+                                                   [:code :string]]]]]]
+                                [:valueQuantity [:map
+                                                 [:value :double]
+                                                 [:unit :string]
+                                                 [:system :string]
+                                                 [:code :string]]]])
+          store (core-db/create-xtdb-store {:resource/schemas [obs-schema]})
+          tenant "probe-vq"
+          reg {"code" {:type "token" :target nil
+                       :columns [{:col "code" :fhir-type "CodeableConcept" :array? false}]}
+               "value-quantity" {:type "quantity" :target nil
+                                 :columns [{:col "valueQuantity" :fhir-type "Quantity" :array? false}]}}
+          mk (fn [id code v]
+               (db/create-resource store tenant :Observation id
+                 {:resourceType "Observation" :status "final"
+                  :code {:coding [{:system "http://loinc.org" :code code}]}
+                  :valueQuantity {:value v :unit "kg"
+                                  :system "http://unitsofmeasure.org" :code "kg"}}))
+          ids (fn [params] (set (map :id (db/search store tenant :Observation params reg))))]
+      (try
+        (mk "w30" "29463-7" 30.0)
+        (mk "w50" "29463-7" 50.0)
+        (mk "w72" "29463-7" 72.5)
+        (mk "w90" "29463-7" 90.0)
+        (mk "h60" "8302-2"  60.0)
+        (testing "ge is inclusive across codes"
+          (is (= #{"w50" "w72" "w90" "h60"} (ids {"value-quantity" "ge50"}))))
+        (testing "gt is exclusive"
+          (is (= #{"w72" "w90" "h60"} (ids {"value-quantity" "gt50"}))))
+        (testing "le is inclusive"
+          (is (= #{"w30" "w50"} (ids {"value-quantity" "le50"}))))
+        (testing "no prefix means equality"
+          (is (= #{"w72"} (ids {"value-quantity" "72.5"}))))
+        (testing "ap matches within +/-10%"
+          (is (= #{"w72"} (ids {"value-quantity" "ap72.5"}))))
+        (testing "code token + value-quantity AND together"
+          (is (= #{"w50" "w72" "w90"} (ids {"code" "29463-7" "value-quantity" "ge50"}))))
+        (testing "matching |system|code unit keeps the result"
+          (is (= #{"w50" "w72" "w90"}
+                 (ids {"code" "29463-7"
+                       "value-quantity" "ge50|http://unitsofmeasure.org|kg"}))))
+        (testing "a non-matching unit code excludes everything"
+          (is (= #{} (ids {"code" "29463-7"
+                           "value-quantity" "ge50|http://unitsofmeasure.org|g"}))))
+        (finally
+          (close-store-nodes! store))))))
+
 (deftest test-transact-bundle-batch
   (testing "Batch bundle: per-entry success/failure, no rollback between entries"
     (let [store (core-db/create-xtdb-store {})
