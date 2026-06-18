@@ -162,18 +162,34 @@
 
 ;; ── Search ──────────────────────────────────────────────────────────────────
 
+(def ^:private page-cap
+  "Page projection captured per query for cross-backend comparison. Bounds the
+   edn size: full-set queries return tens of thousands of resources, but only
+   the first page is worth comparing (and the limited variants return <= 50)."
+  50)
+
 (defn- time-search
-  "Run a single search, returning [elapsed-ns hit-count]."
+  "Run a single search, returning [elapsed-ns result-vector]."
   [store rtype params registry]
   (let [t0  (now-ns)
         res (db/search store tenant rtype params registry)
         el  (- (now-ns) t0)]
-    [el (count res)]))
+    [el res]))
+
+;; The dataset is loaded by POST, so each store assigns its own server-local
+;; ids -- result ids are NOT comparable across backends. The sort key
+;; (Observation.effectiveDateTime) IS stable, so the bench captures the page's
+;; date sequence: for a -date sort both backends must return the same dates in
+;; the same order (the specific resources within an equal-date tie can differ,
+;; since the id tiebreak runs over store-local ids).
+(defn- page-dates [res]
+  (mapv :effectiveDateTime (take page-cap res)))
 
 (defn- bench-query
   "Warm up then time a query several times; report the median latency, the
-   matched-resource throughput, and the hit count."
-  [store {:keys [id desc tier params]}]
+   matched-resource throughput, the hit count, and the first page's
+   effectiveDateTime sequence (for cross-backend ordering comparison)."
+  [store {:keys [id desc tier params limited? sorted?]}]
   (let [rtype    :Observation
         registry (schema/registry-for "Observation")
         warmups  2
@@ -181,11 +197,16 @@
     (dotimes [_ warmups] (time-search store rtype params registry))
     (let [samples (vec (repeatedly iters #(time-search store rtype params registry)))
           times   (sort (map first samples))
-          hits    (second (first samples))
+          res0    (second (first samples))
+          hits    (count res0)
+          dates   (page-dates res0)
           median  (nth times (quot iters 2))
           secs    (/ median 1e9)]
       {:id id :desc desc :tier tier
+       :limited?    (boolean limited?)
+       :sorted?     (boolean sorted?)
        :hits        hits
+       :page-dates  dates
        :median-ms   (->ms median)
        :min-ms      (->ms (first times))
        :max-ms      (->ms (last times))
@@ -260,6 +281,21 @@
 (defn- fmt-ms [x] (if x (format "%.2f" (double x)) "—"))
 (defn- fmt-int [x] (if x (str x) "—"))
 
+(defn- result-match
+  "Compares one query's result across backends. Hit counts must match for every
+   query. For sorted variants the page is ordered by effectiveDateTime, so both
+   backends must return the same date sequence (ids are store-local POST
+   assignments and intentionally not compared). Limit-only (unsorted) pages are
+   an arbitrary slice, so only the hit count is asserted. Returns a short label."
+  [qx qd]
+  (cond
+    (not (and qx qd))            "—"
+    (not= (:hits qx) (:hits qd)) (format "HITS DIFFER %d/%d" (:hits qx) (:hits qd))
+    (:sorted? (or qx qd))        (if (= (:page-dates qx) (:page-dates qd))
+                                   "page order match" "PAGE ORDER DIFF")
+    (:limited? (or qx qd))       "page size match"
+    :else                        "hits match"))
+
 (defn report
   "Aggregate target/bench-xtdb2.edn and target/bench-datomic.edn into a side-by-side
    comparison, printed and written to target/REPORT.md."
@@ -305,8 +341,8 @@
       (emit "")
       (emit "## Search latency (median of 5 runs, ms) and hit counts")
       (emit "")
-      (emit "| query | tier | hits | xtdb2 ms | datomic ms | faster |")
-      (emit "|---|---|---:|---:|---:|---|")
+      (emit "| query | tier | hits | xtdb2 ms | datomic ms | faster | result match |")
+      (emit "|---|---|---:|---:|---:|---|---|")
       (doseq [id ids]
         (let [qx (get xq id) qd (get dq id)
               desc (:desc (or qx qd))
@@ -314,9 +350,10 @@
               mx (:median-ms qx) md (:median-ms qd)
               faster (cond (and mx md) (if (< mx md) "xtdb2" "datomic")
                            mx "xtdb2" md "datomic" :else "—")]
-          (emit (format "| %s | %s | %s | %s | %s | %s |"
+          (emit (format "| %s | %s | %s | %s | %s | %s | %s |"
                         desc (name (:tier (or qx qd)))
-                        (fmt-int hits) (fmt-ms mx) (fmt-ms md) faster))))
+                        (fmt-int hits) (fmt-ms mx) (fmt-ms md) faster
+                        (result-match qx qd)))))
       (emit "")
       (emit "_Note: both stores return `[]` for unsupported search params, so a")
       (emit "0-hit extended query may mean \"unsupported\" rather than \"no matches\"._")
@@ -339,7 +376,19 @@
                         (* 100.0 (/ (Math/abs (- lx ld)) (min lx ld)))))
           (emit (format "- **Search**: xtdb2 faster on %d/%d core queries, datomic on %d/%d."
                         x-wins (count core) d-wins (count core)))
-          (emit "- Conformance of hit counts across backends: identical on every query.")))
+          (let [matches   (map #(result-match (get xq %) (get dq %)) ids)
+                bad       (remove #{"hits match" "page size match" "page order match"} matches)
+                sorted-ok (every? #(= "page order match" %)
+                                  (keep (fn [id]
+                                          (let [q (or (get xq id) (get dq id))]
+                                            (when (:sorted? q) (result-match (get xq id) (get dq id)))))
+                                        ids))]
+            (emit (format "- **Conformance**: %s (%d/%d queries)%s."
+                          (if (empty? bad) "hit counts agree on every query" "MISMATCHES present (see result match column)")
+                          (- (count ids) (count bad)) (count ids)
+                          (if sorted-ok
+                            "; every sorted page returns the same effectiveDateTime ordering (ids are store-local POST assignments and not compared)"
+                            "; some sorted pages differ in date order"))))))
       (let [report-str (str lines)]
         (.mkdirs (io/file "target"))
         (spit "target/REPORT.md" report-str)

@@ -9,11 +9,30 @@
    - category + date        Observation?category=<...>&date=<year>
    - code + value-quantity  Observation?code=<loinc>&value-quantity=<op><n>
 
+   Each base query also gets two more realistic variants:
+   - `*-top50`        the same filter with `_count=50` (a single result page),
+                      exercising the limit/pagination path.
+   - `*-top50-date`   `_count=50` plus `_sort=-date,_id` (most recent first, id
+                      as a deterministic tiebreak), exercising the sort path. The
+                      total order makes the returned page identical across
+                      backends, so the bench can compare result pages, not just
+                      hit counts.
+
    LOINC codes are the common Synthea vitals/labs so a 10k-resource dataset still
-   produces non-empty hit sets. `_count` is set high so the store materializes
-   the whole match set, which is what Blaze measures.")
+   produces non-empty hit sets. The base queries set `_count` high so the store
+   materializes the whole match set, which is what Blaze measures.")
 
 (def ^:private all "100000")
+
+;; The page size for the realistic limited/sorted variants. A FHIR client almost
+;; always pages results; 50 matches the stores' own default `_count`.
+(def ^:private page "50")
+
+;; Most-recent-first, with id as a deterministic tiebreak so the returned page is
+;; a total order and therefore identical across backends (Synthea emits many
+;; observations sharing an effective date, so -date alone would leave the page
+;; boundary ambiguous).
+(def ^:private page-sort "-date,_id")
 
 ;; LOINC codes Synthea emits as top-level Observation.code. Blood pressure is a
 ;; panel (85354-9) whose systolic/diastolic are nested components, so we search
@@ -30,11 +49,8 @@
    :hemoglobin    "718-7"
    :leukocytes    "6690-2"})
 
-(def queries
-  "Ordered vector of query specs. `:params` is the FHIR search param map passed
-   straight to the store's `search`/`count-resources`. `:tier` distinguishes the
-   queries that every backend should support (:core) from the ones that lean on
-   richer search-param handling (:extended) and may legitimately be unsupported."
+(def ^:private base-queries
+  "The full-result-set query families (Blaze methodology)."
   (let [c (fn [k] (get loinc k))]
     [{:id :single-code-weight   :tier :core
       :desc "code=29463-7 (Body weight)"
@@ -63,3 +79,36 @@
      {:id :code-and-value       :tier :extended
       :desc "code=29463-7&value-quantity=ge50"
       :params {:code (c :body-weight) :value-quantity "ge50" :_count all}}]))
+
+(defn- with-id-suffix [q suffix]
+  (update q :id #(keyword (str (name %) suffix))))
+
+(defn- limited
+  "A `_count=50` page of the same filter (limit path, no ordering guarantee)."
+  [q]
+  (-> q
+      (with-id-suffix "-top50")
+      (update :desc str " [top 50]")
+      (assoc :limited? true)
+      (assoc-in [:params :_count] page)))
+
+(defn- limited-sorted
+  "A `_count=50` page ordered by -date,_id (limit + sort path). The total order
+   makes the page deterministic and therefore comparable across backends."
+  [q]
+  (-> q
+      (with-id-suffix "-top50-date")
+      (update :desc str " [top 50 by -date]")
+      (assoc :limited? true :sorted? true)
+      (update :params merge {:_count page :_sort page-sort})))
+
+(def queries
+  "Ordered vector of query specs. `:params` is the FHIR search param map passed
+   straight to the store's `search`/`count-resources`. `:tier` distinguishes the
+   queries that every backend should support (:core) from the ones that lean on
+   richer search-param handling (:extended) and may legitimately be unsupported.
+   `:limited?`/`:sorted?` flag the realistic pagination variants so the report
+   can compare returned pages, not just hit counts."
+  (into (vec base-queries)
+        (concat (map limited base-queries)
+                (map limited-sorted base-queries))))
