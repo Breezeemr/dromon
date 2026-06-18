@@ -283,6 +283,99 @@
         (finally
           (close-store-nodes! store))))))
 
+(deftest test-search-token-flat-codeableconcept
+  (testing "Token search on top-level Coding/CodeableConcept fields uses the
+            denormalized <field>_tokens array: bare code, system|code, comma-OR,
+            and the category array all match; the tokens column never leaks."
+    (let [obs-schema (m/schema [:map {:resourceType "Observation"}
+                                [:resourceType :string]
+                                [:status :string]
+                                [:category [:sequential
+                                            [:map [:coding [:sequential
+                                                            [:map [:system :string] [:code :string]]]]]]]
+                                [:code [:map [:coding [:sequential
+                                                       [:map [:system :string] [:code :string]]]]]]])
+          store (core-db/create-xtdb-store {:resource/schemas [obs-schema]})
+          tenant "probe-flat-tok"
+          reg {"code" {:type "token" :target nil
+                       :columns [{:col "code" :fhir-type "CodeableConcept" :array? false}]}
+               "category" {:type "token" :target nil
+                           :columns [{:col "category" :fhir-type "CodeableConcept" :array? true}]}}
+          mk (fn [id code]
+               (db/create-resource store tenant :Observation id
+                 {:resourceType "Observation" :status "final"
+                  :category [{:coding [{:system "http://terminology.hl7.org/CodeSystem/observation-category"
+                                        :code "vital-signs"}]}]
+                  :code {:coding [{:system "http://loinc.org" :code code}]}}))
+          ids (fn [params] (set (map :id (db/search store tenant :Observation params reg))))]
+      (try
+        (mk "o1" "29463-7")
+        (mk "o2" "8302-2")
+        (mk "o3" "8867-4")
+        (testing "bare code"
+          (is (= #{"o1"} (ids {"code" "29463-7"}))))
+        (testing "system|code"
+          (is (= #{"o1"} (ids {"code" "http://loinc.org|29463-7"}))))
+        (testing "wrong system excludes"
+          (is (= #{} (ids {"code" "http://snomed.info/sct|29463-7"}))))
+        (testing "comma-OR collapses to one IN"
+          (is (= #{"o1" "o2"} (ids {"code" "29463-7,8302-2"}))))
+        (testing "array CodeableConcept (category)"
+          (is (= #{"o1" "o2" "o3"} (ids {"category" "vital-signs"}))))
+        (testing "code + category AND"
+          (is (= #{"o3"} (ids {"code" "8867-4" "category" "vital-signs"}))))
+        (testing "the denormalized token columns do not leak into results"
+          (let [r (first (db/search store tenant :Observation {"code" "29463-7"} reg))]
+            (is (some? r))
+            (is (empty? (filter #(re-find #"tokens$" (name %)) (keys r)))
+                "no *_tokens / *-tokens key should survive into the resource")
+            (is (= "29463-7" (get-in r [:code :coding 0 :code])))))
+        (finally
+          (close-store-nodes! store))))))
+
+(deftest test-search-sort-limit-two-phase
+  (testing "_sort + _count returns the correctly ordered page of full resources
+            (two-phase: sort a narrow _id projection, then fetch the page)."
+    ;; effectiveDateTime kept as :string here -- ISO-8601 strings sort
+    ;; lexicographically == chronologically, and the two-phase fetch/reorder
+    ;; logic under test is independent of the column's storage type.
+    (let [obs-schema (m/schema [:map {:resourceType "Observation"}
+                                [:resourceType :string]
+                                [:status :string]
+                                [:effectiveDateTime :string]
+                                [:code [:map [:coding [:sequential
+                                                       [:map [:system :string] [:code :string]]]]]]])
+          store (core-db/create-xtdb-store {:resource/schemas [obs-schema]})
+          tenant "probe-sort"
+          reg {"date" {:type "date" :target nil
+                       :columns [{:col "effectiveDateTime" :fhir-type "dateTime" :array? false}]}}
+          mk (fn [id d]
+               (db/create-resource store tenant :Observation id
+                 {:resourceType "Observation" :status "final"
+                  :effectiveDateTime d
+                  :code {:coding [{:system "http://loinc.org" :code "29463-7"}]}}))]
+      (try
+        (mk "a" "2011-01-01T00:00:00Z")
+        (mk "b" "2015-01-01T00:00:00Z")
+        (mk "c" "2013-01-01T00:00:00Z")
+        (mk "d" "2012-01-01T00:00:00Z")
+        (testing "descending date page of 2 returns newest two in order, with full bodies"
+          (let [res (db/search store tenant :Observation {"_sort" "-date,_id" "_count" "2"} reg)]
+            (is (= ["b" "c"] (mapv :id res)))
+            (is (= "2015-01-01T00:00:00Z" (:effectiveDateTime (first res))))
+            (is (= "final" (:status (first res))))
+            (is (= "29463-7" (get-in (first res) [:code :coding 0 :code])))))
+        (testing "ascending date returns oldest first"
+          (is (= ["a" "d" "c" "b"]
+                 (mapv :id (db/search store tenant :Observation {"_sort" "date,_id" "_count" "10"} reg)))))
+        (testing "_skip pages through the sorted set"
+          ;; desc order is b(2015) c(2013) d(2012) a(2011); skip 2 -> [d a]
+          (is (= ["d" "a"]
+                 (mapv :id (db/search store tenant :Observation
+                                      {"_sort" "-date,_id" "_count" "2" "_skip" "2"} reg)))))
+        (finally
+          (close-store-nodes! store))))))
+
 (deftest test-transact-bundle-batch
   (testing "Batch bundle: per-entry success/failure, no rollback between entries"
     (let [store (core-db/create-xtdb-store {})
