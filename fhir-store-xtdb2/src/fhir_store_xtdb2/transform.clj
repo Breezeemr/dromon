@@ -150,6 +150,61 @@
                                             (.toOffsetDateTime ^ZonedDateTime v)
                                             v))})}}}))
 
+;; ---------------------------------------------------------------------------
+;; Denormalized token columns
+;;
+;; Token searches on Coding/CodeableConcept fields (e.g. Observation.code,
+;; Observation.category) otherwise compile to a correlated EXISTS over
+;; UNNEST(field.coding) -- an array of structs. Under ORDER BY (which defeats
+;; LIMIT early-termination) XTDB must evaluate that per row over the whole match
+;; set, which is expensive (a multi-value OR becomes one mark-join per value).
+;; We denormalize each top-level Coding/CodeableConcept field into a flat
+;; `<field>_tokens` text[] of "code" and "system|code" strings so the search
+;; layer can match a scalar array with a single UNNEST ... IN (...) instead.
+;; ---------------------------------------------------------------------------
+
+(defn- coding->tokens
+  "Flat token string(s) for one Coding map (string keys, post-encode): the bare
+   code. Only the bare code is stored -- adding \"system|code\" would double the
+   array and slow the common bare-code search; system-qualified token searches
+   fall back to the struct path (see core/token->needle)."
+  [c]
+  (when (map? c)
+    (when-let [code (get c "code")]
+      [code])))
+
+(defn- value->tokens
+  "Extracts the flat token strings from a top-level field value that is a
+   CodeableConcept, a Coding, or an array of either. Returns nil for any other
+   value (Quantity carries a \"code\" too, but also a \"value\", so it is
+   excluded)."
+  [v]
+  (letfn [(cc->toks [cc] (when (map? cc) (mapcat coding->tokens (get cc "coding"))))
+          (one [x] (cond
+                     (and (map? x) (contains? x "coding"))
+                     (cc->toks x)
+                     (and (map? x) (contains? x "code") (not (contains? x "value")))
+                     (coding->tokens x)
+                     :else nil))]
+    (let [ts (cond
+               (sequential? v) (mapcat one v)
+               (map? v)        (one v)
+               :else           nil)]
+      (when (seq ts) (vec (distinct ts))))))
+
+(defn- add-token-columns
+  "Adds a `<field>_tokens` text[] column for every top-level Coding/
+   CodeableConcept field in the encoded doc, so token search can match a flat
+   scalar array instead of UNNEST-ing an array of structs."
+  [doc]
+  (reduce-kv (fn [acc k v]
+               (if (str/ends-with? (name k) "_tokens")
+                 acc
+                 (if-let [toks (value->tokens v)]
+                   (assoc acc (keyword (str (name k) "_tokens")) toks)
+                   acc)))
+             doc doc))
+
 (defn build-storage-encoders
   "Build per-resource-type encoder functions from schemas.
    Returns a map of resource-type-string → (fn [resource] -> xtdb-doc).
@@ -157,14 +212,15 @@
   [schemas]
   (let [default-xf (xtdb-storage-transformer nil)
         default-encoder (m/encoder :map default-xf)
+        wrap (fn [enc] (fn [resource] (add-token-columns (enc resource))))
         type-encoders (into {}
                             (keep (fn [schema]
                                     (let [rt (:resourceType (m/properties schema))]
                                       (when rt
                                         (let [xf (xtdb-storage-transformer rt)]
-                                          [rt (m/encoder schema xf)])))))
+                                          [rt (wrap (m/encoder schema xf))])))))
                             schemas)]
-    (assoc type-encoders :default default-encoder)))
+    (assoc type-encoders :default (wrap default-encoder))))
 
 (defn build-read-decoders
   "Build per-resource-type decoder functions from schemas.

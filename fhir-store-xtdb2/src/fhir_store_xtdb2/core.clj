@@ -611,7 +611,56 @@
               params (into [] (mapcat second) col-conds)]
           [(str "(" (str/join " OR " sqls) ")") params])))))
 
-(defn- build-condition
+(defn- flat-token-columns
+  "When a token search-param's columns are all top-level (no sub-col)
+   Coding/CodeableConcept fields, returns those columns -- each has a
+   denormalized `<col>_tokens` array (see transform/add-token-columns).
+   Otherwise nil (sub-col, Identifier, or simple-code token searches keep the
+   struct path)."
+  [search-param]
+  (let [cols (:columns search-param)]
+    (when (and (= "token" (:type search-param))
+               (seq cols)
+               (every? (fn [c] (and (#{"CodeableConcept" "Coding"} (:fhir-type c))
+                                    (not (:sub-col c))))
+                       cols))
+      cols)))
+
+(defn- token->needle
+  "Maps one FHIR token value to its flat-array needle (a bare code). The
+   denormalized array stores only bare codes, so any system-qualified value
+   (`system|code` or `system|`) returns nil and the caller falls back to the
+   struct path, which matches system + code precisely."
+  [v]
+  (let [parts (str/split v #"\|" -1)]
+    (if (= 1 (count parts))
+      (first parts)                       ; bare code
+      (let [sys (first parts) code (second parts)]
+        (if (and (str/blank? sys) (seq code))
+          code                            ; |code -> bare
+          nil)))))                        ; system|code / system| -> struct fallback
+
+(defn- build-flat-token-condition
+  "Flat-array token condition: one
+   `EXISTS (SELECT 1 FROM UNNEST(\"<col>_tokens\") AS t(v) WHERE t.v IN (?...))`
+   per column, OR'd across columns; comma-separated values become the IN list.
+   Returns [sql params] or nil if any value is system-only (so the caller falls
+   back to the struct path)."
+  [cols value-str]
+  (let [needles (mapv token->needle (str/split value-str #","))]
+    (when (every? some? needles)
+      (let [ph (str/join "," (repeat (count needles) "?"))
+            per-col (map (fn [c]
+                           [(format "EXISTS (SELECT 1 FROM UNNEST(\"%s_tokens\") AS t(v) WHERE t.v IN (%s))"
+                                    (:col c) ph)
+                            needles])
+                         cols)]
+        (if (= 1 (count per-col))
+          (first per-col)
+          [(str "(" (str/join " OR " (map first per-col)) ")")
+           (vec (mapcat second per-col))])))))
+
+(defn- build-condition-struct
   "Builds a parameterized SQL WHERE condition for a given FHIR search parameter.
    Returns [sql-fragment params-vector].
    Handles comma-separated values as OR (per FHIR spec), and pipe-delimited
@@ -623,7 +672,7 @@
         comma-values (str/split param-str #",")]
     (if (> (count comma-values) 1)
       ;; Multiple comma-separated values: OR them together
-      (let [conditions (map #(build-condition param-name % search-param) comma-values)
+      (let [conditions (map #(build-condition-struct param-name % search-param) comma-values)
             sqls (mapv first conditions)
             params (into [] (mapcat second) conditions)]
         [(str "(" (str/join " OR " sqls) ")") params])
@@ -657,6 +706,26 @@
           ;; No registry entry: fallback to direct column match
           :else
           [(format "\"%s\" = ?" pname) [v-str]])))))
+
+(defn- build-condition
+  "Builds a parameterized SQL WHERE condition for a search parameter. For token
+   searches on top-level Coding/CodeableConcept fields, uses the denormalized
+   `<col>_tokens` array (a single scalar UNNEST ... IN) which is far cheaper than
+   UNNEST-ing an array of structs under ORDER BY; everything else falls through
+   to the struct path."
+  [param-name param-value search-param]
+  (let [param-str (if (keyword? param-value) (name param-value) (str param-value))]
+    (or (when search-param
+          (when-let [cols (flat-token-columns search-param)]
+            ;; The flat array only beats the struct UNNEST when the struct would
+            ;; do extra work: a comma-OR (one mark-join per value) or an array-of
+            ;; -CodeableConcept column (a nested UNNEST). For a single value on a
+            ;; single CodeableConcept the struct equality is already optimal and
+            ;; slightly faster, so keep it.
+            (when (or (str/includes? param-str ",")
+                      (some :array? cols))
+              (build-flat-token-condition cols param-str))))
+        (build-condition-struct param-name param-value search-param))))
 (defn ^:no-doc xtdb->fhir
   "Converts an XTDB query result row back to a FHIR resource map.
    Uses the precompiled malli decoder for the resource type, falling back to the
@@ -673,6 +742,15 @@
                                :xt/system_from :xt/system_to :xt/system-from :xt/system-to
                                :xt/valid_from :xt/valid_to
                                :fhir_source :fhir-source)
+                       ;; Drop the denormalized token search columns so they
+                       ;; never leak into the reconstructed resource. XTDB returns
+                       ;; the `<field>_tokens` columns as kebab-cased keywords
+                       ;; (`:code-tokens`), so match either spelling.
+                       (->> (remove (fn [[k _]]
+                                      (let [n (name k)]
+                                        (or (str/ends-with? n "-tokens")
+                                            (str/ends-with? n "_tokens")))))
+                            (into {}))
                        (set/rename-keys {:resourcetype :resourceType}))
           rt (:resourceType stripped)
           decode-fn (get read-decoders rt (get read-decoders :default))
@@ -874,25 +952,53 @@
      :limit limit
      :offset offset}))
 
+(defn- where+params
+  "Builds the WHERE fragment (without the leading WHERE) and its params for a
+   set of filter params, or [nil []] when there are none."
+  [filter-params search-registry]
+  (if (empty? filter-params)
+    [nil []]
+    (let [conditions (map (fn [k]
+                            (build-condition k (get filter-params k)
+                                             (get search-registry (name k))))
+                          (keys filter-params))]
+      [(str/join " AND " (map first conditions))
+       (into [] (mapcat second) conditions)])))
+
+(defn- row-id [r] (or (:_id r) (:xt/id r) (get r "_id")))
+
+(defn- fetch-by-ids
+  "Fetches full rows for `ids` and returns them as FHIR resources in the same
+   order as `ids` (phase 2 of the two-phase sorted search)."
+  [node resource-type ids read-decoders]
+  (if (empty? ids)
+    []
+    (let [rows (xt/q node [(format "SELECT * FROM %s WHERE _id = ANY(?)" (name resource-type))
+                           (vec ids)])
+          by-id (into {} (map (fn [r] [(row-id r) r])) rows)]
+      (into [] (keep #(some-> (get by-id %) (xtdb->fhir read-decoders))) ids))))
+
 (defn- search-sql
   [node resource-type {:keys [filter-params sort-specs search-registry limit offset]} read-decoders]
   ;; LIMIT/OFFSET are bound as params (not inlined) so the SQL text is stable
   ;; across pages — repeated searches of a given shape hit XTDB's plan cache.
-  (let [order-by (build-order-by-clause sort-specs search-registry)]
-    (if (empty? filter-params)
-      (let [query (format "SELECT * FROM %s%s LIMIT ? OFFSET ?"
-                          (name resource-type) (or order-by ""))]
-        (mapv #(xtdb->fhir % read-decoders) (xt/q node [query limit offset])))
-      (let [cols (keys filter-params)
-            conditions (map (fn [k]
-                              (build-condition k (get filter-params k)
-                                               (get search-registry (name k))))
-                            cols)
-            where-clause (str/join " AND " (map first conditions))
-            all-params (into [] (mapcat second) conditions)
-            query (format "SELECT * FROM %s WHERE %s%s LIMIT ? OFFSET ?"
-                          (name resource-type) where-clause (or order-by ""))]
-        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [query] (conj all-params limit offset))))))))
+  (let [order-by (build-order-by-clause sort-specs search-registry)
+        [where params] (where+params filter-params search-registry)
+        where-sql (if where (str " WHERE " where) "")
+        rt (name resource-type)]
+    (if (seq sort-specs)
+      ;; Two-phase: an ORDER BY defeats LIMIT early-termination, so a single
+      ;; SELECT * would materialize every matched row's full column set just to
+      ;; sort and keep `limit`. Instead sort/limit a narrow _id projection
+      ;; (only the WHERE + sort-key columns are read), then fetch the page's
+      ;; full rows by id and restore the sorted order.
+      (let [id-q (format "SELECT _id FROM %s%s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))
+            ids (mapv row-id (xt/q node (into [id-q] (conj params limit offset))))]
+        (fetch-by-ids node resource-type ids read-decoders))
+      ;; No sort: a single SELECT * with LIMIT streams the first `limit` rows and
+      ;; stops (early-termination), so the wide projection cost is already bounded.
+      (let [q (format "SELECT * FROM %s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))]
+        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [q] (conj params limit offset))))))))
 
 (defn- count-sql
   [node resource-type {:keys [filter-params search-registry]}]
