@@ -25,10 +25,14 @@
                 io.netty/netty-transport {:mvn/version "4.1.132.Final"}
                 io.netty/netty-resolver  {:mvn/version "4.1.132.Final"}
                 io.netty/netty-codec     {:mvn/version "4.1.132.Final"}}
+   ;; Java 24+ (JEP 498) restricts sun.misc.Unsafe memory access, which Arrow's
+   ;; netty allocator needs; `--sun-misc-unsafe-memory-access=allow` re-enables
+   ;; it. The flag is rejected on Java <= 23, so this alias requires Java 24+.
    :jvm-opts ["-Xmx28g"
               "--add-opens=java.base/java.nio=ALL-UNNAMED"
               "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
-              "--enable-preview"]}
+              "--enable-preview"
+              "--sun-misc-unsafe-memory-access=allow"]}
 
   :datomic
   {:extra-deps {fhir-store/datomic {:local/root "../../fhir-store-datomic"}}

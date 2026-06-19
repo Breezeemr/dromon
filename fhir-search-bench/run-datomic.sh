@@ -6,8 +6,8 @@
 # on exit (trap), even if the bench fails or is interrupted.
 set -uo pipefail
 
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-export PATH="$JAVA_HOME/bin:$PATH"
+# Uses the ambient JVM (Java 21+). XTDB/Datomic require Java 21; the xtdb run
+# also needs --sun-misc-unsafe-memory-access=allow on Java 24+ (see :xtdb alias).
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
