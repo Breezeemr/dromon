@@ -299,6 +299,16 @@
 
   (println "\n=== Check complete. Environment looks good! ==="))
 
+(defn- target-java-major
+  "Major version of the `java` the spawned `clojure` server will run on
+   (JAVA_HOME if set, else PATH). Defaults to 21 if it can't be determined."
+  []
+  (let [java-bin (if-let [jh (System/getenv "JAVA_HOME")] (str jh "/bin/java") "java")
+        out (try (str (:err (shell {:out :string :err :string :continue true}
+                                   java-bin "-version")))
+                 (catch Exception _ ""))]
+    (or (some-> (re-find #"version \"(\d+)" out) second parse-long) 21)))
+
 (defn run-check! []
   (println "Starting test run...")
 
@@ -338,7 +348,13 @@
                         (concat heap-flags
                                 ["-J--add-opens=java.base/java.nio=ALL-UNNAMED"
                                  "-J--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
-                                 "-J--enable-preview"]))
+                                 "-J--enable-preview"]
+                                ;; Java 24+ (JEP 498) restricts sun.misc.Unsafe
+                                ;; memory access, which Arrow's netty allocator
+                                ;; (the XTDB node) needs. The flag is rejected on
+                                ;; <= 23, so only add it on 24+.
+                                (when (>= (target-java-major) 24)
+                                  ["-J--sun-misc-unsafe-memory-access=allow"])))
         ;; Append :otel to the alias chain when DROMON_OTEL=1 so the OTel
         ;; SDK + OTLP exporter land on the classpath alongside the :test
         ;; deps that include the xtdb2 store and uscore8 schemas.

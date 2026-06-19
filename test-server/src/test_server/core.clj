@@ -146,19 +146,33 @@
   (some-> (System/getenv k) keyword))
 
 (defn- assert-supported-jvm! []
-  ;; The server depends on java.util.concurrent.StructuredTaskScope$ShutdownOnFailure,
-  ;; which was a JEP-453 preview API present in JDK 21-24 and removed in JDK 25 when
-  ;; structured concurrency was finalized with a different class shape. Running under
-  ;; JDK 25+ produces a ClassNotFoundException a few seconds after Jetty starts, with
-  ;; a confusing trace far from the binding. Fail fast with a clear message instead.
+  ;; XTDB v2 (and this server's virtual-thread usage) require Java 21+ (bytecode
+  ;; major 65). There is no upper bound: XTDB 2.2.x is plain Java-21 bytecode (no
+  ;; preview features) and runs on 21 through 25+.
+  ;;
+  ;; On Java 24+, JEP 498 restricts sun.misc.Unsafe memory access, which Arrow's
+  ;; netty allocator (used by the XTDB node) relies on. Without
+  ;; `--sun-misc-unsafe-memory-access=allow` the node init dies inside
+  ;; org.apache.arrow.memory.netty.DefaultAllocationManagerFactory.<clinit> with
+  ;; a confusing trace far from here, so fail fast with a clear message. The
+  ;; inferno runner adds this flag automatically on Java 24+.
   (let [version-prop (System/getProperty "java.specification.version")
-        major        (try (Integer/parseInt version-prop) (catch Exception _ 0))]
-    (when (>= major 25)
-      (throw (ex-info (str "test-server requires Java 21-24. Detected Java "
-                           version-prop ". JDK 25 removed the preview "
-                           "java.util.concurrent.StructuredTaskScope$ShutdownOnFailure "
-                           "API that this server depends on. Set JAVA_HOME to a JDK 21 "
-                           "install (e.g. /usr/lib/jvm/java-21-openjdk-amd64) and retry.")
+        major        (try (Integer/parseInt version-prop) (catch Exception _ 0))
+        input-args   (.getInputArguments (java.lang.management.ManagementFactory/getRuntimeMXBean))
+        unsafe-flag? (boolean (some #(.contains ^String % "sun-misc-unsafe-memory-access=allow")
+                                    input-args))]
+    (cond
+      (< major 21)
+      (throw (ex-info (str "test-server requires Java 21 or newer. Detected Java "
+                           version-prop ". Set JAVA_HOME to a JDK 21+ install "
+                           "(e.g. /usr/lib/jvm/java-21-openjdk-amd64) and retry.")
+                      {:java-specification-version version-prop}))
+
+      (and (>= major 24) (not unsafe-flag?))
+      (throw (ex-info (str "On Java " version-prop " the XTDB node's Arrow/netty "
+                           "allocator needs JEP-498 Unsafe memory access. Launch with "
+                           "-J--sun-misc-unsafe-memory-access=allow (the inferno runner "
+                           "adds this automatically), or use a JDK 21 install.")
                       {:java-specification-version version-prop})))))
 
 (defn -main [& args]
