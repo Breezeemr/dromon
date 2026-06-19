@@ -11,13 +11,13 @@
 
   bench-xtdb
   {:doc "Run the benchmark against the xtdb2 backend."
-   :task (apply shell {:extra-env {"JAVA_HOME" "/usr/lib/jvm/java-21-openjdk-amd64"}}
+   :task (apply shell
                 "clojure" "-X:xtdb" "fhir-search-bench.bench/run" ":backend" ":xtdb2"
                 *command-line-args*)}
 
   bench-datomic
   {:doc "Run the benchmark against the datomic backend (transactor must be running)."
-   :task (apply shell {:extra-env {"JAVA_HOME" "/usr/lib/jvm/java-21-openjdk-amd64"}}
+   :task (apply shell
                 "clojure" "-X:datomic" "fhir-search-bench.bench/run" ":backend" ":datomic"
                 *command-line-args*)}
 
