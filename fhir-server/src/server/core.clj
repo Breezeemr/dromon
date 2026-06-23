@@ -17,6 +17,7 @@
             [ring.middleware.head :refer [wrap-head]]
             [server.auth :as auth]
             [server.keto :as keto]
+            [server.scope :as scope]
             [integrant.core :as ig])
   (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]))
@@ -208,12 +209,15 @@
     :else nil))
 
 (defn fhir-app
-  [store schemas & {:keys [jwks-url keto-url terminology cors-allowed-origins]}]
+  [store schemas & {:keys [jwks-url keto-url terminology cors-allowed-origins enforce-smart-scopes?]}]
   (let [jwks-url (or jwks-url
                      (System/getenv "JWKS_URL")
                      (when-not (System/getenv "JWT_DEV_SECRET")
                        "http://localhost:4444/.well-known/jwks.json"))
         keto-url (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
+        enforce-smart-scopes? (if (some? enforce-smart-scopes?)
+                                enforce-smart-scopes?
+                                (= "1" (System/getenv "ENFORCE_SMART_SCOPES")))
         cors-origins (parse-cors-origins
                        (or cors-allowed-origins
                            (System/getenv "CORS_ALLOWED_ORIGINS")))
@@ -253,8 +257,9 @@
                          rrc/coerce-exceptions-middleware
                          [wrap-fhir-store store]
                          [wrap-terminology terminology]
-                         [auth/wrap-jwt-auth {:jwks-url jwks-url}]
-                         [keto/wrap-keto-authorization {:keto-url keto-url}]]))}})
+                         [auth/wrap-jwt-auth {:jwks-url jwks-url}]])
+                          enforce-smart-scopes? (conj [scope/wrap-smart-scope {}])
+                          true (conj [keto/wrap-keto-authorization {:keto-url keto-url}]))}})
    (some-fn
     (ring/redirect-trailing-slash-handler {:method :strip})
     (ring/create-default-handler
