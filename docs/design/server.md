@@ -1,30 +1,33 @@
 # Server Architecture
 
 ## Overview
-The core HTTP server will be powered by `info.sunng/ring-jetty9-adapter`. Jetty 9 provides robust asynchronous support, WebSocket capabilities, and high performance, which are beneficial for handling a large volume of FHIR API requests.
+The HTTP server is powered by `info.sunng/ring-jetty9-adapter`. It runs on **virtual threads**,
+so blocking FHIR operations (complex searches, backend queries) do not exhaust a bounded worker
+pool — each request gets its own virtual thread and the handler chain stays plainly synchronous.
 
 ## Server Model
-1. **Ring Adapter**: We'll use the Ring adapter to map HTTP requests to our Clojure handler functions. 
-2. **Asynchronous Handlers**: FHIR operations, especially complex searches and backend database queries, can be time-consuming. We will leverage Jetty 9's async capabilities (via `ring.util.http-response` and core.async/manifold/completable-futures) to avoid blocking threads.
-3. **Component Management**: To manage the lifecycle of the server, database connection pools, and external service clients (like Ory endpoints), we will use a state management library like `mount` or `integrant`.
+1. **Ring Adapter** — the Ring adapter maps HTTP requests to Clojure handler functions.
+2. **Concurrency** — virtual threads (Loom) back the Jetty adapter. The handler chain is
+   synchronous; there is no async/core.async/manifold routing. Blocking store calls are safe
+   because each runs on its own virtual thread.
+3. **Component Management** — **Integrant** manages the lifecycle of the server, per-tenant store
+   connections, and external service clients. `test-server` wires the system from data-driven
+   config (`build-config`), selecting the store backend and schema package via aliases / env
+   vars. Integrant was chosen over Mount for its explicit, data-driven wiring, which suits the
+   multiple-backend / multiple-schema configuration surface.
 
 ## Middleware Stack
-The standard Ring middleware stack will include:
-- Request/Response logging.
-- GZIP compression.
-- Content-type negotiation (`application/fhir+json`).
-- Parsing of multipart forms (if we support binary uploads).
-- Error handling that formats exceptions into FHIR `OperationOutcome` resources.
+In order: telemere trace → `wrap-params` → muuntaja format → fhir-exceptions → fhir-decode →
+store injection → jwt-auth → keto-authz → handler. This covers content-type negotiation
+(`application/fhir+json`), request/response handling, and error formatting into FHIR
+`OperationOutcome` resources.
 
-## Decision Points
-- **Lifecycle Library**: Should we use Integrant or Mount? Integrant is more explicit and declarative (data-driven), while Mount is simpler and relies on namespace state. Given the complexity of multiple backends, auth providers, etc., Integrant might be preferable.
-- **Asynchronous Model**: Do we want to build the entire handling chain asynchronously? If we use Reitit's async routing, we need to ensure all database calls (Datomic, XTDB) are also handled non-blockingly, or wrapped in a dedicated thread pool to avoid exhausting Jetty worker threads.
-- **Observability**: We should include OpenTelemetry or Prometheus metrics collection middleware early on.
+## Observability
+OpenTelemetry instrumentation is shipped and enabled behind `DROMON_OTEL=1` (Telemere's
+OpenTelemetry handler, a Jaeger all-in-one dev container, and span coverage across keto, jwt,
+fhir-decode, store ops, store node start, and bundle entries). Telemere also provides structured
+logging. See `docs/tasks/otel-telemere-instrumentation.md`.
 
-## Alternatives
-- **Aleph / Netty**: Extremely fast and heavily async, but the ecosystem around Jetty 9 via the specified adapter is very stable and well-understood.
-- **Immutant**: Built on Undertow, very solid, but development has slowed compared to the Ring Jetty 9 adapter.
-
-## Additional Questions
-1. Do we need to support HTTP/2 immediately? The Jetty 9 adapter can configure this.
-2. What are our logging requirements (JSON structured logging vs plain text)?
+## Open items
+Remaining open server decisions are tracked in
+[`../open-decisions.md`](../open-decisions.md) (HTTP/2 support).

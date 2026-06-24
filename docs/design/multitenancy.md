@@ -1,46 +1,40 @@
 # Multitenancy Design
 
 ## Overview
-The FHIR server must support a robust multitenancy model to serve multiple isolated client organizations securely within a single deployment.
+The FHIR server serves multiple isolated client organizations securely within a single
+deployment.
 
-## Multitenancy Approaches in FHIR
-There are generally three ways to achieve multitenancy in a FHIR database:
-1. **Siloed (Database per Tenant)**: Physical isolation. Every tenant gets a totally separate XTDB node/cluster or Datomic database.
-   - **Pros**: Highest isolation, simple to wipe a tenant, easy per-tenant backup.
-   - **Cons**: High operational overhead, scaling connection pools becomes complicated, difficult to do cross-tenant analytics if occasionally needed.
-2. **Schema/Namespace per Tenant**: (More applicable to Postgres than generic Datalog stores).
-3. **Row-Level/Attribute Visibility (Logical Isolation)**: A single database where every record/resource is tagged with a `tenant_id`.
-   - **Pros**: Easy to maintain, single unified schema, lower resource usage.
-   - **Cons**: Risk of data leakage if queries miss the tenant filter.
+## Approaches considered
+1. **Siloed (Database per Tenant)** — physical isolation; each tenant gets a separate XTDB
+   node/cluster (or Datomic database). Highest isolation, simple per-tenant wipe/backup, at the
+   cost of operational overhead and harder cross-tenant analytics.
+2. **Schema/Namespace per Tenant** — more applicable to Postgres than generic Datalog stores.
+3. **Row-level / logical isolation** — a single database with a `tenant_id` tag per record;
+   cheaper, but risks leakage if a query misses the tenant filter.
 
-## Proposed Strategy: Siloed (Database per Tenant) + Path-Based Routing
-We have decided to proceed with the **Database per Tenant (Siloed)** approach. Every tenant will get a completely separate database (XTDB node or Datomic DB).
+## Decision: Siloed (Database per Tenant) + Path-Based Routing
+Dromon uses the **Database per Tenant (Siloed)** approach. Every tenant maps to a completely
+separate database (XTDB node), with no sharing.
 
-### API Routing
-To support this, the tenant ID will be extracted from the **URL route**: `/{tenant-id}/Patient`. 
-By prefixing every route with the tenant ID, the API gateway or top-level middleware can immediately identify the tenant context and attach the corresponding database connection to the request map.
+### API routing
+The tenant ID is extracted from the **URL route**: `/:tenant-id/fhir/...`. Top-level middleware
+identifies the tenant from the path and attaches the corresponding store connection to the
+request map, making the target tenant unambiguous.
 
-Route injection (e.g., `/{tenant-id}/...`) makes the target tenant unambiguous and easily routable.
+### Database layer
+The `IFHIRStore` implementation routes connections per tenant; each `tenant-id` maps to an
+independent node / connection pool. **Tenant provisioning is explicit** via the protocol's
+`create-tenant` / `warmup-tenant` / `delete-tenant` lifecycle — the `test-server` seeder calls
+`create-tenant {:if-exists :ignore}` and `warmup-tenant` at boot, shifting cold-start cost out
+of the first request. See `backends.md` and `docs/tasks/fhir-store-tenant-lifecycle-protocol.md`.
 
-### Database Layer
-Our `IFHIRStore` protocol will route connections based on the tenant.
-```clojure
-(defprotocol IFHIRStore
-  (create-resource [this tenant-id resource])
-  (read-resource [this tenant-id resource-type id])
-  ;; ...
-  )
-```
-- **Datomic / XTDB**: Every tenant `tenant-id` will map to a completely distinct and independent database connection pool or node configuration. There is no sharing of databases.
+### Authentication & authorization
+- **Kratos** — tenant membership can be stored in Kratos identity `traits` (design; see
+  `auth.md` for current runtime auth status).
+- **Keto** — tenant-scoped relationships (`User U is a member of Tenant T`) let permissions
+  descend from the tenant namespace.
 
-### Authentication & Authorization
-- **Kratos**: Users can belong to tenants. We can store tenant membership in the Kratos identity `traits`.
-- **Keto**: We establish Keto relationships defining tenant hierarchy: `User U is a member of Tenant T`. All permissions within the FHIR server can then logically descend from this tenant namespace.
-
-## Decision Points Complete
-- **Tenant Extraction**: We use path-based routing (`/:tenant-id/fhir/Patient`)
-- **Database Architecture**: **Database per Tenant (Siloed)** approach is accepted. Every tenant gets a totally separate XTDB node or Datomic database.
-
-## Additional Questions
-1. Does a single practitioner/user need to access multiple tenants simultaneously (e.g., an admin dashboard spanning clinics)? If so, logical isolation is heavily favored over physical isolation.
-2. How should tenant provisioning be handled automatically?
+## Open items
+Remaining open multitenancy decisions are tracked in
+[`../open-decisions.md`](../open-decisions.md) (a single user accessing multiple tenants
+simultaneously; fully-automatic / on-demand tenant provisioning).

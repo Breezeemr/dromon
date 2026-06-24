@@ -23,32 +23,15 @@ filtering was dropped during implementation because
 outer `http/request` span (it is opened by `wrap-telemere-trace` which
 wraps `wrap-otel-context` which wraps the tap).
 
-## Approach
+## Solution (shipped)
 
-Two options, pick based on how invasive you want the fix to be:
-
-### Option A — Move the tap outside the telemere wrapper
-
-Reorder middleware so `wrap-trace-tap` sits outside `wrap-telemere-trace`.
-The tap then knows the trace id of the outer span because by the time
-it serializes, the `http/request` span has ended and its `SpanContext`
-is on the response-path `Context`. Drain the queue, filter by
-`trace-id`, return only spans matching the request's own trace. Trivial
-change if the middleware order allows it — but needs a quick check
-that `wrap-otel-context` still fires early enough for downstream
-middleware and the store to see the active context.
-
-### Option B — Capture the trace id at request start
-
-In the tap middleware, before calling the inner handler, start a short
-sentinel span (`trace-tap/request-root`), record its trace-id, pass the
-handler the request, then on response drain the queue and filter by
-the captured trace-id. The sentinel span can be discarded from the
-serialized output or kept as a diagnostic. This works regardless of
+`wrap-trace-tap` now sits outside `wrap-telemere-trace` and, on entry,
+opens a short sentinel `trace-tap/request-root` span to capture the
+request's trace-id. After the handler returns, the drained queue is
+filtered to spans matching that trace-id, so concurrent `bb trace`
+callers each see only their own span tree. This works regardless of
 middleware order, at the cost of one bookkeeping span per traced
 request.
-
-Option A is simpler; Option B is robust to future middleware shuffles.
 
 ## Testing
 

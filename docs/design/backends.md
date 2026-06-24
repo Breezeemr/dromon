@@ -1,10 +1,17 @@
-# Multiple Backends Design
+# Backends Design
 
 ## Overview
-The FHIR server must support multiple pluggable backends. Our initial targets are **Datomic** and **XTDB (v2)**. Both are Datalog-based, immutable, bitemporal (XTDB) or point-in-time (Datomic) databases, making them highly suitable for FHIR's `_history` and audit requirements.
+FHIR resources are persisted behind a pluggable store abstraction. **XTDB v2 is the primary
+backend** (`fhir-store-xtdb2`); a `fhir-store-mock` atom store backs unit tests. A Datomic
+backend lives in a separate `fhir-store-datomic` repo and is kept only for benchmarking
+(see `fhir-search-bench`), not as a runtime target here. Both candidate engines are immutable
+and bitemporal/point-in-time, which suits FHIR's `_history` and audit requirements.
 
 ## Abstraction Layer
-To support multiple backends, we will define a set of Clojure Protocols or Multimethods that encapsulate database operations.
+Backends implement the `IFHIRStore` protocol (`fhir-store-protocol`), which encapsulates
+create / read / vread / update / delete / search / history plus the transaction and tenant
+lifecycle operations:
+
 ```clojure
 (defprotocol IFHIRStore
   (create-resource [this resource])
@@ -16,31 +23,41 @@ To support multiple backends, we will define a set of Clojure Protocols or Multi
   (history [this resource-type id]))
 ```
 
-## Datomic Backend
-- **Schema**: Datomic requires an explicit schema. We need a strategy for mapping FHIR's extensive model to Datomic attributes.
-- **Querying**: Native Datalog is excellent for traversing graph relationships (like FHIR `Reference` types).
-
 ## XTDB v2 Backend
-- **Schema**: XTDB v2 uses SQL and Datalog. It is schema-on-write but flexible.
-- **Temporal Features**: Built-in system time and valid time make implementing FHIR resource versioning (`_history`) almost native.
+- **Data modeling** — FHIR JSON is natively exploded into discrete SQL columns mapped to its
+  schema counterparts, so every attribute is intrinsically indexed for tabular search, while the
+  original JSON is retained in a `fhir_source` column and full history is preserved without
+  opaque-JSON extraction penalties.
+- **Schema** — XTDB v2 is schema-on-write; tables are created dynamically per resource type.
+- **Temporal features** — built-in system time and valid time make FHIR versioning (`_history`)
+  nearly native.
+- **Query mode** — search is translated to **SQL by default** (`:query-mode :sql` in
+  `fhir-store-xtdb2/core.clj`); an **optional XTQL path** (`query_xtql.clj`,
+  `:query-mode :xtql`) exists and is parity-tested against the SQL path. Both use `:sql` ASSERT
+  ops for optimistic concurrency.
+- **Transaction bundles** — `Bundle` type `transaction` is supported at the store layer via
+  `transact-transaction`.
+
+## Tenant Isolation
+Dromon implements a "Database per Tenant (Siloed)" strategy: each `tenant-id` maps to a distinct
+XTDB node / connection pool, selected by the `/:tenant-id/fhir/` route prefix. Tenant
+provisioning is explicit via the `IFHIRStore` `create-tenant` / `warmup-tenant` /
+`delete-tenant` lifecycle. See `multitenancy.md`.
 
 ## Test Environments
-Testing the different database backends requires specific considerations to ensure correct functionality and avoid environment-related crashes.
-
 ### XTDB v2 Testing
-- **Java NIO Access**: XTDB v2 utilizes Apache Arrow extensively, which requires reflective access to Java NIO on JDK 16+. All test runners and REPLs must supply the JVM argument `--add-opens=java.base/java.nio=ALL-UNNAMED` to prevent `InaccessibleObjectException` crashes (`java.nio.Buffer.address`).
-- **In-Memory Node**: Tests should leverage an in-memory XTDB node to ensure clean state and isolate test data.
+- **Java NIO access** — XTDB v2 uses Apache Arrow, which needs reflective NIO access on
+  JDK 16+. Test runners and REPLs must pass
+  `--add-opens=java.base/java.nio=ALL-UNNAMED` (and the Arrow-specific `--add-opens`) to avoid
+  `InaccessibleObjectException`. JDK 24+ additionally needs
+  `--sun-misc-unsafe-memory-access=allow` (JEP 498). These args are already in `deps.edn`.
+- **In-memory node** — tests use an in-memory XTDB node for clean, isolated state.
 
-### Datomic Testing
-- **In-Memory Database**: For isolated testing, an in-memory database (`datomic:mem://test-realm`) should be used.
-- **Schema Initialization**: Unlike XTDB's flexible schema-on-write, Datomic requires all required attributes to be transacted upfront. Because defining the extensive FHIR schema is heavy, unit tests will likely need to rely on shared test utilities to bootstrap the `datomic:mem://` environment with the requisite schema before making Datalog assertions, or mock the database boundaries altogether if purely testing business logic.
+### Mock Store Testing
+The atom-backed `fhir-store-mock` covers handler/business-logic tests without standing up a
+database boundary.
 
-## Decision Points
-- **Data Modeling**: We store FHIR resources by natively exploding the FHIR JSON into discrete database attributes (columns) mapped directly to their schema counterparts dynamically. This enables `XTDB` to index all attributes intrinsically for lightning-fast tabular searches while retaining full historical snapshots without dealing with opaque JSON extraction penalties.
-- **Tenant Isolation**: Dromon implements a "Database per Tenant (Siloed)" strategy implicitly inside the `IFHIRStore` protocol operations. The routing layer pulls `/:tenant-id/fhir/` to distinguish operations, which can be configured per persistence node later.
-- **Search Parameter Translation**: We will map complex FHIR search modifiers (e.g., `:exact`, `:contains`, chained parameters `Patient?general-practitioner.name=Doe`) to `XTQL` pipeline blocks logically utilizing the natively stored columns.
-
-## Additional Questions
-1. Xtdb v2 will be the "primary" or default for the initial MVP.
-2. We are planning to support full transaction bundles (`Bundle` type `transaction`) out of the box? This needs to be handled at the database layer.
-3. It would be nice to have the abstraction layer support streaming large result sets (e.g., for Bulk Data Export) but this is not a requirement for the initial MVP.
+## Open items
+Remaining open backend decisions are tracked in
+[`../open-decisions.md`](../open-decisions.md) (streaming large result sets / Bulk Data Export;
+the long-term SQL-vs-XTQL direction).

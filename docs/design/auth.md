@@ -1,37 +1,44 @@
 # Authentication and Authorization Design
 
-## Overview
-This FHIR server requires a robust, flexible authentication and authorization model capable of supporting both direct system-to-system integration and SMART on FHIR workflows. We will use the Ory ecosystem:
-- **Ory Kratos**: Identity, user management, and authentication flows.
-- **Ory Keto**: Zanzibar-inspired authorization and access control.
-- **Ory Hydra**: OAuth 2.0 and OpenID Connect (OIDC) provider.
+## Status
+Runtime auth is **JWT verification (RS256/JWKS by default, HS256 for dev) + Ory Keto
+authorization**, with **Ory Hydra** providing OAuth2 tokens and a **SMART configuration
+discovery** endpoint. The **`client_credentials`** (machine-to-machine) flow works end to end
+(exercised by the Inferno suite). The interactive **`authorization_code` login/consent flow is
+not yet built** — there is no consent UI and **Ory Kratos has been removed** from the
+environment (see `docs/tasks/kratos-cipher-secret-config.md`). The advertised `authorization_code`
+grant therefore has no backing login provider today.
 
-## SMART on FHIR Implementation
-SMART on FHIR dictates that the server must expose OIDC and OAuth 2.0 endpoints for authorization and token generation. Hydra will act as the OAuth2 authorization server.
-1. **App Launch**: The EHR or standalone app redirects the user to the authorize endpoint.
-2. **Authentication**: Hydra delegates authentication to the Kratos Login UI.
-3. **Consent**: After login, the user grants specific SMART scopes (e.g., `patient/*.read`, `launch`).
-4. **Token Issuance**: Hydra issues a signed JWT containing the authorized SMART scopes and context (e.g., `patient_id`).
+## Authentication (`server.auth/wrap-jwt-auth`)
+buddy-auth JWS token backend, two modes:
+- **RS256 via JWKS** (default) — keys fetched from `:jwks-url` (default
+  `http://localhost:4444/.well-known/jwks.json`, i.e. Hydra), resolved by `kid`, and **re-fetched
+  on cache miss** to support key rotation. `fhir-app` wires this mode by default.
+- **HS256 static secret** — `JWT_DEV_SECRET`, for dev/test.
 
-## Direct Authentication
-For backend services or administrative access, direct authentication might be necessary. This can be achieved via client credentials grants in Hydra or direct API keys mapping to identities in Kratos.
+A valid token populates `:identity` (subject in `:sub`). Verification is fail-closed: a JWKS
+fetch/parse error yields no key and hence no identity. `wrap-jwt-auth` does not itself reject a
+missing token (the optional `wrap-require-auth` exists but is not in the default chain);
+enforcement is delegated to Keto.
 
-## Authorization (Keto)
-Whenever a request reaches the FHIR server:
-1. The bearer token is validated via Hydra.
-2. The extracted identity and scopes are evaluated.
-3. Fine-grained permissions (e.g., "Can User A read Patient B's Encounter C?") are evaluated using Ory Keto.
+## Authorization (`server.keto/wrap-keto-authorization`)
+Checks Ory Keto `/relation-tuples/check` (namespace `"fhir"`). HTTP method maps to a relation
+(GET→`read`, POST/PUT/PATCH→`write`, DELETE→`delete`). Granularity is **two-tier**: the
+**type-level** object (`Patient`) is checked first, then the **instance-level** object
+(`Patient/123`) as a fallback — so a type-level grant covers all instances of that type. Routes
+marked `:public? true` (SMART discovery, `metadata`) bypass authz. A missing subject or a Keto
+error is **fail-closed** to `403`.
 
-## Decision Points
-- **Login UI/Consent Provider**: Hydra requires a custom UI for login and consent. Should we build this in Clojure/Reagent, or use standard Ory React templates?
-- **Identity Mapping**: How are FHIR `Patient` and `Practitioner` resources linked to Kratos identities? A common pattern is storing the Kratos identity ID as an identifier on the FHIR resource.
-- **Keto Granularity**: Will Keto evaluate permissions at the individual resource level (very granular, huge graph) or at the compartment/patient level?
+## OAuth2 / SMART (Ory Hydra)
+- **Hydra** issues OAuth2 tokens. The dev/Inferno path provisions a Hydra client and obtains a
+  token via the `client_credentials` grant.
+- **SMART discovery** — `/.well-known/smart-configuration` advertises `authorization_endpoint` /
+  `token_endpoint`, grant types (`authorization_code`, `client_credentials`), SMART scopes
+  (`launch`, `launch/patient`, `patient/*.read`, ...), and capabilities including
+  `launch-standalone`. The CapabilityStatement advertises the `SMART-on-FHIR` security service.
 
-## Alternatives
-- **Keycloak**: An all-in-one alternative to the Ory stack. It is heavier but avoids the need to run three separate services (Kratos, Keto, Hydra) and build a custom consent UI.
-- **Auth0 / Okta**: Managed services. Excellent Developer Experience but can be costly and less flexible for self-hosted enterprise deployments.
-
-## Additional Questions
-1. Do we need to support both SMART EHR Launch and Standalone Launch from day one?
-2. How will we manage Keto relational tuples provisioning? Will it happen asynchronously via events when FHIR resources are created/updated?
-3. Should we enforce token-based rate limiting?
+## Open items
+Open auth decisions are tracked in [`../open-decisions.md`](../open-decisions.md): building the
+interactive `authorization_code` login/consent UI, identity↔FHIR `Patient`/`Practitioner`
+mapping, Keto relational-tuple provisioning (e.g. event-driven on resource writes), first-class
+EHR vs standalone SMART launch, and token rate limiting.
