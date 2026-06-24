@@ -5,6 +5,7 @@
             [malli.transform :as mt]
             [clojure.string :as str]
             [com.breezeehr.fhir-json-transform :as fjt]
+            [server.compartment :as compartment]
             [server.json-patch :as json-patch]
             [taoensso.telemere :as t]))
 
@@ -643,74 +644,24 @@
 ;; Compartment search (FHIR R4 §3.3.1)
 ;; ---------------------------------------------------------------------------
 
-(def ^:private compartment-definitions
-  "Maps compartment-type -> target-resource-type -> search parameter name.
-   The search parameter links the target resource back to the compartment owner."
-  {"Patient"
-   {"AllergyIntolerance"  "patient"
-    "CarePlan"            "patient"
-    "CareTeam"            "patient"
-    "Condition"           "patient"
-    "Coverage"            "patient"
-    "Device"              "patient"
-    "DiagnosticReport"    "patient"
-    "DocumentReference"   "patient"
-    "Encounter"           "patient"
-    "Goal"                "patient"
-    "Immunization"        "patient"
-    "MedicationDispense"  "patient"
-    "MedicationRequest"   "patient"
-    "Observation"         "patient"
-    "Procedure"           "patient"
-    "QuestionnaireResponse" "patient"
-    "RelatedPerson"       "patient"
-    "ServiceRequest"      "patient"
-    "Specimen"            "patient"}
-
-   "Practitioner"
-   {"Account"             "subject"
-    "AllergyIntolerance"  "recorder"
-    "CarePlan"            "performer"
-    "CareTeam"            "participant"
-    "Condition"           "asserter"
-    "DiagnosticReport"    "performer"
-    "DocumentReference"   "author"
-    "Encounter"           "practitioner"
-    "Immunization"        "performer"
-    "MedicationRequest"   "requester"
-    "Observation"         "performer"
-    "Procedure"           "performer"
-    "ServiceRequest"      "requester"}
-
-   "Encounter"
-   {"Condition"           "encounter"
-    "DiagnosticReport"    "encounter"
-    "DocumentReference"   "encounter"
-    "MedicationRequest"   "encounter"
-    "Observation"         "encounter"
-    "Procedure"           "encounter"
-    "ServiceRequest"      "encounter"}
-
-   "RelatedPerson"
-   {"AllergyIntolerance"  "asserter"
-    "CarePlan"            "performer"
-    "CareTeam"            "participant"
-    "Encounter"           "participant"
-    "Observation"         "performer"
-    "Procedure"           "performer"}
-
-   "Device"
-   {"DeviceMetric"        "source"
-    "DeviceRequest"       "device"
-    "Observation"         "device"}})
-
-(def valid-compartment-types
-  "Set of resource types that define FHIR compartments."
-  (set (keys compartment-definitions)))
+(defn- compartment-confined-search
+  "Runs a compartment-confined search for `rt`, applying the UNION of the R4B
+   link parameters via server.compartment/confine. Returns the matching
+   resources, or [] when the type is a member with no registered link parameter
+   (fail closed)."
+  [store tenant-id compartment-type compartment-id rt params registry]
+  (let [outcome (compartment/confine compartment-type compartment-id rt params registry)]
+    (cond
+      (= :passthrough outcome) []
+      (= :deny outcome) []
+      :else (let [[_ p r] outcome]
+              (db/search store tenant-id (keyword rt) p r)))))
 
 (defn compartment-search
   "Handler for GET /:tenant-id/fhir/:compartment-type/:compartment-id/:target-type
-   Searches for resources of target-type that belong to the given compartment."
+   Searches for resources of target-type that belong to the given compartment.
+   Membership is the UNION of the link parameters the R4B CompartmentDefinition
+   lists for each type (e.g. Observation via subject OR performer)."
   [req]
   (let [store            (:fhir/store req)
         tenant-id        (-> req :path-params :tenant-id)
@@ -718,7 +669,7 @@
         compartment-id   (-> req :path-params :compartment-id)
         target-type      (-> req :path-params :target-type)
         all-registries   (:fhir/all-registries req)
-        compartment-map  (get compartment-definitions compartment-type)]
+        compartment-map  (get compartment/compartment-definitions compartment-type)]
     (cond
       ;; Unknown compartment type
       (nil? compartment-map)
@@ -733,15 +684,11 @@
       (let [params  (merge (or (:query-params req) {}) (or (:form-params req) {}))
             entries (vec
                       (mapcat
-                        (fn [[rt search-param]]
+                        (fn [[rt _params]]
                           (when-let [registry (get all-registries rt)]
-                            (let [ref-value (str compartment-type "/" compartment-id)
-                                  search-params (assoc params
-                                                       search-param ref-value
-                                                       :_count 50
-                                                       :_skip 0)
-                                  results (db/search store tenant-id (keyword rt)
-                                                     search-params registry)]
+                            (let [results (compartment-confined-search
+                                            store tenant-id compartment-type compartment-id rt
+                                            (assoc params :_count 50 :_skip 0) registry)]
                               (mapv (fn [res]
                                       {:fullUrl  (str "/" tenant-id "/fhir/" rt "/" (:id res))
                                        :resource res
@@ -756,46 +703,41 @@
 
       ;; Specific target resource type
       :else
-      (let [search-param (get compartment-map target-type)]
-        (if (nil? search-param)
-          {:status 400
-           :body {:resourceType "OperationOutcome"
-                  :issue [{:severity "error"
-                           :code "invalid"
-                           :diagnostics (str target-type " is not a member of the "
-                                             compartment-type " compartment")}]}}
-          (let [registry  (get all-registries target-type)
-                params    (merge (or (:query-params req) {}) (or (:form-params req) {}))
-                ref-value (str compartment-type "/" compartment-id)
-                count-param (or (get params :_count) (get params "_count") "50")
-                skip-param  (or (get params :_skip) (get params "_skip") "0")
-                limit (if (string? count-param) (parse-long count-param) count-param)
-                skip  (if (string? skip-param)  (parse-long skip-param)  skip-param)
-                search-params (assoc params
-                                     search-param ref-value
-                                     :_count limit
-                                     :_skip skip)
-                results (if registry
-                          (db/search store tenant-id (keyword target-type)
-                                     search-params registry)
-                          [])
-                base-url (str "/" tenant-id "/fhir/" compartment-type "/" compartment-id "/" target-type)
-                entries (mapv (fn [res]
-                                {:fullUrl  (str "/" tenant-id "/fhir/" target-type "/" (:id res))
-                                 :resource res
-                                 :search   {:mode "match"}})
-                              results)
-                self-link {:relation "self" :url base-url}
-                next-link (when (= (count results) limit)
-                            {:relation "next"
-                             :url (str base-url "?_count=" limit "&_skip=" (+ skip limit))})
-                links (filterv some? [self-link next-link])]
-            {:status 200
-             :body {:resourceType "Bundle"
-                    :type "searchset"
-                    :total (count results)
-                    :link links
-                    :entry entries}}))))))
+      (if (nil? (compartment/compartment-link-params compartment-type target-type))
+        {:status 400
+         :body {:resourceType "OperationOutcome"
+                :issue [{:severity "error"
+                         :code "invalid"
+                         :diagnostics (str target-type " is not a member of the "
+                                           compartment-type " compartment")}]}}
+        (let [registry  (get all-registries target-type)
+              params    (merge (or (:query-params req) {}) (or (:form-params req) {}))
+              count-param (or (get params :_count) (get params "_count") "50")
+              skip-param  (or (get params :_skip) (get params "_skip") "0")
+              limit (if (string? count-param) (parse-long count-param) count-param)
+              skip  (if (string? skip-param)  (parse-long skip-param)  skip-param)
+              results (if registry
+                        (compartment-confined-search
+                          store tenant-id compartment-type compartment-id target-type
+                          (assoc params :_count limit :_skip skip) registry)
+                        [])
+              base-url (str "/" tenant-id "/fhir/" compartment-type "/" compartment-id "/" target-type)
+              entries (mapv (fn [res]
+                              {:fullUrl  (str "/" tenant-id "/fhir/" target-type "/" (:id res))
+                               :resource res
+                               :search   {:mode "match"}})
+                            results)
+              self-link {:relation "self" :url base-url}
+              next-link (when (= (count results) limit)
+                          {:relation "next"
+                           :url (str base-url "?_count=" limit "&_skip=" (+ skip limit))})
+              links (filterv some? [self-link next-link])]
+          {:status 200
+           :body {:resourceType "Bundle"
+                  :type "searchset"
+                  :total (count results)
+                  :link links
+                  :entry entries}})))))
 
 ;; ---------------------------------------------------------------------------
 ;; $validate operation (FHIR R4 §3.1.0.11)

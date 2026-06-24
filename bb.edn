@@ -128,4 +128,9 @@
   trace
   {:doc "Wraps curl with X-Dromon-Trace: 1 and renders the captured span tree on stderr. Body passes through to stdout."
    :requires ([server.trace-cli :as tc])
-   :task (apply tc/-main *command-line-args*)}}}
+   :task (apply tc/-main *command-line-args*)}
+
+  compartment-e2e
+  {:doc "Full-stack patient-compartment integration test against the real local Ory stack (Hydra token hook + Keto). Runs every scenario against both the XTDB2 and Datomic backends (or the stores named as args, e.g. `bb compartment-e2e datomic`). Skips if Docker is unavailable."
+   :requires ([server.compartment-e2e-runner :as e2e])
+   :task (apply e2e/run! *command-line-args*)}}}

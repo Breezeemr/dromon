@@ -78,6 +78,14 @@
   [claim]
   (into [] (keep parse-scope) (scope-claim->seq claim)))
 
+(defn request-scopes
+  "Parse the SMART scopes carried by a request's validated JWT `:identity`.
+   Reads the OAuth2 `scope` claim (a space-delimited string) or the RFC 9068
+   `scp` claim (a JSON array), whichever is present — Ory Hydra issues `scp`."
+  [request]
+  (let [identity (:identity request)]
+    (parse-scopes (or (:scope identity) (:scp identity)))))
+
 (defn permitted?
   "True when `parsed-scopes` grant `interaction` on `fhir-type`.
    A wildcard resource scope (`*`) matches any type."
@@ -142,7 +150,7 @@
           public?    (:public? route-data)]
       (if public?
         (handler request)
-        (let [scopes      (parse-scopes (get-in request [:identity :scope]))
+        (let [scopes      (request-scopes request)
               fhir-type   (request->fhir-type request)
               interaction (request->interaction request)]
           (cond

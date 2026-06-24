@@ -18,6 +18,7 @@
             [server.auth :as auth]
             [server.keto :as keto]
             [server.scope :as scope]
+            [server.compartment :as compartment]
             [integrant.core :as ig])
   (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]))
@@ -232,6 +233,7 @@
     {:conflicts nil
      :data {:coercion fhir-coercion/coercion
             :muuntaja muuntaja-instance
+            :fhir/all-registries (routing/collect-registries schemas)
             :middleware (cond-> []
                           trace-tap-mw (conj trace-tap-mw)
                           true (into [middleware/wrap-telemere-trace
@@ -258,7 +260,8 @@
                          [wrap-fhir-store store]
                          [wrap-terminology terminology]
                          [auth/wrap-jwt-auth {:jwks-url jwks-url}]])
-                          enforce-smart-scopes? (conj [scope/wrap-smart-scope {}])
+                          enforce-smart-scopes? (conj [scope/wrap-smart-scope {}]
+                                                      [compartment/wrap-patient-compartment {}])
                           true (conj [keto/wrap-keto-authorization {:keto-url keto-url}]))}})
    (some-fn
     (ring/redirect-trailing-slash-handler {:method :strip})

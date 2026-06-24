@@ -64,6 +64,27 @@
     (is (= [] (scope/parse-scopes "   ")))))
 
 ;; ---------------------------------------------------------------------------
+;; request-scopes — reads `scope` (string) or `scp` (array, RFC 9068 / Hydra)
+;; ---------------------------------------------------------------------------
+
+(deftest request-scopes-claim-sources
+  (testing "OAuth2 `scope` string claim"
+    (is (= #{"Observation"}
+           (set (map :resource (scope/request-scopes
+                                 {:identity {:scope "patient/Observation.rs openid"}}))))))
+  (testing "RFC 9068 / Hydra `scp` array claim"
+    (is (= #{"Observation" "Patient"}
+           (set (map :resource (scope/request-scopes
+                                 {:identity {:scp ["patient/Observation.rs" "patient/Patient.rs"]}}))))))
+  (testing "`scope` wins when both are present"
+    (is (= ["Condition"]
+           (map :resource (scope/request-scopes
+                            {:identity {:scope "patient/Condition.rs"
+                                        :scp ["patient/Observation.rs"]}})))))
+  (testing "no scope claim yields nothing"
+    (is (= [] (scope/request-scopes {:identity {:sub "u"}})))))
+
+;; ---------------------------------------------------------------------------
 ;; permitted?
 ;; ---------------------------------------------------------------------------
 
