@@ -14,6 +14,8 @@
   ;; --- FHIR store backends ---
   :store/xtdb2 {:extra-deps {fhir-store/xtdb2 {:local/root "../fhir-store-xtdb2"}}}
   :store/mock  {:extra-deps {fhir-store/mock  {:local/root "../fhir-store-mock"}}}
+  ;; fhir-store-datomic lives outside the dromon tree (sibling of dromon/).
+  :store/datomic {:extra-deps {fhir-store/datomic {:local/root "../../fhir-store-datomic"}}}
 
   ;; --- FHIR malli schema packages ---
   :malli/r4b             {:extra-deps {com.breezeehr/fhir-malli-r4b             {:local/root "../fhir/malli/r4b"}}}

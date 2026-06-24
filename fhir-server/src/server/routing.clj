@@ -1,7 +1,23 @@
 (ns server.routing
   (:require [malli.core :as m]
+            [server.compartment :as compartment]
             [server.fhir-coercion :as fc]
             [server.handlers :as handlers]))
+
+(defn collect-registries
+  "Builds a {resourceType -> search-registry} map from the given schemas, so any
+   route (and the compartment middleware) can resolve any type's registry."
+  [schemas]
+  (reduce
+   (fn [acc schema]
+     (let [props (m/properties schema)
+           fhir-type (:resourceType props)
+           search-registry (:fhir/search-registry props)]
+       (if (and fhir-type search-registry)
+         (assoc acc fhir-type search-registry)
+         acc)))
+   {}
+   schemas))
 
 (def ^:private open-responses
   "Response schemas that allow any body shape (for search/history Bundles)."
@@ -106,7 +122,7 @@
                                               :responses res-responses}]))
 
         ;; Compartment search child under /:id (only for compartment-defining types)
-        compartment-handler (when (handlers/valid-compartment-types fhir-type)
+        compartment-handler (when (compartment/valid-compartment-types fhir-type)
                               (let [base-handler (resolve-handler 'server.handlers/compartment-search)]
                                 (fn [req]
                                   (base-handler (assoc req
@@ -186,16 +202,7 @@
   ([schemas] (build-resource-routes schemas nil nil))
   ([schemas decoders encoders]
    (let [;; Collect all search registries first so each route can access any type's registry
-         all-registries (reduce
-                         (fn [acc schema]
-                           (let [props (m/properties schema)
-                                 fhir-type (:resourceType props)
-                                 search-registry (:fhir/search-registry props)]
-                             (if (and fhir-type search-registry)
-                               (assoc acc fhir-type search-registry)
-                               acc)))
-                         {}
-                         schemas)]
+         all-registries (collect-registries schemas)]
      (reduce
       (fn [acc schema]
         (let [props (m/properties schema)
@@ -235,16 +242,7 @@
 
 (defn build-fhir-routes [schemas]
   (let [;; Compute all-registries once for both system and resource routes
-        all-registries (reduce
-                        (fn [acc schema]
-                          (let [props (m/properties schema)
-                                fhir-type (:resourceType props)
-                                search-registry (:fhir/search-registry props)]
-                            (if (and fhir-type search-registry)
-                              (assoc acc fhir-type search-registry)
-                              acc)))
-                        {}
-                        schemas)
+        all-registries (collect-registries schemas)
         ;; Per-resourceType cap-schema decoders & encoders, used for bundle
         ;; entries and recursive :contained handling on read/write routes.
         decoders ((resolve-handler 'server.handlers/build-resource-decoders) schemas)

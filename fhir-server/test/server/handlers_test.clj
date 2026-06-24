@@ -1,6 +1,7 @@
 (ns server.handlers-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [fhir-store.mock.core :as mock]
+            [fhir-store.protocol :as db]
             [server.handlers :as handlers]))
 
 (def ^:private tenant "default")
@@ -216,3 +217,79 @@
       (is (= "history" (get-in resp [:body :type])))
       (is (= 2 (get-in resp [:body :total])))
       (is (= 2 (count (get-in resp [:body :entry])))))))
+
+;; ---------------------------------------------------------------------------
+;; compartment-search (GET /:compartment-type/:id/:target-type)
+;; ---------------------------------------------------------------------------
+
+;; Minimal registries mirroring the R4B Patient-compartment link params:
+;; Observation via subject|performer, Condition via patient (-> subject column).
+(def ^:private compartment-registries
+  {"Observation" {"subject"   {:type "reference" :columns [{:col "subject"}]}
+                  "performer" {:type "reference" :columns [{:col "performer" :array? true}]}}
+   "Condition"   {"patient"   {:type "reference" :columns [{:col "subject"}]}}})
+
+(defn- compartment-store
+  "A store seeded with Observations/Conditions for two patients."
+  []
+  (let [store (make-store)
+        ref   (fn [pid] {:reference (str "Patient/" pid)})]
+    (db/create-resource store tenant :Observation "o1" {:resourceType "Observation" :id "o1" :subject (ref "p1")})
+    (db/create-resource store tenant :Observation "o2" {:resourceType "Observation" :id "o2" :subject (ref "p1")})
+    (db/create-resource store tenant :Observation "o3" {:resourceType "Observation" :id "o3" :subject (ref "p2")})
+    (db/create-resource store tenant :Condition   "c1" {:resourceType "Condition"   :id "c1" :subject (ref "p1")})
+    store))
+
+(defn- compartment-request
+  [store compartment-id target-type & {:keys [params]}]
+  {:fhir/store store
+   :fhir/all-registries compartment-registries
+   :query-params (or params {})
+   :path-params {:tenant-id tenant
+                 :compartment-type "Patient"
+                 :compartment-id compartment-id
+                 :target-type target-type}})
+
+(deftest compartment-search-returns-only-members-of-the-compartment
+  (let [resp (handlers/compartment-search (compartment-request (compartment-store) "p1" "Observation"))]
+    (is (= 200 (:status resp)))
+    (is (= "searchset" (get-in resp [:body :type])))
+    (is (= 2 (get-in resp [:body :total])))
+    (is (= #{"o1" "o2"} (set (map (comp :id :resource) (get-in resp [:body :entry])))))))
+
+(deftest compartment-search-excludes-other-patients
+  (let [resp (handlers/compartment-search (compartment-request (compartment-store) "p2" "Observation"))]
+    (is (= 1 (get-in resp [:body :total])))
+    (is (= ["o3"] (mapv (comp :id :resource) (get-in resp [:body :entry]))))))
+
+(deftest compartment-search-wildcard-spans-all-member-types
+  (let [resp (handlers/compartment-search (compartment-request (compartment-store) "p1" "*"))]
+    (is (= 200 (:status resp)))
+    (is (= 3 (get-in resp [:body :total]))
+        "two Observations and one Condition for p1")))
+
+(deftest compartment-search-unknown-compartment-type-is-400
+  (let [resp (handlers/compartment-search
+               (assoc-in (compartment-request (compartment-store) "p1" "Observation")
+                         [:path-params :compartment-type] "Bogus"))]
+    (is (= 400 (:status resp)))
+    (is (= "OperationOutcome" (get-in resp [:body :resourceType])))))
+
+(deftest compartment-search-non-member-target-is-400
+  (let [resp (handlers/compartment-search (compartment-request (compartment-store) "p1" "Medication"))]
+    (is (= 400 (:status resp)))
+    (is (re-find #"not a member" (get-in resp [:body :issue 0 :diagnostics])))))
+
+(deftest compartment-search-empty-result-is-empty-bundle
+  (let [resp (handlers/compartment-search (compartment-request (compartment-store) "nobody" "Observation"))]
+    (is (= 200 (:status resp)))
+    (is (= 0 (get-in resp [:body :total])))
+    (is (empty? (get-in resp [:body :entry])))))
+
+(deftest compartment-search-paginates-with-next-link
+  (let [resp (handlers/compartment-search
+               (compartment-request (compartment-store) "p1" "Observation"
+                                    :params {"_count" "1" "_skip" "0"}))]
+    (is (= 1 (count (get-in resp [:body :entry]))))
+    (is (some #(= "next" (:relation %)) (get-in resp [:body :link]))
+        "a full page yields a next link")))

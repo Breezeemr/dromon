@@ -61,7 +61,16 @@
                 :store-ref (ig/ref :fhir-store/xtdb2-store)}
    :mock  {:requires '[fhir-store.mock.sys]
            :extra    {:fhir-store/mock {}}
-           :store-ref (ig/ref :fhir-store/mock)}})
+           :store-ref (ig/ref :fhir-store/mock)}
+   ;; In-memory Datomic (`datomic:mem://`), no transactor required. Selected via
+   ;; TEST_SERVER_STORE=datomic with the `:store/datomic` deps alias on the
+   ;; classpath. Used by the compartment-e2e runner to verify enforcement
+   ;; against the Datomic backend.
+   :datomic {:requires '[fhir-store-datomic.core]
+             :extra    {:fhir-store/datomic-store {:resource/schemas (ig/ref :fhir/schemas)
+                                                   :storage          :mem
+                                                   :close-on-halt?   true}}
+             :store-ref (ig/ref :fhir-store/datomic-store)}})
 
 (def ^:private schema-presets
   "Map of schema-package -> namespace whose `specs` Var lists the schema
