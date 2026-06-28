@@ -10,6 +10,7 @@ Inferno current:  505 passed,  0 failed,   0 skipped, 0 errors
 
 - [conditional-create-if-none-match-star.md](conditional-create-if-none-match-star.md) — `PUT /{type}/{id}` with `If-None-Match: *` is not honoured (FHIR R4 §2.38.1). Should create only if no row with that id exists; today it silently upserts. Plumb `:if-none-match :wildcard` through the opts map and have each store `ASSERT NOT EXISTS` / cas-on-nil.
 - [conditional-search-criteria-races.md](conditional-search-criteria-races.md) — Conditional update/delete/patch via URL search criteria (`PUT/DELETE/PATCH /{type}?...`) are all TOCTOU-racy: the search and the subsequent write are not atomic. Fix by auto-propagating the matched row's `versionId` as an implicit `If-Match` into the store call, plus a lock for the phantom-create branch of conditional-update.
+- [kratos-reintroduce-secondary-auth-path.md](kratos-reintroduce-secondary-auth-path.md) — Reintroduce Ory Kratos (the `authorization_code` login/consent provider, dropped only as a temporary workaround) in a **secondary, opt-in auth path** — a new runner + `bb auth-code-e2e` task mirroring `compartment-e2e` — without touching the main `bb setup` / `bb inferno-test` path (which stays `ory-pg`/`keto`/`hydra`, 505/505). Prerequisite for the interactive login flow and human-initiated delegation.
 
 ### Tenant lifecycle (new protocol surface)
 
