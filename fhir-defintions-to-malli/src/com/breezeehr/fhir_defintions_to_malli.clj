@@ -950,6 +950,23 @@
     (when (and code (not (fhir-primitives code)))
       code)))
 
+(defn- extract-extension-primitive-value-type
+  "Like `extract-extension-value-type` but returns the value[x] type code when it IS a FHIR
+   primitive (e.g. \"string\" for a `text` sub-extension). Lets an inline primitive value[x]
+   slice collapse to a value-key'd primitive instead of retaining the full Extension (with all
+   value[x] variants). Mirrors the complex-type collapse so primitive and complex slices are
+   generated consistently."
+  [sub-elements main-path]
+  (let [value-elem (first (filter (fn [{:keys [path]}]
+                                    (and (> (count path) (count main-path))
+                                         (let [last-seg (last path)]
+                                           (and (string? last-seg)
+                                                (str/starts-with? last-seg "value")))))
+                                  sub-elements))
+        code (when value-elem (-> value-elem :type first :code))]
+    (when (and code (fhir-primitives code))
+      code)))
+
 (defn- prepare-slice-context
   "Shared setup for both extension and non-extension slice processing."
   [_old-acc k attr-type main-attr sub-elements main-path version base-sch min-val props slice-name]
@@ -972,17 +989,21 @@
         ;; emit the bare value type ref instead of wrapping in Extension.
         bare-value-code (when is-extension?
                           (extract-extension-value-type sub-elements main-path))
-        ;; Compute value-key from the complex type code so the transformer knows
-        ;; which key to extract from FHIR JSON extension entries (e.g. :valueCoding).
-        ;; Only set for complex types here; primitive extensions get value-key via
-        ;; profile-value-key detection below (which also wraps in sequential).
-        value-key-kw (when bare-value-code
-                       (keyword (str "value" (str/upper-case (subs bare-value-code 0 1))
-                                    (subs bare-value-code 1))))
+        ;; An inline primitive value[x] slice (e.g. text -> valueString): collapse it the same
+        ;; way as a complex slice instead of retaining the full Extension (all value[x] variants).
+        prim-value-code (when (and is-extension? (not bare-value-code))
+                          (extract-extension-primitive-value-type sub-elements main-path))
+        ;; Compute value-key from the value[x] type code so the transformer knows which key to
+        ;; extract from FHIR JSON extension entries (e.g. :valueCoding / :valueString). Set for
+        ;; both complex and inline-primitive slices; profile-based primitive extensions get theirs
+        ;; via profile-value-key detection below (which also wraps in sequential).
+        value-key-kw (when-let [c (or bare-value-code prim-value-code)]
+                       (keyword (str "value" (str/upper-case (subs c 0 1)) (subs c 1))))
         final-props (cond-> (merge props type-props)
                       value-key-kw (assoc :fhir/value-key value-key-kw))
         {new-sub-sch :sch new-sub-form :form}
-        (if bare-value-code
+        (cond
+          bare-value-code
           ;; Emit bare value type: skip Extension wrapping, use the value type directly.
           ;; Wrap in [:sequential ...] when max > 1.
           (let [value-kw (lookup-schema-kw bare-value-code version)
@@ -997,6 +1018,19 @@
                       `[:sequential {:max ~max-val} [:ref ~value-kw]]
                       `[:sequential [:ref ~value-kw]])]})
 
+          prim-value-code
+          ;; Emit the primitive value schema directly (value-key'd), dropping the Extension
+          ;; wrapper and its unused value[x] siblings. Sequential to match the slice convention.
+          (let [prim-sch (get fhir-primitives prim-value-code)
+                attr-max (:max main-attr)
+                max-val (when (and attr-max (not= attr-max "*") (not= attr-max "0"))
+                          (parse-long attr-max))]
+            {:sch (if max-val [:sequential {:max max-val} prim-sch] [:sequential prim-sch])
+             :form [(if max-val
+                      `[:sequential {:max ~max-val} ~prim-sch]
+                      `[:sequential ~prim-sch])]})
+
+          :else
           ;; Filter sub-elements to only those belonging to this slice.
           ;; Without this filter, sub-elements from all slices (e.g. both
           ;; component:systolic and component:diastolic) are mixed together,
