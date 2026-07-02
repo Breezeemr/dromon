@@ -47,6 +47,11 @@
    'us-core.capability.v8-0-1.ServiceRequest/capability
    'us-core.capability.v8-0-1.Specimen/capability
    ;; Resources not in US Core CapabilityStatement — add basic interactions
+   ;; Appointment: base R4B fallback (no US Core profile); Patient-compartment
+   ;; member via `actor`, used by the cabotage2 home screen.
+   {:schema 'org.hl7.fhir.StructureDefinition.Appointment.v4-3-0/full-sch
+    :interactions ["create" "search-type" "read" "vread"
+                   "update" "patch" "delete" "history-instance" "history-type"]}
    {:schema 'us-core.capability.v8-0-1.ValueSet/capability
     :interactions ["create" "search-type" "read" "vread"
                    "update" "patch" "delete" "history-instance"]}
