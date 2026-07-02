@@ -67,13 +67,18 @@
                                        (not (#{"metadata" "_history" "_search"} (nth parts 3))))
                               (nth parts 3)))
               request-method (:request-method request)
-              relation (case request-method
-                         :get "read"
-                         :post "write"
-                         :put "write"
-                         :delete "delete"
-                         :patch "write"
-                         "read")
+              ;; Routes may pin the required relation via :keto/relation route
+              ;; data (e.g. operations that write no clinical data and should
+              ;; be available to read-only grants). Otherwise it is derived
+              ;; from the HTTP method.
+              relation (or (:keto/relation route-data)
+                           (case request-method
+                             :get "read"
+                             :post "write"
+                             :put "write"
+                             :delete "delete"
+                             :patch "write"
+                             "read"))
               resource-id (get-in request [:path-params :id])
               object (cond
                        (and fhir-type resource-id) (str fhir-type "/" resource-id)

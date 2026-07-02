@@ -94,6 +94,19 @@
    specs to feed into `:fhir/schemas`."
   {:uscore8 'test-server.schemas.uscore8})
 
+(def ^:private extra-operations
+  "Deployment-specific FHIR operations merged over the fhir-server built-ins
+   (see `server.core/resource-operations`).
+
+   $telehealth-signal carries WebRTC signaling between the patient portal
+   and the provider over long polling. It writes no clinical data, so it is
+   gated on the `read` Keto relation: anyone who may read the appointment
+   may signal on it."
+  {"Appointment"
+   {"$telehealth-signal" {:get  'server.telehealth/poll-signal
+                          :post 'server.telehealth/post-signal
+                          :keto/relation "read"}}})
+
 (defn- load-ns! [ns-sym]
   (require ns-sym))
 
@@ -122,7 +135,8 @@
                                                 (throw (ex-info "Unknown store" {:store store})))
         specs (resolve-schema-specs schemas)]
     (run! load-ns! requires)
-    (merge {:fhir/schemas {:specs specs}
+    (merge {:fhir/schemas {:specs specs
+                           :operations extra-operations}
             :test-server/seeder    {:store store-ref}
             :fhir-terminology/tx-proxy {:base-url nil}
             :fhir-terminology/cached   {:delegate (ig/ref :fhir-terminology/tx-proxy)}

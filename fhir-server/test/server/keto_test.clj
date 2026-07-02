@@ -37,6 +37,19 @@
           (is (= 200 (:status response)))
           (is (= "OK" (:body response))))))
 
+    (testing "route data :keto/relation overrides the method-derived relation"
+      (with-redefs [hc/get (fn [_ opts]
+                             (is (= "read" (get (:query-params opts) "relation"))
+                                 "POST normally maps to write; the route pins read")
+                             {:status 200 :body {:allowed true}})]
+        (let [request {:reitit.core/match {:data {:keto/relation "read"}}
+                       :identity {:sub "user123"}
+                       :request-method :post
+                       :uri "/default/fhir/Appointment/a1/$telehealth-signal"
+                       :path-params {:id "a1"}}
+              response (wrapped-handler request)]
+          (is (= 200 (:status response))))))
+
     (testing "denies access when keto disallows"
       (with-redefs [hc/get (fn [_ _] {:status 403 :body {:allowed false}})]
         (let [request {:identity {:sub "user123"}

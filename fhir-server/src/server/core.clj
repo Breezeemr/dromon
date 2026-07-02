@@ -63,10 +63,25 @@
    :conditional-patch   'server.handlers/conditional-patch})
 
 (def resource-operations
+  "Built-in resource-level operations, keyed by resource type then operation
+   name. Each operation maps HTTP method keywords to fully qualified handler
+   symbols; non-method keys become Reitit route data (see
+   `server.routing/build-operation-routes`).
+
+   Consumers extend this per deployment by passing an `:operations` map of
+   the same shape to [[resolve-schemas]] (or the `:fhir/schemas` integrant
+   component); entries merge over these defaults."
   {"ValueSet" {"$expand" {:get  'server.handlers/valueset-expand
                            :post 'server.handlers/valueset-expand}
                "$lookup" {:get  'server.handlers/valueset-lookup
                            :post 'server.handlers/valueset-lookup}}})
+
+(defn- merge-operations
+  "Merges an extra {resourceType {op-name config}} operations map over the
+   built-in defaults, merging per resource type so extensions can add
+   operations to types that already have built-ins."
+  [extra-operations]
+  (merge-with merge resource-operations (or extra-operations {})))
 
 (defn cap-data->multi-schema
   "Compile the capability data map (as emitted by
@@ -108,14 +123,19 @@
    supplied explicitly. Pre-compiled malli schemas are accepted for
    backward compatibility."
   ([cap-or-data]
-   (capability-schema->server-schema cap-or-data nil))
+   (capability-schema->server-schema cap-or-data nil nil))
   ([cap-or-data registry]
+   (capability-schema->server-schema cap-or-data registry nil))
+  ([cap-or-data registry extra-operations]
    (let [registry     (or registry (when (cap-data? cap-or-data) (:registry cap-or-data)))
          cap-compiled (if (cap-data? cap-or-data)
                         (cap-data->multi-schema cap-or-data registry)
                         cap-or-data)
-         resource-type   (:resourceType cap-compiled)
          props           (m/properties  cap-compiled)
+         ;; NOTE: keyword lookup on a compiled malli schema returns nil; the
+         ;; resource type lives in the schema properties. Reading it off the
+         ;; schema directly silently dropped operations for every type.
+         resource-type   (:resourceType props)
          interactions    (:interactions props [])
          search-params   (:search-params props [])
          search-registry (sr/build-resource-registry search-params cap-compiled)
@@ -131,7 +151,7 @@
                             (contains? interaction-map :delete) (conj :conditional-delete)
                             (contains? interaction-map :patch)  (conj :conditional-patch))
          handlers        (select-keys default-handlers (into (keys interaction-map) conditional-keys))
-         operations      (get resource-operations resource-type {})]
+         operations      (get (merge-operations extra-operations) resource-type {})]
      (mu/update-properties cap-compiled
                            into
                            {:fhir/interactions    interaction-map
@@ -169,25 +189,31 @@
    - a map `{:schema <fq-sym> :interactions [..]}` where :interactions,
      when provided, override the schema-declared interactions before
      conversion."
-  [spec]
-  (let [{:keys [schema interactions]} (if (map? spec) spec {:schema spec})
-        resolved @(resolve-sym schema)
-        registry (when (cap-data? resolved) (sibling-registry-var schema))
-        resolved (if interactions
-                   (if (cap-data? resolved)
-                     (assoc resolved :interactions interactions)
-                     (mu/update-properties resolved into {:interactions interactions}))
-                   resolved)]
-    (capability-schema->server-schema resolved registry)))
+  ([spec] (resolve-schema spec nil))
+  ([spec {:keys [operations]}]
+   (let [{:keys [schema interactions]} (if (map? spec) spec {:schema spec})
+         resolved @(resolve-sym schema)
+         registry (when (cap-data? resolved) (sibling-registry-var schema))
+         resolved (if interactions
+                    (if (cap-data? resolved)
+                      (assoc resolved :interactions interactions)
+                      (mu/update-properties resolved into {:interactions interactions}))
+                    resolved)]
+     (capability-schema->server-schema resolved registry operations))))
 
 (defn resolve-schemas
   "Resolve a collection of schema specs (see [[resolve-schema]]) into the
-   server-ready vector consumed by [[fhir-app]] and the routing layer."
-  [specs]
-  (mapv resolve-schema specs))
+   server-ready vector consumed by [[fhir-app]] and the routing layer.
 
-(defmethod ig/init-key :fhir/schemas [_ {:keys [specs]}]
-  (resolve-schemas specs))
+   `opts` supports:
+   - :operations -- {resourceType {op-name {method handler-sym, ...}}} map of
+     deployment-specific operations merged over [[resource-operations]]."
+  ([specs] (resolve-schemas specs nil))
+  ([specs opts]
+   (mapv #(resolve-schema % opts) specs)))
+
+(defmethod ig/init-key :fhir/schemas [_ {:keys [specs operations]}]
+  (resolve-schemas specs {:operations operations}))
 
 (defn wrap-fhir-store [handler store]
   (fn [req]

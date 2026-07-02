@@ -173,12 +173,21 @@
 
     (into [base-path {}] type-children)))
 
+(def ^:private http-method-keys
+  #{:get :post :put :patch :delete :head :options})
+
 (defn- build-operation-routes
-  "Given a fhir type and its configured operations, build Reitit route vectors."
+  "Given a fhir type and its configured operations, build Reitit route vectors.
+
+   Each operation config maps HTTP method keywords to handler symbols.
+   Non-method keys are passed through as Reitit route data, so an operation
+   can carry middleware directives (e.g. :keto/relation, :public?)."
   [fhir-type operations]
   (reduce
-   (fn [acc [op-name methods-map]]
-     (let [route-data (reduce
+   (fn [acc [op-name op-config]]
+     (let [methods-map (select-keys op-config http-method-keys)
+           extra-route-data (apply dissoc op-config http-method-keys)
+           route-data (reduce
                        (fn [m [method handler-sym]]
                          (let [handler-fn (resolve-handler handler-sym)
                                wrapped-handler (fn [req]
@@ -186,7 +195,7 @@
                                                                     :fhir/resource-type fhir-type
                                                                     :fhir/operation op-name)))]
                            (assoc m method wrapped-handler)))
-                       {}
+                       extra-route-data
                        methods-map)]
        (-> acc
            (conj [(str "/:tenant-id/fhir/" fhir-type "/" op-name) route-data])
