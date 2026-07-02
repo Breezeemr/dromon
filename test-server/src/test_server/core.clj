@@ -70,7 +70,24 @@
              :extra    {:fhir-store/datomic-store {:resource/schemas (ig/ref :fhir/schemas)
                                                    :storage          :mem
                                                    :close-on-halt?   true}}
-             :store-ref (ig/ref :fhir-store/datomic-store)}})
+             :store-ref (ig/ref :fhir-store/datomic-store)}
+   ;; Persistent Datomic dev storage pointed at a pre-existing database
+   ;; produced by fhir-datomic-decant. The `default` tenant is mapped to the
+   ;; decant target database instead of the usual `{prefix}-{tenant}` name.
+   ;; Requires a running transactor (default datomic:dev://localhost:4334);
+   ;; override with DATOMIC_BASE_URI / DATOMIC_DEFAULT_DB. Selected via
+   ;; TEST_SERVER_STORE=datomic-decant with the `:store/datomic` deps alias.
+   :datomic-decant
+   {:requires '[fhir-store-datomic.core]
+    :extra    {:fhir-store/datomic-store
+               {:resource/schemas (ig/ref :fhir/schemas)
+                :storage          :dev
+                :base-uri         (or (System/getenv "DATOMIC_BASE_URI")
+                                      "datomic:dev://localhost:4334")
+                :tenant-db-names  {"default" (or (System/getenv "DATOMIC_DEFAULT_DB")
+                                                 "phi-fhir-test-decanted")}
+                :close-on-halt?   false}}
+    :store-ref (ig/ref :fhir-store/datomic-store)}})
 
 (def ^:private schema-presets
   "Map of schema-package -> namespace whose `specs` Var lists the schema
