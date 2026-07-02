@@ -232,6 +232,21 @@
                                (handler-fn (assoc req :fhir/all-registries all-registries))))]
     [["/.well-known/smart-configuration" {:get  ((resolve-handler 'server.handlers/smart-configuration))
                                           :public? true}]
+     ;; SMART patient-set grant machinery (server.grant). /auth/grants has no
+     ;; resource-type URL segment, so server.keto gates it on the "system"
+     ;; object -- grant administration requires a system read/write tuple.
+     ["/auth/grants" {:post   (resolve-handler 'server.grant/create-grant)
+                      :get    (resolve-handler 'server.grant/read-grant)
+                      :delete (resolve-handler 'server.grant/delete-grant)}]
+     ;; Self-service: any authenticated subject may list its own granted
+     ;; patients. Public so the Keto system gate does not apply; the handler
+     ;; enforces authentication itself.
+     ["/auth/my-patients" {:get (resolve-handler 'server.grant/my-patients)
+                           :public? true}]
+     ;; Ory Hydra token webhook (OAUTH2_TOKEN_HOOK_URL). Called by Hydra, not
+     ;; by end users; optionally protected by TOKEN_HOOK_SECRET.
+     ["/auth/token-hook" {:post (resolve-handler 'server.grant/token-hook)
+                          :public? true}]
      ["/:tenant-id/fhir/metadata" {:get ((resolve-handler 'server.handlers/capability-statement) schemas)
                                    :public? true}]
      ["/:tenant-id/fhir/_history" {:get (wrap-system-search (resolve-handler 'server.handlers/system-history))}]
