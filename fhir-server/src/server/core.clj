@@ -265,12 +265,21 @@
                           true (conj [keto/wrap-keto-authorization {:keto-url keto-url}]))}})
    (some-fn
     (ring/redirect-trailing-slash-handler {:method :strip})
+    ;; The default handler runs OUTSIDE the router's middleware chain, so
+    ;; muuntaja never encodes its body. A raw map body makes the Jetty
+    ;; adapter throw (no StreamableResponseBody impl for PersistentArrayMap),
+    ;; turning every unmatched route (e.g. a resource type with no schema)
+    ;; into a 500. Pre-encode the OperationOutcome to a JSON string.
     (ring/create-default-handler
-     {:not-found (constantly {:status 404
-                              :body {:resourceType "OperationOutcome"
-                                     :issue [{:severity "error"
-                                              :code "not-found"
-                                              :diagnostics "Resource or endpoint not found"}]}})})))))
+     {:not-found
+      (constantly
+       {:status 404
+        :headers {"Content-Type" "application/fhir+json"}
+        :body (json/write-value-as-string
+               {:resourceType "OperationOutcome"
+                :issue [{:severity "error"
+                         :code "not-found"
+                         :diagnostics "Resource or endpoint not found"}]})})})))))
 
 
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
