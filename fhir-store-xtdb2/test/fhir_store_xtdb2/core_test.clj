@@ -5,7 +5,8 @@
             [xtdb.api :as xt]
             [xtdb.node :as xtn]
             [fhir-store-xtdb2.core :as core-db]
-            [fhir-store.protocol :as db]))
+            [fhir-store.protocol :as db]
+            [com.breezeehr.fhir-primitives :as fp]))
 
 (defn- close-store-nodes!
   "Closes all tenant pools + nodes in a store's nodes atom."
@@ -117,6 +118,33 @@
       (nil? e) nil
       (some-> e ex-data :fhir/status) (ex-data e)
       :else (recur (.getCause e)))))
+
+(deftest test-empty-sequential-omitted-on-read
+  (testing "empty repeating elements are omitted from the read surface, not emitted as []"
+    (let [store (core-db/create-xtdb-store {})
+          tenant-id "tenant-empty"]
+      (try
+        ;; A repeating element with zero entries (Claim.insurance) plus a nested
+        ;; empty array (item.detail); primitives that are falsey/empty-but-present
+        ;; (false, 0, "") must survive untouched.
+        (db/create-resource store tenant-id :Claim "c1"
+                            {:status "active"
+                             :insurance []
+                             :note ""
+                             :active false
+                             :count 0
+                             :item [{:sequence 1 :detail []}]
+                             :patient {:reference "Patient/p1"}})
+        (let [res (db/read-resource store tenant-id :Claim "c1")]
+          (is (not (contains? res :insurance))
+              "empty top-level repeating element must be absent, not []")
+          (is (= [{:sequence 1}] (:item res))
+              "nested empty repeating element must be pruned, its parent kept")
+          (is (contains? res :note))
+          (is (= "" (:note res)) "empty string must be preserved")
+          (is (= false (:active res)) "false must be preserved")
+          (is (= 0 (:count res)) "0 must be preserved"))
+        (finally (close-store-nodes! store))))))
 
 (deftest test-if-match-update
   (testing "Store enforces :if-match atomically for update-resource"
@@ -631,4 +659,45 @@
         (db/warmup-tenant store "t1")
         (db/warmup-tenant store "t1")
         (is (nil? (db/read-resource store "t1" :Patient "nope")))
+        (finally (close-store-nodes! store))))))
+
+(deftest test-decimal-roundtrips-as-bigdecimal
+  (testing "FHIR decimal leaves (Quantity.value) round-trip as java.math.BigDecimal
+            with preserved scale -- never downgraded to a Double. FHIR decimal
+            carries precision/trailing-zero semantics (1.50 != 1.5, 0.1 must be
+            exact) that a Double representation silently destroys. The server
+            decodes JSON with :bigdecimals true and FHIR schemas model decimals
+            as :decimal, so values arrive as BigDecimal; XTDB stores a struct
+            field's type from the inserted Java class (BigDecimal -> DECIMAL),
+            so this pins the type across encode + XTDB column + decode."
+    (let [obs-schema (m/schema [:map {:resourceType "Observation"}
+                                [:resourceType :string]
+                                [:status :string]
+                                [:valueQuantity [:map
+                                                 [:value :decimal]
+                                                 [:unit :string]]]]
+                               fp/fhir-registry-options)
+          store (core-db/create-xtdb-store {:resource/schemas [obs-schema]})
+          tenant "probe-decimal"
+          round-trip (fn [id v]
+                       (db/create-resource store tenant :Observation id
+                         {:resourceType "Observation" :status "final"
+                          :valueQuantity {:value v :unit "mg"}})
+                       (get-in (db/read-resource store tenant :Observation id)
+                               [:valueQuantity :value]))]
+      (try
+        ;; [id inserted-value expected-scale expected-canonical-string]
+        (doseq [[id v scale s] [["d150" 1.50M               2 "1.50"]
+                                ["d01"  0.1M                1 "0.1"]
+                                ["d123" 123.456M            3 "123.456"]
+                                ["dbig" 12345678901234.5678M 4 "12345678901234.5678"]
+                                ["dint" 42M                 0 "42"]]]
+          (let [rv (round-trip id v)]
+            (is (instance? java.math.BigDecimal rv)
+                (str id " must decode as BigDecimal, got " (some-> rv class .getName)))
+            (is (== v rv) (str id " must be numerically equal"))
+            (is (= scale (.scale ^java.math.BigDecimal rv))
+                (str id " must preserve decimal scale"))
+            (is (= s (str rv))
+                (str id " must preserve canonical string form (trailing zeros)"))))
         (finally (close-store-nodes! store))))))
