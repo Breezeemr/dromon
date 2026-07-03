@@ -746,12 +746,33 @@
                       (some :array? cols))
               (build-flat-token-condition cols param-str))))
         (build-condition-struct param-name param-value search-param))))
+(defn- drop-empty-sequentials
+  "Recursively removes map entries whose value is an empty sequential collection
+   (`[]` or an empty list). FHIR wire semantics require a repeating element with
+   zero entries to be OMITTED, not serialized as `[]`; a column stored as an
+   empty array (e.g. Claim.insurance) would otherwise decode back to `[]` and
+   diverge from the datomic read surface, which carries no such key. Only
+   sequential emptiness is pruned -- empty strings, `false`, `0`, and empty maps
+   are preserved, since those are legitimate primitive/element values."
+  [x]
+  (walk/postwalk
+   (fn [node]
+     (if (map? node)
+       (into (empty node)
+             (remove (fn [[_ v]] (and (sequential? v) (empty? v))))
+             node)
+       node))
+   x))
+
 (defn ^:no-doc xtdb->fhir
   "Converts an XTDB query result row back to a FHIR resource map.
    Uses the precompiled malli decoder for the resource type, falling back to the
    :default decoder (built from :map) for types without a specific schema.
    Captures the server-managed fhir_version column and xt/system_from so they can
-   be injected back as :meta :versionId / :meta :lastUpdated after decoding."
+   be injected back as :meta :versionId / :meta :lastUpdated after decoding.
+   Empty sequential collections are pruned from the reconstructed resource so the
+   read surface matches FHIR wire semantics (repeating elements with zero entries
+   are omitted, never emitted as `[]`)."
   [record read-decoders]
   (when record
     (let [id (or (:xt/id record) (:_id record))
@@ -774,7 +795,7 @@
                        (set/rename-keys {:resourcetype :resourceType}))
           rt (:resourceType stripped)
           decode-fn (get read-decoders rt (get read-decoders :default))
-          base (decode-fn stripped)
+          base (drop-empty-sequentials (decode-fn stripped))
           with-id (if id (assoc base :id (str id)) base)]
       (inject-meta with-id version system-from))))
 
