@@ -21,12 +21,14 @@
   (keyword (name resource-type)))
 
 (defn- from-star [rt-k]
-  ;; (from :RT [*])  — returns all projected columns, matching SELECT *
-  (list 'from rt-k '[*]))
+  ;; (from :RT [xt/system-from *]) — `*` alone does not include xtdb's system
+  ;; columns; binding xt/system-from keeps meta.lastUpdated available, matching
+  ;; the SQL pathway's `SELECT *, _system_from`.
+  (list 'from rt-k '[xt/system-from *]))
 
 (defn- from-star-opts [rt-k opts]
-  ;; (from :RT {:for-system-time ... :bind [*]})
-  (list 'from rt-k (assoc opts :bind '[*])))
+  ;; (from :RT {:for-system-time ... :bind [xt/system-from *]})
+  (list 'from rt-k (assoc opts :bind '[xt/system-from *])))
 
 (defn read-xtql [node resource-type id read-decoders]
   (t/trace!
@@ -179,7 +181,8 @@
           sort-specs)))
 
 (defn- compose-search-query
-  "Assembles a runtime XTQL pipeline form for a search: (-> (from :RT [*]) (where ...) ...)"
+  "Assembles a runtime XTQL pipeline form for a search:
+   (-> (from :RT [xt/system-from *]) (where ...) ...)"
   [resource-type wheres sort-specs limit offset]
   (let [base (from-star (rt-kw resource-type))
         pipeline (cond-> [base]

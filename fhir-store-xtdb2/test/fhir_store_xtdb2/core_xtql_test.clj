@@ -2,7 +2,8 @@
   "Parity tests for the :query-mode :xtql pathway. Structure mirrors the
    SQL-mode suite in core-test.clj; assertions call the same protocol
    methods, just against a store configured with :query-mode :xtql."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [fhir-store-xtdb2.core :as core-db]
             [fhir-store.protocol :as db]))
 
@@ -14,6 +15,16 @@
 
 (defn- xtql-store []
   (core-db/create-xtdb-store {:query-mode :xtql}))
+
+(defn- valid-last-updated?
+  "True when the resource carries meta.lastUpdated as a valid FHIR instant
+   string (parseable by Instant/parse, no zone-region suffix like [UTC])."
+  [resource]
+  (let [lu (get-in resource [:meta :lastUpdated])]
+    (and (string? lu)
+         (not (str/includes? lu "["))
+         (some? (try (java.time.Instant/parse lu)
+                     (catch Exception _ nil))))))
 
 (deftest test-xtql-read-and-search
   (testing "Simple reads and flat-column searches under :xtql"
@@ -28,7 +39,9 @@
         (db/create-resource store tenant :Patient "p3" pt-c)
 
         (testing "read-resource"
-          (is (= "p1" (:id (db/read-resource store tenant :Patient "p1"))))
+          (let [r (db/read-resource store tenant :Patient "p1")]
+            (is (= "p1" (:id r)))
+            (is (valid-last-updated? r)))
           (is (nil? (db/read-resource store tenant :Patient "missing"))))
 
         (testing "search: boolean flat column"
@@ -39,7 +52,8 @@
         (testing "search: string flat column"
           (let [r (db/search store tenant :Patient {:gender "male"} nil)]
             (is (= 1 (count r)))
-            (is (= "p1" (:id (first r))))))
+            (is (= "p1" (:id (first r))))
+            (is (valid-last-updated? (first r)))))
 
         (testing "search: _id equality"
           (let [r (db/search store tenant :Patient {:_id "p2"} nil)]
@@ -70,15 +84,20 @@
           (db/update-resource store tenant :Patient "h1" (assoc patient :active false))
 
           (testing "history returns both versions"
-            (is (= 2 (count (db/history store tenant :Patient "h1")))))
+            (let [versions (db/history store tenant :Patient "h1")]
+              (is (= 2 (count versions)))
+              (is (every? valid-last-updated? versions))))
 
           (testing "vread returns the earlier version"
             (let [v (db/vread-resource store tenant :Patient "h1" time-before)]
               (is (some? v))
-              (is (= true (:active v))))))
+              (is (= true (:active v)))
+              (is (valid-last-updated? v)))))
 
         (testing "history-type returns rows"
-          (is (pos? (count (db/history-type store tenant :Patient {})))))
+          (let [rows (db/history-type store tenant :Patient {})]
+            (is (pos? (count rows)))
+            (is (every? valid-last-updated? rows))))
 
         (finally (close-store-nodes! store))))))
 
