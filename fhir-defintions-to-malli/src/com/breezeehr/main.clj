@@ -193,14 +193,21 @@
    Options:
      :base-dir           — base output directory (default: [\"..\" \"fhir\" \"malli\"])
      :staging-dir        — staging directory (default: [\"target\" \"staging\" \"src\"])
-     :force-download?    — re-download packages even if already present (default: false)"
-  [& {:keys [base-dir staging-dir force-download?]
+     :force-download?    — re-download packages even if already present (default: false)
+     :schema-atom        — schema atom to accumulate generated entries into
+                           (default: a fresh atom). Pass one in to chain further
+                           packages (e.g. downstream IGs deriving from these
+                           profiles) onto the same generation state.
+
+   The return map includes :urls — the set of all StructureDefinition URLs
+   processed across the pipeline — for use as the roots of a chained package."
+  [& {:keys [base-dir staging-dir force-download? schema-atom]
       :or   {base-dir         [".." "fhir" "malli"]
              staging-dir      ["target" "staging" "src"]
              force-download?  false}}]
   (println "Clearing staging directory...")
   (delete-directory-recursive! (Paths/get (first staging-dir) (into-array String (rest staging-dir))))
-  (let [sa          (atom {})
+  (let [sa          (or schema-atom (atom {}))
         r4b-sources (version-sources "scratch/definitions.json/")
         r4b-pkg     (conj base-dir "r4b")
         xver-pkg    (conj base-dir "xver")
@@ -297,4 +304,5 @@
      :sdc            sdc-result
      :uscore         uscore-result
      :capability     cap-result
-     :search-params  {:r4b r4b-sp :fhir-extensions fhirext-sp :sdc sdc-sp :uscore uscore-sp}}))
+     :search-params  {:r4b r4b-sp :fhir-extensions fhirext-sp :sdc sdc-sp :uscore uscore-sp}
+     :urls           (into sdc-urls (map :url) uscore-plan)}))
