@@ -73,6 +73,40 @@
         (finally
           (close-store-nodes! store))))))
 
+(def ^:private patient-schema-without-race
+  "Mimics the us-core capability :multi dispatching a Patient without a
+   us-core meta.profile onto the base R4B branch: the schema carries no entry
+   for the promoted :race extension struct, so the schema-driven keyword->
+   string key conversion never reaches it and the post-encode stringify walk
+   must protect the struct field names from XTDB case folding."
+  (m/schema
+    [:map {:resourceType "Patient"}
+     [:id {:optional true} :string]
+     [:active {:optional true} :boolean]
+     [:name {:optional true} [:sequential [:map [:family {:optional true} :string]]]]]))
+
+(deftest test-promoted-extension-struct-key-case
+  (testing "schema-uncovered nested struct keys round-trip case-exactly (us-core-race)"
+    (let [store (core-db/create-xtdb-store {:resource/schemas [patient-schema-without-race]})
+          tenant-id "tenant-race"
+          ;; Promoted us-core-race / us-core-ethnicity extension shape as the
+          ;; FHIR JSON transform produces it: camelCase sub-extension keys.
+          race {:ombCategory [{:system "urn:oid:2.16.840.1.113883.6.238"
+                               :code "2106-3"
+                               :display "White"}]
+                :text ["White"]}]
+      (try
+        (db/create-resource store tenant-id :Patient "p-race"
+                            {:active true
+                             :name [{:family "Doe"}]
+                             :race race})
+        (let [result (db/read-resource store tenant-id :Patient "p-race")]
+          (is (= race (:race result))
+              "camelCase struct field names must survive the XTDB round trip")
+          (is (not (contains? (:race result) :ombcategory))
+              "XTDB must not case-fold the ombCategory struct field"))
+        (finally (close-store-nodes! store))))))
+
 (defn- root-ex-data
   "Walk the cause chain and return the first ex-data that carries :fhir/status.
    Required because store-layer exceptions are wrapped by telemere `trace!`,

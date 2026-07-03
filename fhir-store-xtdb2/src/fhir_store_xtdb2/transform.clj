@@ -192,6 +192,39 @@
                :else           nil)]
       (when (seq ts) (vec (distinct ts))))))
 
+(defn- stringify-nested-keys
+  "Recursively converts keyword map keys to strings below the document root.
+   XTDB case-folds keyword struct keys like unquoted SQL identifiers
+   (:ombCategory is stored as ombcategory) while string keys are stored
+   case-exactly. The schema-driven :map encoder already stringifies keys for
+   schema-covered entries; this walk covers nested maps the schema walk does
+   not reach -- promoted extension structs on resources dispatched to a schema
+   branch without those entries (e.g. us-core race/ethnicity on the base R4B
+   Patient branch), unknown keys, and the :default open-map encoder."
+  [v]
+  (cond
+    (map? v)
+    (persistent!
+      (reduce-kv (fn [acc k v']
+                   (assoc! acc (if (keyword? k) (name k) k)
+                           (stringify-nested-keys v')))
+                 (transient {}) v))
+
+    (sequential? v)
+    (mapv stringify-nested-keys v)
+
+    :else v))
+
+(defn- stringify-doc-nested-keys
+  "Applies stringify-nested-keys to every top-level value of an encoded doc.
+   Root keys stay as-is: they become column names, which the SQL builder
+   splices double-quoted (case-exact) itself."
+  [doc]
+  (persistent!
+    (reduce-kv (fn [acc k v]
+                 (assoc! acc k (stringify-nested-keys v)))
+               (transient {}) doc)))
+
 (defn- add-token-columns
   "Adds a `<field>_tokens` text[] column for every top-level Coding/
    CodeableConcept field in the encoded doc, so token search can match a flat
@@ -212,7 +245,9 @@
   [schemas]
   (let [default-xf (xtdb-storage-transformer nil)
         default-encoder (m/encoder :map default-xf)
-        wrap (fn [enc] (fn [resource] (add-token-columns (enc resource))))
+        wrap (fn [enc]
+               (fn [resource]
+                 (add-token-columns (stringify-doc-nested-keys (enc resource)))))
         type-encoders (into {}
                             (keep (fn [schema]
                                     (let [rt (:resourceType (m/properties schema))]
