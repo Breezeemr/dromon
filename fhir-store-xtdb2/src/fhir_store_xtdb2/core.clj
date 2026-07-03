@@ -84,10 +84,12 @@
       (dissoc :_id)
       (assoc :xt/id (:_id doc))))
 
-(defn- extract-and-build-sql
+(defn ^:no-doc extract-and-build-sql
   "Takes a resource map and resource-type, builds a parameterized SQL INSERT for XTDB.
    Optional kwargs:
-     :version — the monotonic version string to inject as the \"fhir_version\" column."
+     :version — the monotonic version string to inject as the \"fhir_version\" column.
+   Public (no-doc) so bulk importers (fhir-datomic-decant's xtdb target) reuse the
+   exact document/SQL shape the live store writes."
   [resource-type id resource-map storage-encoders & {:keys [version]}]
   (let [doc (encode-resource-doc resource-type id resource-map storage-encoders :version version)
         cols (keys doc)
@@ -107,11 +109,12 @@
       (when-let [v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
         (str v)))))
 
-(defn- current-versions-bulk
+(defn ^:no-doc current-versions-bulk
   "Bulk variant of current-version: takes a collection of ids for a single
    resource type and returns a map of id -> version string for rows that
    exist. Missing ids are absent from the map. Used by transact-transaction
-   to avoid N sequential round-trips when building PUT version numbers."
+   to avoid N sequential round-trips when building PUT version numbers, and
+   by bulk importers to seed their version caches on resume."
   [node resource-type ids]
   (let [ids (distinct ids)]
     (if (empty? ids)
