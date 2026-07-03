@@ -63,6 +63,17 @@
 (json-gen/add-encoder YearMonth (fn [d jg] (.writeString jg (str d))))
 
 
+(defn ^:no-doc table-name
+  "SQL table identifier for a resource type: the LOWERCASED name, double-quoted.
+   xtdb SQL folds unquoted identifiers to lowercase, so every existing database
+   (written historically with unquoted `INSERT INTO Patient`) stores lowercase
+   table names -- quoting the lowercased form resolves to the same tables AND
+   parses for resource types that collide with reserved words (`Flag` failed to
+   parse entirely when spliced unquoted). Use this for every table splice; a
+   quoted mixed-case form like \"Patient\" would be a DIFFERENT table."
+  [resource-type]
+  (str "\"" (str/lower-case (name resource-type)) "\""))
+
 (defn ^:no-doc encode-resource-doc
   "Runs the malli storage encoder for the given resource type and returns the
    raw XTDB document map (pre-SQL-serialization) with :_id and :fhir_version
@@ -95,7 +106,7 @@
         cols (keys doc)
         col-names (str/join ", " (map #(format "\"%s\"" (name %)) cols))
         placeholders (str/join ", " (repeat (count cols) "?"))
-        sql (format "INSERT INTO %s (%s) VALUES (%s)" (name resource-type) col-names placeholders)
+        sql (format "INSERT INTO %s (%s) VALUES (%s)" (table-name resource-type) col-names placeholders)
         args (mapv doc cols)]
     [sql args]))
 
@@ -103,7 +114,7 @@
   "Reads the current fhir_version column for a resource row. Returns the version
    string or nil if no row exists."
   [node resource-type id]
-  (let [query (format "SELECT fhir_version FROM %s WHERE _id = ?" (name resource-type))
+  (let [query (format "SELECT fhir_version FROM %s WHERE _id = ?" (table-name resource-type))
         row (first (xt/q node [query id]))]
     (when row
       (when-let [v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
@@ -122,7 +133,7 @@
       ;; = ANY(?) with a single array param keeps the SQL text stable regardless
       ;; of id count, so it hits XTDB's plan cache instead of recompiling per size.
       (let [query (format "SELECT _id, fhir_version FROM %s WHERE _id = ANY(?)"
-                          (name resource-type))
+                          (table-name resource-type))
             rows (xt/q node [query (vec ids)])]
         (into {}
               (keep (fn [row]
@@ -149,7 +160,7 @@
     (if (empty? ids)
       {}
       (let [query (format "SELECT * FROM %s WHERE _id = ANY(?)"
-                          (name resource-type))
+                          (table-name resource-type))
             rows (xt/q node [query (vec ids)])]
         (into {}
               (keep (fn [row]
@@ -908,27 +919,27 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- read-sql [node resource-type id read-decoders]
-  (let [query (format "SELECT * FROM %s WHERE _id = ?" (name resource-type))
+  (let [query (format "SELECT * FROM %s WHERE _id = ?" (table-name resource-type))
         results (into [] (xt/q node [query id]))]
     (xtdb->fhir (first results) read-decoders)))
 
 (defn- vread-sql [node resource-type id vid read-decoders]
-  (let [query (format "SELECT * FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (name resource-type))
+  (let [query (format "SELECT * FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (table-name resource-type))
         results (into [] (xt/q node [query vid id]))]
     (xtdb->fhir (first results) read-decoders)))
 
 (defn- deleted?-sql [node resource-type id]
-  (let [rt-name (name resource-type)
-        current-query (format "SELECT _id FROM %s WHERE _id = ?" rt-name)
+  (let [table (table-name resource-type)
+        current-query (format "SELECT _id FROM %s WHERE _id = ?" table)
         current-results (into [] (xt/q node [current-query id]))]
     (if (seq current-results)
       false
-      (let [history-query (format "SELECT _id FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" rt-name)
+      (let [history-query (format "SELECT _id FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" table)
             history-results (into [] (xt/q node [history-query id]))]
         (boolean (seq history-results))))))
 
 (defn- history-sql [node resource-type id read-decoders]
-  (let [query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (name resource-type))]
+  (let [query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (table-name resource-type))]
     (mapv #(xtdb->fhir % read-decoders) (xt/q node [query id]))))
 
 (def ^:private ^:no-doc result-params
@@ -976,7 +987,7 @@
   [node resource-type ids read-decoders]
   (if (empty? ids)
     []
-    (let [rows (xt/q node [(format "SELECT * FROM %s WHERE _id = ANY(?)" (name resource-type))
+    (let [rows (xt/q node [(format "SELECT * FROM %s WHERE _id = ANY(?)" (table-name resource-type))
                            (vec ids)])
           by-id (into {} (map (fn [r] [(row-id r) r])) rows)]
       (into [] (keep #(some-> (get by-id %) (xtdb->fhir read-decoders))) ids))))
@@ -988,7 +999,7 @@
   (let [order-by (build-order-by-clause sort-specs search-registry)
         [where params] (where+params filter-params search-registry)
         where-sql (if where (str " WHERE " where) "")
-        rt (name resource-type)]
+        rt (table-name resource-type)]
     (if (seq sort-specs)
       ;; Two-phase: an ORDER BY defeats LIMIT early-termination, so a single
       ;; SELECT * would materialize every matched row's full column set just to
@@ -1007,7 +1018,7 @@
   [node resource-type {:keys [filter-params search-registry]}]
   (let [[query-str all-params]
         (if (empty? filter-params)
-          [(format "SELECT COUNT(*) AS cnt FROM %s" (name resource-type)) []]
+          [(format "SELECT COUNT(*) AS cnt FROM %s" (table-name resource-type)) []]
           (let [cols (keys filter-params)
                 conditions (map (fn [k]
                                   (build-condition k (get filter-params k)
@@ -1016,7 +1027,7 @@
                 where-clause (str/join " AND " (map first conditions))
                 p (into [] (mapcat second) conditions)]
             [(format "SELECT COUNT(*) AS cnt FROM %s WHERE %s"
-                     (name resource-type) where-clause) p]))
+                     (table-name resource-type) where-clause) p]))
         result (first (xt/q node (into [query-str] all-params)))]
     (or (:cnt result) 0)))
 
@@ -1029,7 +1040,8 @@
         rt-name (name resource-type)
         [sql args] (extract-and-build-sql resource-type id resource storage-encoders
                                           :version version)
-        assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" rt-name)
+        assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
+                                (table-name resource-type))
                    [id]]]
     (try
       (xt/execute-tx node [assert-op [:sql sql args]])
@@ -1043,7 +1055,7 @@
         (assoc-in [:meta :versionId] version))))
 
 (defn- update-sql [node resource-type id resource opts storage-encoders]
-  (let [rt-name (name resource-type)
+  (let [rt-name (table-name resource-type)
         if-match (:if-match opts)
         current (current-version node resource-type id)
         _ (when (and if-match (nil? current))
@@ -1081,7 +1093,7 @@
         (assoc-in [:meta :versionId] new-version))))
 
 (defn- delete-sql [node resource-type id opts]
-  (let [rt-name (name resource-type)
+  (let [rt-name (table-name resource-type)
         if-match (:if-match opts)
         current (when if-match (current-version node resource-type id))
         _ (when (and if-match (nil? current))
@@ -1122,7 +1134,7 @@
           at    [" WHERE _system_from <= TIMESTAMP ?" [at]]
           :else ["" []])
         query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT ?"
-                      (name resource-type) where-clause)
+                      (table-name resource-type) where-clause)
         results (into [] (xt/q node (into [query] (conj where-params limit))))]
     (mapv #(xtdb->fhir % read-decoders) results)))
 
@@ -1337,7 +1349,7 @@
               "DELETE"
               (if xtql-mode?
                 [:delete-docs (keyword resource-type) id]
-                [:sql (format "DELETE FROM %s WHERE _id = ?" (name resource-type))
+                [:sql (format "DELETE FROM %s WHERE _id = ?" (table-name resource-type))
                  [id]])))
           {:keys [tx-ops entry-results]}
           (t/trace!

@@ -16,4 +16,8 @@
          :main-opts ["-m" "kaocha.runner"]
          :jvm-opts ["-Xmx6g"
                     "--add-opens=java.base/java.nio=ALL-UNNAMED"
-                    "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]}}}
+                    "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
+                    ;; JEP 498 (Java 24+): Arrow's netty allocator needs Unsafe
+                    ;; memory access; without this the node init dies in
+                    ;; DefaultAllocationManagerFactory.<clinit>.
+                    "--sun-misc-unsafe-memory-access=allow"]}}}
