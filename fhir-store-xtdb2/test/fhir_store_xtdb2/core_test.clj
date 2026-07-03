@@ -1,5 +1,6 @@
 (ns fhir-store-xtdb2.core-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [malli.core :as m]
             [xtdb.api :as xt]
             [xtdb.node :as xtn]
@@ -427,6 +428,58 @@
               "read after update exposes versionId '2'")
           (is (= false (:active read2))
               "read after update returns the updated payload"))
+        (finally
+          (close-store-nodes! store))))))
+
+(defn- fhir-instant?
+  "True when s is a parseable ISO instant with no zone-name suffix, i.e. a
+   valid FHIR instant for :meta :lastUpdated (guards against the raw
+   ZonedDateTime str form \"...Z[UTC]\" leaking through)."
+  [s]
+  (and (string? s)
+       (not (str/includes? s "["))
+       (some? (try (java.time.Instant/parse s)
+                   (catch Exception _ nil)))))
+
+(deftest test-meta-last-updated-populated
+  (testing "read/vread/search/history all inject :meta :lastUpdated from _system_from"
+    (let [store (core-db/create-xtdb-store {})
+          tenant-id "tenant-lastupdated"
+          patient {:resourceType "Patient" :active true :name [{"family" "Stamp"}]}]
+      (try
+        (db/create-resource store tenant-id :Patient "lu1" patient)
+        (let [time-before-update (str (java.time.Instant/now))]
+          (Thread/sleep 10)
+          (db/update-resource store tenant-id :Patient "lu1" (assoc patient :active false))
+
+          (testing "read"
+            (let [res (db/read-resource store tenant-id :Patient "lu1")]
+              (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
+
+          (testing "vread"
+            (let [res (db/vread-resource store tenant-id :Patient "lu1" time-before-update)]
+              (is (some? res))
+              (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
+
+          (testing "search without sort (single SELECT branch)"
+            (let [res (db/search store tenant-id :Patient {:active false} nil)]
+              (is (= 1 (count res)))
+              (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
+
+          (testing "search with sort (two-phase fetch-by-ids branch)"
+            (let [res (db/search store tenant-id :Patient {"_sort" "_id"} nil)]
+              (is (= 1 (count res)))
+              (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
+
+          (testing "instance history"
+            (let [hist (db/history store tenant-id :Patient "lu1")]
+              (is (= 2 (count hist)))
+              (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
+
+          (testing "type history"
+            (let [hist (db/history-type store tenant-id :Patient {})]
+              (is (= 2 (count hist)))
+              (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist)))))
         (finally
           (close-store-nodes! store))))))
 

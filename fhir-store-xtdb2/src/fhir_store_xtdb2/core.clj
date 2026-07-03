@@ -159,7 +159,7 @@
   (let [ids (distinct ids)]
     (if (empty? ids)
       {}
-      (let [query (format "SELECT * FROM %s WHERE _id = ANY(?)"
+      (let [query (format "SELECT *, _system_from FROM %s WHERE _id = ANY(?)"
                           (table-name resource-type))
             rows (xt/q node [query (vec ids)])]
         (into {}
@@ -179,11 +179,17 @@
     "1"))
 
 (defn- inject-meta
-  "Injects :meta :versionId and :meta :lastUpdated onto a decoded FHIR resource."
+  "Injects :meta :versionId and :meta :lastUpdated onto a decoded FHIR resource.
+   XTDB returns _system_from as a ZonedDateTime whose str form carries a zone
+   suffix (\"...Z[UTC]\") that is not a valid FHIR instant, so it is converted
+   to an Instant first."
   [result version system-from]
   (cond-> result
     version     (assoc-in [:meta :versionId] (str version))
-    system-from (assoc-in [:meta :lastUpdated] (str system-from))))
+    system-from (assoc-in [:meta :lastUpdated]
+                          (str (if (instance? ZonedDateTime system-from)
+                                 (.toInstant ^ZonedDateTime system-from)
+                                 system-from)))))
 
 (defn- parse-date-prefix
   "Parses a FHIR date search value into [prefix date-string].
@@ -918,13 +924,17 @@
 ;; the XTQL siblings (fhir-store-xtdb2.query-xtql) under :query-mode :xtql.
 ;; ---------------------------------------------------------------------------
 
+;; All read-surface SELECTs project `*, _system_from`: SELECT * alone does NOT
+;; include xtdb's system columns, and _system_from is what inject-meta turns
+;; into :meta :lastUpdated.
+
 (defn- read-sql [node resource-type id read-decoders]
-  (let [query (format "SELECT * FROM %s WHERE _id = ?" (table-name resource-type))
+  (let [query (format "SELECT *, _system_from FROM %s WHERE _id = ?" (table-name resource-type))
         results (into [] (xt/q node [query id]))]
     (xtdb->fhir (first results) read-decoders)))
 
 (defn- vread-sql [node resource-type id vid read-decoders]
-  (let [query (format "SELECT * FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (table-name resource-type))
+  (let [query (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (table-name resource-type))
         results (into [] (xt/q node [query vid id]))]
     (xtdb->fhir (first results) read-decoders)))
 
@@ -939,7 +949,7 @@
         (boolean (seq history-results))))))
 
 (defn- history-sql [node resource-type id read-decoders]
-  (let [query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (table-name resource-type))]
+  (let [query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (table-name resource-type))]
     (mapv #(xtdb->fhir % read-decoders) (xt/q node [query id]))))
 
 (def ^:private ^:no-doc result-params
@@ -987,7 +997,7 @@
   [node resource-type ids read-decoders]
   (if (empty? ids)
     []
-    (let [rows (xt/q node [(format "SELECT * FROM %s WHERE _id = ANY(?)" (table-name resource-type))
+    (let [rows (xt/q node [(format "SELECT *, _system_from FROM %s WHERE _id = ANY(?)" (table-name resource-type))
                            (vec ids)])
           by-id (into {} (map (fn [r] [(row-id r) r])) rows)]
       (into [] (keep #(some-> (get by-id %) (xtdb->fhir read-decoders))) ids))))
@@ -1011,7 +1021,7 @@
         (fetch-by-ids node resource-type ids read-decoders))
       ;; No sort: a single SELECT * with LIMIT streams the first `limit` rows and
       ;; stops (early-termination), so the wide projection cost is already bounded.
-      (let [q (format "SELECT * FROM %s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))]
+      (let [q (format "SELECT *, _system_from FROM %s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))]
         (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [q] (conj params limit offset))))))))
 
 (defn- count-sql
@@ -1133,7 +1143,7 @@
           since [" WHERE _system_from > TIMESTAMP ?" [since]]
           at    [" WHERE _system_from <= TIMESTAMP ?" [at]]
           :else ["" []])
-        query (format "SELECT * FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT ?"
+        query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT ?"
                       (table-name resource-type) where-clause)
         results (into [] (xt/q node (into [query] (conj where-params limit))))]
     (mapv #(xtdb->fhir % read-decoders) results)))
