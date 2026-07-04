@@ -1320,16 +1320,23 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- build-sd-properties
-  "Build the properties map for a StructureDefinition."
-  [{:keys [description title] t :type} base-element]
-  (-> {:closed true}
-      (cond->
-        t           (assoc :resourceType t)
-        description (assoc :fhir.structure-definition/description description)
-        title       (assoc :fhir.structure-definition/title title))
-      (cond->
-        (:definition base-element) (assoc :fhir/definition (:definition base-element))
-        (:short base-element) (assoc :fhir/short (:short base-element)))))
+  "Build the properties map for a StructureDefinition. For a complex extension
+   (type \"Extension\") the canonical :url and :fhir/value-key :complex are stamped so
+   the schema carries enough to fold/unfold the extension without an external
+   url->value-type registry (simple extensions get :fhir/value-key :valueX instead).
+   Non-extension StructureDefinitions (profiles, resources) are unaffected."
+  [{:keys [description title url] t :type} base-element]
+  (let [extension? (= t "Extension")]
+    (-> {:closed true}
+        (cond->
+          t           (assoc :resourceType t)
+          description (assoc :fhir.structure-definition/description description)
+          title       (assoc :fhir.structure-definition/title title)
+          (and extension? url) (assoc :url url)
+          extension?  (assoc :fhir/value-key :complex))
+        (cond->
+          (:definition base-element) (assoc :fhir/definition (:definition base-element))
+          (:short base-element) (assoc :fhir/short (:short base-element))))))
 
 (defn structure-definition->patch [{:keys [version]
                                     {:keys [element]} :differential t :type
@@ -1450,13 +1457,19 @@
 ;; Simple extension patch
 ;; ---------------------------------------------------------------------------
 
-(defn- simple-extension->patch [{:keys [name title description]
+(defn- simple-extension->patch [{:keys [name title description url]
                                  {:keys [element]} :differential}]
   (let [value-element (first (filter #(-> % :path (= "Extension.value[x]")) element))
         attr-types (:type value-element)
         attr-type (if (seq attr-types) (first attr-types) {:code "Element"})
         id (:id value-element)
-        main-path (into [] (str/split (or id (:path value-element)) #"\."))]
+        main-path (into [] (str/split (or id (:path value-element)) #"\."))
+        ;; Value key (:valueString / :valueReference / ...) derived from the single
+        ;; value[x] type code, so the extension schema carries enough to fold/unfold a
+        ;; FHIR extension entry without an external url->value-type registry. Only set
+        ;; when the value[x] has a concrete type (skip the {:code "Element"} fallback).
+        value-key (when-let [c (and (seq attr-types) (:code attr-type))]
+                    (keyword (str "value" (str/upper-case (subs c 0 1)) (subs c 1))))]
     (fn [_acc]
       (let [{new-sub-sch :sch new-sub-form :form primitive? :primitive?}
             (attr->value-schema-patch {:sch nil, :form [], :new-field? true}
@@ -1466,6 +1479,8 @@
                            :resourceType name}
                     description (assoc :fhir.structure-definition/description description)
                     title (assoc :fhir.structure-definition/title title)
+                    url (assoc :url url)
+                    value-key (assoc :fhir/value-key value-key)
                     (:definition value-element) (assoc :fhir/definition (:definition value-element))
                     (:short value-element) (assoc :fhir/short (:short value-element))
                     primitive? (assoc :fhir/primitive-extension true)
