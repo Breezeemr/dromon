@@ -166,10 +166,39 @@
             (println "Error extracting:" (:err result))))
         (println "Done.")))))
 
+(def davinci-crd-target-dir "scratch/davinci-crd")
+
+(defn download-and-extract-davinci-crd! [version & {:keys [force?] :or {force? false}}]
+  (let [package-url (str "https://packages.fhir.org/hl7.fhir.us.davinci-crd/" version)
+        out-dir (io/file davinci-crd-target-dir version)
+        package-dir (io/file out-dir "package")
+        temp-tgz (io/file out-dir "package.tgz")]
+    (if (and (not force?) (.isDirectory package-dir))
+      (println "Da Vinci CRD" version "already downloaded, skipping.")
+      (do
+        (when-not (.exists out-dir)
+          (.mkdirs out-dir))
+
+        (println "Downloading Da Vinci CRD version" version "to" (.getAbsolutePath temp-tgz) "...")
+        (with-open [in (:body (hc/get package-url {:as :stream}))
+                    out (io/output-stream temp-tgz)]
+          (io/copy in out))
+
+        (println "Extracting" (.getAbsolutePath temp-tgz) "...")
+        (let [result (shell/sh "tar" "-xzf" (.getAbsolutePath temp-tgz) "-C" (.getAbsolutePath out-dir))]
+          (if (zero? (:exit result))
+            (do
+              (println "Extraction successful.")
+              (.delete temp-tgz))
+            (println "Error extracting:" (:err result))))
+        (println "Done.")))))
+
 (comment
   (download "4.3.0")
 
   (download-and-extract-uscore! "STU8.0.1")
+
+  (download-and-extract-davinci-crd! "2.0.1")
 
   (download-and-extract-sdc! "STU4")
 

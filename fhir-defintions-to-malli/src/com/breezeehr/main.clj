@@ -297,12 +297,32 @@
         uscore-sp   (copy-search-parameters!
                      [{:type :directory :path "scratch/us-core/STU8.0.1/package"}]
                      uscore-pkg)
-        _           (println "  Copied" uscore-sp "US Core SearchParameter resources")]
+        _           (println "  Copied" uscore-sp "US Core SearchParameter resources")
+        uscore-urls (into sdc-urls (map :url) uscore-plan)
+
+        ;; --- 8. Da Vinci CRD extensions ---
+        ;; The decant carries the CRD ext-coverage-information extension self-describing
+        ;; (fhir-datomic-decant ig-extensions). Only the Extension StructureDefinitions are
+        ;; generated; the CRD profiles are out of scope for the decant read surface. The
+        ;; extension refs resolve against the r4b/us-core chain already generated above.
+        _           (println "\n=== Step 8: Da Vinci CRD extensions ===")
+        davinci-pkg (conj base-dir "davinci")
+        _           (download-fhir/download-and-extract-davinci-crd! "2.0.1" :force? force-download?)
+        davinci-plan-all (gen/plan [{:type :directory :path "scratch/davinci-crd/2.0.1/package"}]
+                                   uscore-urls :skip-missing true)
+        davinci-plan (filterv #(= "Extension" (:type %)) davinci-plan-all)
+        davinci-result (gen/generate! sa staging-dir (conj davinci-pkg "src") davinci-plan)
+        _           (write-deps-edn! davinci-pkg [{:name "r4b" :relative-path "../r4b"}
+                                                  {:name "xver" :relative-path "../xver"}
+                                                  {:name "fhir-extensions" :relative-path "../fhir-extensions"}
+                                                  {:name "sdc" :relative-path "../sdc"}
+                                                  {:name "uscore8" :relative-path "../uscore8"}])]
     {:r4b            r4b-result
      :xver           xver-result
      :fhir-extensions fhirext-result
      :sdc            sdc-result
      :uscore         uscore-result
+     :davinci        davinci-result
      :capability     cap-result
      :search-params  {:r4b r4b-sp :fhir-extensions fhirext-sp :sdc sdc-sp :uscore uscore-sp}
-     :urls           (into sdc-urls (map :url) uscore-plan)}))
+     :urls           (into uscore-urls (map :url) davinci-plan)}))
