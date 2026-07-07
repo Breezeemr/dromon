@@ -2,8 +2,9 @@
 # Dockerized Datomic dev transactor for the fhir-search-bench, replacing the
 # in-repo bin/transactor. Isolated container on 4337 with its own data dir, so it
 # never touches the :4334 PHI-realm transactor and never pkills datomic.launcher.
-# The image already carries hasch on /app/lib (built by datomic-transactor-image/),
-# so no DATOMIC_EXT_CLASSPATH is needed.
+# The image already carries hasch on /app/lib (built by datomic-transactor-image/,
+# which bundles the dspiteself hasch perf fork), so no DATOMIC_EXT_CLASSPATH is
+# needed.
 #
 # Usage: transactor-docker.sh {start|stop|foreground}
 #   start       run detached, wait for 4337/4338, return
@@ -13,7 +14,7 @@ set -uo pipefail
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATOMIC_DIR="$BENCH_DIR/../../local-datomic/datomic-pro"
-IMAGE="${DATOMIC_TRANSACTOR_IMAGE:-localhost/datomic-fhir-transactor:hasch-1.0.7622}"
+IMAGE="${DATOMIC_TRANSACTOR_IMAGE:-localhost/datomic-fhir-transactor:hasch-fork-1.0.7622}"
 CMD="${CONTAINER_CMD:-podman}"
 NAME="fhir-bench-transactor"
 DATA_DIR="$DATOMIC_DIR/data-fhir-bench"
@@ -29,6 +30,8 @@ ensure_image() {
   if ! "$CMD" image exists "$IMAGE" 2>/dev/null; then
     echo "ERROR: transactor image not found: $IMAGE" >&2
     echo "  build it: (cd ../../datomic-transactor-image && ./build.bb --no-push)" >&2
+    echo "  then tag it locally: $CMD tag \\" >&2
+    echo "    us-central1-docker.pkg.dev/breeze-health-platform/bhp-images/datomic:hasch-fork-1.0.7622 $IMAGE" >&2
     echo "  or set DATOMIC_TRANSACTOR_IMAGE to a pullable ref." >&2
     exit 1
   fi
