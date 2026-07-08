@@ -226,9 +226,15 @@
                                       (build-interaction-routes fhir-type interactions handlers cap-schema search-registry all-registries decoders encoders))
                   operation-routes (when (seq operations)
                                      (build-operation-routes fhir-type operations))]
+              ;; Operations before the interaction tree: the router runs with
+              ;; {:conflicts nil}, which resolves the /{Type}/:id vs
+              ;; /{Type}/$op conflict by insertion order. Emitting operations
+              ;; second shadows every type-level $operation (including the
+              ;; built-in ValueSet/$expand) behind the read route's :id
+              ;; wildcard.
               (cond-> acc
-                interaction-route (conj interaction-route)
-                operation-routes (into operation-routes)))
+                operation-routes (into operation-routes)
+                interaction-route (conj interaction-route)))
             acc)))
       []
       schemas))))

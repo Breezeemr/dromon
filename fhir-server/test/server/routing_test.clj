@@ -1,8 +1,52 @@
 (ns server.routing-test
   (:require [clojure.test :refer [deftest is testing]]
             [malli.core :as m]
+            [reitit.core :as r]
+            [reitit.ring :as ring]
             [server.core :as sc]
             [server.routing :as routing]))
+
+(defn- match-template
+  "Route template matched for a path on a router built the way fhir-app
+   builds it ({:conflicts nil} resolves conflicts by insertion order)."
+  [routes path]
+  (-> (ring/router routes {:conflicts nil})
+      (r/match-by-path path)
+      :template))
+
+(deftest type-level-operations-not-shadowed-by-id-route
+  ;; Regression: build-resource-routes used to emit the interaction tree
+  ;; before operation routes, so under {:conflicts nil} the /{Type}/:id
+  ;; read route matched /{Type}/$op first. That shadowed every type-level
+  ;; operation, including the built-in ValueSet/$expand.
+  (let [schema (m/schema
+                [:map {:resourceType "Appointment"
+                       :fhir/interactions {:read {}}
+                       :fhir/handlers {:read 'clojure.core/identity}
+                       :fhir/operations
+                       {"$probe" {:get 'clojure.core/identity}}}])
+        routes (routing/build-resource-routes [schema])]
+    (testing "type-level operation path matches the operation route"
+      (is (= "/:tenant-id/fhir/Appointment/$probe"
+             (match-template routes "/t/fhir/Appointment/$probe"))))
+    (testing "reads by id still match the interaction tree"
+      (is (= "/:tenant-id/fhir/Appointment/:id"
+             (match-template routes "/t/fhir/Appointment/a1"))))
+    (testing "the matched operation handler receives operation context"
+      (let [handler (ring/ring-handler (ring/router routes {:conflicts nil}))
+            req-seen (handler {:request-method :get
+                               :uri "/t/fhir/Appointment/$probe"})]
+        (is (= "$probe" (:fhir/operation req-seen)))
+        (is (= "Appointment" (:fhir/resource-type req-seen))))))
+  (testing "built-in ValueSet/$expand routes ahead of the read wildcard"
+    (let [schema (m/schema [:map {:resourceType "ValueSet"
+                                  :fhir/interactions {:read {}}
+                                  :fhir/handlers {:read 'clojure.core/identity}}
+                            [:id :string]])
+          server-schema (sc/capability-schema->server-schema schema nil nil)
+          routes (routing/build-resource-routes [server-schema])]
+      (is (= "/:tenant-id/fhir/ValueSet/$expand"
+             (match-template routes "/t/fhir/ValueSet/$expand"))))))
 
 (deftest operation-routes-carry-route-data
   (testing "non-method keys in an operation config surface as Reitit route
