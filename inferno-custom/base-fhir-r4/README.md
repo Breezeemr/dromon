@@ -32,10 +32,15 @@ so the same layout works both here and under `lib/`.
 ```bash
 INFERNO_SUITE=base_fhir_r4 \
 INFERNO_GROUPS=all \
-INFERNO_INPUTS='url:https://fhir.local:3001/default/fhir access_token:{{token}}' \
+INFERNO_INPUTS='url:https://fhir.local:3001/default/fhir access_token:{{token}} patient_id:123' \
 bb inferno-test
 ```
 
 The runner substitutes `{{token}}` with the client-credentials access token it
 obtains from Ory Hydra. The report is written to
 `target/inferno-report-base_fhir_r4.json`.
+
+Note: `INFERNO_INPUTS` fully replaces the `--inputs` tokens, and the Inferno CLI
+does not apply a suite input's declared `default:`, so pass `patient_id:123`
+explicitly (the runner seeds `Patient/123`). Omitting it leaves `patient_id`
+empty and the two Patient tests fail.
