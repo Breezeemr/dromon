@@ -947,8 +947,11 @@
                   (System/getenv "OAUTH_BASE_URL")
                   "http://localhost:4444")]
      (fn [_req]
+       ;; Return a plain map body (no explicit Content-Type) so the muuntaja
+       ;; response middleware serializes it, exactly like the /metadata
+       ;; handler. Setting Content-Type here suppresses that encoding and Ring
+       ;; then fails to stream the raw map (HTTP 500).
        {:status 200
-        :headers {"Content-Type" "application/json"}
         :body {:issuer                 base
                :jwks_uri               (str base "/.well-known/jwks.json")
                :authorization_endpoint (str base "/oauth2/auth")
