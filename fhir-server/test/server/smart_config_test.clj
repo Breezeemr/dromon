@@ -38,6 +38,25 @@
     (is (= ["client_secret_basic" "private_key_jwt"]
            (:token_endpoint_auth_methods_supported smart-config-body)))))
 
+(deftest smart-configuration-stu2-discovery-required-fields
+  (testing "document satisfies SMART App Launch STU2 well-known discovery"
+    ;; Mirror the assertions in smart_app_launch_test_kit's
+    ;; well_known_capabilities_stu2 test so Inferno's discovery group passes.
+    (is (string? (:authorization_endpoint smart-config-body)))
+    (is (string? (:token_endpoint smart-config-body)))
+    (is (vector? (:capabilities smart-config-body)))
+    (is (every? string? (:capabilities smart-config-body)))
+    (is (some #{"authorization_code"} (:grant_types_supported smart-config-body))
+        "grant_types_supported must include authorization_code")
+    (is (some #{"S256"} (:code_challenge_methods_supported smart-config-body))
+        "code_challenge_methods_supported must include S256")
+    (is (not-any? #{"plain"} (:code_challenge_methods_supported smart-config-body))
+        "code_challenge_methods_supported must not include plain")
+    (testing "sso-openid-connect capability requires issuer + jwks_uri"
+      (when (some #{"sso-openid-connect"} (:capabilities smart-config-body))
+        (is (string? (:issuer smart-config-body)))
+        (is (string? (:jwks_uri smart-config-body)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; CapabilityStatement SMART-on-FHIR security
 ;; ---------------------------------------------------------------------------

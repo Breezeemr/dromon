@@ -258,6 +258,12 @@
                           :public? true}]
      ["/:tenant-id/fhir/metadata" {:get ((resolve-handler 'server.handlers/capability-statement) schemas)
                                    :public? true}]
+     ;; SMART App Launch discovery. Inferno (and SMART clients) fetch
+     ;; `<fhir-base>/.well-known/smart-configuration`, i.e. tenant-scoped, not
+     ;; the root path above. Public so no bearer token is required.
+     ["/:tenant-id/fhir/.well-known/smart-configuration"
+      {:get ((resolve-handler 'server.handlers/smart-configuration))
+       :public? true}]
      ["/:tenant-id/fhir/_history" {:get (wrap-system-search (resolve-handler 'server.handlers/system-history))}]
      ["/:tenant-id/fhir/_search"  {:get (wrap-system-search (resolve-handler 'server.handlers/system-search))
                                    :post (wrap-system-search (resolve-handler 'server.handlers/system-search))}]
