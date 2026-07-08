@@ -35,7 +35,7 @@
                    (shell "mkcert" "-pkcs12" "-p12-file" (.getPath keystore) domain))))))}
 
   inferno-setup
-  {:doc "Clones the US Core Test Kit and runs its setup script to build docker images."
+  {:doc "Clones the US Core Test Kit, installs custom suites (base-fhir-r4), and builds docker images."
    :depends [tls-setup]
    :requires ([clj-yaml.core :as yaml])
    :task (let [compose-file "inferno-test-kit/docker-compose.yml"
@@ -43,7 +43,23 @@
                rootca-file  (clojure.java.io/file "inferno-test-kit/rootCA.pem")
                patched?     (fn [f]
                               (and (.exists (clojure.java.io/file f))
-                                   (clojure.string/includes? (slurp f) "fhir.local:host-gateway")))]
+                                   (clojure.string/includes? (slurp f) "fhir.local:host-gateway")))
+               ;; Copy the tracked custom Inferno suites into the (gitignored)
+               ;; kit clone so Inferno auto-loads them from lib/*.rb. Idempotent
+               ;; and cheap; run every time so a fresh checkout gets them even
+               ;; when the kit itself is already set up.
+               install-custom-suites!
+               (fn []
+                 (let [src "inferno-custom/base-fhir-r4"
+                       lib "inferno-test-kit/lib"]
+                   (when (.isDirectory (clojure.java.io/file src))
+                     (println "Installing base-fhir-r4 custom suite into" lib "...")
+                     (.mkdirs (clojure.java.io/file lib "base_fhir_r4"))
+                     (clojure.java.io/copy (clojure.java.io/file src "base_fhir_r4_test_kit.rb")
+                                           (clojure.java.io/file lib "base_fhir_r4_test_kit.rb"))
+                     (doseq [f (.listFiles (clojure.java.io/file src "base_fhir_r4"))
+                             :when (and (.isFile f) (clojure.string/ends-with? (.getName f) ".rb"))]
+                       (clojure.java.io/copy f (clojure.java.io/file lib "base_fhir_r4" (.getName f)))))))]
            (when-not (.exists (clojure.java.io/file "inferno-test-kit"))
              (println "Cloning us-core-test-kit...")
              (shell "git" "clone" "https://github.com/inferno-framework/us-core-test-kit" "inferno-test-kit"))
@@ -60,6 +76,7 @@
              (let [caroot (clojure.string/trim (:out (shell {:out :string} "mkcert" "-CAROOT")))]
                (println "Copying mkcert rootCA.pem into inferno-test-kit/ ...")
                (clojure.java.io/copy (clojure.java.io/file caroot "rootCA.pem") rootca-file)))
+           (install-custom-suites!)
            (if (and (patched? compose-file) (patched? bg-file))
              (println "Inferno test kit already set up and patched -- skipping.")
              (do
@@ -87,7 +104,13 @@
                (let [bg      (yaml/parse-string (slurp bg-file))
                      patched (assoc-in bg [:services :nginx :ports] ["8080:80"])]
                  (spit bg-file (yaml/generate-string patched :dumper-options {:flow-style :block}))
-                 (println "  docker-compose.background.yml patched.")))))}
+                 (println "  docker-compose.background.yml patched."))))
+           ;; Bake the custom suites into the image (cache-friendly; a no-op
+           ;; when lib/ is unchanged). Runs regardless of the patched?
+           ;; short-circuit above, so an already-set-up kit still picks them up.
+           (when (.exists (clojure.java.io/file compose-file))
+             (println "Rebuilding inferno image so custom suites are present...")
+             (shell {:dir "inferno-test-kit"} "docker" "compose" "build" "inferno" "worker")))}
 
   inferno-run
   {:doc "Runs the Inferno Test Kit suite locally"
