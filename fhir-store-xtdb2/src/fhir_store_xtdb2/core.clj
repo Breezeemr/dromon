@@ -178,6 +178,19 @@
       "1")
     "1"))
 
+(defn ^:no-doc tx-key->basis
+  "Store basis of a committed transaction, from the xt/execute-tx return
+   (an xtdb TxKey). tx-id is monotonically increasing per node."
+  [tx-key]
+  {:tx-id (:tx-id tx-key)
+   :system-time (:system-time tx-key)})
+
+(defn ^:no-doc with-basis
+  "Attach the committed transaction's basis as :fhir-store/basis metadata
+   on a write return value (see the IFHIRStore protocol docstring)."
+  [ret tx-key]
+  (vary-meta ret assoc :fhir-store/basis (tx-key->basis tx-key)))
+
 (defn- inject-meta
   "Injects :meta :versionId and :meta :lastUpdated onto a decoded FHIR resource.
    XTDB returns _system_from as a ZonedDateTime whose str form carries a zone
@@ -1073,17 +1086,19 @@
                                           :version version)
         assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
                                 (table-name resource-type))
-                   [id]]]
-    (try
-      (xt/execute-tx node [assert-op [:sql sql args]])
-      (catch Exception e
-        (throw (ex-info (str "Resource already exists: " rt-name "/" id)
-                        {:fhir/status 409 :fhir/code "conflict"
-                         :resource-type rt-name :id id}
-                        e))))
-    (-> resource
-        (assoc :id id)
-        (assoc-in [:meta :versionId] version))))
+                   [id]]
+        tx-key (try
+                 (xt/execute-tx node [assert-op [:sql sql args]])
+                 (catch Exception e
+                   (throw (ex-info (str "Resource already exists: " rt-name "/" id)
+                                   {:fhir/status 409 :fhir/code "conflict"
+                                    :resource-type rt-name :id id}
+                                   e))))]
+    (with-basis
+      (-> resource
+          (assoc :id id)
+          (assoc-in [:meta :versionId] version))
+      tx-key)))
 
 (defn- update-sql [node resource-type id resource opts storage-encoders]
   (let [rt-name (table-name resource-type)
@@ -1107,21 +1122,23 @@
                      [id expected-vid]]
                     [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
                                   rt-name)
-                     [id]])]
-    (try
-      (xt/execute-tx node [assert-op [:sql sql args]])
-      (catch Exception e
-        (if if-match
-          (throw (ex-info (str "Version conflict: " (ex-message e))
-                          {:fhir/status 412 :fhir/code "conflict"
-                           :expected if-match}
-                          e))
-          (throw (ex-info (str "Conflict: " (ex-message e))
-                          {:fhir/status 409 :fhir/code "conflict"}
-                          e)))))
-    (-> resource
-        (assoc :id id)
-        (assoc-in [:meta :versionId] new-version))))
+                     [id]])
+        tx-key (try
+                 (xt/execute-tx node [assert-op [:sql sql args]])
+                 (catch Exception e
+                   (if if-match
+                     (throw (ex-info (str "Version conflict: " (ex-message e))
+                                     {:fhir/status 412 :fhir/code "conflict"
+                                      :expected if-match}
+                                     e))
+                     (throw (ex-info (str "Conflict: " (ex-message e))
+                                     {:fhir/status 409 :fhir/code "conflict"}
+                                     e)))))]
+    (with-basis
+      (-> resource
+          (assoc :id id)
+          (assoc-in [:meta :versionId] new-version))
+      tx-key)))
 
 (defn- delete-sql [node resource-type id opts]
   (let [rt-name (table-name resource-type)
@@ -1140,19 +1157,21 @@
                                   rt-name)
                      [id if-match]])
         delete-op [:sql (format "DELETE FROM %s WHERE _id = ?" rt-name) [id]]
-        tx-ops (if assert-op [assert-op delete-op] [delete-op])]
-    (try
-      (xt/execute-tx node tx-ops)
-      (catch Exception e
-        (if if-match
-          (throw (ex-info (str "Version conflict: " (ex-message e))
-                          {:fhir/status 412 :fhir/code "conflict"
-                           :expected if-match}
-                          e))
-          (throw (ex-info (str "Conflict: " (ex-message e))
-                          {:fhir/status 409 :fhir/code "conflict"}
-                          e)))))
-    nil))
+        tx-ops (if assert-op [assert-op delete-op] [delete-op])
+        tx-key (try
+                 (xt/execute-tx node tx-ops)
+                 (catch Exception e
+                   (if if-match
+                     (throw (ex-info (str "Version conflict: " (ex-message e))
+                                     {:fhir/status 412 :fhir/code "conflict"
+                                      :expected if-match}
+                                     e))
+                     (throw (ex-info (str "Conflict: " (ex-message e))
+                                     {:fhir/status 409 :fhir/code "conflict"}
+                                     e)))))]
+    ;; Deletes have no resource to return; an empty map carries the basis
+    ;; metadata so the write-return convention holds across all writes.
+    (with-basis {} tx-key)))
 
 (defn- history-type-sql [node resource-type params read-decoders]
   (let [raw-count (or (get params :_count) (get params "_count") "50")
@@ -1418,10 +1437,10 @@
                        (update acc :entry-results conj em)))
                    {:tx-ops [] :entry-results []}
                    entry-metas))]
-      (t/trace!
-       {:id :store/transact-transaction.execute-tx
-        :data {:op-count (count tx-ops)}}
-       (xt/execute-tx node tx-ops))
+      (let [tx-key (t/trace!
+                    {:id :store/transact-transaction.execute-tx
+                     :data {:op-count (count tx-ops)}}
+                    (xt/execute-tx node tx-ops))]
       ;; Build the response. Writes return from in-memory metadata (no
       ;; round-trips). GET/HEAD entries, if any, still need a read — batched
       ;; per resource-type to avoid N sequential SELECTs.
@@ -1438,9 +1457,10 @@
                      {}
                      (group-by :resource-type read-needed))
              last-mod-str (str last-updated)]
-         {:resourceType "Bundle"
-          :type "transaction-response"
-          :entry (mapv (fn [{:keys [method resource-type id resource vid]}]
+         (with-basis
+          {:resourceType "Bundle"
+           :type "transaction-response"
+           :entry (mapv (fn [{:keys [method resource-type id resource vid]}]
                          (case method
                            "DELETE"
                            {:response {:status "204 No Content"}}
@@ -1463,7 +1483,8 @@
                                                 last-mod-str (assoc :lastModified last-mod-str)
                                                 (= method "POST") (assoc :location (str "/" tenant-id "/fhir/" resource-type "/" id "/_history/" vid)))}
                              resource (assoc :resource resource))))
-                       entry-results)})))))))
+                       entry-results)}
+          tx-key)))))))))
 
   (transact-bundle [this tenant-id entries]
     ;; Batch semantics: each entry is processed independently via the
