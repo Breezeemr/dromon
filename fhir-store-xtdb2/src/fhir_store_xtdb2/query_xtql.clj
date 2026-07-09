@@ -277,17 +277,19 @@
          put-doc (core/doc->put-doc doc)
          assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" rt-name)
                     [id]]
-         put-op [:put-docs (rt-kw resource-type) put-doc]]
-     (try
-       (xt/execute-tx node [assert-op put-op])
-       (catch Exception e
-         (throw (ex-info (str "Resource already exists: " rt-name "/" id)
-                         {:fhir/status 409 :fhir/code "conflict"
-                          :resource-type rt-name :id id}
-                         e))))
-     (-> resource
-         (assoc :id id)
-         (assoc-in [:meta :versionId] version)))))
+         put-op [:put-docs (rt-kw resource-type) put-doc]
+         tx-key (try
+                  (xt/execute-tx node [assert-op put-op])
+                  (catch Exception e
+                    (throw (ex-info (str "Resource already exists: " rt-name "/" id)
+                                    {:fhir/status 409 :fhir/code "conflict"
+                                     :resource-type rt-name :id id}
+                                    e))))]
+     (core/with-basis
+       (-> resource
+           (assoc :id id)
+           (assoc-in [:meta :versionId] version))
+       tx-key))))
 
 (defn update-xtql [node resource-type id resource opts storage-encoders]
   (t/trace!
@@ -316,21 +318,23 @@
                      [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
                                    rt-name)
                       [id]])
-         put-op [:put-docs (rt-kw resource-type) put-doc]]
-     (try
-       (xt/execute-tx node [assert-op put-op])
-       (catch Exception e
-         (if if-match
-           (throw (ex-info (str "Version conflict: " (ex-message e))
-                           {:fhir/status 412 :fhir/code "conflict"
-                            :expected if-match}
-                           e))
-           (throw (ex-info (str "Conflict: " (ex-message e))
-                           {:fhir/status 409 :fhir/code "conflict"}
-                           e)))))
-     (-> resource
-         (assoc :id id)
-         (assoc-in [:meta :versionId] new-version)))))
+         put-op [:put-docs (rt-kw resource-type) put-doc]
+         tx-key (try
+                  (xt/execute-tx node [assert-op put-op])
+                  (catch Exception e
+                    (if if-match
+                      (throw (ex-info (str "Version conflict: " (ex-message e))
+                                      {:fhir/status 412 :fhir/code "conflict"
+                                       :expected if-match}
+                                      e))
+                      (throw (ex-info (str "Conflict: " (ex-message e))
+                                      {:fhir/status 409 :fhir/code "conflict"}
+                                      e)))))]
+     (core/with-basis
+       (-> resource
+           (assoc :id id)
+           (assoc-in [:meta :versionId] new-version))
+       tx-key))))
 
 (defn delete-xtql [node resource-type id opts]
   (t/trace!
@@ -352,19 +356,21 @@
                                    rt-name)
                       [id if-match]])
          delete-op [:delete-docs (rt-kw resource-type) id]
-         tx-ops (if assert-op [assert-op delete-op] [delete-op])]
-     (try
-       (xt/execute-tx node tx-ops)
-       (catch Exception e
-         (if if-match
-           (throw (ex-info (str "Version conflict: " (ex-message e))
-                           {:fhir/status 412 :fhir/code "conflict"
-                            :expected if-match}
-                           e))
-           (throw (ex-info (str "Conflict: " (ex-message e))
-                           {:fhir/status 409 :fhir/code "conflict"}
-                           e)))))
-     nil)))
+         tx-ops (if assert-op [assert-op delete-op] [delete-op])
+         tx-key (try
+                  (xt/execute-tx node tx-ops)
+                  (catch Exception e
+                    (if if-match
+                      (throw (ex-info (str "Version conflict: " (ex-message e))
+                                      {:fhir/status 412 :fhir/code "conflict"
+                                       :expected if-match}
+                                      e))
+                      (throw (ex-info (str "Conflict: " (ex-message e))
+                                      {:fhir/status 409 :fhir/code "conflict"}
+                                      e)))))]
+     ;; Deletes have no resource to return; an empty map carries the basis
+     ;; metadata so the write-return convention holds across all writes.
+     (core/with-basis {} tx-key))))
 
 (defn history-type-xtql [node resource-type params read-decoders]
   (t/trace!

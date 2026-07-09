@@ -701,3 +701,36 @@
             (is (= s (str rv))
                 (str id " must preserve canonical string form (trailing zeros)"))))
         (finally (close-store-nodes! store))))))
+
+(deftest write-returns-carry-store-basis
+  ;; Write-return basis convention (see the IFHIRStore protocol docstring):
+  ;; every write return carries {:fhir-store/basis {:tx-id .. :system-time ..}}
+  ;; metadata, with tx-id monotonically increasing per node. A change feed
+  ;; stamps frames from this instead of minting its own counter.
+  (testing "create/update/delete/transact returns carry monotonic basis metadata"
+    (let [store (core-db/create-xtdb-store {})
+          tenant "basis-probe"
+          basis-of (fn [ret]
+                     (let [b (:fhir-store/basis (meta ret))]
+                       (is (some? b) "write return must carry basis metadata")
+                       (is (int? (:tx-id b)))
+                       (is (some? (:system-time b)))
+                       b))]
+      (try
+        (let [created (db/create-resource store tenant :Patient "b1"
+                                          {:resourceType "Patient" :active true})
+              updated (db/update-resource store tenant :Patient "b1"
+                                          {:resourceType "Patient" :active false})
+              deleted (db/delete-resource store tenant :Patient "b1")
+              txed    (db/transact-transaction
+                       store tenant
+                       [{:request {:method "PUT" :url "Patient/b2"}
+                         :resource {:resourceType "Patient" :active true}}
+                        {:request {:method "PUT" :url "Patient/b3"}
+                         :resource {:resourceType "Patient" :active true}}])
+              bases   (mapv basis-of [created updated deleted txed])]
+          (is (= {} deleted) "delete returns an empty basis-carrying map")
+          (is (= "Bundle" (:resourceType txed)))
+          (is (apply < (map :tx-id bases))
+              "tx-ids must be strictly increasing across sequential writes"))
+        (finally (close-store-nodes! store))))))

@@ -43,6 +43,20 @@
          (when scope# (.close scope#))))))
 
 (defprotocol IFHIRStore
+  "Store contract for FHIR resource persistence.
+
+   Write-return basis convention: write methods (create-resource,
+   update-resource, delete-resource, transact-transaction) SHOULD attach
+   the committed transaction's store basis as Clojure metadata on their
+   return value:
+
+     {:fhir-store/basis {:tx-id <long> :system-time <instant>}}
+
+   tx-id is monotonically increasing per store node, so a change feed can
+   stamp and order frames by it without minting its own counter. Deletes,
+   having no resource to return, return an empty map carrying the
+   metadata. Backends that cannot supply a basis omit the metadata;
+   callers must treat it as optional."
   (create-resource [this tenant-id resource-type id resource])
   (read-resource [this tenant-id resource-type id])
   (vread-resource [this tenant-id resource-type id vid])
