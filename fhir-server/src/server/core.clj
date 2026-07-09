@@ -19,6 +19,10 @@
             [server.keto :as keto]
             [server.scope :as scope]
             [server.compartment :as compartment]
+            ;; Required eagerly so the :fhir/bulk-job-store init-key defmethod is
+            ;; registered before ig/init runs (integrant does not auto-require a
+            ;; bare "fhir" namespace for the composite key).
+            [server.bulk-job-store]
             [integrant.core :as ig])
   (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]))
