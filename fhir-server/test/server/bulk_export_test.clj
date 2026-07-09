@@ -617,6 +617,36 @@
           (is (not (.exists (io/file (:temp-dir job))))
               "the aborted job's temp files are deleted"))))))
 
+(deftest total-on-disk-cap-aborts-job-and-deletes-only-its-files
+  (testing "a job under the per-job cap still aborts when the TOTAL on-disk
+            bytes across all jobs exceed max-total-bytes: it flips to :error with
+            the total-cap message and only ITS temp files are deleted (the
+            pre-existing job's recorded files are left untouched)"
+    (let [job-store (bjs/create-store {:max-total-bytes 1000
+                                       :max-job-bytes   (* 1024 1024 1024)})]
+      ;; A previously completed job already occupies more than the total cap, so
+      ;; any new job's first page pushes the on-disk total over the limit.
+      (bjs/put-job! job-store "default"
+                    {:id          "prior"
+                     :tenant      "default"
+                     :status      :complete
+                     :finished-at (System/currentTimeMillis)
+                     :files       {"pf" {:path  "/nonexistent/prior.ndjson"
+                                         :type  "Patient" :count 1 :bytes 1000000}}})
+      (let [{:keys [kickoff]} (system-route-handlers {"Patient" :reg} {})
+            kick-resp (kickoff (bulk-req job-store))]
+        (is (= 202 (:status kick-resp)) "kickoff is under the per-job/concurrency caps")
+        (let [job-id (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
+          (is (= :error (await-status job-store "default" job-id)))
+          (let [job (bjs/get-job job-store "default" job-id)]
+            (is (str/includes? (:diagnostics (first (:error job))) "total on-disk cap")
+                "the error names the total-on-disk cap, not the per-job cap")
+            (is (empty? (:files job)))
+            (is (not (.exists (io/file (:temp-dir job))))
+                "the aborted job's temp files are deleted")
+            (is (some? (bjs/get-job job-store "default" "prior"))
+                "the pre-existing job is left in the store")))))))
+
 (deftest max-concurrent-jobs-cap-returns-429
   (testing "kickoff at/above the concurrency cap returns 429 with Retry-After
             and an OperationOutcome, and starts no job"

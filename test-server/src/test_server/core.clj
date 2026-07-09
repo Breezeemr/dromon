@@ -11,6 +11,7 @@
    so the same `test-server.core` namespace works against any combination
    of backends present on the classpath."
   (:require [server.core :as fhir-server]
+            [server.bulk-job-store :as bulk-job-store]
             [server.logging :as logging]
             [clojure.edn :as edn]
             [integrant.core :as ig]
@@ -138,8 +139,13 @@
     (merge {:fhir/schemas {:specs specs
                            :operations extra-operations}
             :test-server/seeder    {:store store-ref}
-            ;; In-memory Bulk Data Access ($export) job registry.
-            :fhir/bulk-job-store {}
+            ;; In-memory Bulk Data Access ($export) job registry with the
+            ;; approved bounded-memory caps (max-concurrent-jobs=4,
+            ;; max-job-bytes=1GB, max-total-bytes=5GB, ttl-ms=1h) from
+            ;; server.bulk-job-store/default-config. Override any key here per
+            ;; deployment, or via the BULK_* env vars (the :fhir/bulk-job-store
+            ;; init-key layers env overrides on top).
+            :fhir/bulk-job-store bulk-job-store/default-config
             :fhir-terminology/tx-proxy {:base-url nil}
             :fhir-terminology/cached   {:delegate (ig/ref :fhir-terminology/tx-proxy)}
             :server/jetty {:port          port
