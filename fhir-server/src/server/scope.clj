@@ -105,7 +105,12 @@
   (or (:fhir/resource-type request)
       (let [parts (str/split (or (:uri request) "") #"/")]
         (when (and (> (count parts) 3)
-                   (not (#{"metadata" "_history" "_search"} (nth parts 3))))
+                   ;; Bulk-data $export endpoints are system-level and carry no
+                   ;; resource-type URL segment; join metadata/_history/_search
+                   ;; so scope enforcement does not treat "$export" as a type.
+                   (not (#{"metadata" "_history" "_search"
+                           "$export" "$export-status" "$export-file"}
+                         (nth parts 3))))
           (nth parts 3)))))
 
 (defn request->interaction

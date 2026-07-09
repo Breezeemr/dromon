@@ -223,6 +223,14 @@
   (fn [req]
     (handler (assoc req :fhir/terminology terminology))))
 
+(defn wrap-bulk-job-store
+  "Inject the Bulk Data Access ($export) job registry into each request,
+   mirroring wrap-fhir-store. The bulk-export handlers read it from
+   :fhir/bulk-job-store."
+  [handler bulk-job-store]
+  (fn [req]
+    (handler (assoc req :fhir/bulk-job-store bulk-job-store))))
+
 (defn- parse-cors-origins
   "Parses CORS allowed origins from a comma-separated string or collection into a set.
    Returns nil if input is nil or blank."
@@ -236,7 +244,7 @@
     :else nil))
 
 (defn fhir-app
-  [store schemas & {:keys [jwks-url keto-url terminology cors-allowed-origins enforce-smart-scopes?]}]
+  [store schemas & {:keys [jwks-url keto-url terminology cors-allowed-origins enforce-smart-scopes? bulk-job-store]}]
   (let [jwks-url (or jwks-url
                      (System/getenv "JWKS_URL")
                      (when-not (System/getenv "JWT_DEV_SECRET")
@@ -285,6 +293,7 @@
                          rrc/coerce-exceptions-middleware
                          [wrap-fhir-store store]
                          [wrap-terminology terminology]
+                         [wrap-bulk-job-store bulk-job-store]
                          [auth/wrap-jwt-auth {:jwks-url jwks-url}]])
                           enforce-smart-scopes? (conj [scope/wrap-smart-scope {}]
                                                       [compartment/wrap-patient-compartment {}])
@@ -309,7 +318,7 @@
 
 
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
-                                                jwks-url keto-url terminology cors-allowed-origins]}]
+                                                jwks-url keto-url terminology cors-allowed-origins bulk-job-store]}]
   (println "Starting Jetty Server on port" port "and SSL port" ssl-port "with virtual threads")
   (let [jetty-opts (merge {:port port
                            :join? false
@@ -321,7 +330,7 @@
                              :keystore-type keystore-type
                              :key-password key-password}))]
     (jetty/run-jetty (fhir-app store schemas :jwks-url jwks-url :keto-url keto-url :terminology terminology
-                               :cors-allowed-origins cors-allowed-origins) jetty-opts)))
+                               :cors-allowed-origins cors-allowed-origins :bulk-job-store bulk-job-store) jetty-opts)))
 
 (defmethod ig/halt-key! :server/jetty [_ server]
   (println "Stopping Jetty Server")

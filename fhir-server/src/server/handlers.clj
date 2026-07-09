@@ -921,7 +921,11 @@
                           schemas)]
       {:status 200
        :body {:resourceType "CapabilityStatement"
-              :instantiates ["http://hl7.org/fhir/us/core/CapabilityStatement/us-core-server"]
+              ;; The bulk-data IG canonical advertises Bulk Data Access
+              ;; ($export) support; Inferno's bulk_data suite asserts it is
+              ;; present in `instantiates`.
+              :instantiates ["http://hl7.org/fhir/us/core/CapabilityStatement/us-core-server"
+                             "http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"]
               :text {:status "generated"
                      :div "<div xmlns=\"http://www.w3.org/1999/xhtml\">Dromon Capability Statement</div>"}
               :status "active"
@@ -936,6 +940,9 @@
               :rest [{:mode "server"
                       :security {:service [{:coding [{:system "http://terminology.hl7.org/CodeSystem/restful-security-service"
                                                       :code "SMART-on-FHIR"}]}]}
+                      ;; System-level $export operation (Bulk Data Access IG).
+                      :operation [{:name "export"
+                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"}]
                       :resource resources}]}})))
 
 ;; SMART Backend Services (bulk data) discovery advertised below only declares
