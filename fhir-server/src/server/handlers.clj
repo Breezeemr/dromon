@@ -947,16 +947,24 @@
                   (System/getenv "OAUTH_BASE_URL")
                   "http://localhost:4444")]
      (fn [_req]
+       ;; Return a plain map body (no explicit Content-Type) so the muuntaja
+       ;; response middleware serializes it, exactly like the /metadata
+       ;; handler. Setting Content-Type here suppresses that encoding and Ring
+       ;; then fails to stream the raw map (HTTP 500).
        {:status 200
-        :headers {"Content-Type" "application/json"}
-        :body {:authorization_endpoint (str base "/oauth2/auth")
+        :body {:issuer                 base
+               :jwks_uri               (str base "/.well-known/jwks.json")
+               :authorization_endpoint (str base "/oauth2/auth")
                :token_endpoint         (str base "/oauth2/token")
                :token_endpoint_auth_methods_supported ["client_secret_basic" "private_key_jwt"]
                :grant_types_supported  ["authorization_code" "client_credentials"]
+               :code_challenge_methods_supported ["S256"]
                :scopes_supported       ["openid" "profile" "launch" "launch/patient"
                                         "patient/*.read" "patient/*.write"
                                         "user/*.read" "user/*.write"]
                :response_types_supported ["code"]
+               ;; `sso-openid-connect` in :capabilities requires `issuer` +
+               ;; `jwks_uri` to be present (SMART App Launch STU2 discovery).
                :capabilities           ["launch-standalone" "client-public" "client-confidential-symmetric"
                                         "sso-openid-connect" "context-passthrough-banner"
                                         "permission-offline" "permission-patient" "permission-user"]}}))))

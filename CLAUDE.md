@@ -45,6 +45,27 @@ bb inferno-down    # stops Inferno containers
 bb teardown        # stops Ory containers
 ```
 
+`bb inferno-test` defaults to the US Core v6.1.0 suite (`us_core_v610`,
+`--groups 2`). The runner (`server.inferno-runner`) is suite-configurable via
+env vars so the same flow can target other suites the image provides
+(`inferno suites` lists them, e.g. `smart_stu2`, `tls`, or a custom base R4
+suite):
+
+```bash
+INFERNO_SUITE=smart_stu2 INFERNO_GROUPS=all bb inferno-test
+```
+
+- `INFERNO_SUITE`       suite id (default `us_core_v610`)
+- `INFERNO_GROUPS`      space/comma group ids, or `all`/empty for the whole suite (default `2`)
+- `INFERNO_FHIR_URL`    server base url (default the local `default` tenant)
+- `INFERNO_PATIENT_IDS` `patient_ids` input (default `123`)
+- `INFERNO_INPUTS`      full replacement for the `--inputs` tokens (`key:value`, space separated); `{{token}}`/`{{cred_json}}` expand to the obtained access token and its JSON envelope
+
+The per-run report is written to `target/inferno-report-<suite>.json` (and the
+stable `target/inferno-report.json`). The datomic runner
+(`datomic-test-server`) reuses this same function, so it honors the same env
+vars.
+
 ### Run with OpenTelemetry tracing (Jaeger UI)
 ```bash
 # Start the dev stack with Jaeger all-in-one alongside Ory.

@@ -176,21 +176,59 @@
         (println "Response body:" (:body resp))
         (System/exit 1)))))
 
+;; ── Suite configuration (env-overridable) ─────────────────────────────────────
+;; The suite, group filter, and inputs default to the historical US Core v6.1.0
+;; run so existing tooling is unaffected. Override via env to point the same
+;; runner at other suites (e.g. base FHIR R4, SMART App Launch):
+;;   INFERNO_SUITE       suite id (default "us_core_v610")
+;;   INFERNO_GROUPS      space/comma list of group ids, or "all"/"" to run the
+;;                       whole suite (default "2")
+;;   INFERNO_FHIR_URL    server base url (default the local default tenant)
+;;   INFERNO_PATIENT_IDS patient_ids input (default "123")
+;;   INFERNO_INPUTS      full replacement for the --inputs tokens, space
+;;                       separated "key:value"; the tokens {{token}} and
+;;                       {{cred_json}} are substituted with the obtained access
+;;                       token and its JSON envelope.
+
+(def default-suite "us_core_v610")
+
+(defn inferno-suite []
+  (or (not-empty (System/getenv "INFERNO_SUITE")) default-suite))
+
+(defn- group-args []
+  (let [g (or (System/getenv "INFERNO_GROUPS") "2")]
+    (if (contains? #{"" "all" "ALL"} (str/trim g))
+      []
+      (into ["--groups"] (remove str/blank? (str/split g #"[,\s]+"))))))
+
+(defn- input-args
+  "The `--inputs k:v ...` argument vector. INFERNO_INPUTS fully replaces the
+   defaults; {{token}}/{{cred_json}} are substituted with the access token."
+  [token]
+  (let [cred-json (json/generate-string {:access_token token})
+        subst (fn [s] (-> s
+                          (str/replace "{{cred_json}}" cred-json)
+                          (str/replace "{{token}}" token)))
+        url (or (not-empty (System/getenv "INFERNO_FHIR_URL"))
+                "https://fhir.local:3001/default/fhir")
+        tokens (if-let [raw (not-empty (System/getenv "INFERNO_INPUTS"))]
+                 (mapv subst (remove str/blank? (str/split raw #"\s+")))
+                 [(str "url:" url)
+                  (str "patient_ids:" (or (not-empty (System/getenv "INFERNO_PATIENT_IDS")) "123"))
+                  (str "smart_auth_info:" cred-json)])]
+    (into ["--inputs"] tokens)))
+
 ;; ── Test runner ───────────────────────────────────────────────────────────────
 
 (defn run-inferno-tests [token]
-  (println "Running Inferno tests...")
+  (println "Running Inferno tests for suite" (inferno-suite) "...")
   (.mkdirs (io/file "target"))
 
-  (let [cred-json (json/generate-string {:access_token token})
-        cmd ["docker" "compose" "exec" "-T" "inferno" "bundle" "exec" "inferno" "execute"
-             "--suite" "us_core_v610"
-             "--groups" "2"
-             "--inputs"
-             "url:https://fhir.local:3001/default/fhir"
-             "patient_ids:123"
-             (str "smart_auth_info:" cred-json)
-             "--outputter" "json"]
+  (let [cmd (into ["docker" "compose" "exec" "-T" "inferno" "bundle" "exec" "inferno" "execute"
+                   "--suite" (inferno-suite)]
+                  (concat (group-args)
+                          (input-args token)
+                          ["--outputter" "json"]))
         _ (println "Executing:" (str/join " " cmd))]
 
     (try
@@ -206,8 +244,11 @@
           (do
             (when (seq (:err result))
               (println "Inferno stderr:" (:err result)))
-            (spit "target/inferno-report.json" (:out result))
-            (println "Inferno run completed. Report written to target/inferno-report.json")
+            (let [report-file (str "target/inferno-report-" (inferno-suite) ".json")]
+              (spit "target/inferno-report.json" (:out result))
+              (spit report-file (:out result))
+              (println "Inferno run completed. Report written to" report-file
+                       "(and target/inferno-report.json)"))
             (let [report (try (json/parse-string (:out result) true) (catch Exception _ nil))]
               (if report
                 (let [passes (count (filter #(= "pass" (:result %)) report))
