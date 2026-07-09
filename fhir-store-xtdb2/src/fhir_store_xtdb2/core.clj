@@ -1173,6 +1173,84 @@
     ;; metadata so the write-return convention holds across all writes.
     (with-basis {} tx-key)))
 
+;; ---------------------------------------------------------------------------
+;; Point-in-time snapshot reads (basis capture + as-of scan/count)
+;;
+;; These back the bulk export's lazy stream-at-download model: pin a basis at
+;; kickoff (current-basis) and read every resource of a type AS OF that basis at
+;; download time (scan-type-as-of). XTDB v2's `FOR SYSTEM_TIME AS OF <instant>`
+;; gives the consistent snapshot; the basis system-time is the commit time of
+;; the latest visible transaction, read from `xt/status`.
+;; ---------------------------------------------------------------------------
+
+(defn ^:no-doc xtdb-current-basis
+  "Read the tenant node's latest-completed-transaction basis as
+   {:tx-id <long-or-nil> :system-time <Instant>}. system-time is the commit
+   time of that transaction, normalized to a java.time.Instant; on a node with
+   no committed transactions it falls back to the wall-clock now so the returned
+   token is always usable by `FOR SYSTEM_TIME AS OF`."
+  [node]
+  (let [tx-key (-> (xt/status node) :latest-completed-txs vals first first)
+        st     (:system-time tx-key)
+        inst   (cond
+                 (instance? Instant st)        st
+                 (instance? ZonedDateTime st)  (.toInstant ^ZonedDateTime st)
+                 (some? st)                     (Instant/parse (str st))
+                 :else                          (Instant/now))]
+    {:tx-id (:tx-id tx-key)
+     :system-time inst}))
+
+(defn ^:no-doc basis->system-time
+  "Coerce a basis map's :system-time to a java.time.Instant for use as the
+   `FOR SYSTEM_TIME AS OF ?` parameter. A nil basis (or nil :system-time) reads
+   the live snapshot (now)."
+  ^java.time.Instant [basis]
+  (let [st (:system-time basis)]
+    (cond
+      (instance? Instant st)       st
+      (instance? ZonedDateTime st) (.toInstant ^ZonedDateTime st)
+      (some? st)                   (Instant/parse (str st))
+      :else                        (Instant/now))))
+
+(def ^:private ^:no-doc scan-page-size 1000)
+
+(defn ^:no-doc scan-type-as-of-reducible
+  "Reducible (IReduceInit) that streams every live resource of `resource-type`
+   as of `as-of` (an Instant), keyset-paginated by _id so only one page of
+   `page-size` rows is materialized at a time. Backpressure: the reduce pulls
+   the next page only after the reducing fn returns for the current page, so a
+   fn that blocks on a slow OutputStream bounds peak memory to one page. A
+   `reduced` accumulator halts the scan without fetching further pages. The
+   pinned system-time makes keyset paging stable (no rows shift between pages)."
+  [pool resource-type ^java.time.Instant as-of read-decoders page-size]
+  (reify clojure.lang.IReduceInit
+    (reduce [_ f init]
+      (with-open [conn (jdbc/get-connection pool)]
+        (let [q (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id > ? ORDER BY _id LIMIT ?"
+                        (table-name resource-type))]
+          (loop [after "" acc init]
+            (let [rows (xt/q conn [q as-of after page-size])
+                  n    (count rows)]
+              (if (zero? n)
+                acc
+                (let [result (reduce (fn [a row]
+                                       (let [a' (f a (xtdb->fhir row read-decoders))]
+                                         (if (reduced? a') (reduced a') a')))
+                                     acc rows)]
+                  (if (reduced? result)
+                    @result
+                    (if (< n page-size)
+                      result
+                      (recur (str (row-id (nth rows (dec n)))) result))))))))))))
+
+(defn ^:no-doc count-as-of-sql
+  "COUNT(*) of `resource-type` as of `as-of` (an Instant)."
+  [conn resource-type ^java.time.Instant as-of]
+  (let [result (first (xt/q conn [(format "SELECT COUNT(*) AS cnt FROM %s FOR SYSTEM_TIME AS OF ?"
+                                          (table-name resource-type))
+                                  as-of]))]
+    (or (:cnt result) 0)))
+
 (defn- history-type-sql [node resource-type params read-decoders]
   (let [raw-count (or (get params :_count) (get params "_count") "50")
         limit (if (string? raw-count) (parse-long raw-count) raw-count)
@@ -1638,7 +1716,41 @@
          (try
            (fp/search this tid rt {"_count" "1"} {})
            (catch Throwable _ nil)))
-       nil))))
+       nil)))
+
+  (current-basis [this tenant-id]
+    (t/trace!
+     {:id :store/current-basis
+      :data {:tenant-id (str tenant-id)}}
+     (let [{:keys [node]} (get-or-create-entry this tenant-id)]
+       (xtdb-current-basis node))))
+
+  (scan-type-as-of [this tenant-id resource-type basis]
+    ;; SQL-only (works under both :sql and :xtql query-modes: both write the
+    ;; same lowercased tables, so `FOR SYSTEM_TIME AS OF` reads are valid
+    ;; regardless of the write pathway). The reducible borrows a pooled
+    ;; connection lazily inside its reduce, i.e. at download/consumption time.
+    (t/trace!
+     {:id :store/scan-type-as-of
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
+     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+       (scan-type-as-of-reducible pool resource-type (basis->system-time basis)
+                                  read-decoders scan-page-size))))
+
+  (count-as-of [this tenant-id resource-type basis]
+    (t/trace!
+     {:id :store/count-as-of
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
+     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+       (try
+         (with-open [conn (jdbc/get-connection pool)]
+           (count-as-of-sql conn resource-type (basis->system-time basis)))
+         (catch Exception e
+           (t/event! ::count-as-of-failed
+                     {:level :warn
+                      :data {:resource-type (name resource-type)
+                             :error (.getMessage e)}})
+           0))))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
   ;; In a real XTDB implementation, we'd query for codes using XTDB

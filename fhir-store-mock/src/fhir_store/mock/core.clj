@@ -425,7 +425,32 @@
     ;; Mock has no cold state worth warming. Ensure the tenant key
     ;; exists so subsequent searches do not 404, then return.
     (swap! state update (str tenant-id) (fnil identity {}))
-    nil))
+    nil)
+
+  (current-basis [this _tenant-id]
+    ;; No-history limitation: the mock keeps only current state, so it cannot
+    ;; reconstruct a past snapshot. The basis is a strictly monotonic token
+    ;; (successive kickoffs get distinct :tx-id) but scan-type-as-of /
+    ;; count-as-of below ignore it and read CURRENT state.
+    {:tx-id (or (some-> (:basis-counter this) (swap! inc)) (System/nanoTime))
+     :system-time (java.time.Instant/now)})
+
+  (scan-type-as-of [_ tenant-id resource-type _basis]
+    ;; No history: returns a lazy seq over the CURRENT live resources of
+    ;; `resource-type` (the basis is ignored). @state is snapshotted eagerly so
+    ;; the seq is stable against later writes; the transformation is lazy and
+    ;; realized incrementally by the consumer.
+    (->> (get-in @state [tenant-id resource-type])
+         vals
+         (remove :deleted?)
+         (map :resource)))
+
+  (count-as-of [_ tenant-id resource-type _basis]
+    ;; No history: count of CURRENT live resources of `resource-type`.
+    (->> (get-in @state [tenant-id resource-type])
+         vals
+         (remove :deleted?)
+         count)))
 
 (defn- mock-valueset-expand [store tenant-id _params id]
   ;; Mock an expansion logic
@@ -456,8 +481,10 @@
 
 (defn create-mock-store [options]
   (let [store (->MockStore (atom {}) options)]
-    (assoc store :operations {:valueset-expand mock-valueset-expand
-                              :valueset-lookup mock-valueset-lookup})))
+    (assoc store
+           :basis-counter (atom 0)
+           :operations {:valueset-expand mock-valueset-expand
+                        :valueset-lookup mock-valueset-lookup})))
 
 (defn halt-mock-store [store]
   (reset! (:state store) {})

@@ -149,7 +149,39 @@
      Returns nil. Never throws on a missing tenant; instead, creates
      the tenant as a side effect and then runs the warmup. This mirrors
      the current `get-or-create-node` / `ensure-tenant-conn!` laziness
-     but makes it explicit and callable at application boot."))
+     but makes it explicit and callable at application boot.")
+  (current-basis [this tenant-id]
+    "Capture the current point-in-time basis (snapshot token) for `tenant-id`
+     as a map:
+
+       {:tx-id <long-or-nil> :system-time <java.time.Instant>}
+
+     :system-time is the commit time of the latest transaction visible to the
+     tenant (never nil; backends with no committed transactions fall back to
+     the wall-clock now). Pass the returned map straight to `scan-type-as-of`
+     and `count-as-of` to read a consistent snapshot as of this moment. This is
+     the read-side dual of the write-return basis convention: it pins a moment
+     WITHOUT producing any resource bytes, so an async export can snapshot at
+     kickoff and stream lazily at download time.")
+  (scan-type-as-of [this tenant-id resource-type basis]
+    "Stream every resource of `resource-type` as of `basis` (a token from
+     `current-basis`). Returns a REDUCIBLE (clojure.lang.IReduceInit) — NOT a
+     realized collection — that pulls the resource set from the store one
+     internal page at a time, holding at most one page in memory. The reduce is
+     driven by the consumer: a reducing function that blocks (e.g. writing to a
+     backpressured OutputStream) pauses the pull, so peak memory stays bounded
+     regardless of type size. Early termination (a `reduced` accumulator) stops
+     the scan without fetching further pages.
+
+     No filtering is applied here beyond the snapshot: _type / _since /
+     _typeFilter / compartment confinement and id-dedup are the export layer's
+     responsibility, applied while consuming the stream. Deleted resources are
+     excluded (only live rows as of the basis are streamed).")
+  (count-as-of [this tenant-id resource-type basis]
+    "Total number of live resources of `resource-type` as of `basis` (a token
+     from `current-basis`). Unfiltered snapshot count, intended for manifest
+     `output[].count` entries. Cheaper than realizing `scan-type-as-of`; a
+     backend that cannot count cheaply may return 0."))
 
 (defn create-store
   "Creates an IFHIRStore implementation. `impl-fn` is a function that takes
