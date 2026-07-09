@@ -12,7 +12,19 @@
             [server.bulk-export :as be]
             [server.bulk-job-store :as bjs]
             [server.compartment :as compartment]
+            [server.handlers :as handlers]
             [server.routing :as routing]))
+
+(def ^:private authorized
+  "Per-request override that grants the caller the 'system' read tuple so the
+   bulk handlers' inline Keto check (server.bulk-export/authorize-system) passes
+   without a live Keto server."
+  {:fhir/system-authorized? (constantly true)})
+
+(def ^:private unauthorized
+  "Per-request override denying the 'system' read tuple (authenticated caller
+   without the system grant)."
+  {:fhir/system-authorized? (constantly false)})
 
 (def ^:private json->clj
   (partial json/read-value))
@@ -89,9 +101,44 @@
     (testing "status/cancel gate on the system read tuple"
       (is (= "read" (:keto/relation status-route)))
       (is (not (:public? status-route))))
-    (testing "file download is gated on the system read tuple, not public"
-      (is (= "read" (:keto/relation file-route)))
-      (is (not (:public? file-route))))))
+    (testing "file download is public + auth-fronted (401 tokenless), gating on
+              the system tuple inline rather than via the Keto middleware"
+      (is (true? (:public? file-route)))
+      (is (fn? (:get file-route)))
+      (is (nil? (:keto/relation file-route))))))
+
+(deftest file-tokenless-returns-401
+  (let [{:keys [file]} (system-route-handlers {} {})
+        resp (file {:request-method :get
+                    :path-params {:tenant-id "default" :job-id "j" :file-id "f"}
+                    :headers {}})]
+    (is (= 401 (:status resp))
+        "tokenless file download must be 401 (Inferno wants 400/401), not 403")))
+
+(deftest file-authenticated-without-system-tuple-returns-403
+  (let [{:keys [file]} (system-route-handlers {} {})
+        resp (file (merge {:request-method :get
+                           :path-params {:tenant-id "default" :job-id "j" :file-id "f"}
+                           :headers {}
+                           :identity {:sub "tester"}
+                           :fhir/bulk-job-store (bjs/create-store)}
+                          unauthorized))]
+    (is (= 403 (:status resp))
+        "authenticated caller without the system tuple must be 403")))
+
+(deftest kickoff-authz-gap-closed-403-without-system-tuple
+  (testing "an authenticated token without the system read tuple cannot start a
+            full-tenant export at any level (system/patient/group); the authz
+            check short-circuits before any store access"
+    (doseq [handler [be/kickoff be/patient-export be/group-export]]
+      (let [resp (handler (merge {:request-method :get
+                                  :path-params {:tenant-id "default" :id "g1"}
+                                  :headers {"host" "h"}
+                                  :scheme :https
+                                  :identity {:sub "no-grant"}
+                                  :fhir/bulk-job-store (bjs/create-store)}
+                                 unauthorized))]
+        (is (= 403 (:status resp)))))))
 
 (deftest patient-and-group-kickoff-routes-are-public-and-auth-fronted
   (let [routes  (routing/build-system-routes [] {"Patient" :reg} nil {})
@@ -167,12 +214,13 @@
 (deftest kickoff-status-file-happy-path
   (let [job-store (bjs/create-store)
         {:keys [kickoff status file]} (system-route-handlers {"Patient" :reg} {})
-        base-req {:path-params {:tenant-id "default"}
-                  :headers {"host" "fhir.local:3001"}
-                  :scheme :https
-                  :identity {:sub "tester"}
-                  :fhir/store (fake-store)
-                  :fhir/bulk-job-store job-store}
+        base-req (merge {:path-params {:tenant-id "default"}
+                         :headers {"host" "fhir.local:3001"}
+                         :scheme :https
+                         :identity {:sub "tester"}
+                         :fhir/store (fake-store)
+                         :fhir/bulk-job-store job-store}
+                        authorized)
         kick-resp (kickoff (assoc base-req :request-method :get :uri "/default/fhir/$export"))]
 
     (testing "kickoff returns 202 with an absolute Content-Location"
@@ -385,12 +433,13 @@
 
 (deftest group-export-404-when-group-missing
   (let [store (fake-search-store {})
-        resp  (be/group-export {:path-params {:tenant-id "default" :id "nope"}
-                                :headers {"host" "h"}
-                                :scheme :https
-                                :identity {:sub "t"}
-                                :fhir/store store
-                                :fhir/bulk-job-store (bjs/create-store)})]
+        resp  (be/group-export (merge {:path-params {:tenant-id "default" :id "nope"}
+                                       :headers {"host" "h"}
+                                       :scheme :https
+                                       :identity {:sub "t"}
+                                       :fhir/store store
+                                       :fhir/bulk-job-store (bjs/create-store)}
+                                      authorized))]
     (is (= 404 (:status resp)))))
 
 (deftest group-export-happy-path-confines-output-to-members
@@ -403,16 +452,17 @@
                            {:resourceType "Patient" :id "p2"}
                            {:resourceType "Patient" :id "p3"}]})
         job-store (bjs/create-store)
-        req   {:path-params {:tenant-id "default" :id "g1"}
-               :uri "/default/fhir/Group/g1/$export"
-               :request-method :get
-               :headers {"host" "fhir.local:3001"}
-               :scheme :https
-               :identity {:sub "t"}
-               :fhir/store store
-               :fhir/bulk-job-store job-store
-               :fhir/all-registries {"Patient" :reg}
-               :fhir/resource-encoders {}}
+        req   (merge {:path-params {:tenant-id "default" :id "g1"}
+                      :uri "/default/fhir/Group/g1/$export"
+                      :request-method :get
+                      :headers {"host" "fhir.local:3001"}
+                      :scheme :https
+                      :identity {:sub "t"}
+                      :fhir/store store
+                      :fhir/bulk-job-store job-store
+                      :fhir/all-registries {"Patient" :reg}
+                      :fhir/resource-encoders {}}
+                     authorized)
         resp  (be/group-export req)]
     (is (= 202 (:status resp)))
     (let [job-id (last (str/split (get-in resp [:headers "Content-Location"]) #"/"))]
@@ -430,16 +480,17 @@
                {"Patient" [{:resourceType "Patient" :id "p1"}
                            {:resourceType "Patient" :id "p2"}]})
         job-store (bjs/create-store)
-        req   {:path-params {:tenant-id "default"}
-               :uri "/default/fhir/Patient/$export"
-               :request-method :get
-               :headers {"host" "fhir.local:3001"}
-               :scheme :https
-               :identity {:sub "t"}
-               :fhir/store store
-               :fhir/bulk-job-store job-store
-               :fhir/all-registries {"Patient" :reg}
-               :fhir/resource-encoders {}}
+        req   (merge {:path-params {:tenant-id "default"}
+                      :uri "/default/fhir/Patient/$export"
+                      :request-method :get
+                      :headers {"host" "fhir.local:3001"}
+                      :scheme :https
+                      :identity {:sub "t"}
+                      :fhir/store store
+                      :fhir/bulk-job-store job-store
+                      :fhir/all-registries {"Patient" :reg}
+                      :fhir/resource-encoders {}}
+                     authorized)
         resp  (be/patient-export req)]
     (is (= 202 (:status resp)))
     (let [job-id (last (str/split (get-in resp [:headers "Content-Location"]) #"/"))]
@@ -456,17 +507,18 @@
             OperationOutcome error file rather than leaking or failing"
     (let [store (fake-search-store {"Patient" [{:resourceType "Patient" :id "p1"}]})
           job-store (bjs/create-store)
-          req   {:path-params {:tenant-id "default"}
-                 :uri "/default/fhir/Patient/$export"
-                 :request-method :get
-                 :headers {"host" "fhir.local:3001"}
-                 :scheme :https
-                 :identity {:sub "t"}
-                 :query-params {"_type" "Patient,Location"}
-                 :fhir/store store
-                 :fhir/bulk-job-store job-store
-                 :fhir/all-registries {"Patient" :reg "Location" :reg}
-                 :fhir/resource-encoders {}}
+          req   (merge {:path-params {:tenant-id "default"}
+                        :uri "/default/fhir/Patient/$export"
+                        :request-method :get
+                        :headers {"host" "fhir.local:3001"}
+                        :scheme :https
+                        :identity {:sub "t"}
+                        :query-params {"_type" "Patient,Location"}
+                        :fhir/store store
+                        :fhir/bulk-job-store job-store
+                        :fhir/all-registries {"Patient" :reg "Location" :reg}
+                        :fhir/resource-encoders {}}
+                       authorized)
           resp  (be/patient-export req)]
       (is (= 202 (:status resp)))
       (let [job-id (last (str/split (get-in resp [:headers "Content-Location"]) #"/"))]
@@ -481,3 +533,43 @@
             (is (str/includes? (:url (first (:error manifest))) "$export-file")))
           (testing "Patient still exports successfully alongside the error"
             (is (= ["Patient"] (mapv :type (:output manifest))))))))))
+
+;; ---------------------------------------------------------------------------
+;; CapabilityStatement $export operation declarations
+;;
+;; Inferno's bulk_data operation_support check locates system export at the
+;; rest level and patient-/group-level export at rest.resource[type].operation
+;; (operation.name "export" + the type's OperationDefinition canonical). See
+;; BulkDataExportOperationTests#check_export_support.
+;; ---------------------------------------------------------------------------
+
+(deftest capability-statement-declares-export-operations
+  (let [schemas [(m/schema [:map {:resourceType "Patient"
+                                  :fhir/interactions {:read {}}} [:id :string]])
+                 (m/schema [:map {:resourceType "Observation"
+                                  :fhir/interactions {:read {}}} [:id :string]])]
+        body    (:body ((handlers/capability-statement schemas) {}))
+        rest0   (first (:rest body))
+        resources (:resource rest0)
+        find-export (fn [rtype]
+                      (->> resources
+                           (filter #(= rtype (:type %)))
+                           first
+                           :operation
+                           (filter #(= "export" (:name %)))
+                           first))]
+    (testing "system-level export stays at the rest level"
+      (is (some #(and (= "export" (:name %))
+                      (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"
+                         (:definition %)))
+                (:operation rest0))))
+    (testing "Patient resource declares export with the patient-export canonical"
+      (is (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
+             (:definition (find-export "Patient")))))
+    (testing "Group resource is appended (not a registered type here) with the
+              group-export canonical"
+      (is (some #(= "Group" (:type %)) resources))
+      (is (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
+             (:definition (find-export "Group")))))
+    (testing "non-bulk resources get no injected export operation"
+      (is (nil? (find-export "Observation"))))))

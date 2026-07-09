@@ -46,6 +46,17 @@
                      :else "system")]
         (check-permission keto-url namespace object relation subject-id)))))
 
+(defn system-read-allowed?
+  "Whether `subject-id` holds a 'system' read tuple in the 'fhir' namespace.
+   Public entry point mirroring the middleware's check against the 'system'
+   object, for :public? routes (bulk-data $export / $export-file) where
+   wrap-keto-authorization is bypassed and the handler must perform the same
+   authorization check itself. `keto-url` falls back to the default when nil."
+  [keto-url subject-id]
+  (boolean
+   (and subject-id
+        (check-permission (or keto-url default-keto-url) "fhir" "system" "read" subject-id))))
+
 (defn wrap-keto-authorization
   "Middleware that checks Ory Keto to see if the identity is authorized to perform the action.
    Requires `identity` to be populated by buddy-auth.

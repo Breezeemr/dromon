@@ -235,6 +235,14 @@
   (fn [req]
     (handler (assoc req :fhir/bulk-job-store bulk-job-store))))
 
+(defn wrap-keto-url
+  "Inject the configured Keto read API URL so the :public? bulk-data handlers,
+   where wrap-keto-authorization is bypassed, can perform the same 'system'
+   authorization check the middleware would (server.keto/system-read-allowed?)."
+  [handler keto-url]
+  (fn [req]
+    (handler (assoc req :fhir/keto-url keto-url))))
+
 (defn- parse-cors-origins
   "Parses CORS allowed origins from a comma-separated string or collection into a set.
    Returns nil if input is nil or blank."
@@ -298,6 +306,7 @@
                          [wrap-fhir-store store]
                          [wrap-terminology terminology]
                          [wrap-bulk-job-store bulk-job-store]
+                         [wrap-keto-url keto-url]
                          [auth/wrap-jwt-auth {:jwks-url jwks-url}]])
                           enforce-smart-scopes? (conj [scope/wrap-smart-scope {}]
                                                       [compartment/wrap-patient-compartment {}])

@@ -877,6 +877,33 @@
                   :issue [{:severity "error" :code "not-supported"
                            :diagnostics "ValueSet $lookup not supported"}]}})))))
 
+(def ^:private bulk-export-resource-operations
+  "Bulk Data IG per-resource $export operation declarations. Inferno's
+   bulk_data operation_support check locates Patient- and Group-level export at
+   rest.resource[type].operation, matching operation.name = \"export\" and the
+   type's OperationDefinition canonical (system-level export is checked at the
+   rest level instead). See BulkDataExportOperationTests#check_export_support."
+  {"Patient" {:name "export"
+              :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"}
+   "Group"   {:name "export"
+              :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"}})
+
+(defn- with-bulk-export-operations
+  "Ensure the Patient and Group resource capabilities declare the Bulk Data
+   $export operation. Patient is a registered resource type, so its existing
+   entry is augmented in place; Group is not a registered type here, so a
+   minimal resource entry is appended when absent."
+  [resources]
+  (let [present (into #{} (map :type) resources)
+        augment (fn [entry]
+                  (if-let [op (bulk-export-resource-operations (:type entry))]
+                    (update entry :operation (fnil conj []) op)
+                    entry))]
+    (cond-> (mapv augment resources)
+      (not (contains? present "Group"))
+      (conj {:type "Group"
+             :operation [(bulk-export-resource-operations "Group")]}))))
+
 (defn capability-statement [schemas]
   (fn [_req]
     (let [resources (mapv (fn [schema]
@@ -940,17 +967,14 @@
               :rest [{:mode "server"
                       :security {:service [{:coding [{:system "http://terminology.hl7.org/CodeSystem/restful-security-service"
                                                       :code "SMART-on-FHIR"}]}]}
-                      ;; Bulk Data Access IG $export operations: system-level,
-                      ;; patient-level (Patient/$export), and group-level
-                      ;; (Group/[id]/$export). Inferno asserts each against its
-                      ;; OperationDefinition canonical URL.
+                      ;; System-level Bulk Data $export. Inferno's bulk_data
+                      ;; operation_support check locates system export at the
+                      ;; rest level (operation.name "export"); the patient- and
+                      ;; group-level declarations live under their respective
+                      ;; rest.resource entries (see with-bulk-export-operations).
                       :operation [{:name "export"
-                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"}
-                                  {:name "patient-export"
-                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"}
-                                  {:name "group-export"
-                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"}]
-                      :resource resources}]}})))
+                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"}]
+                      :resource (with-bulk-export-operations resources)}]}})))
 
 ;; SMART Backend Services (bulk data) discovery advertised below only declares
 ;; what the token endpoint supports; the token issuance and `private_key_jwt`

@@ -24,6 +24,7 @@
             [server.bulk-job-store :as bjs]
             [server.compartment :as compartment]
             [server.handlers :as handlers]
+            [server.keto :as keto]
             [taoensso.telemere :as t])
   (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]))
@@ -57,6 +58,41 @@
 (defn- oo-response [status code diagnostics]
   (str-response status "application/fhir+json"
                 (json-str (operation-outcome "error" code diagnostics))))
+
+;; ---------------------------------------------------------------------------
+;; Authorization
+;;
+;; The kickoff ($export / Patient/$export / Group/[id]/$export) and file
+;; ($export-file) routes are `:public?` so a tokenless request yields 401 from
+;; server.auth/wrap-require-auth rather than the Keto 403 that a missing subject
+;; would otherwise produce. Because `:public?` also bypasses the Keto
+;; middleware, an authenticated caller could otherwise start or read a
+;; full-tenant export with any valid token; these handlers therefore replicate
+;; the middleware's "system" object check inline: no token -> 401 (upstream),
+;; token without the system read tuple -> 403, token with it -> proceed.
+;; ---------------------------------------------------------------------------
+
+(defn- system-authorized?
+  "Whether the request's authenticated subject holds the 'system' read tuple.
+   Overridable per-request via :fhir/system-authorized? (a
+   (fn [subject-id] -> boolean), used by tests); otherwise performs a live
+   server.keto check against the 'system' object using the injected
+   :fhir/keto-url (server.core/wrap-keto-url)."
+  [req]
+  (let [subject-id (get-in req [:identity :sub])]
+    (if-let [pred (:fhir/system-authorized? req)]
+      (boolean (pred subject-id))
+      (keto/system-read-allowed? (:fhir/keto-url req) subject-id))))
+
+(defn- authorize-system
+  "Gate a :public? bulk route on the 'system' Keto read tuple. Returns nil to
+   proceed, or a 403 OperationOutcome response when the subject is not
+   authorized. Tokenless requests never reach here (wrap-require-auth -> 401)."
+  [req]
+  (when-not (system-authorized? req)
+    (oo-response 403 "forbidden"
+                 (str "Subject " (get-in req [:identity :sub])
+                      " is not authorized for bulk export against the system object."))))
 
 ;; ---------------------------------------------------------------------------
 ;; URL helpers
@@ -424,31 +460,39 @@
                       "")))))
 
 (defn kickoff
-  "GET /:tenant-id/fhir/$export — system-level export kickoff."
+  "GET /:tenant-id/fhir/$export — system-level export kickoff. Authorized
+   against the 'system' Keto object (the :public? route bypasses the Keto
+   middleware); an authenticated caller lacking the system read tuple -> 403."
   [req]
-  (start-export! req :system nil))
+  (or (authorize-system req)
+      (start-export! req :system nil)))
 
 (defn patient-export
   "GET /:tenant-id/fhir/Patient/$export — patient-level export kickoff. The
    subject set is every Patient in the tenant; each requested type is confined
-   to each Patient's compartment (server.compartment/confine)."
+   to each Patient's compartment (server.compartment/confine). Authorized
+   against the 'system' Keto object (see kickoff)."
   [req]
-  (start-export! req :patient nil))
+  (or (authorize-system req)
+      (start-export! req :patient nil)))
 
 (defn group-export
   "GET /:tenant-id/fhir/Group/:id/$export — group-level export kickoff. Reads
    the Group (404 when absent), resolves its member.entity Patient references,
    and confines each requested type to the union of those Patients'
-   compartments."
+   compartments. Authorized against the 'system' Keto object (see kickoff); the
+   authorization check runs before the Group read so an unauthorized caller
+   cannot probe Group existence."
   [req]
-  (let [tenant-id (-> req :path-params :tenant-id)
-        group-id  (-> req :path-params :id)
-        store     (:fhir/store req)
-        group     (try (db/read-resource store tenant-id :Group group-id)
-                       (catch Throwable _ nil))]
-    (if (nil? group)
-      (oo-response 404 "not-found" (str "Group/" group-id " not found"))
-      (start-export! req :group group-id))))
+  (or (authorize-system req)
+      (let [tenant-id (-> req :path-params :tenant-id)
+            group-id  (-> req :path-params :id)
+            store     (:fhir/store req)
+            group     (try (db/read-resource store tenant-id :Group group-id)
+                           (catch Throwable _ nil))]
+        (if (nil? group)
+          (oo-response 404 "not-found" (str "Group/" group-id " not found"))
+          (start-export! req :group group-id)))))
 
 (defn status
   "GET /:tenant-id/fhir/$export-status/:job-id — poll job status.
@@ -500,17 +544,20 @@
 
 (defn file
   "GET /:tenant-id/fhir/$export-file/:job-id/:file-id — download one NDJSON
-   output (or error) file. Gated on the system Keto tuple (manifest
-   requiresAccessToken is true); the body is pre-serialized NDJSON with an
-   explicit Content-Type, bypassing muuntaja."
+   output (or error) file. The :public? route yields 401 for a tokenless
+   request (wrap-require-auth) and this handler then gates on the system Keto
+   tuple (manifest requiresAccessToken is true): a token without the system
+   read tuple -> 403. The body is pre-serialized NDJSON with an explicit
+   Content-Type, bypassing muuntaja."
   [req]
-  (let [tenant-id (-> req :path-params :tenant-id)
-        job-id    (-> req :path-params :job-id)
-        file-id   (-> req :path-params :file-id)
-        job-store (:fhir/bulk-job-store req)
-        job       (bjs/get-job job-store tenant-id job-id)
-        ndjson    (get-in job [:files file-id])]
-    (if (and ndjson (= :complete (:status job)))
-      (str-response 200 "application/fhir+ndjson" ndjson)
-      (oo-response 404 "not-found"
-                   (str "Export file " file-id " not found for job " job-id)))))
+  (or (authorize-system req)
+      (let [tenant-id (-> req :path-params :tenant-id)
+            job-id    (-> req :path-params :job-id)
+            file-id   (-> req :path-params :file-id)
+            job-store (:fhir/bulk-job-store req)
+            job       (bjs/get-job job-store tenant-id job-id)
+            ndjson    (get-in job [:files file-id])]
+        (if (and ndjson (= :complete (:status job)))
+          (str-response 200 "application/fhir+ndjson" ndjson)
+          (oo-response 404 "not-found"
+                       (str "Export file " file-id " not found for job " job-id))))))
