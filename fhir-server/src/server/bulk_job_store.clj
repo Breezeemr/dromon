@@ -3,7 +3,7 @@
 
    Jobs are ephemeral and per-node: the store is
    `{:jobs (atom {[tenant-id job-id] -> job})
-     :active-streams (atom <long>)
+     :active-streams (atom {stream-token -> start-epoch-ms})
      :config {...}}`. Keying on `[tenant-id job-id]` keeps the registry
    multitenant without a store-backed table (which would diverge across the
    xtdb2/datomic backends). This is the MVP choice documented in
@@ -14,8 +14,9 @@
    NDJSON is ever held in the job map and nothing is spooled to disk; the bytes
    are produced by streaming from the store at download time (see
    server.bulk-export). The only bounded resource is the number of concurrent
-   download streams, tracked by `:active-streams` and capped by
-   :max-concurrent-streams.
+   download streams, tracked by `:active-streams` (timestamped tokens, so a
+   slot leaked by a client that disconnects before Jetty writes the body
+   self-heals after :max-stream-ms) and capped by :max-concurrent-streams.
 
    Job record shape:
      {:id               job-id string
@@ -39,10 +40,14 @@
 (def default-config
   "Bounded-resource config for the bulk job store. :max-concurrent-streams caps
    simultaneous download streams (each holds at most one store page in memory);
-   :ttl-ms (milliseconds) bounds how long completed job metadata lingers.
-   Overridable via the Integrant component opts and the BULK_* env vars (see the
-   :fhir/bulk-job-store init-key)."
+   :max-stream-ms (milliseconds) bounds how long a leaked stream slot lingers
+   before it self-heals (a client can disconnect after the 200 but before Jetty
+   writes the body, so the body's release finally never runs); :ttl-ms bounds
+   how long completed job metadata lingers. Overridable via the Integrant
+   component opts and the BULK_* env vars (see the :fhir/bulk-job-store
+   init-key)."
   {:max-concurrent-streams 4
+   :max-stream-ms          3600000     ; 1h -- self-heal a leaked stream slot
    :ttl-ms                 3600000})   ; 1h
 
 (defn create-store
@@ -50,7 +55,7 @@
   ([] (create-store {}))
   ([config]
    {:jobs           (atom {})
-    :active-streams (atom 0)
+    :active-streams (atom {})
     :config         (merge default-config config)}))
 
 (defn config
@@ -95,30 +100,49 @@
 ;; Concurrent-stream accounting (memory bound)
 ;; ---------------------------------------------------------------------------
 
+(defn- prune-stale
+  "Drop stream tokens whose start is older than `max-ms` (leaked slots)."
+  [streams now max-ms]
+  (into {} (remove (fn [[_ started]] (> (- now (long started)) max-ms))) streams))
+
 (defn active-stream-count
-  "Number of download streams currently in flight (concurrency-cap input)."
+  "Number of download streams currently in flight, excluding leaked (stale)
+   slots (concurrency-cap input). Prunes stale slots as a side effect."
   [store]
-  (long @(:active-streams store)))
+  (let [a      (:active-streams store)
+        max-ms (long (:max-stream-ms (config store)))]
+    (loop []
+      (let [cur  @a
+            live (prune-stale cur (System/currentTimeMillis) max-ms)]
+        (if (or (identical? cur live) (compare-and-set! a cur live))
+          (count live)
+          (recur))))))
 
 (defn acquire-stream!
-  "Atomically reserve a download-stream slot: increment the active-stream
-   counter iff it is below `max`, returning true on success or false when the
-   cap is already reached. Pair every true return with exactly one
-   release-stream!."
+  "Atomically reserve a download-stream slot, first self-healing any leaked
+   slots (a stream whose release never ran, e.g. a client disconnect before the
+   body was written) older than :max-stream-ms. Returns an opaque token on
+   success, or nil when `max` live slots are already held. Pass the token to
+   release-stream! exactly once."
   [store max]
-  (let [a (:active-streams store)
-        m (long max)]
+  (let [a      (:active-streams store)
+        m      (long max)
+        max-ms (long (:max-stream-ms (config store)))
+        token  (str (random-uuid))]
     (loop []
-      (let [n (long @a)]
-        (cond
-          (>= n m)                        false
-          (compare-and-set! a n (inc n))  true
-          :else                           (recur))))))
+      (let [cur  @a
+            now  (System/currentTimeMillis)
+            live (prune-stale cur now max-ms)]
+        (if (>= (count live) m)
+          (if (or (identical? cur live) (compare-and-set! a cur live)) nil (recur))
+          (if (compare-and-set! a cur (assoc live token now)) token (recur)))))))
 
 (defn release-stream!
-  "Release a previously acquired download-stream slot (never below zero)."
-  [store]
-  (swap! (:active-streams store) (fn [n] (max 0 (dec (long n)))))
+  "Release a previously acquired download-stream slot by its `token`
+   (idempotent; a nil token is a no-op)."
+  [store token]
+  (when token
+    (swap! (:active-streams store) dissoc token))
   nil)
 
 (defn- env-long [name]
@@ -130,6 +154,8 @@
   (cond-> {}
     (System/getenv "BULK_MAX_CONCURRENT_STREAMS")
     (assoc :max-concurrent-streams (env-long "BULK_MAX_CONCURRENT_STREAMS"))
+    (System/getenv "BULK_MAX_STREAM_MS")
+    (assoc :max-stream-ms (env-long "BULK_MAX_STREAM_MS"))
     (System/getenv "BULK_JOB_TTL_MS")
     (assoc :ttl-ms (env-long "BULK_JOB_TTL_MS"))))
 

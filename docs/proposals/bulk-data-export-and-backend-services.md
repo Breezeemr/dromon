@@ -240,14 +240,19 @@ backpressure, so peak memory is one store page regardless of type size.
 4. Bound concurrency, not disk. There is no disk to cap and no worker to abort,
    so the cap model becomes a **concurrent-stream limit**. The
    `:fhir/bulk-job-store` Integrant component carries
-   `max-concurrent-streams=4` (env `BULK_MAX_CONCURRENT_STREAMS`) and
+   `max-concurrent-streams=4` (env `BULK_MAX_CONCURRENT_STREAMS`),
+   `max-stream-ms=3600000` / 1h (env `BULK_MAX_STREAM_MS`), and
    `ttl-ms=3600000` / 1h (env `BULK_JOB_TTL_MS`); the init-key layers the env
    overrides over the component opts. Enforcement:
    - Kickoff and `$export-file` both check the live active-stream count; at or
      above `max-concurrent-streams` they return 429 with an `OperationOutcome`
-     and a `Retry-After` header. `$export-file` atomically acquires a slot
-     (compare-and-set on an `:active-streams` counter) for the duration of the
-     stream and releases it in a `finally` once `write-body-to-stream` returns.
+     and a `Retry-After` header. `$export-file` atomically acquires a slot (a
+     timestamped token in the `:active-streams` map) for the duration of the
+     stream and releases it by token in a `finally` once `write-body-to-stream`
+     returns. Because a client can disconnect after the 200 but before Jetty
+     writes the body (so that `finally` never runs), slots are self-healing:
+     both acquire and the count check prune any token older than `max-stream-ms`,
+     so leaked slots cannot permanently wedge the cap.
    - TTL eviction: completed/cancelled jobs older than `ttl-ms` are dropped. The
      records are now tiny metadata, so eviction is a plain `dissoc` - no files
      to delete. A lazy sweep runs at the head of each bulk request.

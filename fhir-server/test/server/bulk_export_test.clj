@@ -721,16 +721,37 @@
           pt        (first (filter #(= "Patient" (:type %)) (:output job)))
           file-req  (assoc base :path-params {:tenant-id "default"
                                               :job-id job-id :file-id (:file-id pt)})]
-      (is (true? (bjs/acquire-stream! job-store 1)) "manually saturate the single slot")
-      (let [resp (file file-req)]
-        (is (= 429 (:status resp)))
-        (is (= "120" (get-in resp [:headers "Retry-After"]))))
-      (bjs/release-stream! job-store)
+      (let [tok (bjs/acquire-stream! job-store 1)]
+        (is (some? tok) "manually saturate the single slot")
+        (let [resp (file file-req)]
+          (is (= 429 (:status resp)))
+          (is (= "120" (get-in resp [:headers "Retry-After"]))))
+        (bjs/release-stream! job-store tok))
       (testing "once the slot frees, the same download succeeds and re-releases"
         (let [resp (file file-req)]
           (is (= 200 (:status resp)))
           (stream-body->string (:body resp))
           (is (zero? (bjs/active-stream-count job-store))))))))
+
+(deftest leaked-stream-slot-self-heals
+  (testing "a stream slot leaked by a client that disconnected before the body
+            was written (its release finally never ran) is reclaimed after
+            :max-stream-ms, so leaked slots cannot permanently wedge the cap"
+    (let [job-store (bjs/create-store {:max-concurrent-streams 1 :max-stream-ms 1000})
+          streams   (:active-streams job-store)]
+      ;; A leaked slot: a token whose start is older than :max-stream-ms.
+      (reset! streams {"leaked" (- (System/currentTimeMillis) 5000)})
+      ;; A concurrent fresh slot must NOT be reclaimed.
+      (swap! streams assoc "fresh" (System/currentTimeMillis))
+      (is (= 1 (bjs/active-stream-count job-store))
+          "the leaked slot is pruned, the fresh slot is kept")
+      (is (= #{"fresh"} (set (keys @streams)))
+          "only the leaked slot was swept")
+      ;; Even at the cap, acquire reclaims a leaked slot instead of wedging.
+      (reset! streams {"leaked" (- (System/currentTimeMillis) 5000)})
+      (let [tok (bjs/acquire-stream! job-store 1)]
+        (is (some? tok) "acquire reclaims the leaked slot despite being at the cap")
+        (is (= #{tok} (set (keys @streams))))))))
 
 (deftest ttl-sweep-evicts-expired-job-metadata
   (testing "a lazy sweep on the next bulk request removes terminal jobs older

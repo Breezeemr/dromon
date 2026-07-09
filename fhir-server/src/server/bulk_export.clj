@@ -668,7 +668,7 @@
    the job's pinned basis, releasing a concurrency slot when done. An :output
    descriptor scans the type and applies compartment/_typeFilter/_since/dedup;
    an :error descriptor writes a single OperationOutcome line."
-  [job-store job store all-registries encoders descriptor]
+  [job-store job store all-registries encoders descriptor token]
   (let [{:keys [kind basis owner-ids params]} job
         {:keys [type diagnostics]} descriptor
         encode       (partial handlers/encode-resource-by-type encoders)
@@ -686,7 +686,7 @@
              (stream-output! store (:tenant job) basis kind owner-ids type registry
                              (filters-for type-filters type) since encode out)))
           (finally
-            (bjs/release-stream! job-store)))))))
+            (bjs/release-stream! job-store token)))))))
 
 (defn file
   "GET /:tenant-id/fhir/$export-file/:job-id/:file-id — download one NDJSON
@@ -715,13 +715,12 @@
           (oo-response 404 "not-found"
                        (str "Export file " file-id " not found for job " job-id))
 
-          (not (bjs/acquire-stream! job-store max-streams))
-          (oo-response 429 "throttled"
-                       (str "Too many concurrent export streams (limit " max-streams
-                            "). Retry after the indicated delay.")
-                       {"Retry-After" "120"})
-
           :else
-          {:status  200
-           :headers {"Content-Type" "application/fhir+ndjson"}
-           :body    (output-stream-body job-store job store all-registries encoders descriptor)}))))
+          (if-let [token (bjs/acquire-stream! job-store max-streams)]
+            {:status  200
+             :headers {"Content-Type" "application/fhir+ndjson"}
+             :body    (output-stream-body job-store job store all-registries encoders descriptor token)}
+            (oo-response 429 "throttled"
+                         (str "Too many concurrent export streams (limit " max-streams
+                              "). Retry after the indicated delay.")
+                         {"Retry-After" "120"}))))))
