@@ -1,12 +1,21 @@
 (ns server.bulk-job-store
   "In-memory registry for FHIR Bulk Data Access ($export) jobs.
 
-   Jobs are ephemeral and per-node: the store is a small map
-   `{:jobs (atom {[tenant-id job-id] -> job}) :config {...}}`. Keying on
-   `[tenant-id job-id]` keeps the registry multitenant without a store-backed
-   table (which would diverge across the xtdb2/datomic backends). This is the
-   MVP choice documented in
+   Jobs are ephemeral and per-node: the store is
+   `{:jobs (atom {[tenant-id job-id] -> job})
+     :active-streams (atom <long>)
+     :config {...}}`. Keying on `[tenant-id job-id]` keeps the registry
+   multitenant without a store-backed table (which would diverge across the
+   xtdb2/datomic backends). This is the MVP choice documented in
    docs/proposals/bulk-data-export-and-backend-services.md.
+
+   Lazy stream-at-download model: a job holds only tiny metadata (a pinned
+   store basis + a pre-serialized manifest + per-file stream descriptors). No
+   NDJSON is ever held in the job map and nothing is spooled to disk; the bytes
+   are produced by streaming from the store at download time (see
+   server.bulk-export). The only bounded resource is the number of concurrent
+   download streams, tracked by `:active-streams` and capped by
+   :max-concurrent-streams.
 
    Job record shape:
      {:id               job-id string
@@ -14,39 +23,38 @@
       :kind             #{:system :patient :group}
       :group-id         optional string
       :params           request query params map
+      :basis            pinned point-in-time store basis (db/current-basis)
+      :owner-ids        set of subject Patient ids (patient/group), else nil
       :status           #{:in-progress :complete :error :cancelled}
-      :transaction-time ISO-8601 instant string
+      :transaction-time ISO-8601 instant string derived from the basis
       :request-url      absolute kickoff URL string
       :created-at       epoch millis at kickoff
       :finished-at      epoch millis when the job reached a terminal status
-      :temp-dir         absolute path of this job's temp directory tree
+      :manifest         pre-serialized application/json status manifest string
       :output           [{:type rt :file-id id :count n} ...]
-      :error            [ ... OperationOutcome-ish maps ... ]
-      :files            {file-id {:path :type :count :bytes}}}
-
-   NDJSON content is never held in the job map: it is streamed to the temp
-   files whose metadata lives under :files (see server.bulk-export)."
+      :error            [{:type \"OperationOutcome\" :file-id id :diagnostics s} ...]
+      :files            {file-id {:kind #{:output :error} :type :diagnostics}}}"
   (:require [integrant.core :as ig]))
 
 (def default-config
-  "Bounded-memory caps for the bulk job store. All byte values are in bytes;
-   ttl-ms is milliseconds. Overridable via the Integrant component opts and the
-   BULK_* env vars (see the :fhir/bulk-job-store init-key)."
-  {:max-concurrent-jobs 4
-   :max-job-bytes       (* 1024 1024 1024)       ; 1 GB per job
-   :max-total-bytes     (* 5 1024 1024 1024)     ; 5 GB across all jobs on disk
-   :ttl-ms              3600000                  ; 1h
-   :temp-dir            (System/getProperty "java.io.tmpdir")})
+  "Bounded-resource config for the bulk job store. :max-concurrent-streams caps
+   simultaneous download streams (each holds at most one store page in memory);
+   :ttl-ms (milliseconds) bounds how long completed job metadata lingers.
+   Overridable via the Integrant component opts and the BULK_* env vars (see the
+   :fhir/bulk-job-store init-key)."
+  {:max-concurrent-streams 4
+   :ttl-ms                 3600000})   ; 1h
 
 (defn create-store
   "Create a fresh, empty job registry with `config` merged over the defaults."
   ([] (create-store {}))
   ([config]
-   {:jobs   (atom {})
-    :config (merge default-config config)}))
+   {:jobs           (atom {})
+    :active-streams (atom 0)
+    :config         (merge default-config config)}))
 
 (defn config
-  "The bounded-memory config map for `store`."
+  "The bounded-resource config map for `store`."
   [store]
   (:config store))
 
@@ -83,24 +91,35 @@
   [store]
   (vec (vals @(jobs-atom store))))
 
-(defn in-progress-count
-  "Number of jobs currently in the :in-progress status (concurrency cap input)."
-  [store]
-  (reduce (fn [n job] (if (= :in-progress (:status job)) (inc n) n))
-          0
-          (vals @(jobs-atom store))))
+;; ---------------------------------------------------------------------------
+;; Concurrent-stream accounting (memory bound)
+;; ---------------------------------------------------------------------------
 
-(defn total-on-disk-bytes
-  "Sum of the recorded :bytes across every file of every job in the store. A
-   job records its files only once it completes, so while a worker is still
-   writing, this total covers the OTHER jobs' on-disk footprint."
+(defn active-stream-count
+  "Number of download streams currently in flight (concurrency-cap input)."
   [store]
-  (reduce (fn [total job]
-            (reduce (fn [t f] (+ t (long (or (:bytes f) 0))))
-                    total
-                    (vals (:files job))))
-          0
-          (vals @(jobs-atom store))))
+  (long @(:active-streams store)))
+
+(defn acquire-stream!
+  "Atomically reserve a download-stream slot: increment the active-stream
+   counter iff it is below `max`, returning true on success or false when the
+   cap is already reached. Pair every true return with exactly one
+   release-stream!."
+  [store max]
+  (let [a (:active-streams store)
+        m (long max)]
+    (loop []
+      (let [n (long @a)]
+        (cond
+          (>= n m)                        false
+          (compare-and-set! a n (inc n))  true
+          :else                           (recur))))))
+
+(defn release-stream!
+  "Release a previously acquired download-stream slot (never below zero)."
+  [store]
+  (swap! (:active-streams store) (fn [n] (max 0 (dec (long n)))))
+  nil)
 
 (defn- env-long [name]
   (some-> (System/getenv name) Long/parseLong))
@@ -109,16 +128,10 @@
   "Config overrides read from the BULK_* env vars (only keys that are set)."
   []
   (cond-> {}
-    (System/getenv "BULK_MAX_CONCURRENT_JOBS")
-    (assoc :max-concurrent-jobs (env-long "BULK_MAX_CONCURRENT_JOBS"))
-    (System/getenv "BULK_MAX_JOB_BYTES")
-    (assoc :max-job-bytes (env-long "BULK_MAX_JOB_BYTES"))
-    (System/getenv "BULK_MAX_TOTAL_BYTES")
-    (assoc :max-total-bytes (env-long "BULK_MAX_TOTAL_BYTES"))
+    (System/getenv "BULK_MAX_CONCURRENT_STREAMS")
+    (assoc :max-concurrent-streams (env-long "BULK_MAX_CONCURRENT_STREAMS"))
     (System/getenv "BULK_JOB_TTL_MS")
-    (assoc :ttl-ms (env-long "BULK_JOB_TTL_MS"))
-    (System/getenv "BULK_TEMP_DIR")
-    (assoc :temp-dir (System/getenv "BULK_TEMP_DIR"))))
+    (assoc :ttl-ms (env-long "BULK_JOB_TTL_MS"))))
 
 (defmethod ig/init-key :fhir/bulk-job-store [_ opts]
   ;; Integrant opts provide the base config; BULK_* env vars override per key.

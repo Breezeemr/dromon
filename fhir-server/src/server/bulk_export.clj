@@ -1,26 +1,39 @@
 (ns server.bulk-export
-  "FHIR Bulk Data Access ($export) MVP: system-level export.
+  "FHIR Bulk Data Access ($export) MVP: system-, patient- and group-level export.
 
    Implements the async kickoff / status / cancel / file download handshake
    from the Bulk Data Access IG (STU2). This is the Phase B increment of
-   docs/proposals/bulk-data-export-and-backend-services.md:
+   docs/proposals/bulk-data-export-and-backend-services.md.
 
      - kickoff  GET  /:tenant-id/fhir/$export
      - status   GET  /:tenant-id/fhir/$export-status/:job-id
      - cancel   DELETE .../$export-status/:job-id
      - file     GET  /:tenant-id/fhir/$export-file/:job-id/:file-id
 
+   Memory/IO model (lazy stream-at-download): kickoff produces NO resource
+   bytes and touches NO disk. It pins a point-in-time store basis
+   (db/current-basis), builds the tiny status manifest (which types, a per-type
+   count-as-of, a transactionTime derived from the basis), pre-serializes it,
+   and stores only that metadata in the job. The actual NDJSON is produced
+   lazily at DOWNLOAD time: $export-file returns a Ring StreamableResponseBody
+   whose write-body-to-stream scans the type AS OF the pinned basis
+   (db/scan-type-as-of) and writes NDJSON lines straight to the socket,
+   flushing per batch so Jetty applies TCP backpressure and peak memory stays
+   bounded to one store page regardless of type size. No background worker, no
+   temp files.
+
    Response-encoding note (critical): the status manifest is application/json
-   and the NDJSON files are application/fhir+ndjson, neither of which is what
+   and the NDJSON stream is application/fhir+ndjson, neither of which is what
    muuntaja would negotiate. A Clojure map body carrying an explicit
-   Content-Type bypasses muuntaja and then fails to stream (HTTP 500), so
-   every response here is PRE-SERIALIZED to a string and returned with an
-   explicit Content-Type, deliberately bypassing muuntaja (mirroring the
-   default-404 handler in server.core). See the smart-configuration comment in
-   server.handlers for the map-body-vs-Content-Type gotcha."
-  (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+   Content-Type bypasses muuntaja and then fails to stream (HTTP 500), so the
+   manifest is PRE-SERIALIZED to a string and the NDJSON body is a
+   StreamableResponseBody (a reify, not a map/coll) returned with an explicit
+   Content-Type; muuntaja leaves both untouched (it only encodes map/coll
+   bodies). See the smart-configuration comment in server.handlers for the
+   map-body-vs-Content-Type gotcha."
+  (:require [clojure.string :as str]
             [jsonista.core :as json]
+            [ring.core.protocols :as ring-protocols]
             [fhir-store.protocol :as db]
             [server.bulk-job-store :as bjs]
             [server.compartment :as compartment]
@@ -29,6 +42,7 @@
             [taoensso.telemere :as t])
   (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]
+           [java.io OutputStream OutputStreamWriter BufferedWriter Writer]
            [java.nio.charset StandardCharsets]))
 
 (def ^:private json-mapper
@@ -42,7 +56,7 @@
   (json/write-value-as-string x json-mapper))
 
 ;; ---------------------------------------------------------------------------
-;; Response helpers (all bodies pre-serialized to strings, explicit CT)
+;; Response helpers (all non-stream bodies pre-serialized to strings, explicit CT)
 ;; ---------------------------------------------------------------------------
 
 (defn- str-response
@@ -176,7 +190,7 @@
 (defn- parse-type-filters
   "Parse `_typeFilter` values (each `ResourceType?param=value&...`) into
    {resource-type [search-param-map ...]}. Multiple filters for one type are
-   unioned by the enumerator. Malformed specs (no `?`) are ignored."
+   unioned while streaming. Malformed specs (no `?`) are ignored."
   [params]
   (reduce
    (fn [acc raw]
@@ -216,209 +230,147 @@
           :else (try (not (.isBefore (java.time.Instant/parse (str lu)) since))
                      (catch Exception _ true))))))
 
-;; ---------------------------------------------------------------------------
-;; Enumeration
-;; ---------------------------------------------------------------------------
+(defn- matches-type-filter?
+  "Best-effort in-memory match of a single _typeFilter search-param map against
+   `resource`: every non-underscore string param must equal the resource's
+   top-level field (stringwise). An empty map matches everything. This is a
+   pragmatic subset of FHIR search semantics (there is no general search
+   evaluator over an already-read resource); underscore params (_id etc.) and
+   parameters that do not map to a top-level element are ignored."
+  [param-map resource]
+  (every? (fn [[k v]]
+            (if (and (string? k) (not (str/starts-with? k "_")))
+              (= (str (get resource (keyword k))) v)
+              true))
+          param-map))
 
-(def ^:private page-size 1000)
-
-(defn- scan
-  "Page every resource of `resource-type` matching `params` via IFHIRStore
-   search, stopping at the first short page. O(pages), fine for the small
-   subject-set lookups (patient ids) this uses it for; the export worker itself
-   streams via `scan-pages` rather than materializing a vector."
-  [store tenant-id resource-type params registry]
-  (loop [skip 0
-         acc  (transient [])]
-    (let [results (db/search store tenant-id (keyword resource-type)
-                             (assoc params :_count page-size :_skip skip)
-                             registry)
-          acc (reduce conj! acc results)]
-      (if (< (count results) page-size)
-        (persistent! acc)
-        (recur (+ skip page-size) acc)))))
-
-(defn- scan-pages
-  "Lazy seq of result pages (each a seq of resources) for `resource-type`
-   matching `params`, stopping at the first short page. Only one page is held
-   in memory at a time, so a caller that consumes and discards each page never
-   materializes the whole type."
-  [store tenant-id resource-type params registry]
-  (letfn [(step [skip]
-            (lazy-seq
-             (let [results (db/search store tenant-id (keyword resource-type)
-                                      (assoc params :_count page-size :_skip skip)
-                                      registry)]
-               (cons results
-                     (when (= (count results) page-size)
-                       (step (+ skip page-size)))))))]
-    (step 0)))
-
-(defn- type-pages
-  "Lazy seq of resource pages for `resource-type` under a single `params` map,
-   honoring `kind`. :system scans the whole type; :patient/:group confine to
-   each patient's compartment (unioned across `patient-ids`). A non-member type
-   (`:passthrough`) contributes nothing, and a member type with no registered
-   link parameter (`:deny`) fails closed to empty."
-  [store tenant-id kind patient-ids resource-type registry params]
-  (if (= kind :system)
-    (scan-pages store tenant-id resource-type params registry)
-    (mapcat (fn [patient-id]
-              (let [outcome (compartment/confine "Patient" patient-id resource-type
-                                                 params registry)]
-                (case outcome
-                  :passthrough nil
-                  :deny        nil
-                  (let [[_ p r] outcome]
-                    (scan-pages store tenant-id resource-type p r)))))
-            patient-ids)))
-
-(defn- reduce-type-pages
-  "Reduce `f` over the export's resources for `resource-type`, one deduped +
-   `_since`-filtered PAGE at a time: `f` is called as (f acc filtered-page)
-   where filtered-page is a vector of resources. Dedup (by :id) is global across
-   pages and across `param-maps`; only the seen-id set and one page are held in
-   memory at a time. Each of `param-maps` (the type's _typeFilter specs, or
-   `[{}]`) is applied and unioned."
-  [store tenant-id kind patient-ids resource-type registry param-maps since f init]
-  (let [seen (java.util.HashSet.)]
-    (reduce
-     (fn [acc params]
-       (reduce
-        (fn [acc page]
-          (f acc (into []
-                       (filter (fn [r]
-                                 (let [id (:id r)]
-                                   (and (not (.contains seen id))
-                                        (after-since? since r)
-                                        (do (.add seen id) true)))))
-                       page)))
-        acc
-        (type-pages store tenant-id kind patient-ids resource-type registry params)))
-     init
-     param-maps)))
-
-(defn- gather-type
-  "Collect all resources of `resource-type` for the export, deduped by id and
-   filtered by `_since`, as a single vector. Retained for the enumeration unit
-   tests; the worker streams via `reduce-type-pages` and never materializes the
-   whole type in the heap."
-  [store tenant-id kind patient-ids resource-type registry param-maps since]
-  (reduce-type-pages store tenant-id kind patient-ids resource-type registry
-                     param-maps since into []))
+(defn- matches-any-type-filter?
+  "True when `resource` matches at least one of `param-maps` (the type's
+   _typeFilter specs unioned, or `[{}]` for unfiltered)."
+  [param-maps resource]
+  (boolean (some #(matches-type-filter? % resource) param-maps)))
 
 ;; ---------------------------------------------------------------------------
-;; Temp-file storage + byte accounting
+;; Snapshot enumeration (as-of the pinned basis, filtered while streaming)
 ;;
-;; NDJSON is streamed to temp files on disk (never held in the job map). Each
-;; job owns a directory tree `<temp-dir>/dromon-bulk/<tenant>/<job-id>/`; every
-;; output/error file is `<dir>/<file-id>.ndjson`. The job record stores only the
-;; file metadata {file-id {:path :type :count :bytes}}.
+;; scan-type-as-of streams every live resource of a type as of the basis; the
+;; export layer applies compartment confinement (patient/group), _typeFilter,
+;; _since and id-dedup here. Everything is a reduce over the store's reducible
+;; (never `seq`/`doseq`), so an IReduceInit backend (xtdb2) and a lazy-seq
+;; backend (mock) both work and only one page is held at a time.
 ;; ---------------------------------------------------------------------------
 
-(defn- job-temp-dir
-  "The per-job temp directory File, namespaced by tenant and job id."
-  ^java.io.File [base tenant-id job-id]
-  (io/file base "dromon-bulk" (str tenant-id) (str job-id)))
+(defn- export-filter-xf
+  "A STATEFUL transducer for one export type: keeps only resources that pass
+   compartment confinement (for :patient/:group), match at least one
+   _typeFilter spec, satisfy _since, and have a not-yet-seen id (global dedup
+   within this stream). Create a fresh one per stream/collect; it closes over a
+   mutable seen-id set."
+  [kind owner-ids resource-type registry param-maps since]
+  (let [seen (java.util.HashSet.)
+        in-compartment? (if (= kind :system)
+                          (constantly true)
+                          (fn [r] (compartment/resource-in-any-compartment?
+                                   "Patient" owner-ids resource-type r registry)))]
+    (filter (fn [r]
+              (let [id (:id r)]
+                (and (in-compartment? r)
+                     (matches-any-type-filter? param-maps r)
+                     (after-since? since r)
+                     (not (.contains seen id))
+                     (do (.add seen id) true)))))))
 
-(defn- delete-tree!
-  "Recursively delete `f` (a File or nil), depth-first. Safe on a missing path."
-  [^java.io.File f]
-  (when (and f (.exists f))
-    (when (.isDirectory f)
-      (doseq [child (.listFiles f)] (delete-tree! child)))
-    (.delete f)))
+(defn- scan-type
+  "Reducible of live resources of `resource-type` as of `basis`."
+  [store tenant-id resource-type basis]
+  (db/scan-type-as-of store tenant-id (keyword resource-type) basis))
 
-(defn- delete-job-files!
-  "Delete a job's whole temp directory tree (its NDJSON output/error files)."
-  [job]
-  (when-let [dir (:temp-dir job)]
-    (delete-tree! (io/file dir))))
+(defn- collect-type
+  "Fully realize (into a vector) the export's resources for `resource-type` as
+   of `basis`, applying compartment confinement, _typeFilter, _since and
+   id-dedup. Retained for the enumeration unit tests; the download path streams
+   the same set via stream-output! and never materializes the whole type."
+  [store tenant-id basis kind owner-ids resource-type registry param-maps since]
+  (into []
+        (export-filter-xf kind owner-ids resource-type registry param-maps since)
+        (scan-type store tenant-id resource-type basis)))
 
-(defn- bytes-utf8
-  "UTF-8 byte length of `s` (the on-disk footprint of one NDJSON line)."
-  ^long [^String s]
-  (alength (.getBytes s StandardCharsets/UTF_8)))
-
-(defn- check-caps!
-  "Throw an abort ex-info when this job's cumulative bytes exceed max-job-bytes
-   or the total on-disk bytes across all jobs (other jobs + this job's in-flight
-   bytes) exceed max-total-bytes. Called after each page so a runaway export is
-   stopped rather than silently truncated. `job-store` is the bulk job store
-   (used to sum the OTHER jobs' on-disk footprint), distinct from the FHIR
-   `:store` this ctx also carries for scanning."
-  [{:keys [job-store job-bytes max-job-bytes max-total-bytes]}]
-  (let [jb @job-bytes]
-    (when (> jb (long max-job-bytes))
-      (throw (ex-info (str "Export job exceeded the per-job size cap of "
-                           max-job-bytes " bytes and was aborted.")
-                      {:bulk/abort :max-job-bytes})))
-    (when (> (+ (bjs/total-on-disk-bytes job-store) jb) (long max-total-bytes))
-      (throw (ex-info (str "Bulk export storage exceeded the total on-disk cap of "
-                           max-total-bytes " bytes and the job was aborted.")
-                      {:bulk/abort :max-total-bytes})))))
-
-(defn- write-type-file!
-  "Stream `resource-type`'s NDJSON to a temp file, deduped by id and
-   `_since`-filtered, tracking bytes + line count and enforcing the caps after
-   each page. Returns file metadata {:type :file-id :path :count :bytes}, or nil
-   when no resource matched (the empty file is removed). Throws a `:bulk/abort`
-   ex-info when a cap is exceeded (the writer is closed first)."
-  [{:keys [store tenant-id kind patient-ids encode since dir job-bytes] :as ctx}
-   resource-type registry param-maps]
-  (let [file-id (str (random-uuid))
-        file    (io/file dir (str file-id ".ndjson"))
-        counter (long-array 2)]              ; [line-count bytes]
-    (io/make-parents file)
-    (with-open [w (io/writer file :encoding "UTF-8")]
-      (reduce-type-pages
-       store tenant-id kind patient-ids resource-type registry param-maps since
-       (fn [_ page]
-         (doseq [r page]
-           (let [line (str (json-str (encode r)) "\n")
-                 n    (bytes-utf8 line)]
-             (.write w ^String line)
-             (aset counter 0 (inc (aget counter 0)))
-             (aset counter 1 (+ (aget counter 1) n))
-             (swap! job-bytes + n)))
-         (check-caps! ctx)
-         nil)
-       nil))
-    (let [cnt (aget counter 0)
-          bts (aget counter 1)]
-      (if (zero? cnt)
-        (do (.delete file) nil)
-        {:type    resource-type
-         :file-id file-id
-         :path    (.getAbsolutePath file)
-         :count   cnt
-         :bytes   bts}))))
-
-(defn- write-error-file!
-  "Write a single-line OperationOutcome NDJSON error file to disk (surfaced in
-   the manifest :error array). Returns its metadata."
-  [dir job-bytes diagnostics]
-  (let [file-id (str (random-uuid))
-        file    (io/file dir (str file-id ".ndjson"))
-        line    (str (json-str (operation-outcome "error" "processing" diagnostics)) "\n")
-        n       (bytes-utf8 line)]
-    (io/make-parents file)
-    (spit file line)
-    (swap! job-bytes + n)
-    {:type    "OperationOutcome"
-     :file-id file-id
-     :path    (.getAbsolutePath file)
-     :count   1
-     :bytes   n}))
+(defn- confined-count
+  "Exact number of resources `resource-type` contributes to this export as of
+   `basis`: reduce the snapshot through the SAME export filter the stream uses
+   (compartment confinement + _typeFilter + _since + id-dedup) and count. Reads
+   resources but produces no bytes; used for patient/group manifest counts so
+   the count equals the streamed line count and empty-in-compartment types are
+   omitted from :output (the unfiltered count-as-of would overcount a
+   compartment and list empty files that the Bulk Data validator rejects)."
+  [store tenant-id basis kind owner-ids resource-type registry param-maps since]
+  (transduce (export-filter-xf kind owner-ids resource-type registry param-maps since)
+             (completing (fn [n _] (inc n)))
+             0
+             (scan-type store tenant-id resource-type basis)))
 
 ;; ---------------------------------------------------------------------------
-;; Patient-set resolution
+;; NDJSON streaming (write-body-to-stream)
+;; ---------------------------------------------------------------------------
+
+(def ^:private flush-every
+  "Flush the socket writer every this-many NDJSON lines so Jetty pushes bytes
+   (and applies TCP backpressure) without paying a syscall per line."
+  128)
+
+(defn- writing-rf
+  "Reducing function that writes each resource as one NDJSON line to `w`,
+   flushing every `flush-every` lines and once at completion. The accumulator
+   is the running line count."
+  [^Writer w encode]
+  (fn
+    ([n] (.flush w) n)
+    ([n resource]
+     (.write w ^String (json-str (encode resource)))
+     (.write w "\n")
+     (let [n' (inc n)]
+       (when (zero? (rem n' flush-every)) (.flush w))
+       n'))))
+
+(defn- writer-on
+  "A UTF-8 BufferedWriter over the response OutputStream. Not closed here (that
+   would close the socket); the caller flushes via the reducing fn's completion
+   arity, and Jetty owns the stream lifecycle."
+  ^Writer [^OutputStream out]
+  (BufferedWriter. (OutputStreamWriter. out StandardCharsets/UTF_8)))
+
+(defn- stream-output!
+  "Stream `resource-type`'s NDJSON to `out` lazily: reduce over the as-of
+   snapshot through the export filter transducer, writing and flushing per
+   batch. Peak memory is one store page: scan-type-as-of pulls the next page
+   only after the reducing fn returns, and a backpressured socket pauses that
+   pull."
+  [store tenant-id basis kind owner-ids resource-type registry param-maps since encode
+   ^OutputStream out]
+  (let [w (writer-on out)]
+    (transduce (export-filter-xf kind owner-ids resource-type registry param-maps since)
+               (writing-rf w encode)
+               0
+               (scan-type store tenant-id resource-type basis))))
+
+(defn- stream-error!
+  "Stream a single-line OperationOutcome NDJSON error to `out` (the manifest
+   :error entries carry per-type skip/failure diagnostics computed at kickoff)."
+  [diagnostics ^OutputStream out]
+  (let [w (writer-on out)]
+    (.write w ^String (json-str (operation-outcome "error" "processing" diagnostics)))
+    (.write w "\n")
+    (.flush w)))
+
+;; ---------------------------------------------------------------------------
+;; Subject-set resolution (patient/group owner ids)
 ;; ---------------------------------------------------------------------------
 
 (defn- patient-ids-in-tenant
-  "All Patient logical ids in the tenant (Patient-level export subject set)."
-  [store tenant-id all-registries]
-  (mapv :id (scan store tenant-id "Patient" {} (get all-registries "Patient"))))
+  "All Patient logical ids in the tenant as of `basis` (the Patient-level export
+   subject set), as a set for O(1) membership while streaming member types."
+  [store tenant-id basis]
+  (into #{} (map :id) (scan-type store tenant-id "Patient" basis)))
 
 (defn- group-patient-ids
   "Resolve the Patient logical ids referenced by `Group.member.entity`. Returns
@@ -434,7 +386,7 @@
           (:member group))))
 
 ;; ---------------------------------------------------------------------------
-;; Background worker
+;; Type set + manifest
 ;; ---------------------------------------------------------------------------
 
 (defn- requested-types
@@ -449,141 +401,69 @@
         (vec (keys all-registries))
         (into [] (filter #(compartment/member? "Patient" %)) (keys all-registries))))))
 
-(defn- run-export!
-  "Background worker: resolve the subject patient set (for patient/group),
-   enumerate each requested type, and STREAM its NDJSON to a temp file on disk
-   (never into the heap/job map), tracking bytes + count per file and enforcing
-   the per-job / total-on-disk byte caps after each page. On success the job
-   flips to :complete with :output, an :error array of OperationOutcome files
-   for per-type failures or skipped types, and :files metadata. A cap breach or
-   fatal error flips it to :error and DELETES the job's temp files."
-  [job-store store tenant-id job-id all-registries encoders]
-  (t/trace!
-   {:id :bulk/export.run
-    :data {:tenant tenant-id :job-id job-id}}
-   (let [job (bjs/get-job job-store tenant-id job-id)
-         dir (:temp-dir job)]
-     (try
-       (let [{:keys [kind group-id params]} job
-             cfg          (bjs/config job-store)
-             encode       (partial handlers/encode-resource-by-type encoders)
-             since        (parse-since params)
-             type-filters (parse-type-filters params)
-             types        (requested-types kind params all-registries)
-             patient-ids  (case kind
-                            :system  nil
-                            :patient (patient-ids-in-tenant store tenant-id all-registries)
-                            :group   (group-patient-ids store tenant-id group-id))
-             job-bytes    (atom 0)
-             ctx          {:store           store
-                           :job-store       job-store
-                           :tenant-id       tenant-id
-                           :kind            kind
-                           :patient-ids     patient-ids
-                           :encode          encode
-                           :since           since
-                           :dir             dir
-                           :job-bytes       job-bytes
-                           :max-job-bytes   (:max-job-bytes cfg)
-                           :max-total-bytes (:max-total-bytes cfg)}
-             {:keys [outputs errors]}
-             (reduce
-              (fn [acc rt]
-                (let [registry (get all-registries rt)]
-                  (cond
-                    (nil? registry)
-                    (update acc :errors conj
-                            (write-error-file! dir job-bytes
-                                               (str "Unknown or unsupported resource type: " rt)))
+(defn- build-job-files
+  "Compute the export's output/error file descriptors at kickoff WITHOUT
+   producing any resource bytes. For each requested type: an unknown type or a
+   non-member type on a patient/group export becomes an :error descriptor
+   (OperationOutcome, streamed on demand); every other type gets an :output
+   descriptor ONLY when it contributes at least one resource (empty types are
+   omitted, so the Bulk Data validator never downloads an empty file). The count
+   is the cheap unfiltered count-as-of for :system (exact there, no
+   confinement), and the exact confinement/_typeFilter/_since-filtered count for
+   :patient/:group (equal to what the stream will emit). A type with zero
+   resources tenant-wide is skipped before any confined scan. Returns
+   {:outputs [{:type :file-id :count}...] :errors [{:type :file-id :diagnostics}...]}."
+  [store tenant-id basis kind owner-ids all-registries types since type-filters]
+  (reduce
+   (fn [acc rt]
+     (let [registry (get all-registries rt)]
+       (cond
+         (nil? registry)
+         (update acc :errors conj
+                 {:type "OperationOutcome" :file-id (str (random-uuid))
+                  :diagnostics (str "Unknown or unsupported resource type: " rt)})
 
-                    (and (not= kind :system) (not (compartment/member? "Patient" rt)))
-                    (update acc :errors conj
-                            (write-error-file! dir job-bytes
-                                               (str rt " is not a Patient-compartment member; "
-                                                    "skipped for " (name kind) "-level export.")))
+         (and (not= kind :system) (not (compartment/member? "Patient" rt)))
+         (update acc :errors conj
+                 {:type "OperationOutcome" :file-id (str (random-uuid))
+                  :diagnostics (str rt " is not a Patient-compartment member; "
+                                    "skipped for " (name kind) "-level export.")})
 
-                    :else
-                    (try
-                      (if-let [out (write-type-file! ctx rt registry
-                                                     (filters-for type-filters rt))]
-                        (update acc :outputs conj out)
-                        acc)
-                      (catch clojure.lang.ExceptionInfo e
-                        ;; Cap aborts propagate to the outer handler (which drops
-                        ;; the temp files); ordinary per-type failures are
-                        ;; recorded as an OperationOutcome error file.
-                        (if (:bulk/abort (ex-data e))
-                          (throw e)
-                          (update acc :errors conj
-                                  (write-error-file! dir job-bytes
-                                                     (str "Failed to export " rt ": "
-                                                          (or (.getMessage e) (str e)))))))
-                      (catch Throwable e
-                        (update acc :errors conj
-                                (write-error-file! dir job-bytes
-                                                   (str "Failed to export " rt ": "
-                                                        (or (.getMessage e) (str e))))))))))
-              {:outputs [] :errors []}
-              types)
-             files (into {}
-                         (map (juxt :file-id #(select-keys % [:path :type :count :bytes])))
-                         (concat outputs errors))]
-         ;; If the job was cancelled while we were writing, drop what we wrote
-         ;; and leave the :cancelled status untouched.
-         (if (= :cancelled (:status (bjs/get-job job-store tenant-id job-id)))
-           (delete-tree! (some-> dir io/file))
-           (bjs/update-job! job-store tenant-id job-id
-                            (fn [job]
-                              (cond
-                                (nil? job) nil
-                                (= :cancelled (:status job)) job
-                                :else (assoc job
-                                             :status :complete
-                                             :finished-at (System/currentTimeMillis)
-                                             :output (mapv #(select-keys % [:type :file-id :count]) outputs)
-                                             :error  (mapv #(select-keys % [:type :file-id :count]) errors)
-                                             :files  files))))))
-       (catch Throwable e
-         (delete-tree! (some-> dir io/file))
-         (bjs/update-job! job-store tenant-id job-id
-                          (fn [job]
-                            (when job
-                              (assoc job
-                                     :status :error
-                                     :finished-at (System/currentTimeMillis)
-                                     :output []
-                                     :files {}
-                                     :error [{:type "OperationOutcome"
-                                              :diagnostics (or (.getMessage e) "export failed")}]))))
-         (t/error! {:id :bulk/export.failed
-                    :data {:tenant tenant-id :job-id job-id}}
-                   e))))))
+         :else
+         (let [tenant-cnt (try (db/count-as-of store tenant-id (keyword rt) basis)
+                               (catch Throwable _ 0))]
+           (if (zero? (long (or tenant-cnt 0)))
+             ;; Nothing of this type exists as of the basis (the compartment is a
+             ;; subset, so it is empty too): omit it without a confined scan.
+             acc
+             (let [cnt (if (= kind :system)
+                         tenant-cnt
+                         (confined-count store tenant-id basis kind owner-ids rt
+                                         registry (filters-for type-filters rt) since))]
+               (if (pos? (long (or cnt 0)))
+                 (update acc :outputs conj
+                         {:type rt :file-id (str (random-uuid)) :count cnt})
+                 acc)))))))
+   {:outputs [] :errors []}
+   types))
 
-;; ---------------------------------------------------------------------------
-;; TTL eviction (lazy sweep on each bulk request)
-;; ---------------------------------------------------------------------------
-
-(defn- sweep-expired!
-  "Evict completed/errored/cancelled jobs older than the configured ttl-ms,
-   deleting their temp files. Runs lazily at the head of each bulk request."
-  [job-store]
-  (let [ttl (long (:ttl-ms (bjs/config job-store)))
-        now (System/currentTimeMillis)]
-    (doseq [job (bjs/all-jobs job-store)]
-      (when (and (#{:complete :error :cancelled} (:status job))
-                 (> (- now (long (or (:finished-at job) (:created-at job) now))) ttl))
-        (delete-job-files! job)
-        (bjs/remove-job! job-store (:tenant job) (:id job))))))
-
-;; ---------------------------------------------------------------------------
-;; Manifest builder
-;; ---------------------------------------------------------------------------
+(defn- file-descriptors
+  "Index the output/error entries by file-id into the per-file stream
+   descriptors the $export-file handler resolves ({file-id {:kind :type
+   :diagnostics}})."
+  [{:keys [outputs errors]}]
+  (into {}
+        (concat
+         (map (fn [o] [(:file-id o) {:kind :output :type (:type o)}]) outputs)
+         (map (fn [e] [(:file-id e) {:kind :error
+                                     :type (:type e)
+                                     :diagnostics (:diagnostics e)}]) errors))))
 
 (defn build-manifest
-  "Build the completed-export status manifest for `job`. Output and error file
-   URLs are made absolute from the polling request so they are reachable by the
-   client that received them. requiresAccessToken is true: the file routes are
-   gated on the system Keto tuple (see server.routing)."
+  "Build the completed-export status manifest map for `job`. Output and error
+   file URLs are made absolute from `req` so they are reachable by the client
+   that received them. requiresAccessToken is true: the file routes are gated on
+   the system Keto tuple (see server.routing)."
   [req job]
   (let [tenant-id (:tenant job)
         job-id    (:id job)
@@ -599,28 +479,43 @@
                                 (:error job))}))
 
 ;; ---------------------------------------------------------------------------
-;; Handlers
+;; TTL eviction (lazy sweep on each bulk request)
+;; ---------------------------------------------------------------------------
+
+(defn- sweep-expired!
+  "Evict terminal (complete/error/cancelled) jobs older than the configured
+   ttl-ms. Jobs are now tiny metadata (no files), so eviction just drops the
+   record. Runs lazily at the head of each bulk request."
+  [job-store]
+  (let [ttl (long (:ttl-ms (bjs/config job-store)))
+        now (System/currentTimeMillis)]
+    (doseq [job (bjs/all-jobs job-store)]
+      (when (and (#{:complete :error :cancelled} (:status job))
+                 (> (- now (long (or (:finished-at job) (:created-at job) now))) ttl))
+        (bjs/remove-job! job-store (:tenant job) (:id job))))))
+
+;; ---------------------------------------------------------------------------
+;; Kickoff
 ;; ---------------------------------------------------------------------------
 
 (defn- start-export!
-  "Validate _outputFormat, enforce the concurrency cap, mint an :in-progress job
-   of `kind` (optionally pinned to `group-id`), spawn a virtual thread to
-   enumerate and stream NDJSON to temp files, and return 202 with an absolute
-   Content-Location status URL and no body.
+  "Validate _outputFormat, enforce the concurrent-stream cap, pin the store
+   basis, compute the manifest (types + per-type count-as-of, NO bytes, NO
+   disk), pre-serialize it, store the job metadata, and return 202 with an
+   absolute Content-Location status URL and no body.
 
    Fronted by server.auth/wrap-require-auth in routing so a tokenless request
-   returns 401 (not the Keto 403). When the in-progress job count is at or above
-   the configured max-concurrent-jobs, returns 429 with a Retry-After."
+   returns 401 (not the Keto 403). When the number of active download streams
+   is at or above max-concurrent-streams, returns 429 with a Retry-After."
   [req kind group-id]
   (let [tenant-id      (-> req :path-params :tenant-id)
         store          (:fhir/store req)
         job-store      (:fhir/bulk-job-store req)
         all-registries (:fhir/all-registries req)
-        encoders       (:fhir/resource-encoders req)
         params         (merge (or (:form-params req) {}) (or (:query-params req) {}))
         output-format  (get-param params "_outputFormat")
         cfg            (bjs/config job-store)
-        max-concurrent (long (:max-concurrent-jobs cfg))]
+        max-streams    (long (:max-concurrent-streams cfg))]
     (sweep-expired! job-store)
     (cond
       (not (valid-output-format? output-format))
@@ -628,36 +523,49 @@
                    (str "Unsupported _outputFormat: '" output-format
                         "'. Supported: application/fhir+ndjson."))
 
-      (>= (bjs/in-progress-count job-store) max-concurrent)
+      (>= (bjs/active-stream-count job-store) max-streams)
       (oo-response 429 "throttled"
-                   (str "Too many concurrent export jobs (limit " max-concurrent
+                   (str "Too many concurrent export streams (limit " max-streams
                         "). Retry after the indicated delay.")
                    {"Retry-After" "120"})
 
       :else
-      (let [job-id (str (random-uuid))
-            dir    (job-temp-dir (:temp-dir cfg) tenant-id job-id)
-            job    {:id               job-id
-                    :tenant           tenant-id
-                    :kind             kind
-                    :group-id         group-id
-                    :params           params
-                    :status           :in-progress
-                    :transaction-time (str (java.time.Instant/now))
-                    :request-url      (request-url req)
-                    :created-at       (System/currentTimeMillis)
-                    :temp-dir         (.getAbsolutePath dir)
-                    :output           []
-                    :error            []
-                    :files            {}}]
-        (bjs/put-job! job-store tenant-id job)
-        (Thread/startVirtualThread
-         ^Runnable (fn []
-                     (run-export! job-store store tenant-id job-id
-                                  all-registries encoders)))
-        (str-response 202 "application/json"
-                      {"Content-Location" (status-url req tenant-id job-id)}
-                      "")))))
+      (t/trace!
+       {:id :bulk/export.kickoff
+        :data {:tenant tenant-id :kind kind}}
+       (let [job-id       (str (random-uuid))
+             basis        (db/current-basis store tenant-id)
+             txn-time     (str (:system-time basis))
+             owner-ids    (case kind
+                            :system  nil
+                            :patient (patient-ids-in-tenant store tenant-id basis)
+                            :group   (set (group-patient-ids store tenant-id group-id)))
+             types        (requested-types kind params all-registries)
+             since        (parse-since params)
+             type-filters (parse-type-filters params)
+             files        (build-job-files store tenant-id basis kind owner-ids
+                                           all-registries types since type-filters)
+             now          (System/currentTimeMillis)
+             base-job    {:id               job-id
+                          :tenant           tenant-id
+                          :kind             kind
+                          :group-id         group-id
+                          :params           params
+                          :basis            basis
+                          :owner-ids        owner-ids
+                          :status           :complete
+                          :transaction-time txn-time
+                          :request-url      (request-url req)
+                          :created-at       now
+                          :finished-at      now
+                          :output           (:outputs files)
+                          :error            (:errors files)
+                          :files            (file-descriptors files)}
+             job         (assoc base-job :manifest (json-str (build-manifest req base-job)))]
+         (bjs/put-job! job-store tenant-id job)
+         (str-response 202 "application/json"
+                       {"Content-Location" (status-url req tenant-id job-id)}
+                       ""))))))
 
 (defn kickoff
   "GET /:tenant-id/fhir/$export — system-level export kickoff. Authorized
@@ -670,7 +578,7 @@
 (defn patient-export
   "GET /:tenant-id/fhir/Patient/$export — patient-level export kickoff. The
    subject set is every Patient in the tenant; each requested type is confined
-   to each Patient's compartment (server.compartment/confine). Authorized
+   to the union of those Patients' compartments while streaming. Authorized
    against the 'system' Keto object (see kickoff)."
   [req]
   (or (authorize-system req)
@@ -680,9 +588,9 @@
   "GET /:tenant-id/fhir/Group/:id/$export — group-level export kickoff. Reads
    the Group (404 when absent), resolves its member.entity Patient references,
    and confines each requested type to the union of those Patients'
-   compartments. Authorized against the 'system' Keto object (see kickoff); the
-   authorization check runs before the Group read so an unauthorized caller
-   cannot probe Group existence."
+   compartments while streaming. Authorized against the 'system' Keto object
+   (see kickoff); the authorization check runs before the Group read so an
+   unauthorized caller cannot probe Group existence."
   [req]
   (or (authorize-system req)
       (let [tenant-id (-> req :path-params :tenant-id)
@@ -694,11 +602,15 @@
           (oo-response 404 "not-found" (str "Group/" group-id " not found"))
           (start-export! req :group group-id)))))
 
+;; ---------------------------------------------------------------------------
+;; Status / cancel
+;; ---------------------------------------------------------------------------
+
 (defn status
   "GET /:tenant-id/fhir/$export-status/:job-id — poll job status.
 
+   :complete    -> 200 application/json manifest (pre-serialized at kickoff).
    :in-progress -> 202 with X-Progress + Retry-After.
-   :complete    -> 200 application/json manifest.
    :error       -> 500 OperationOutcome.
    :cancelled / unknown -> 404."
   [req]
@@ -708,14 +620,14 @@
         _         (sweep-expired! job-store)
         job       (bjs/get-job job-store tenant-id job-id)]
     (case (:status job)
+      :complete
+      (str-response 200 "application/json" (:manifest job))
+
       :in-progress
       (str-response 202 "application/json"
-                    {"X-Progress"  "in-progress, building files"
+                    {"X-Progress"  "in-progress, building manifest"
                      "Retry-After" "1"}
                     "")
-
-      :complete
-      (str-response 200 "application/json" (json-str (build-manifest req job)))
 
       :error
       (oo-response 500 "exception" "Export failed")
@@ -726,8 +638,9 @@
                    (str "Export job " job-id " not found")))))
 
 (defn cancel
-  "DELETE /:tenant-id/fhir/$export-status/:job-id — cancel a job (202) and
-   delete its temp files (the whole per-job temp directory tree)."
+  "DELETE /:tenant-id/fhir/$export-status/:job-id — cancel a job (202). There is
+   no on-disk content to reclaim; the job metadata is flipped to :cancelled and
+   TTL-swept later."
   [req]
   (let [tenant-id (-> req :path-params :tenant-id)
         job-id    (-> req :path-params :job-id)
@@ -739,7 +652,6 @@
         (bjs/update-job! job-store tenant-id job-id
                          (fn [j] (when j (assoc j :status :cancelled
                                                :finished-at (System/currentTimeMillis)))))
-        (delete-job-files! job)
         (str-response 202 "application/json"
                       (json-str (operation-outcome
                                  "information" "informational"
@@ -747,27 +659,69 @@
       (oo-response 404 "not-found"
                    (str "Export job " job-id " not found")))))
 
+;; ---------------------------------------------------------------------------
+;; File download (lazy NDJSON stream at download time)
+;; ---------------------------------------------------------------------------
+
+(defn- output-stream-body
+  "A Ring StreamableResponseBody that lazily streams `descriptor`'s NDJSON as of
+   the job's pinned basis, releasing a concurrency slot when done. An :output
+   descriptor scans the type and applies compartment/_typeFilter/_since/dedup;
+   an :error descriptor writes a single OperationOutcome line."
+  [job-store job store all-registries encoders descriptor]
+  (let [{:keys [kind basis owner-ids params]} job
+        {:keys [type diagnostics]} descriptor
+        encode       (partial handlers/encode-resource-by-type encoders)
+        since        (parse-since params)
+        type-filters (parse-type-filters params)
+        registry     (get all-registries type)]
+    (reify ring-protocols/StreamableResponseBody
+      (write-body-to-stream [_ _response out]
+        (try
+          (t/trace!
+           {:id :bulk/export.stream
+            :data {:tenant (:tenant job) :job-id (:id job) :type type}}
+           (if (= :error (:kind descriptor))
+             (stream-error! diagnostics out)
+             (stream-output! store (:tenant job) basis kind owner-ids type registry
+                             (filters-for type-filters type) since encode out)))
+          (finally
+            (bjs/release-stream! job-store)))))))
+
 (defn file
   "GET /:tenant-id/fhir/$export-file/:job-id/:file-id — download one NDJSON
-   output (or error) file by STREAMING it from disk. The :public? route yields
-   401 for a tokenless request (wrap-require-auth) and this handler then gates
-   on the system Keto tuple (manifest requiresAccessToken is true): a token
-   without the system read tuple -> 403. The body is a java.io.File (Ring
-   streams File bodies) with an explicit Content-Type so muuntaja leaves it
-   untouched."
+   output (or error) file by STREAMING it from the store as of the job's pinned
+   basis. The :public? route yields 401 for a tokenless request
+   (wrap-require-auth) and this handler then gates on the system Keto tuple
+   (manifest requiresAccessToken is true): a token without the system read tuple
+   -> 403. Acquires one of max-concurrent-streams slots (429 when saturated) and
+   returns a StreamableResponseBody with an explicit Content-Type so muuntaja
+   leaves it untouched."
   [req]
   (or (authorize-system req)
-      (let [tenant-id (-> req :path-params :tenant-id)
-            job-id    (-> req :path-params :job-id)
-            file-id   (-> req :path-params :file-id)
-            job-store (:fhir/bulk-job-store req)
-            _         (sweep-expired! job-store)
-            job       (bjs/get-job job-store tenant-id job-id)
-            path      (get-in job [:files file-id :path])
-            f         (some-> path io/file)]
-        (if (and f (= :complete (:status job)) (.exists f))
+      (let [tenant-id      (-> req :path-params :tenant-id)
+            job-id         (-> req :path-params :job-id)
+            file-id        (-> req :path-params :file-id)
+            job-store      (:fhir/bulk-job-store req)
+            store          (:fhir/store req)
+            all-registries (:fhir/all-registries req)
+            encoders       (:fhir/resource-encoders req)
+            _              (sweep-expired! job-store)
+            job            (bjs/get-job job-store tenant-id job-id)
+            descriptor     (get-in job [:files file-id])
+            max-streams    (long (:max-concurrent-streams (bjs/config job-store)))]
+        (cond
+          (or (nil? descriptor) (not= :complete (:status job)))
+          (oo-response 404 "not-found"
+                       (str "Export file " file-id " not found for job " job-id))
+
+          (not (bjs/acquire-stream! job-store max-streams))
+          (oo-response 429 "throttled"
+                       (str "Too many concurrent export streams (limit " max-streams
+                            "). Retry after the indicated delay.")
+                       {"Retry-After" "120"})
+
+          :else
           {:status  200
            :headers {"Content-Type" "application/fhir+ndjson"}
-           :body    f}
-          (oo-response 404 "not-found"
-                       (str "Export file " file-id " not found for job " job-id))))))
+           :body    (output-stream-body job-store job store all-registries encoders descriptor)}))))

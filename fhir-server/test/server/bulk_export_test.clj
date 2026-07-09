@@ -1,20 +1,26 @@
 (ns server.bulk-export-test
-  "Focused unit tests for the Bulk Data Access ($export) MVP: _outputFormat
-   validation, the manifest builder, the 401-on-missing-token path, and the
-   in-memory kickoff -> status -> file cycle against a fake store."
+  "Focused unit tests for the Bulk Data Access ($export) MVP in its lazy
+   stream-at-download form: _outputFormat validation, the manifest builder, the
+   401/403 authz paths, and the kickoff -> status -> file cycle against a fake
+   store. Kickoff pins a store basis and builds the manifest WITHOUT producing
+   any resource bytes or touching disk; $export-file returns a Ring
+   StreamableResponseBody that streams NDJSON from the store as of the pinned
+   basis."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
             [clojure.string :as str]
             [jsonista.core :as json]
             [malli.core :as m]
             [reitit.core :as reitit]
             [reitit.ring :as ring]
+            [ring.core.protocols :as ring-protocols]
             [fhir-store.protocol :as db]
             [server.bulk-export :as be]
             [server.bulk-job-store :as bjs]
             [server.compartment :as compartment]
             [server.handlers :as handlers]
-            [server.routing :as routing]))
+            [server.routing :as routing])
+  (:import [java.io ByteArrayOutputStream]
+           [java.nio.charset StandardCharsets]))
 
 (def ^:private authorized
   "Per-request override that grants the caller the 'system' read tuple so the
@@ -29,6 +35,16 @@
 
 (def ^:private json->clj
   (partial json/read-value))
+
+(defn- stream-body->string
+  "Drive a Ring StreamableResponseBody to a UTF-8 string, the way Jetty would."
+  [body]
+  (let [baos (ByteArrayOutputStream.)]
+    (ring-protocols/write-body-to-stream body {} baos)
+    (String. (.toByteArray baos) StandardCharsets/UTF_8)))
+
+(def ^:private fixed-basis
+  {:tx-id 1 :system-time (java.time.Instant/parse "2026-07-09T00:00:00Z")})
 
 ;; ---------------------------------------------------------------------------
 ;; _outputFormat validation
@@ -184,7 +200,7 @@
       (is (= "/:tenant-id/fhir/Patient/:id" (tmpl "/t/fhir/Patient/123"))))))
 
 ;; ---------------------------------------------------------------------------
-;; kickoff -> status -> file cycle against a fake store
+;; Fake stores (implement only the bulk-export surface of IFHIRStore)
 ;; ---------------------------------------------------------------------------
 
 (def ^:private patients
@@ -192,25 +208,83 @@
    {:resourceType "Patient" :id "bulk-export-2" :name [{:family "Doe"}]}])
 
 (defn- fake-store
-  "Minimal IFHIRStore returning the two Patients on the first page and empty
-   for everything else, so scan-type terminates immediately."
+  "Minimal IFHIRStore snapshotting the two Patients: count-as-of and
+   scan-type-as-of answer for :Patient, everything else is empty."
   []
   (reify db/IFHIRStore
-    (search [_ _tenant resource-type params _registry]
-      (if (and (= :Patient resource-type)
-               (zero? (long (:_skip params 0))))
-        patients
-        []))))
+    (current-basis [_ _tenant] fixed-basis)
+    (count-as-of [_ _tenant resource-type _basis]
+      (if (= :Patient resource-type) (count patients) 0))
+    (scan-type-as-of [_ _tenant resource-type _basis]
+      (if (= :Patient resource-type) patients []))
+    (read-resource [_ _tenant _rt _id] nil)
+    (search [_ _tenant _rt _params _registry] [])))
 
-(defn- await-status
-  "Poll the job status until it stops being :in-progress, or throw after ~5s."
-  [job-store tenant-id job-id]
-  (loop [tries 0]
-    (let [st (:status (bjs/get-job job-store tenant-id job-id))]
-      (cond
-        (not= :in-progress st) st
-        (> tries 500) (throw (ex-info "export did not complete" {:status st}))
-        :else (do (Thread/sleep 10) (recur (inc tries)))))))
+(defn- reduce-only-reducible
+  "An IReduceInit that ONLY supports reduce — no seq/first/count — so a consumer
+   that tries to fully realize it (via seq/doall/map/doseq) throws. Proves the
+   export STREAMS via reduce rather than materializing the whole type."
+  [coll]
+  (reify clojure.lang.IReduceInit
+    (reduce [_ f init] (reduce f init coll))))
+
+(defn- reduce-only-store
+  "Like fake-store, but scan-type-as-of hands back a reduce-only reducible."
+  []
+  (reify db/IFHIRStore
+    (current-basis [_ _tenant] fixed-basis)
+    (count-as-of [_ _tenant resource-type _basis]
+      (if (= :Patient resource-type) (count patients) 0))
+    (scan-type-as-of [_ _tenant resource-type _basis]
+      (reduce-only-reducible (if (= :Patient resource-type) patients [])))
+    (read-resource [_ _tenant _rt _id] nil)
+    (search [_ _tenant _rt _params _registry] [])))
+
+(defn- fake-search-store
+  "IFHIRStore over static `data` ({type-string [resources]}). search honors the
+   owner `_id` filter, the synthetic `_compartment` union param (matched against
+   :subject references), and generic equality on any non-underscore string
+   search param (so Group member reads work). read-resource returns the first
+   row of a type whose :id matches. The as-of snapshot methods (current-basis /
+   count-as-of / scan-type-as-of) return the CURRENT static data unfiltered —
+   the export layer applies compartment/_typeFilter/_since/dedup while
+   consuming."
+  [data]
+  (reify db/IFHIRStore
+    (search [_ _tenant rt params _registry]
+      (let [rows     (get data (name rt) [])
+            id       (get params "_id")
+            comp-ref (get params compartment/compartment-search-param)]
+        (into []
+              (filter (fn [r]
+                        (and (or (nil? id) (= (:id r) id))
+                             (or (nil? comp-ref)
+                                 (let [s (:subject r)]
+                                   (some #(= (:reference %) comp-ref)
+                                         (if (sequential? s) s [s]))))
+                             (every? (fn [[k v]]
+                                       (if (and (string? k) (not (str/starts-with? k "_")))
+                                         (= (str (get r (keyword k))) v)
+                                         true))
+                                     params))))
+              rows)))
+    (read-resource [_ _tenant rt id]
+      (first (filter #(= (:id %) id) (get data (name rt) []))))
+    (current-basis [_ _tenant] fixed-basis)
+    (count-as-of [_ _tenant rt _basis]
+      (count (get data (name rt) [])))
+    (scan-type-as-of [_ _tenant rt _basis]
+      (get data (name rt) []))))
+
+(def ^:private obs-registry
+  {"subject" {:type "reference" :columns [{:col "subject"}]}})
+
+;; ---------------------------------------------------------------------------
+;; kickoff -> status -> file cycle against a fake store
+;; ---------------------------------------------------------------------------
+
+(defn- content-location-job-id [resp]
+  (last (str/split (get-in resp [:headers "Content-Location"]) #"/")))
 
 (deftest kickoff-status-file-happy-path
   (let [job-store (bjs/create-store)
@@ -229,22 +303,27 @@
       (let [loc (get-in kick-resp [:headers "Content-Location"])]
         (is (str/starts-with? loc "https://fhir.local:3001/default/fhir/$export-status/"))))
 
-    (let [job-id (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
-      (testing "the background worker completes the job"
-        (is (= :complete (await-status job-store "default" job-id))))
+    (let [job-id (content-location-job-id kick-resp)]
+      (testing "kickoff pins a basis and completes synchronously (no worker)"
+        (let [job (bjs/get-job job-store "default" job-id)]
+          (is (= :complete (:status job)))
+          (is (some? (:basis job)))
+          (is (nil? (:temp-dir job)) "nothing is spooled to disk")))
 
       (let [status-resp (status (assoc base-req :request-method :get
                                        :path-params {:tenant-id "default" :job-id job-id}))]
-        (testing "status returns 200 application/json manifest"
+        (testing "status returns 200 application/json manifest (pre-serialized string)"
           (is (= 200 (:status status-resp)))
           (is (= "application/json" (get-in status-resp [:headers "Content-Type"])))
+          (is (string? (:body status-resp)))
           (let [manifest (json->clj (:body status-resp))]
             (is (= true (get manifest "requiresAccessToken")))
+            (is (= "2026-07-09T00:00:00Z" (get manifest "transactionTime")))
             (is (seq (get manifest "output")) "output must be non-empty")
             (let [pt (first (filter #(= "Patient" (get % "type")) (get manifest "output")))]
               (is (some? pt))
               (is (= 2 (get pt "count")))
-              (testing "the Patient output file has >= 2 distinct ids"
+              (testing "the Patient output streams >= 2 distinct ids as a StreamableResponseBody"
                 (let [file-id (last (str/split (get pt "url") #"/"))
                       file-resp (file (assoc base-req :request-method :get
                                              :path-params {:tenant-id "default"
@@ -253,13 +332,16 @@
                   (is (= 200 (:status file-resp)))
                   (is (= "application/fhir+ndjson"
                          (get-in file-resp [:headers "Content-Type"])))
-                  (testing "the file body is a java.io.File streamed from disk (not a heap string)"
-                    (is (instance? java.io.File (:body file-resp)))
-                    (is (.exists ^java.io.File (:body file-resp))))
-                  (let [lines (remove str/blank? (str/split-lines (slurp (:body file-resp))))
+                  (testing "the body is a Ring stream, not a heap string or a File"
+                    (is (satisfies? ring-protocols/StreamableResponseBody (:body file-resp)))
+                    (is (not (string? (:body file-resp))))
+                    (is (not (instance? java.io.File (:body file-resp)))))
+                  (let [lines (remove str/blank? (str/split-lines (stream-body->string (:body file-resp))))
                         ids (set (map #(get (json->clj %) "id") lines))]
                     (is (= 2 (count lines)))
-                    (is (= #{"123" "bulk-export-2"} ids))))))))))))
+                    (is (= #{"123" "bulk-export-2"} ids)))
+                  (testing "the concurrency slot is released after the stream drains"
+                    (is (zero? (bjs/active-stream-count job-store)))))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; status/cancel edge cases
@@ -344,39 +426,8 @@
       (is (= #{"Patient" "Observation"} (set (resolve :group {} regs)))))))
 
 ;; ---------------------------------------------------------------------------
-;; Compartment-aware enumeration (patient/group)
+;; Snapshot enumeration + streaming filters (collect-type)
 ;; ---------------------------------------------------------------------------
-
-(defn- fake-search-store
-  "IFHIRStore over static `data` ({type-string [resources]}). search honors the
-   owner `_id` filter, the synthetic `_compartment` union param (matched against
-   :subject references), and generic equality on any non-underscore string
-   search param (so _typeFilter push-down is observable). read-resource returns
-   the first row of a type whose :id matches."
-  [data]
-  (reify db/IFHIRStore
-    (search [_ _tenant rt params _registry]
-      (let [rows     (get data (name rt) [])
-            id       (get params "_id")
-            comp-ref (get params compartment/compartment-search-param)]
-        (into []
-              (filter (fn [r]
-                        (and (or (nil? id) (= (:id r) id))
-                             (or (nil? comp-ref)
-                                 (let [s (:subject r)]
-                                   (some #(= (:reference %) comp-ref)
-                                         (if (sequential? s) s [s]))))
-                             (every? (fn [[k v]]
-                                       (if (and (string? k) (not (str/starts-with? k "_")))
-                                         (= (str (get r (keyword k))) v)
-                                         true))
-                                     params))))
-              rows)))
-    (read-resource [_ _tenant rt id]
-      (first (filter #(= (:id %) id) (get data (name rt) []))))))
-
-(def ^:private obs-registry
-  {"subject" {:type "reference" :columns [{:col "subject"}]}})
 
 (deftest group-member-patient-resolution
   (let [group {:resourceType "Group" :id "g1"
@@ -392,48 +443,67 @@
     (testing "a missing Group yields no patients"
       (is (= [] (resolve store "default" "nope"))))))
 
-(deftest gather-type-confines-group-and-patient-to-compartments
-  (let [store  (fake-search-store
-                {"Patient"     [{:resourceType "Patient" :id "p1"}
-                                {:resourceType "Patient" :id "p2"}
-                                {:resourceType "Patient" :id "p3"}]
-                 "Observation" [{:resourceType "Observation" :id "o1" :subject {:reference "Patient/p1"}}
-                                {:resourceType "Observation" :id "o2" :subject {:reference "Patient/p2"}}
-                                {:resourceType "Observation" :id "o3" :subject {:reference "Patient/p3"}}]})
-        gather @#'be/gather-type
-        pids   ["p1" "p2"]]
-    (testing "owner Patient rows are confined to the subject set by _id"
+(deftest collect-type-confines-group-and-patient-to-compartments
+  (let [store   (fake-search-store
+                 {"Patient"     [{:resourceType "Patient" :id "p1"}
+                                 {:resourceType "Patient" :id "p2"}
+                                 {:resourceType "Patient" :id "p3"}]
+                  "Observation" [{:resourceType "Observation" :id "o1" :subject {:reference "Patient/p1"}}
+                                 {:resourceType "Observation" :id "o2" :subject {:reference "Patient/p2"}}
+                                 {:resourceType "Observation" :id "o3" :subject {:reference "Patient/p3"}}]})
+        collect @#'be/collect-type
+        basis   (db/current-basis store "default")
+        owners  #{"p1" "p2"}]
+    (testing "owner Patient rows are confined to the subject set by id"
       (is (= #{"p1" "p2"}
-             (set (map :id (gather store "default" :group pids "Patient" :reg [{}] nil))))))
+             (set (map :id (collect store "default" basis :group owners "Patient" :reg [{}] nil))))))
     (testing "member rows are confined to the subject patients' compartments"
       (is (= #{"o1" "o2"}
-             (set (map :id (gather store "default" :group pids "Observation" obs-registry [{}] nil))))))
+             (set (map :id (collect store "default" basis :group owners "Observation" obs-registry [{}] nil))))))
     (testing ":system ignores the subject set and scans the whole type"
       (is (= #{"o1" "o2" "o3"}
-             (set (map :id (gather store "default" :system nil "Observation" obs-registry [{}] nil))))))))
+             (set (map :id (collect store "default" basis :system nil "Observation" obs-registry [{}] nil))))))))
 
-(deftest gather-type-applies-type-filter-and-since
-  (let [store  (fake-search-store
-                {"Patient" [{:resourceType "Patient" :id "f" :gender "female"
-                             :meta {:lastUpdated (java.time.Instant/parse "2026-06-01T00:00:00Z")}}
-                            {:resourceType "Patient" :id "m" :gender "male"
-                             :meta {:lastUpdated (java.time.Instant/parse "2026-06-01T00:00:00Z")}}
-                            {:resourceType "Patient" :id "old-f" :gender "female"
-                             :meta {:lastUpdated (java.time.Instant/parse "2025-06-01T00:00:00Z")}}]})
-        gather @#'be/gather-type
-        t0     (java.time.Instant/parse "2026-01-01T00:00:00Z")]
-    (testing "_typeFilter pushes a search param down to the scan"
+(deftest collect-type-applies-type-filter-and-since
+  (let [store   (fake-search-store
+                 {"Patient" [{:resourceType "Patient" :id "f" :gender "female"
+                              :meta {:lastUpdated (java.time.Instant/parse "2026-06-01T00:00:00Z")}}
+                             {:resourceType "Patient" :id "m" :gender "male"
+                              :meta {:lastUpdated (java.time.Instant/parse "2026-06-01T00:00:00Z")}}
+                             {:resourceType "Patient" :id "old-f" :gender "female"
+                              :meta {:lastUpdated (java.time.Instant/parse "2025-06-01T00:00:00Z")}}]})
+        collect @#'be/collect-type
+        basis   (db/current-basis store "default")
+        t0      (java.time.Instant/parse "2026-01-01T00:00:00Z")]
+    (testing "_typeFilter narrows the streamed set (in-memory equality)"
       (is (= #{"f" "old-f"}
-             (set (map :id (gather store "default" :system nil "Patient" :reg
-                                   [{"gender" "female"}] nil))))))
+             (set (map :id (collect store "default" basis :system nil "Patient" :reg
+                                    [{"gender" "female"}] nil))))))
     (testing "_since post-filters the type-filtered set"
       (is (= #{"f"}
-             (set (map :id (gather store "default" :system nil "Patient" :reg
-                                   [{"gender" "female"}] t0))))))
+             (set (map :id (collect store "default" basis :system nil "Patient" :reg
+                                    [{"gender" "female"}] t0))))))
     (testing "multiple type-filters union, deduped by id"
       (is (= #{"f" "m" "old-f"}
-             (set (map :id (gather store "default" :system nil "Patient" :reg
-                                   [{"gender" "female"} {"gender" "male"}] nil))))))))
+             (set (map :id (collect store "default" basis :system nil "Patient" :reg
+                                    [{"gender" "female"} {"gender" "male"}] nil))))))))
+
+;; ---------------------------------------------------------------------------
+;; Patient- and group-level kickoff (end-to-end against a fake store)
+;; ---------------------------------------------------------------------------
+
+(defn- stream-output-ids
+  "Kickoff `resp`'s job, download its Patient output file via `file`, and return
+   the set of streamed resource ids."
+  [file base-req job-store tenant-id job-id]
+  (let [job     (bjs/get-job job-store tenant-id job-id)
+        pt      (first (filter #(= "Patient" (:type %)) (:output job)))
+        f-resp  (file (assoc base-req :request-method :get
+                             :path-params {:tenant-id tenant-id
+                                           :job-id job-id :file-id (:file-id pt)}))
+        ndjson  (stream-body->string (:body f-resp))]
+    (set (map #(get (json->clj %) "id")
+              (remove str/blank? (str/split-lines ndjson))))))
 
 (deftest group-export-404-when-group-missing
   (let [store (fake-search-store {})
@@ -456,7 +526,8 @@
                            {:resourceType "Patient" :id "p2"}
                            {:resourceType "Patient" :id "p3"}]})
         job-store (bjs/create-store)
-        req   (merge {:path-params {:tenant-id "default" :id "g1"}
+        {:keys [file]} (system-route-handlers {"Patient" :reg} {})
+        base  (merge {:path-params {:tenant-id "default" :id "g1"}
                       :uri "/default/fhir/Group/g1/$export"
                       :request-method :get
                       :headers {"host" "fhir.local:3001"}
@@ -467,25 +538,20 @@
                       :fhir/all-registries {"Patient" :reg}
                       :fhir/resource-encoders {}}
                      authorized)
-        resp  (be/group-export req)]
+        resp  (be/group-export base)]
     (is (= 202 (:status resp)))
-    (let [job-id (last (str/split (get-in resp [:headers "Content-Location"]) #"/"))]
-      (is (= :complete (await-status job-store "default" job-id)))
-      (let [job (bjs/get-job job-store "default" job-id)
-            pt  (first (filter #(= "Patient" (:type %)) (:output job)))
-            meta (get-in job [:files (:file-id pt)])
-            ndjson (slurp (:path meta))
-            ids (set (map #(get (json->clj %) "id")
-                          (remove str/blank? (str/split-lines ndjson))))]
-        (is (some? pt) "a Patient output file is produced")
-        (is (= #{"p1" "p2"} ids) "output is confined to the group's member patients")))))
+    (let [job-id (content-location-job-id resp)]
+      (is (= :complete (:status (bjs/get-job job-store "default" job-id))))
+      (is (= #{"p1" "p2"} (stream-output-ids file base job-store "default" job-id))
+          "output is confined to the group's member patients"))))
 
 (deftest patient-export-unions-all-tenant-patients
   (let [store (fake-search-store
                {"Patient" [{:resourceType "Patient" :id "p1"}
                            {:resourceType "Patient" :id "p2"}]})
         job-store (bjs/create-store)
-        req   (merge {:path-params {:tenant-id "default"}
+        {:keys [file]} (system-route-handlers {"Patient" :reg} {})
+        base  (merge {:path-params {:tenant-id "default"}
                       :uri "/default/fhir/Patient/$export"
                       :request-method :get
                       :headers {"host" "fhir.local:3001"}
@@ -496,21 +562,15 @@
                       :fhir/all-registries {"Patient" :reg}
                       :fhir/resource-encoders {}}
                      authorized)
-        resp  (be/patient-export req)]
+        resp  (be/patient-export base)]
     (is (= 202 (:status resp)))
-    (let [job-id (last (str/split (get-in resp [:headers "Content-Location"]) #"/"))]
-      (is (= :complete (await-status job-store "default" job-id)))
-      (let [job (bjs/get-job job-store "default" job-id)
-            pt  (first (filter #(= "Patient" (:type %)) (:output job)))
-            meta (get-in job [:files (:file-id pt)])
-            ndjson (slurp (:path meta))
-            ids (set (map #(get (json->clj %) "id")
-                          (remove str/blank? (str/split-lines ndjson))))]
-        (is (= #{"p1" "p2"} ids))))))
+    (let [job-id (content-location-job-id resp)]
+      (is (= :complete (:status (bjs/get-job job-store "default" job-id))))
+      (is (= #{"p1" "p2"} (stream-output-ids file base job-store "default" job-id))))))
 
 (deftest export-error-array-reports-unknown-and-non-member-types
   (testing "requesting a non-member type on a patient-level export records an
-            OperationOutcome error file rather than leaking or failing"
+            OperationOutcome error entry rather than leaking or failing"
     (let [store (fake-search-store {"Patient" [{:resourceType "Patient" :id "p1"}]})
           job-store (bjs/create-store)
           req   (merge {:path-params {:tenant-id "default"}
@@ -527,8 +587,8 @@
                        authorized)
           resp  (be/patient-export req)]
       (is (= 202 (:status resp)))
-      (let [job-id (last (str/split (get-in resp [:headers "Content-Location"]) #"/"))]
-        (is (= :complete (await-status job-store "default" job-id)))
+      (let [job-id (content-location-job-id resp)]
+        (is (= :complete (:status (bjs/get-job job-store "default" job-id))))
         (let [job      (bjs/get-job job-store "default" job-id)
               manifest (be/build-manifest req job)]
           (testing "requiresAccessToken is true in the tightened manifest"
@@ -541,144 +601,149 @@
             (is (= ["Patient"] (mapv :type (:output manifest))))))))))
 
 ;; ---------------------------------------------------------------------------
-;; Streaming to disk + bounded memory
+;; Lazy stream-at-download + concurrency cap + TTL eviction
 ;; ---------------------------------------------------------------------------
 
 (defn- bulk-req
   "A base kickoff request wired for a system-level export against `job-store`
-   and the two-Patient fake store, pre-authorized for the system tuple."
-  [job-store]
+   and `store`, pre-authorized for the system tuple."
+  [job-store store]
   (merge {:path-params    {:tenant-id "default"}
           :headers        {"host" "fhir.local:3001"}
           :scheme         :https
           :uri            "/default/fhir/$export"
           :request-method :get
           :identity       {:sub "tester"}
-          :fhir/store     (fake-store)
+          :fhir/store     store
           :fhir/bulk-job-store job-store}
          authorized))
 
-(deftest worker-streams-ndjson-to-temp-files-not-heap
-  (let [job-store (bjs/create-store)
-        {:keys [kickoff]} (system-route-handlers {"Patient" :reg} {})
-        kick-resp (kickoff (bulk-req job-store))
-        job-id    (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
-    (is (= :complete (await-status job-store "default" job-id)))
-    (let [job  (bjs/get-job job-store "default" job-id)
-          pt   (first (filter #(= "Patient" (:type %)) (:output job)))
-          meta (get-in job [:files (:file-id pt)])]
-      (testing "the job record stores file METADATA, not NDJSON heap strings"
-        (is (some? pt))
-        (is (map? meta))
-        (is (string? (:path meta)))
-        (is (= 2 (:count meta)))
-        (is (pos? (long (:bytes meta))))
-        (is (every? map? (vals (:files job)))
-            "every :files value is a metadata map, never an NDJSON string")
-        (is (not-any? string? (vals (:files job)))))
-      (testing "the NDJSON lives on disk under the per-tenant/job temp dir"
-        (is (.exists (io/file (:path meta))))
-        (is (str/includes? (:path meta)
-                           (str "dromon-bulk" java.io.File/separator "default"
-                                java.io.File/separator job-id)))
-        (let [lines (remove str/blank? (str/split-lines (slurp (:path meta))))]
-          (is (= 2 (count lines)))
-          (is (= #{"123" "bulk-export-2"}
-                 (set (map #(get (json->clj %) "id") lines)))))))))
-
-(deftest cancel-deletes-temp-files
-  (let [job-store (bjs/create-store)
-        {:keys [kickoff cancel]} (system-route-handlers {"Patient" :reg} {})
-        kick-resp (kickoff (bulk-req job-store))
-        job-id    (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
-    (is (= :complete (await-status job-store "default" job-id)))
-    (let [dir (io/file (:temp-dir (bjs/get-job job-store "default" job-id)))]
-      (is (.exists dir) "the job's temp dir exists after completion")
-      (let [cancel-resp (cancel (merge (bulk-req job-store)
-                                       {:request-method :delete
-                                        :path-params {:tenant-id "default" :job-id job-id}}))]
-        (is (= 202 (:status cancel-resp)))
-        (is (= :cancelled (:status (bjs/get-job job-store "default" job-id))))
-        (is (not (.exists dir)) "cancel deletes the job's temp files")))))
-
-(deftest job-byte-cap-aborts-and-deletes-temp-files
-  (testing "a job that exceeds max-job-bytes is aborted (not truncated): it
-            flips to :error with a clear OperationOutcome and its temp files are
-            deleted"
-    (let [job-store (bjs/create-store {:max-job-bytes 1})
+(deftest kickoff-builds-manifest-without-producing-bytes-or-files
+  (testing "kickoff pins the basis and stores ONLY tiny metadata: a
+            pre-serialized manifest + per-file stream descriptors, no NDJSON and
+            no temp files"
+    (let [job-store (bjs/create-store)
           {:keys [kickoff]} (system-route-handlers {"Patient" :reg} {})
-          kick-resp (kickoff (bulk-req job-store))]
+          kick-resp (kickoff (bulk-req job-store (fake-store)))
+          job-id    (content-location-job-id kick-resp)
+          job       (bjs/get-job job-store "default" job-id)]
       (is (= 202 (:status kick-resp)))
-      (let [job-id (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
-        (is (= :error (await-status job-store "default" job-id)))
-        (let [job (bjs/get-job job-store "default" job-id)]
-          (is (str/includes? (:diagnostics (first (:error job))) "per-job size cap"))
-          (is (empty? (:files job)))
-          (is (not (.exists (io/file (:temp-dir job))))
-              "the aborted job's temp files are deleted"))))))
+      (is (= :complete (:status job)))
+      (is (= fixed-basis (:basis job)) "the point-in-time basis is pinned")
+      (is (string? (:manifest job)) "the manifest is pre-serialized at kickoff")
+      (is (nil? (:temp-dir job)) "no temp directory")
+      (testing "the Patient output descriptor carries type/count, no bytes/path"
+        (let [pt   (first (filter #(= "Patient" (:type %)) (:output job)))
+              desc (get-in job [:files (:file-id pt)])]
+          (is (= 2 (:count pt)))
+          (is (= {:kind :output :type "Patient"} desc))
+          (is (every? map? (vals (:files job))))
+          (is (not-any? #(contains? % :path) (vals (:files job)))
+              "no on-disk path is recorded on any file descriptor")))
+      (testing "kickoff opened no download streams"
+        (is (zero? (bjs/active-stream-count job-store)))))))
 
-(deftest total-on-disk-cap-aborts-job-and-deletes-only-its-files
-  (testing "a job under the per-job cap still aborts when the TOTAL on-disk
-            bytes across all jobs exceed max-total-bytes: it flips to :error with
-            the total-cap message and only ITS temp files are deleted (the
-            pre-existing job's recorded files are left untouched)"
-    (let [job-store (bjs/create-store {:max-total-bytes 1000
-                                       :max-job-bytes   (* 1024 1024 1024)})]
-      ;; A previously completed job already occupies more than the total cap, so
-      ;; any new job's first page pushes the on-disk total over the limit.
-      (bjs/put-job! job-store "default"
-                    {:id          "prior"
-                     :tenant      "default"
-                     :status      :complete
-                     :finished-at (System/currentTimeMillis)
-                     :files       {"pf" {:path  "/nonexistent/prior.ndjson"
-                                         :type  "Patient" :count 1 :bytes 1000000}}})
-      (let [{:keys [kickoff]} (system-route-handlers {"Patient" :reg} {})
-            kick-resp (kickoff (bulk-req job-store))]
-        (is (= 202 (:status kick-resp)) "kickoff is under the per-job/concurrency caps")
-        (let [job-id (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
-          (is (= :error (await-status job-store "default" job-id)))
-          (let [job (bjs/get-job job-store "default" job-id)]
-            (is (str/includes? (:diagnostics (first (:error job))) "total on-disk cap")
-                "the error names the total-on-disk cap, not the per-job cap")
-            (is (empty? (:files job)))
-            (is (not (.exists (io/file (:temp-dir job))))
-                "the aborted job's temp files are deleted")
-            (is (some? (bjs/get-job job-store "default" "prior"))
-                "the pre-existing job is left in the store")))))))
+(deftest export-file-streams-via-reduce-not-materialized
+  (testing "the $export-file body is a StreamableResponseBody that consumes the
+            store snapshot via reduce (a reduce-only reducible that would throw
+            if the code tried to fully realize it via seq)"
+    (let [job-store (bjs/create-store)
+          {:keys [kickoff file]} (system-route-handlers {"Patient" :reg} {})
+          base      (bulk-req job-store (reduce-only-store))
+          kick-resp (kickoff base)
+          job-id    (content-location-job-id kick-resp)
+          job       (bjs/get-job job-store "default" job-id)
+          pt        (first (filter #(= "Patient" (:type %)) (:output job)))
+          file-resp (file (assoc base :path-params {:tenant-id "default"
+                                                    :job-id job-id
+                                                    :file-id (:file-id pt)}))
+          body      (:body file-resp)]
+      (is (= 200 (:status file-resp)))
+      (is (satisfies? ring-protocols/StreamableResponseBody body))
+      (is (not (string? body)))
+      (is (not (instance? java.io.File body)))
+      (let [ids (set (map #(get (json->clj %) "id")
+                          (remove str/blank? (str/split-lines (stream-body->string body)))))]
+        (is (= #{"123" "bulk-export-2"} ids)))
+      (is (zero? (bjs/active-stream-count job-store))
+          "the concurrency slot is released after the stream drains"))))
 
-(deftest max-concurrent-jobs-cap-returns-429
-  (testing "kickoff at/above the concurrency cap returns 429 with Retry-After
-            and an OperationOutcome, and starts no job"
-    (let [job-store (bjs/create-store {:max-concurrent-jobs 0})
+(deftest export-file-streams-error-operationoutcome
+  (testing "downloading an :error descriptor streams a single OperationOutcome
+            NDJSON line (per-type skip/failure diagnostics computed at kickoff)"
+    (let [store (fake-search-store {"Patient" [{:resourceType "Patient" :id "p1"}]})
+          job-store (bjs/create-store)
+          {:keys [file]} (system-route-handlers {"Patient" :reg "Location" :reg} {})
+          base (merge {:path-params {:tenant-id "default"}
+                       :uri "/default/fhir/Patient/$export"
+                       :request-method :get
+                       :headers {"host" "fhir.local:3001"}
+                       :scheme :https
+                       :identity {:sub "t"}
+                       :query-params {"_type" "Patient,Location"}
+                       :fhir/store store
+                       :fhir/bulk-job-store job-store
+                       :fhir/all-registries {"Patient" :reg "Location" :reg}
+                       :fhir/resource-encoders {}}
+                      authorized)
+          job-id (content-location-job-id (be/patient-export base))
+          err    (first (:error (bjs/get-job job-store "default" job-id)))
+          f-resp (file (assoc base :path-params {:tenant-id "default"
+                                                 :job-id job-id :file-id (:file-id err)}))
+          lines  (remove str/blank? (str/split-lines (stream-body->string (:body f-resp))))]
+      (is (= 200 (:status f-resp)))
+      (is (= "application/fhir+ndjson" (get-in f-resp [:headers "Content-Type"])))
+      (is (= 1 (count lines)))
+      (let [oo (json->clj (first lines))]
+        (is (= "OperationOutcome" (get oo "resourceType")))
+        (is (str/includes? (get-in oo ["issue" 0 "diagnostics"]) "Location")))
+      (is (zero? (bjs/active-stream-count job-store))))))
+
+(deftest max-concurrent-streams-cap-returns-429
+  (testing "kickoff at/above the concurrent-stream cap returns 429 with
+            Retry-After and an OperationOutcome, and starts no job"
+    (let [job-store (bjs/create-store {:max-concurrent-streams 0})
           {:keys [kickoff]} (system-route-handlers {"Patient" :reg} {})
-          resp (kickoff (bulk-req job-store))]
+          resp (kickoff (bulk-req job-store (fake-store)))]
       (is (= 429 (:status resp)))
       (is (= "120" (get-in resp [:headers "Retry-After"])))
       (is (= "application/fhir+json" (get-in resp [:headers "Content-Type"])))
       (is (empty? (bjs/all-jobs job-store))))))
 
-(deftest ttl-sweep-evicts-expired-jobs-and-deletes-files
+(deftest file-download-429-when-streams-saturated
+  (testing "with every stream slot already held, a download returns 429 (the
+            memory bound is on concurrent streams, not on kickoff)"
+    (let [job-store (bjs/create-store {:max-concurrent-streams 1})
+          {:keys [kickoff file]} (system-route-handlers {"Patient" :reg} {})
+          base      (bulk-req job-store (fake-store))
+          job-id    (content-location-job-id (kickoff base))
+          job       (bjs/get-job job-store "default" job-id)
+          pt        (first (filter #(= "Patient" (:type %)) (:output job)))
+          file-req  (assoc base :path-params {:tenant-id "default"
+                                              :job-id job-id :file-id (:file-id pt)})]
+      (is (true? (bjs/acquire-stream! job-store 1)) "manually saturate the single slot")
+      (let [resp (file file-req)]
+        (is (= 429 (:status resp)))
+        (is (= "120" (get-in resp [:headers "Retry-After"]))))
+      (bjs/release-stream! job-store)
+      (testing "once the slot frees, the same download succeeds and re-releases"
+        (let [resp (file file-req)]
+          (is (= 200 (:status resp)))
+          (stream-body->string (:body resp))
+          (is (zero? (bjs/active-stream-count job-store))))))))
+
+(deftest ttl-sweep-evicts-expired-job-metadata
   (testing "a lazy sweep on the next bulk request removes terminal jobs older
-            than ttl-ms and deletes their temp files"
-    (let [job-store (bjs/create-store {:ttl-ms 0})
-          dir       (io/file (System/getProperty "java.io.tmpdir")
-                             (str "dromon-bulk-test-" (random-uuid)))
-          f         (io/file dir "x.ndjson")]
-      (io/make-parents f)
-      (spit f "{}\n")
+            than ttl-ms (metadata only, no files to reclaim)"
+    (let [job-store (bjs/create-store {:ttl-ms 0})]
       (bjs/put-job! job-store "default"
                     {:id "old" :tenant "default" :status :complete
-                     :finished-at (- (System/currentTimeMillis) 10000)
-                     :temp-dir (.getAbsolutePath dir)
-                     :files {"f1" {:path (.getAbsolutePath f) :type "Patient"
-                                   :count 1 :bytes 3}}})
+                     :finished-at (- (System/currentTimeMillis) 10000)})
       ;; Any bulk request triggers the sweep; an unknown-job status poll is fine.
       (be/status {:path-params {:tenant-id "default" :job-id "other"}
                   :headers {"host" "h"}
                   :fhir/bulk-job-store job-store})
-      (is (nil? (bjs/get-job job-store "default" "old")) "expired job evicted")
-      (is (not (.exists dir)) "expired job's temp files deleted"))))
+      (is (nil? (bjs/get-job job-store "default" "old")) "expired job evicted"))))
 
 ;; ---------------------------------------------------------------------------
 ;; CapabilityStatement $export operation declarations
