@@ -187,6 +187,20 @@
     :address [{:line ["456 Oak Ave"] :city "Anytown" :state "NY"
                :postalCode "12345" :country "US"}]}])
 
+(def ^:private seed-groups
+  "Baseline Groups seeded into the default tenant. Group \"1\" exists so
+   Group-level Bulk Data Access (Group/1/$export) resolves to 202 instead of
+   404; the Inferno bulk_data suite drives group export against group_id:1. Its
+   member.entity references the two baseline Patients so the group export
+   confines its output to that cohort. This is a minimal, base-R4-valid Group
+   (required elements: type, actual)."
+  [{:resourceType "Group"
+    :id "1"
+    :type "person"
+    :actual true
+    :member [{:entity {:reference "Patient/123"}}
+             {:entity {:reference "Patient/bulk-export-2"}}]}])
+
 (defmethod ig/init-key :test-server/seeder [_ {:keys [store]}]
   (println "Provisioning default tenant...")
   (db/create-tenant store "default" {:if-exists :ignore})
@@ -207,6 +221,13 @@
            {:request  {:method "PUT" :url (str "Patient/" (:id p))}
             :resource p})
          seed-patients))
+  (println "Seeding" (count seed-groups) "baseline Groups...")
+  (db/transact-transaction
+   store "default"
+   (mapv (fn [g]
+           {:request  {:method "PUT" :url (str "Group/" (:id g))}
+            :resource g})
+         seed-groups))
   true)
 
 (defonce system (atom nil))
