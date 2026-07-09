@@ -22,6 +22,7 @@
             [jsonista.core :as json]
             [fhir-store.protocol :as db]
             [server.bulk-job-store :as bjs]
+            [server.compartment :as compartment]
             [server.handlers :as handlers]
             [taoensso.telemere :as t])
   (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
@@ -102,57 +103,237 @@
   (or (nil? fmt) (contains? valid-output-formats fmt)))
 
 ;; ---------------------------------------------------------------------------
+;; Parameter parsing (_type, _since, _typeFilter)
+;; ---------------------------------------------------------------------------
+
+(defn- get-param
+  "Read a bulk parameter under either its string or keyword spelling
+   (query-params arrive string-keyed; form-params may be keyword-keyed)."
+  [params k]
+  (or (get params k) (get params (keyword k))))
+
+(defn- get-param-values
+  "Read a possibly-repeated parameter as a vector of strings (a single value,
+   a Ring-collected vector, or empty when absent)."
+  [params k]
+  (let [v (get-param params k)]
+    (cond
+      (nil? v)        []
+      (sequential? v) (vec v)
+      :else           [v])))
+
+(defn- parse-query-params
+  "Parse an inner `param=value&param2=value2` query string (as carried inside a
+   _typeFilter spec) into a string-keyed search-parameter map."
+  [query]
+  (into {}
+        (comp (remove str/blank?)
+              (map (fn [pair]
+                     (let [[k v] (str/split pair #"=" 2)]
+                       [k (or v "")]))))
+        (str/split (or query "") #"&")))
+
+(defn- parse-type-filters
+  "Parse `_typeFilter` values (each `ResourceType?param=value&...`) into
+   {resource-type [search-param-map ...]}. Multiple filters for one type are
+   unioned by the enumerator. Malformed specs (no `?`) are ignored."
+  [params]
+  (reduce
+   (fn [acc raw]
+     (let [spec (str/trim (str raw))
+           idx  (str/index-of spec "?")]
+       (if idx
+         (update acc (subs spec 0 idx) (fnil conj [])
+                 (parse-query-params (subs spec (inc idx))))
+         acc)))
+   {}
+   (get-param-values params "_typeFilter")))
+
+(defn- filters-for
+  "Search-param maps to run for `resource-type`: the type's _typeFilter specs,
+   or a single empty map (unfiltered) when none apply."
+  [type-filters resource-type]
+  (or (seq (get type-filters resource-type)) [{}]))
+
+(defn- parse-since
+  "Parse the `_since` instant, or nil when absent/unparseable (degrade
+   gracefully: an unparseable _since disables the filter rather than failing)."
+  [params]
+  (when-let [s (get-param params "_since")]
+    (try (java.time.Instant/parse s) (catch Exception _ nil))))
+
+(defn- after-since?
+  "True when `resource` was last updated at/after `since`. _since is applied as
+   an in-memory post-scan filter on meta.lastUpdated so it works uniformly
+   across backends regardless of whether they support _lastUpdated search. A
+   resource with no lastUpdated is included (cannot prove it is older)."
+  [^java.time.Instant since resource]
+  (or (nil? since)
+      (let [lu (get-in resource [:meta :lastUpdated])]
+        (cond
+          (nil? lu)                       true
+          (instance? java.time.Instant lu) (not (.isBefore ^java.time.Instant lu since))
+          :else (try (not (.isBefore (java.time.Instant/parse (str lu)) since))
+                     (catch Exception _ true))))))
+
+;; ---------------------------------------------------------------------------
 ;; Enumeration
 ;; ---------------------------------------------------------------------------
 
 (def ^:private page-size 1000)
 
-(defn- scan-type
-  "Page every resource of `resource-type` via IFHIRStore search, stopping at
-   the first short page. MVP enumeration: O(pages), fine for the small
+(defn- scan
+  "Page every resource of `resource-type` matching `params` via IFHIRStore
+   search, stopping at the first short page. O(pages), fine for the small
    datasets this MVP targets."
-  [store tenant-id resource-type registry]
+  [store tenant-id resource-type params registry]
   (loop [skip 0
          acc  (transient [])]
     (let [results (db/search store tenant-id (keyword resource-type)
-                             {:_count page-size :_skip skip}
+                             (assoc params :_count page-size :_skip skip)
                              registry)
           acc (reduce conj! acc results)]
       (if (< (count results) page-size)
         (persistent! acc)
         (recur (+ skip page-size) acc)))))
 
-(defn- serialize-type
-  "Enumerate one resource type and return an output descriptor with the
-   NDJSON payload, or nil when the type has no resources."
-  [store tenant-id encode resource-type registry]
-  (let [resources (scan-type store tenant-id resource-type registry)]
-    (when (seq resources)
-      {:type    resource-type
-       :file-id (str (random-uuid))
-       :count   (count resources)
-       :ndjson  (str (->> resources
-                          (map (fn [r] (json-str (encode r))))
-                          (str/join "\n"))
-                     "\n")})))
+(defn- confined-scan
+  "Scan `resource-type` confined to one patient's compartment via
+   server.compartment/confine. A non-member type (`:passthrough`) contributes
+   nothing to a patient's compartment, and a member type with no registered
+   link parameter (`:deny`) fails closed to empty."
+  [store tenant-id patient-id resource-type params registry]
+  (let [outcome (compartment/confine "Patient" patient-id resource-type params registry)]
+    (cond
+      (= outcome :passthrough) []
+      (= outcome :deny)        []
+      :else (let [[_ p r] outcome] (scan store tenant-id resource-type p r)))))
+
+(defn- gather-type
+  "Collect all resources of `resource-type` for the export, deduped by id and
+   filtered by `_since`. For :system, scans the whole type; for :patient/:group
+   it unions each patient's compartment. Each of `param-maps` (the type's
+   _typeFilter specs, or `[{}]`) is applied and its results unioned."
+  [store tenant-id kind patient-ids resource-type registry param-maps since]
+  (let [by-id (reduce
+               (fn [acc params]
+                 (let [rs (if (= kind :system)
+                            (scan store tenant-id resource-type params registry)
+                            (into [] (mapcat #(confined-scan store tenant-id % resource-type
+                                                             params registry))
+                                  patient-ids))]
+                   (reduce (fn [m r] (assoc m (:id r) r)) acc rs)))
+               {}
+               param-maps)]
+    (into [] (filter #(after-since? since %)) (vals by-id))))
+
+;; ---------------------------------------------------------------------------
+;; Output/error file descriptors
+;; ---------------------------------------------------------------------------
+
+(defn- output-file
+  "An output descriptor with its NDJSON payload for a non-empty resource set."
+  [resource-type encode resources]
+  {:type    resource-type
+   :file-id (str (random-uuid))
+   :count   (count resources)
+   :ndjson  (str (str/join "\n" (map (fn [r] (json-str (encode r))) resources)) "\n")})
+
+(defn- error-file
+  "An error descriptor: a single-line OperationOutcome NDJSON file that the
+   manifest surfaces in its :error array (Bulk Data IG error output)."
+  [diagnostics]
+  {:type    "OperationOutcome"
+   :file-id (str (random-uuid))
+   :count   1
+   :ndjson  (str (json-str (operation-outcome "error" "processing" diagnostics)) "\n")})
+
+;; ---------------------------------------------------------------------------
+;; Patient-set resolution
+;; ---------------------------------------------------------------------------
+
+(defn- patient-ids-in-tenant
+  "All Patient logical ids in the tenant (Patient-level export subject set)."
+  [store tenant-id all-registries]
+  (mapv :id (scan store tenant-id "Patient" {} (get all-registries "Patient"))))
+
+(defn- group-patient-ids
+  "Resolve the Patient logical ids referenced by `Group.member.entity`. Returns
+   [] when the Group is missing or references no Patients."
+  [store tenant-id group-id]
+  (let [group (try (db/read-resource store tenant-id :Group group-id)
+                   (catch Throwable _ nil))]
+    (into []
+          (comp (keep #(get-in % [:entity :reference]))
+                (filter #(str/starts-with? % "Patient/"))
+                (map #(subs % (count "Patient/")))
+                (distinct))
+          (:member group))))
+
+;; ---------------------------------------------------------------------------
+;; Background worker
+;; ---------------------------------------------------------------------------
+
+(defn- requested-types
+  "Resolve which resource types this export enumerates. `_type` narrows the
+   set; otherwise :system exports every registered type and :patient/:group
+   export every registered Patient-compartment member type (including Patient)."
+  [kind params all-registries]
+  (let [type-param (get-param params "_type")]
+    (if (not-empty type-param)
+      (vec (str/split type-param #","))
+      (if (= kind :system)
+        (vec (keys all-registries))
+        (into [] (filter #(compartment/member? "Patient" %)) (keys all-registries))))))
 
 (defn- run-export!
-  "Background worker: enumerate `types`, serialize each to NDJSON, then flip
-   the job to :complete (unless it was cancelled). Any failure flips it to
-   :error with an OperationOutcome-ish error array."
-  [job-store store tenant-id job-id all-registries encoders types]
+  "Background worker: resolve the subject patient set (for patient/group),
+   enumerate each requested type, serialize NDJSON, and flip the job to
+   :complete with :output plus an :error array of OperationOutcome files for
+   any per-type failures or skipped types. A fatal error flips it to :error."
+  [job-store store tenant-id job-id all-registries encoders]
   (t/trace!
    {:id :bulk/export.run
-    :data {:tenant tenant-id :job-id job-id :type-count (count types)}}
+    :data {:tenant tenant-id :job-id job-id}}
    (try
-     (let [encode  (partial handlers/encode-resource-by-type encoders)
-           outputs (into []
-                         (keep (fn [rt]
-                                 (when-let [registry (get all-registries rt)]
-                                   (serialize-type store tenant-id encode rt registry))))
-                         types)
-           files   (into {} (map (juxt :file-id :ndjson)) outputs)
-           output  (mapv #(select-keys % [:type :file-id :count]) outputs)]
+     (let [job          (bjs/get-job job-store tenant-id job-id)
+           {:keys [kind group-id params]} job
+           encode       (partial handlers/encode-resource-by-type encoders)
+           since        (parse-since params)
+           type-filters (parse-type-filters params)
+           types        (requested-types kind params all-registries)
+           patient-ids  (case kind
+                          :system  nil
+                          :patient (patient-ids-in-tenant store tenant-id all-registries)
+                          :group   (group-patient-ids store tenant-id group-id))
+           {:keys [outputs errors]}
+           (reduce
+            (fn [acc rt]
+              (let [registry (get all-registries rt)]
+                (cond
+                  (nil? registry)
+                  (update acc :errors conj
+                          (error-file (str "Unknown or unsupported resource type: " rt)))
+
+                  (and (not= kind :system) (not (compartment/member? "Patient" rt)))
+                  (update acc :errors conj
+                          (error-file (str rt " is not a Patient-compartment member; "
+                                           "skipped for " (name kind) "-level export.")))
+
+                  :else
+                  (try
+                    (let [resources (gather-type store tenant-id kind patient-ids rt registry
+                                                 (filters-for type-filters rt) since)]
+                      (if (seq resources)
+                        (update acc :outputs conj (output-file rt encode resources))
+                        acc))
+                    (catch Throwable e
+                      (update acc :errors conj
+                              (error-file (str "Failed to export " rt ": "
+                                               (or (.getMessage e) (str e))))))))))
+            {:outputs [] :errors []}
+            types)
+           files (into {} (map (juxt :file-id :ndjson)) (concat outputs errors))]
        (bjs/update-job! job-store tenant-id job-id
                         (fn [job]
                           (cond
@@ -160,8 +341,9 @@
                             (= :cancelled (:status job)) job
                             :else (assoc job
                                          :status :complete
-                                         :output output
-                                         :files files)))))
+                                         :output (mapv #(select-keys % [:type :file-id :count]) outputs)
+                                         :error  (mapv #(select-keys % [:type :file-id :count]) errors)
+                                         :files  files)))))
      (catch Throwable e
        (bjs/update-job! job-store tenant-id job-id
                         (fn [job]
@@ -169,9 +351,7 @@
                             (assoc job
                                    :status :error
                                    :error [{:type "OperationOutcome"
-                                            :url (str (operation-outcome
-                                                       "error" "exception"
-                                                       (or (.getMessage e) "export failed")))}]))))
+                                            :diagnostics (or (.getMessage e) "export failed")}]))))
        (t/error! {:id :bulk/export.failed
                   :data {:tenant tenant-id :job-id job-id}}
                  e)))))
@@ -181,53 +361,52 @@
 ;; ---------------------------------------------------------------------------
 
 (defn build-manifest
-  "Build the completed-export status manifest for `job`. Output/file URLs are
-   made absolute from the polling request so they are reachable by the client
-   that received them."
+  "Build the completed-export status manifest for `job`. Output and error file
+   URLs are made absolute from the polling request so they are reachable by the
+   client that received them. requiresAccessToken is true: the file routes are
+   gated on the system Keto tuple (see server.routing)."
   [req job]
   (let [tenant-id (:tenant job)
-        job-id    (:id job)]
+        job-id    (:id job)
+        ->url     (fn [o] (file-url req tenant-id job-id (:file-id o)))]
     {:transactionTime     (:transaction-time job)
      :request             (:request-url job)
-     :requiresAccessToken false
-     :output              (mapv (fn [o]
-                                  {:type  (:type o)
-                                   :count (:count o)
-                                   :url   (file-url req tenant-id job-id (:file-id o))})
+     :requiresAccessToken true
+     :output              (mapv (fn [o] {:type  (:type o)
+                                         :count (:count o)
+                                         :url   (->url o)})
                                 (:output job))
-     :error               (or (:error job) [])}))
+     :error               (mapv (fn [o] {:type (:type o) :url (->url o)})
+                                (:error job))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Handlers
 ;; ---------------------------------------------------------------------------
 
-(defn kickoff
-  "GET /:tenant-id/fhir/$export — system-level export kickoff.
+(defn- start-export!
+  "Validate _outputFormat, mint an :in-progress job of `kind` (optionally
+   pinned to `group-id`), spawn a virtual thread to enumerate and serialize,
+   and return 202 with an absolute Content-Location status URL and no body.
 
    Fronted by server.auth/wrap-require-auth in routing so a tokenless request
-   returns 401 (not the Keto 403). Validates _outputFormat, mints an
-   :in-progress job, spawns a virtual thread to enumerate and serialize, and
-   returns 202 with an absolute Content-Location status URL and no body."
-  [req]
+   returns 401 (not the Keto 403)."
+  [req kind group-id]
   (let [tenant-id      (-> req :path-params :tenant-id)
         store          (:fhir/store req)
         job-store      (:fhir/bulk-job-store req)
         all-registries (:fhir/all-registries req)
         encoders       (:fhir/resource-encoders req)
         params         (merge (or (:form-params req) {}) (or (:query-params req) {}))
-        output-format  (or (get params "_outputFormat") (get params :_outputFormat))
-        type-param     (or (get params "_type") (get params :_type))]
+        output-format  (get-param params "_outputFormat")]
     (if-not (valid-output-format? output-format)
       (oo-response 400 "invalid"
                    (str "Unsupported _outputFormat: '" output-format
                         "'. Supported: application/fhir+ndjson."))
       (let [job-id (str (random-uuid))
-            types  (if (not-empty type-param)
-                     (vec (str/split type-param #","))
-                     (vec (keys all-registries)))
             job    {:id               job-id
                     :tenant           tenant-id
-                    :kind             :system
+                    :kind             kind
+                    :group-id         group-id
                     :params           params
                     :status           :in-progress
                     :transaction-time (str (java.time.Instant/now))
@@ -239,10 +418,37 @@
         (Thread/startVirtualThread
          ^Runnable (fn []
                      (run-export! job-store store tenant-id job-id
-                                  all-registries encoders types)))
+                                  all-registries encoders)))
         (str-response 202 "application/json"
                       {"Content-Location" (status-url req tenant-id job-id)}
                       "")))))
+
+(defn kickoff
+  "GET /:tenant-id/fhir/$export — system-level export kickoff."
+  [req]
+  (start-export! req :system nil))
+
+(defn patient-export
+  "GET /:tenant-id/fhir/Patient/$export — patient-level export kickoff. The
+   subject set is every Patient in the tenant; each requested type is confined
+   to each Patient's compartment (server.compartment/confine)."
+  [req]
+  (start-export! req :patient nil))
+
+(defn group-export
+  "GET /:tenant-id/fhir/Group/:id/$export — group-level export kickoff. Reads
+   the Group (404 when absent), resolves its member.entity Patient references,
+   and confines each requested type to the union of those Patients'
+   compartments."
+  [req]
+  (let [tenant-id (-> req :path-params :tenant-id)
+        group-id  (-> req :path-params :id)
+        store     (:fhir/store req)
+        group     (try (db/read-resource store tenant-id :Group group-id)
+                       (catch Throwable _ nil))]
+    (if (nil? group)
+      (oo-response 404 "not-found" (str "Group/" group-id " not found"))
+      (start-export! req :group group-id))))
 
 (defn status
   "GET /:tenant-id/fhir/$export-status/:job-id — poll job status.
@@ -294,7 +500,9 @@
 
 (defn file
   "GET /:tenant-id/fhir/$export-file/:job-id/:file-id — download one NDJSON
-   output file. Public route (requiresAccessToken false in the MVP manifest)."
+   output (or error) file. Gated on the system Keto tuple (manifest
+   requiresAccessToken is true); the body is pre-serialized NDJSON with an
+   explicit Content-Type, bypassing muuntaja."
   [req]
   (let [tenant-id (-> req :path-params :tenant-id)
         job-id    (-> req :path-params :job-id)

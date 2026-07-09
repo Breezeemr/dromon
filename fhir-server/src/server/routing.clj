@@ -293,6 +293,20 @@
      ["/:tenant-id/fhir/$export"
       {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/kickoff)))
        :public? true}]
+     ;; Patient-level export: union each Patient's compartment. The 4th URL
+     ;; segment is the real "Patient" type, so (like the system kickoff) the
+     ;; route is `:public?` + wrap-require-auth to yield 401 (not the Keto 403
+     ;; on the "Patient" object) for a tokenless request while still honoring a
+     ;; valid backend-services token that only holds the "system" tuple.
+     ["/:tenant-id/fhir/Patient/$export"
+      {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/patient-export)))
+       :public? true}]
+     ;; Group-level export: resolve Group.member.entity Patient refs and union
+     ;; their compartments. Placed in the system routes (ahead of the resource
+     ;; tree) so `$export` beats the Group /:id read wildcard.
+     ["/:tenant-id/fhir/Group/:id/$export"
+      {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/group-export)))
+       :public? true}]
      ;; Status polling + cancel gate on the already-granted "system" Keto
      ;; object (see the $export-status exclusion in server.keto/server.scope).
      ;; :keto/relation "read" pins both GET (poll) and DELETE (cancel) to the
@@ -302,12 +316,15 @@
       {:get           (wrap-bulk (resolve-handler 'server.bulk-export/status))
        :delete        (wrap-bulk (resolve-handler 'server.bulk-export/cancel))
        :keto/relation "read"}]
-     ;; File download is public in the MVP (manifest requiresAccessToken
-     ;; false); the body is pre-serialized NDJSON with an explicit
-     ;; Content-Type, bypassing muuntaja.
+     ;; File download is gated on the already-granted "system" Keto object
+     ;; (manifest requiresAccessToken true): $export-file is in the keto/scope
+     ;; URL-parse exclusion sets, so a non-public route with :keto/relation
+     ;; "read" pins it to the system read tuple the backend-services token
+     ;; holds. The body is pre-serialized NDJSON with an explicit Content-Type,
+     ;; bypassing muuntaja.
      ["/:tenant-id/fhir/$export-file/:job-id/:file-id"
-      {:get     (wrap-bulk (resolve-handler 'server.bulk-export/file))
-       :public? true}]
+      {:get           (wrap-bulk (resolve-handler 'server.bulk-export/file))
+       :keto/relation "read"}]
      ["/:tenant-id/fhir"          {:post (let [build-tx (resolve-handler 'server.handlers/transaction)]
                                            (build-tx decoders))}]]))
 

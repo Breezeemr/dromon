@@ -940,9 +940,16 @@
               :rest [{:mode "server"
                       :security {:service [{:coding [{:system "http://terminology.hl7.org/CodeSystem/restful-security-service"
                                                       :code "SMART-on-FHIR"}]}]}
-                      ;; System-level $export operation (Bulk Data Access IG).
+                      ;; Bulk Data Access IG $export operations: system-level,
+                      ;; patient-level (Patient/$export), and group-level
+                      ;; (Group/[id]/$export). Inferno asserts each against its
+                      ;; OperationDefinition canonical URL.
                       :operation [{:name "export"
-                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"}]
+                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"}
+                                  {:name "patient-export"
+                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"}
+                                  {:name "group-export"
+                                   :definition "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"}]
                       :resource resources}]}})))
 
 ;; SMART Backend Services (bulk data) discovery advertised below only declares
