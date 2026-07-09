@@ -59,7 +59,33 @@
                                            (clojure.java.io/file lib "base_fhir_r4_test_kit.rb"))
                      (doseq [f (.listFiles (clojure.java.io/file src "base_fhir_r4"))
                              :when (and (.isFile f) (clojure.string/ends-with? (.getName f) ".rb"))]
-                       (clojure.java.io/copy f (clojure.java.io/file lib "base_fhir_r4" (.getName f)))))))]
+                       (clojure.java.io/copy f (clojure.java.io/file lib "base_fhir_r4" (.getName f)))))))
+               ;; Wire the Inferno bulk_data_test_kit into the cloned kit so the
+               ;; bulk_data_v200/bulk_data_v101 suites become available:
+               ;;   1. Append `gem "bulk_data_test_kit"` to the Gemfile so the
+               ;;      image build's `bundle install` pulls it in. Unpinned, so
+               ;;      Bundler's conservative resolution keeps inferno_core and
+               ;;      the other locked kits untouched (resolves to 0.13.0).
+               ;;   2. Drop a loader file into lib/ that requires the gem.
+               ;;      Inferno's suite boot only globs the app's own lib/*.rb
+               ;;      (gem suites are not auto-loaded), so without this shim the
+               ;;      installed gem registers no suites.
+               ;; Both steps are idempotent.
+               ensure-bulk-gem!
+               (fn []
+                 (let [gemfile (clojure.java.io/file "inferno-test-kit/Gemfile")
+                       loader  (clojure.java.io/file "inferno-test-kit/lib/bulk_data_test_kit_loader.rb")]
+                   (when (.isFile gemfile)
+                     (let [contents (slurp gemfile)]
+                       (when-not (clojure.string/includes? contents "bulk_data_test_kit")
+                         (println "Appending bulk_data_test_kit gem to" (.getPath gemfile) "...")
+                         (spit gemfile (str (clojure.string/trimr contents)
+                                            "\n\ngem \"bulk_data_test_kit\"\n"))))
+                     (let [loader-src "require \"bulk_data_test_kit\"\n"]
+                       (when-not (and (.isFile loader) (= loader-src (slurp loader)))
+                         (println "Writing bulk_data_test_kit loader into" (.getPath loader) "...")
+                         (.mkdirs (.getParentFile loader))
+                         (spit loader loader-src))))))]
            (when-not (.exists (clojure.java.io/file "inferno-test-kit"))
              (println "Cloning us-core-test-kit...")
              (shell "git" "clone" "https://github.com/inferno-framework/us-core-test-kit" "inferno-test-kit"))
@@ -77,6 +103,7 @@
                (println "Copying mkcert rootCA.pem into inferno-test-kit/ ...")
                (clojure.java.io/copy (clojure.java.io/file caroot "rootCA.pem") rootca-file)))
            (install-custom-suites!)
+           (ensure-bulk-gem!)
            (if (and (patched? compose-file) (patched? bg-file))
              (println "Inferno test kit already set up and patched -- skipping.")
              (do
