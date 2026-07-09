@@ -187,43 +187,87 @@ the protocol supplies a monotonic tx-id to stamp as `transactionTime`.
 ## Requirement: streaming and bounded memory
 
 The first-cut MVP retained every export's NDJSON as in-heap strings in the job
-map (`:files {file-id ndjson-string}`) with no eviction, and the background
-worker built those strings in memory. On a large tenant this is an unbounded
-heap / OOM risk: a single system-level export materializes every resource of
-every type as one concatenated string, and completed jobs are never released.
-The bulk APIs must therefore stream and bound memory:
+map (`:files {file-id ndjson-string}`) with no eviction, and a background worker
+built those strings in memory. On a large tenant this is an unbounded heap / OOM
+risk: a single system-level export materializes every resource of every type as
+one concatenated string, and completed jobs are never released. An intermediate
+revision spooled that NDJSON to temp files on disk during the worker, which
+bounds heap but adds disk pressure, an on-disk byte-cap / cleanup regime, and a
+window where every exported resource is duplicated to the filesystem.
 
-1. Stream to temp files, not the heap. The worker writes each output type's
-   NDJSON to a temp file on disk through a buffered writer as it pages the
-   store, tracking bytes and line count per file. The job record stores file
-   metadata only - `:files {file-id {:path :type :count :bytes}}` - never the
-   content. Temp files live under a configurable base dir (default
-   `java.io.tmpdir`) namespaced per tenant/job (`<dir>/dromon-bulk/<tenant>/<job-id>/`).
+The current design removes both the worker and the disk spool: it is
+**lazy stream-at-download** against a **pinned point-in-time DB basis**. No
+resource bytes are produced and no disk is touched until (and unless) the client
+actually downloads a file; the bytes then flow store -> socket under TCP
+backpressure, so peak memory is one store page regardless of type size.
 
-2. Serve files by streaming from disk. The `$export-file` handler returns
-   `{:status 200 :headers {"Content-Type" "application/fhir+ndjson"} :body
-   (clojure.java.io/file path)}`. Ring streams `File`/`InputStream` bodies, and
-   the explicit `Content-Type` keeps muuntaja from touching it (the same reason
-   the manifest and 202 responses are pre-serialized with an explicit CT). The
-   401-tokenless and system-authorization behavior is preserved.
+1. Pin a snapshot at kickoff; produce no bytes. Kickoff captures the tenant's
+   current DB basis via `IFHIRStore/current-basis` (a `{:tx-id :system-time}`
+   snapshot token that reads no resource bytes) and derives `transactionTime`
+   from it. It computes the manifest - which types, and a per-type count via
+   `count-as-of` (system) or the exact confined filter count (patient/group) -
+   without serializing any resource. The job stores only tiny metadata:
+   `{:basis :manifest (pre-serialized string) :status :kind :params :owner-ids
+   :output :error :files ...}`, never NDJSON and never a file path. Kickoff
+   returns 202 + an absolute `Content-Location`.
 
-3. Configurable cap plus TTL, enforced by aborting (never silently
-   truncating). The `:fhir/bulk-job-store` Integrant component carries a config
-   map with env overrides. Defaults: `max-concurrent-jobs=4`
-   (`BULK_MAX_CONCURRENT_JOBS`), `max-job-bytes=1GB` (`BULK_MAX_JOB_BYTES`),
-   `max-total-bytes=5GB` across all jobs on disk (`BULK_MAX_TOTAL_BYTES`),
-   `ttl-ms=3600000` / 1h (`BULK_JOB_TTL_MS`), plus `temp-dir` (`BULK_TEMP_DIR`).
-   Enforcement:
-   - Kickoff when the in-progress job count is at or above `max-concurrent-jobs`
-     returns 429 with an `OperationOutcome` and a `Retry-After` header.
-   - The worker checks caps after each page; if a job exceeds `max-job-bytes`,
-     or the total on-disk bytes across all jobs exceeds `max-total-bytes`, it
-     aborts that job: sets `:status :error` with a clear `OperationOutcome`
-     message and deletes the job's temp files.
-   - TTL eviction: completed/errored/cancelled jobs older than `ttl-ms` are
-     removed and their temp files deleted. A lazy sweep runs on each bulk
-     request.
-   - Cancel deletes the job's temp files (the whole per-job temp dir tree).
+2. Stream from the store at download time. `$export-file` returns a Ring
+   `StreamableResponseBody` (`reify ring.core.protocols/StreamableResponseBody`)
+   whose `write-body-to-stream` scans the type AS OF the pinned basis via
+   `IFHIRStore/scan-type-as-of` - a reducible (`IReduceInit`) that keyset-
+   paginates and holds at most one page - and writes NDJSON lines to the
+   `OutputStream`, flushing per batch (every ~128 lines and at completion). A
+   backpressured Jetty socket pauses the next page pull, so a slow client bounds
+   memory rather than buffering the whole type. Compartment confinement
+   (patient/group), `_typeFilter`, `_since` and id-dedup are applied as a
+   stateful transducer WHILE streaming. The body carries an explicit
+   `Content-Type: application/fhir+ndjson`; because it is a `reify` (not a
+   map/coll), muuntaja leaves it untouched - the same bypass reason the manifest
+   and 202 are pre-serialized strings with an explicit CT. Pinning the basis at
+   kickoff and reading as-of it at download keeps snapshot consistency in the
+   async model: writes committed after kickoff are invisible to the download,
+   even though the two happen at different wall-clock times.
+
+3. Preserve the async contract and auth. Status returns 200 with the
+   `application/json` manifest (pre-serialized at kickoff) containing
+   `transactionTime` / `request` / `requiresAccessToken` / `output` / `error`;
+   output entries carry `type` + `url` (+ `count`). The `:public?` kickoff and
+   file routes yield 401 for a tokenless request (via `wrap-require-auth`, not
+   the Keto 403), and each handler then gates on the `system` read tuple inline
+   (`requiresAccessToken: true`), so an authenticated caller must hold `system`
+   read.
+
+4. Bound concurrency, not disk. There is no disk to cap and no worker to abort,
+   so the cap model becomes a **concurrent-stream limit**. The
+   `:fhir/bulk-job-store` Integrant component carries
+   `max-concurrent-streams=4` (env `BULK_MAX_CONCURRENT_STREAMS`) and
+   `ttl-ms=3600000` / 1h (env `BULK_JOB_TTL_MS`); the init-key layers the env
+   overrides over the component opts. Enforcement:
+   - Kickoff and `$export-file` both check the live active-stream count; at or
+     above `max-concurrent-streams` they return 429 with an `OperationOutcome`
+     and a `Retry-After` header. `$export-file` atomically acquires a slot
+     (compare-and-set on an `:active-streams` counter) for the duration of the
+     stream and releases it in a `finally` once `write-body-to-stream` returns.
+   - TTL eviction: completed/cancelled jobs older than `ttl-ms` are dropped. The
+     records are now tiny metadata, so eviction is a plain `dissoc` - no files
+     to delete. A lazy sweep runs at the head of each bulk request.
+   - Cancel flips the job to `:cancelled` (202); there is no on-disk content to
+     reclaim.
+
+The removed machinery - the background worker, the `:files
+{file-id ndjson-string}` / on-disk file-metadata storage, the per-tenant/job
+temp-dir tree, and the on-disk byte caps `max-job-bytes` / `max-total-bytes` /
+`temp-dir` (`BULK_MAX_JOB_BYTES` / `BULK_MAX_TOTAL_BYTES` / `BULK_TEMP_DIR`) and
+`max-concurrent-jobs` (`BULK_MAX_CONCURRENT_JOBS`) - no longer exist.
+
+Note - datomic write batching (future `$import`, not this export): `$export` is
+read-only and streams a snapshot, so it never transacts. A future bulk
+`$import` that ingests uploaded NDJSON WILL write, and on the datomic backend
+those write paths must chunk their transactions to roughly 1000 datoms each
+rather than committing one giant transaction, to stay within transactor limits
+and keep memory bounded on the write side. That batching requirement is
+reserved for the import work and does not apply to the read-only export path
+described here.
 
 ## Phased plan
 
