@@ -3,6 +3,7 @@
    validation, the manifest builder, the 401-on-missing-token path, and the
    in-memory kickoff -> status -> file cycle against a fake store."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [jsonista.core :as json]
             [malli.core :as m]
@@ -252,7 +253,10 @@
                   (is (= 200 (:status file-resp)))
                   (is (= "application/fhir+ndjson"
                          (get-in file-resp [:headers "Content-Type"])))
-                  (let [lines (remove str/blank? (str/split-lines (:body file-resp)))
+                  (testing "the file body is a java.io.File streamed from disk (not a heap string)"
+                    (is (instance? java.io.File (:body file-resp)))
+                    (is (.exists ^java.io.File (:body file-resp))))
+                  (let [lines (remove str/blank? (str/split-lines (slurp (:body file-resp))))
                         ids (set (map #(get (json->clj %) "id") lines))]
                     (is (= 2 (count lines)))
                     (is (= #{"123" "bulk-export-2"} ids))))))))))))
@@ -469,7 +473,8 @@
       (is (= :complete (await-status job-store "default" job-id)))
       (let [job (bjs/get-job job-store "default" job-id)
             pt  (first (filter #(= "Patient" (:type %)) (:output job)))
-            ndjson (get-in job [:files (:file-id pt)])
+            meta (get-in job [:files (:file-id pt)])
+            ndjson (slurp (:path meta))
             ids (set (map #(get (json->clj %) "id")
                           (remove str/blank? (str/split-lines ndjson))))]
         (is (some? pt) "a Patient output file is produced")
@@ -497,7 +502,8 @@
       (is (= :complete (await-status job-store "default" job-id)))
       (let [job (bjs/get-job job-store "default" job-id)
             pt  (first (filter #(= "Patient" (:type %)) (:output job)))
-            ndjson (get-in job [:files (:file-id pt)])
+            meta (get-in job [:files (:file-id pt)])
+            ndjson (slurp (:path meta))
             ids (set (map #(get (json->clj %) "id")
                           (remove str/blank? (str/split-lines ndjson))))]
         (is (= #{"p1" "p2"} ids))))))
@@ -533,6 +539,116 @@
             (is (str/includes? (:url (first (:error manifest))) "$export-file")))
           (testing "Patient still exports successfully alongside the error"
             (is (= ["Patient"] (mapv :type (:output manifest))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Streaming to disk + bounded memory
+;; ---------------------------------------------------------------------------
+
+(defn- bulk-req
+  "A base kickoff request wired for a system-level export against `job-store`
+   and the two-Patient fake store, pre-authorized for the system tuple."
+  [job-store]
+  (merge {:path-params    {:tenant-id "default"}
+          :headers        {"host" "fhir.local:3001"}
+          :scheme         :https
+          :uri            "/default/fhir/$export"
+          :request-method :get
+          :identity       {:sub "tester"}
+          :fhir/store     (fake-store)
+          :fhir/bulk-job-store job-store}
+         authorized))
+
+(deftest worker-streams-ndjson-to-temp-files-not-heap
+  (let [job-store (bjs/create-store)
+        {:keys [kickoff]} (system-route-handlers {"Patient" :reg} {})
+        kick-resp (kickoff (bulk-req job-store))
+        job-id    (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
+    (is (= :complete (await-status job-store "default" job-id)))
+    (let [job  (bjs/get-job job-store "default" job-id)
+          pt   (first (filter #(= "Patient" (:type %)) (:output job)))
+          meta (get-in job [:files (:file-id pt)])]
+      (testing "the job record stores file METADATA, not NDJSON heap strings"
+        (is (some? pt))
+        (is (map? meta))
+        (is (string? (:path meta)))
+        (is (= 2 (:count meta)))
+        (is (pos? (long (:bytes meta))))
+        (is (every? map? (vals (:files job)))
+            "every :files value is a metadata map, never an NDJSON string")
+        (is (not-any? string? (vals (:files job)))))
+      (testing "the NDJSON lives on disk under the per-tenant/job temp dir"
+        (is (.exists (io/file (:path meta))))
+        (is (str/includes? (:path meta)
+                           (str "dromon-bulk" java.io.File/separator "default"
+                                java.io.File/separator job-id)))
+        (let [lines (remove str/blank? (str/split-lines (slurp (:path meta))))]
+          (is (= 2 (count lines)))
+          (is (= #{"123" "bulk-export-2"}
+                 (set (map #(get (json->clj %) "id") lines)))))))))
+
+(deftest cancel-deletes-temp-files
+  (let [job-store (bjs/create-store)
+        {:keys [kickoff cancel]} (system-route-handlers {"Patient" :reg} {})
+        kick-resp (kickoff (bulk-req job-store))
+        job-id    (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
+    (is (= :complete (await-status job-store "default" job-id)))
+    (let [dir (io/file (:temp-dir (bjs/get-job job-store "default" job-id)))]
+      (is (.exists dir) "the job's temp dir exists after completion")
+      (let [cancel-resp (cancel (merge (bulk-req job-store)
+                                       {:request-method :delete
+                                        :path-params {:tenant-id "default" :job-id job-id}}))]
+        (is (= 202 (:status cancel-resp)))
+        (is (= :cancelled (:status (bjs/get-job job-store "default" job-id))))
+        (is (not (.exists dir)) "cancel deletes the job's temp files")))))
+
+(deftest job-byte-cap-aborts-and-deletes-temp-files
+  (testing "a job that exceeds max-job-bytes is aborted (not truncated): it
+            flips to :error with a clear OperationOutcome and its temp files are
+            deleted"
+    (let [job-store (bjs/create-store {:max-job-bytes 1})
+          {:keys [kickoff]} (system-route-handlers {"Patient" :reg} {})
+          kick-resp (kickoff (bulk-req job-store))]
+      (is (= 202 (:status kick-resp)))
+      (let [job-id (last (str/split (get-in kick-resp [:headers "Content-Location"]) #"/"))]
+        (is (= :error (await-status job-store "default" job-id)))
+        (let [job (bjs/get-job job-store "default" job-id)]
+          (is (str/includes? (:diagnostics (first (:error job))) "per-job size cap"))
+          (is (empty? (:files job)))
+          (is (not (.exists (io/file (:temp-dir job))))
+              "the aborted job's temp files are deleted"))))))
+
+(deftest max-concurrent-jobs-cap-returns-429
+  (testing "kickoff at/above the concurrency cap returns 429 with Retry-After
+            and an OperationOutcome, and starts no job"
+    (let [job-store (bjs/create-store {:max-concurrent-jobs 0})
+          {:keys [kickoff]} (system-route-handlers {"Patient" :reg} {})
+          resp (kickoff (bulk-req job-store))]
+      (is (= 429 (:status resp)))
+      (is (= "120" (get-in resp [:headers "Retry-After"])))
+      (is (= "application/fhir+json" (get-in resp [:headers "Content-Type"])))
+      (is (empty? (bjs/all-jobs job-store))))))
+
+(deftest ttl-sweep-evicts-expired-jobs-and-deletes-files
+  (testing "a lazy sweep on the next bulk request removes terminal jobs older
+            than ttl-ms and deletes their temp files"
+    (let [job-store (bjs/create-store {:ttl-ms 0})
+          dir       (io/file (System/getProperty "java.io.tmpdir")
+                             (str "dromon-bulk-test-" (random-uuid)))
+          f         (io/file dir "x.ndjson")]
+      (io/make-parents f)
+      (spit f "{}\n")
+      (bjs/put-job! job-store "default"
+                    {:id "old" :tenant "default" :status :complete
+                     :finished-at (- (System/currentTimeMillis) 10000)
+                     :temp-dir (.getAbsolutePath dir)
+                     :files {"f1" {:path (.getAbsolutePath f) :type "Patient"
+                                   :count 1 :bytes 3}}})
+      ;; Any bulk request triggers the sweep; an unknown-job status poll is fine.
+      (be/status {:path-params {:tenant-id "default" :job-id "other"}
+                  :headers {"host" "h"}
+                  :fhir/bulk-job-store job-store})
+      (is (nil? (bjs/get-job job-store "default" "old")) "expired job evicted")
+      (is (not (.exists dir)) "expired job's temp files deleted"))))
 
 ;; ---------------------------------------------------------------------------
 ;; CapabilityStatement $export operation declarations

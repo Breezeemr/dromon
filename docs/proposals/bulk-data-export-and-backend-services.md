@@ -184,6 +184,47 @@ the protocol supplies a monotonic tx-id to stamp as `transactionTime`.
   needs to be a valid Hydra token with the `system` Keto tuple. Full
   `system/*.read` scope enforcement is a nicety, not required to pass.
 
+## Requirement: streaming and bounded memory
+
+The first-cut MVP retained every export's NDJSON as in-heap strings in the job
+map (`:files {file-id ndjson-string}`) with no eviction, and the background
+worker built those strings in memory. On a large tenant this is an unbounded
+heap / OOM risk: a single system-level export materializes every resource of
+every type as one concatenated string, and completed jobs are never released.
+The bulk APIs must therefore stream and bound memory:
+
+1. Stream to temp files, not the heap. The worker writes each output type's
+   NDJSON to a temp file on disk through a buffered writer as it pages the
+   store, tracking bytes and line count per file. The job record stores file
+   metadata only - `:files {file-id {:path :type :count :bytes}}` - never the
+   content. Temp files live under a configurable base dir (default
+   `java.io.tmpdir`) namespaced per tenant/job (`<dir>/dromon-bulk/<tenant>/<job-id>/`).
+
+2. Serve files by streaming from disk. The `$export-file` handler returns
+   `{:status 200 :headers {"Content-Type" "application/fhir+ndjson"} :body
+   (clojure.java.io/file path)}`. Ring streams `File`/`InputStream` bodies, and
+   the explicit `Content-Type` keeps muuntaja from touching it (the same reason
+   the manifest and 202 responses are pre-serialized with an explicit CT). The
+   401-tokenless and system-authorization behavior is preserved.
+
+3. Configurable cap plus TTL, enforced by aborting (never silently
+   truncating). The `:fhir/bulk-job-store` Integrant component carries a config
+   map with env overrides. Defaults: `max-concurrent-jobs=4`
+   (`BULK_MAX_CONCURRENT_JOBS`), `max-job-bytes=1GB` (`BULK_MAX_JOB_BYTES`),
+   `max-total-bytes=5GB` across all jobs on disk (`BULK_MAX_TOTAL_BYTES`),
+   `ttl-ms=3600000` / 1h (`BULK_JOB_TTL_MS`), plus `temp-dir` (`BULK_TEMP_DIR`).
+   Enforcement:
+   - Kickoff when the in-progress job count is at or above `max-concurrent-jobs`
+     returns 429 with an `OperationOutcome` and a `Retry-After` header.
+   - The worker checks caps after each page; if a job exceeds `max-job-bytes`,
+     or the total on-disk bytes across all jobs exceeds `max-total-bytes`, it
+     aborts that job: sets `:status :error` with a clear `OperationOutcome`
+     message and deletes the job's temp files.
+   - TTL eviction: completed/errored/cancelled jobs older than `ttl-ms` are
+     removed and their temp files deleted. A lazy sweep runs on each bulk
+     request.
+   - Cancel deletes the job's temp files (the whole per-job temp dir tree).
+
 ## Phased plan
 
 ### Phase A - SMART Backend Services auth (mostly Ory config)
