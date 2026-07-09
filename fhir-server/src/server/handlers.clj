@@ -938,6 +938,22 @@
                                                       :code "SMART-on-FHIR"}]}]}
                       :resource resources}]}})))
 
+;; SMART Backend Services (bulk data) discovery advertised below only declares
+;; what the token endpoint supports; the token issuance and `private_key_jwt`
+;; RS384/ES384 client-assertion validation are entirely Ory Hydra's job. To
+;; make a discovered backend-services flow actually work (Phase A of
+;; docs/proposals/bulk-data-export-and-backend-services.md), the deployment
+;; must, OUTSIDE dromon:
+;;   1. Register an Ory Hydra client with
+;;        grant_types:              ["client_credentials"]
+;;        token_endpoint_auth_method: "private_key_jwt"
+;;        jwks (or jwks_uri):        the PUBLIC half of the key the client
+;;                                   (Inferno) signs its assertions with.
+;;   2. Confirm Hydra accepts RS384/ES384 client assertions (must match the
+;;      algs advertised here).
+;;   3. Grant that client subject a Keto "system" read tuple so the resulting
+;;      RS256 access token passes dromon's Keto authorization.
+;; dromon's own token validation (Hydra RS256 access tokens) is unchanged.
 (defn smart-configuration
   "Returns SMART configuration. When called as a 0-arg handler, uses env vars
    or localhost defaults. When called with an oauth-base-url, uses that."
@@ -957,15 +973,26 @@
                :authorization_endpoint (str base "/oauth2/auth")
                :token_endpoint         (str base "/oauth2/token")
                :token_endpoint_auth_methods_supported ["client_secret_basic" "private_key_jwt"]
+               ;; SMART Backend Services (SMART App Launch v2.2.0) requires the
+               ;; asymmetric client-assertion signing algorithms the server's
+               ;; token endpoint (Ory Hydra) accepts for `private_key_jwt`.
+               :token_endpoint_auth_signing_alg_values_supported ["RS384" "ES384"]
                :grant_types_supported  ["authorization_code" "client_credentials"]
                :code_challenge_methods_supported ["S256"]
+               ;; `system/*.read` and `system/*.rs` advertise SMART Backend
+               ;; Services (bulk data) scopes alongside the launch/patient/user
+               ;; scopes.
                :scopes_supported       ["openid" "profile" "launch" "launch/patient"
                                         "patient/*.read" "patient/*.write"
-                                        "user/*.read" "user/*.write"]
+                                        "user/*.read" "user/*.write"
+                                        "system/*.read" "system/*.rs"]
                :response_types_supported ["code"]
                ;; `sso-openid-connect` in :capabilities requires `issuer` +
                ;; `jwks_uri` to be present (SMART App Launch STU2 discovery).
+               ;; `client-confidential-asymmetric` advertises the
+               ;; `private_key_jwt` backend-services authentication method.
                :capabilities           ["launch-standalone" "client-public" "client-confidential-symmetric"
+                                        "client-confidential-asymmetric"
                                         "sso-openid-connect" "context-passthrough-banner"
                                         "permission-offline" "permission-patient" "permission-user"]}}))))
 
