@@ -198,13 +198,15 @@
 
 (defn wrap-not-acceptable
   "Returns 406 Not Acceptable when the Accept header specifies a format the server cannot produce.
-   Allows requests with no Accept header, */* , or JSON-compatible types."
+   Allows requests with no Accept header, */* , JSON-compatible types, or the
+   FHIR bulk-data NDJSON types (application/fhir+ndjson, application/ndjson)
+   that the $export file download requests."
   [handler]
   (fn [request]
     (let [accept (get-in request [:headers "accept"])]
       (if (and accept
                (not (str/blank? accept))
-               (not (re-find #"(?i)application/(fhir\+)?json|application/json-patch\+json|\*/\*" accept)))
+               (not (re-find #"(?i)application/(fhir\+)?(nd)?json|application/json-patch\+json|\*/\*" accept)))
         (json-error-response 406 "error" "not-supported"
                              (str "Not Acceptable: server only supports application/fhir+json. Received Accept: " accept))
         (handler request)))))

@@ -241,10 +241,20 @@
 
 (defn build-system-routes
   "Returns non-resource FHIR system routes."
-  [schemas all-registries decoders]
+  [schemas all-registries decoders encoders]
   (let [wrap-system-search (fn [handler-fn]
                              (fn [req]
-                               (handler-fn (assoc req :fhir/all-registries all-registries))))]
+                               (handler-fn (assoc req :fhir/all-registries all-registries))))
+        ;; Bulk-export handlers need the full registry set (to enumerate every
+        ;; type) and the per-type response encoders (to demote extensions when
+        ;; serializing NDJSON). Both are closed over here and injected per
+        ;; request, mirroring wrap-system-search.
+        wrap-bulk (fn [handler-fn]
+                    (fn [req]
+                      (handler-fn (assoc req
+                                         :fhir/all-registries all-registries
+                                         :fhir/resource-encoders encoders))))
+        require-auth (resolve-handler 'server.auth/wrap-require-auth)]
     [["/.well-known/smart-configuration" {:get  ((resolve-handler 'server.handlers/smart-configuration))
                                           :public? true}]
      ;; SMART patient-set grant machinery (server.grant). /auth/grants has no
@@ -273,6 +283,48 @@
      ["/:tenant-id/fhir/_history" {:get (wrap-system-search (resolve-handler 'server.handlers/system-history))}]
      ["/:tenant-id/fhir/_search"  {:get (wrap-system-search (resolve-handler 'server.handlers/system-search))
                                    :post (wrap-system-search (resolve-handler 'server.handlers/system-search))}]
+     ;; Bulk Data Access ($export) MVP: system-level export.
+     ;;
+     ;; Kickoff is fronted with wrap-require-auth so a tokenless request
+     ;; returns 401 (Inferno requires 400/401); it is also `:public?` so the
+     ;; Keto middleware -- which 403s a missing subject -- does not pre-empt
+     ;; that 401. The JWT middleware still validates any presented token, so a
+     ;; valid token yields 202 and an invalid/absent one yields 401.
+     ["/:tenant-id/fhir/$export"
+      {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/kickoff)))
+       :public? true}]
+     ;; Patient-level export: union each Patient's compartment. The 4th URL
+     ;; segment is the real "Patient" type, so (like the system kickoff) the
+     ;; route is `:public?` + wrap-require-auth to yield 401 (not the Keto 403
+     ;; on the "Patient" object) for a tokenless request while still honoring a
+     ;; valid backend-services token that only holds the "system" tuple.
+     ["/:tenant-id/fhir/Patient/$export"
+      {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/patient-export)))
+       :public? true}]
+     ;; Group-level export: resolve Group.member.entity Patient refs and union
+     ;; their compartments. Placed in the system routes (ahead of the resource
+     ;; tree) so `$export` beats the Group /:id read wildcard.
+     ["/:tenant-id/fhir/Group/:id/$export"
+      {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/group-export)))
+       :public? true}]
+     ;; Status polling + cancel gate on the already-granted "system" Keto
+     ;; object (see the $export-status exclusion in server.keto/server.scope).
+     ;; :keto/relation "read" pins both GET (poll) and DELETE (cancel) to the
+     ;; system read tuple the backend-services token already holds; cancel
+     ;; writes no clinical data, so gating it on read is intentional.
+     ["/:tenant-id/fhir/$export-status/:job-id"
+      {:get           (wrap-bulk (resolve-handler 'server.bulk-export/status))
+       :delete        (wrap-bulk (resolve-handler 'server.bulk-export/cancel))
+       :keto/relation "read"}]
+     ;; File download is gated on the already-granted "system" Keto object
+     ;; (manifest requiresAccessToken true): $export-file is in the keto/scope
+     ;; URL-parse exclusion sets, so a non-public route with :keto/relation
+     ;; "read" pins it to the system read tuple the backend-services token
+     ;; holds. The body is pre-serialized NDJSON with an explicit Content-Type,
+     ;; bypassing muuntaja.
+     ["/:tenant-id/fhir/$export-file/:job-id/:file-id"
+      {:get           (wrap-bulk (resolve-handler 'server.bulk-export/file))
+       :keto/relation "read"}]
      ["/:tenant-id/fhir"          {:post (let [build-tx (resolve-handler 'server.handlers/transaction)]
                                            (build-tx decoders))}]]))
 
@@ -283,5 +335,5 @@
         ;; entries and recursive :contained handling on read/write routes.
         decoders ((resolve-handler 'server.handlers/build-resource-decoders) schemas)
         encoders ((resolve-handler 'server.handlers/build-resource-encoders) schemas)]
-    (into (build-system-routes schemas all-registries decoders)
+    (into (build-system-routes schemas all-registries decoders encoders)
           (build-resource-routes schemas decoders encoders))))

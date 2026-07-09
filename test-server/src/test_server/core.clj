@@ -138,6 +138,8 @@
     (merge {:fhir/schemas {:specs specs
                            :operations extra-operations}
             :test-server/seeder    {:store store-ref}
+            ;; In-memory Bulk Data Access ($export) job registry.
+            :fhir/bulk-job-store {}
             :fhir-terminology/tx-proxy {:base-url nil}
             :fhir-terminology/cached   {:delegate (ig/ref :fhir-terminology/tx-proxy)}
             :server/jetty {:port          port
@@ -148,12 +150,42 @@
                            :store         store-ref
                            :schemas       (ig/ref :fhir/schemas)
                            :terminology   (ig/ref :fhir-terminology/cached)
+                           :bulk-job-store (ig/ref :fhir/bulk-job-store)
                            ;; Force integrant to init the seeder (which creates
                            ;; and warms the default tenant) before Jetty starts
                            ;; accepting traffic, so the first real request is
                            ;; never billed for per-tenant cold-start cost.
                            :seeded        (ig/ref :test-server/seeder)}}
            extra)))
+
+(def ^:private seed-patients
+  "Baseline Patients seeded into the default tenant so a system-level
+   $export produces a Patient NDJSON file with at least two DISTINCT ids
+   (the Bulk Data validator requires >= 2). The inferno runner additionally
+   PUTs Patient/123; seeding it here too makes that PUT idempotent and keeps
+   the two-id guarantee even when the runner is not involved."
+  [{:resourceType "Patient"
+    :id "123"
+    :text {:status "generated"
+           :div "<div xmlns=\"http://www.w3.org/1999/xhtml\">John Smith</div>"}
+    :active true
+    :identifier [{:system "urn:oid:1.2.36.146.595.217.0.1" :value "pat-123"}]
+    :name [{:family "Smith" :given ["John"]}]
+    :gender "male"
+    :birthDate "1980-01-01"
+    :address [{:line ["123 Main St"] :city "Anytown" :state "NY"
+               :postalCode "12345" :country "US"}]}
+   {:resourceType "Patient"
+    :id "bulk-export-2"
+    :text {:status "generated"
+           :div "<div xmlns=\"http://www.w3.org/1999/xhtml\">Jane Doe</div>"}
+    :active true
+    :identifier [{:system "urn:oid:1.2.36.146.595.217.0.1" :value "pat-bulk-2"}]
+    :name [{:family "Doe" :given ["Jane"]}]
+    :gender "female"
+    :birthDate "1975-05-05"
+    :address [{:line ["456 Oak Ave"] :city "Anytown" :state "NY"
+               :postalCode "12345" :country "US"}]}])
 
 (defmethod ig/init-key :test-server/seeder [_ {:keys [store]}]
   (println "Provisioning default tenant...")
@@ -168,6 +200,13 @@
                          :resource p})
                       sp/search-parameters)]
     (db/transact-transaction store "default" entries))
+  (println "Seeding" (count seed-patients) "baseline Patients...")
+  (db/transact-transaction
+   store "default"
+   (mapv (fn [p]
+           {:request  {:method "PUT" :url (str "Patient/" (:id p))}
+            :resource p})
+         seed-patients))
   true)
 
 (defonce system (atom nil))

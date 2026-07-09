@@ -25,6 +25,13 @@
                      "user/*.read" "user/*.write"]]
         (is (contains? advertised scope) (str "missing advertised scope: " scope))))))
 
+(deftest smart-configuration-advertises-backend-services-scopes
+  (testing "SMART Backend Services (bulk data) system scopes are advertised"
+    (let [advertised (set (:scopes_supported smart-config-body))]
+      (doseq [scope ["system/*.read" "system/*.rs"]]
+        (is (contains? advertised scope)
+            (str "missing backend-services scope: " scope))))))
+
 (deftest smart-configuration-capabilities-and-grants
   (testing "advertises SMART capabilities, grant types and auth methods"
     (let [caps (set (:capabilities smart-config-body))]
@@ -37,6 +44,23 @@
     (is (= ["code"] (:response_types_supported smart-config-body)))
     (is (= ["client_secret_basic" "private_key_jwt"]
            (:token_endpoint_auth_methods_supported smart-config-body)))))
+
+(deftest smart-configuration-backend-services-discovery
+  (testing "advertises SMART Backend Services (private_key_jwt) discovery"
+    (let [caps (set (:capabilities smart-config-body))]
+      (is (contains? caps "client-confidential-asymmetric")
+          "missing client-confidential-asymmetric capability"))
+    (testing "asymmetric client-assertion signing algorithms are advertised"
+      (let [algs (set (:token_endpoint_auth_signing_alg_values_supported smart-config-body))]
+        (is (vector? (:token_endpoint_auth_signing_alg_values_supported smart-config-body)))
+        (doseq [alg ["RS384" "ES384"]]
+          (is (contains? algs alg) (str "missing signing alg: " alg)))))
+    (is (some #{"private_key_jwt"}
+              (:token_endpoint_auth_methods_supported smart-config-body))
+        "token_endpoint_auth_methods_supported must include private_key_jwt")
+    (is (some #{"client_credentials"}
+              (:grant_types_supported smart-config-body))
+        "grant_types_supported must include client_credentials")))
 
 (deftest smart-configuration-stu2-discovery-required-fields
   (testing "document satisfies SMART App Launch STU2 well-known discovery"

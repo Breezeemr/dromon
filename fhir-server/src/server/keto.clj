@@ -64,7 +64,15 @@
               ;; Prefer explicit fhir type if provided by Reitit match, else fallback to URL parsing
               fhir-type (or (:fhir/resource-type request)
                             (when (and (> (count parts) 3)
-                                       (not (#{"metadata" "_history" "_search"} (nth parts 3))))
+                                       ;; System endpoints whose 4th segment is
+                                       ;; not a resource type gate on the
+                                       ;; "system" object, not a bogus one
+                                       ;; parsed from the URL. The bulk-data
+                                       ;; $export endpoints join metadata/
+                                       ;; _history/_search here.
+                                       (not (#{"metadata" "_history" "_search"
+                                               "$export" "$export-status" "$export-file"}
+                                             (nth parts 3))))
                               (nth parts 3)))
               request-method (:request-method request)
               ;; Routes may pin the required relation via :keto/relation route
