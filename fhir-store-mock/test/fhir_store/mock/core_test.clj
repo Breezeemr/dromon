@@ -262,3 +262,47 @@
                                 {:resourceType "Patient" :name [{:family "Keep"}]})
       (protocol/warmup-tenant store "tid")
       (is (some? (protocol/read-resource store "tid" "Patient" "p1"))))))
+
+(deftest current-basis-monotonic-test
+  (testing "current-basis returns a strictly monotonic :tx-id token"
+    (let [store (mock/create-mock-store {})
+          b1 (protocol/current-basis store "tid")
+          b2 (protocol/current-basis store "tid")]
+      (is (integer? (:tx-id b1)))
+      (is (instance? java.time.Instant (:system-time b1)))
+      (is (< (:tx-id b1) (:tx-id b2)) "successive kickoffs get distinct, increasing tokens"))))
+
+(deftest scan-type-as-of-test
+  (let [store (mock/create-mock-store {})
+        tenant "tid"
+        _ (protocol/create-resource store tenant "Patient" "p1"
+                                    {:resourceType "Patient" :name [{:family "A"}]})
+        _ (protocol/create-resource store tenant "Patient" "p2"
+                                    {:resourceType "Patient" :name [{:family "B"}]})
+        _ (protocol/create-resource store tenant "Observation" "o1"
+                                    {:resourceType "Observation" :status "final"})
+        basis (protocol/current-basis store tenant)]
+    (testing "scan-type-as-of returns a lazy seq of the type's live resources"
+      (let [scan (protocol/scan-type-as-of store tenant "Patient" basis)]
+        (is (seq? scan) "returns a (lazy) seq")
+        (is (= #{"p1" "p2"} (set (map :id scan))))))
+
+    (testing "scan-type-as-of scopes to the requested type"
+      (is (= ["o1"] (mapv :id (protocol/scan-type-as-of store tenant "Observation" basis)))))
+
+    (testing "count-as-of counts the type's live resources"
+      (is (= 2 (protocol/count-as-of store tenant "Patient" basis)))
+      (is (= 1 (protocol/count-as-of store tenant "Observation" basis)))
+      (is (= 0 (protocol/count-as-of store tenant "Encounter" basis))))
+
+    (testing "deleted resources are excluded from scan and count"
+      (protocol/delete-resource store tenant "Patient" "p2")
+      (is (= ["p1"] (mapv :id (protocol/scan-type-as-of store tenant "Patient" basis))))
+      (is (= 1 (protocol/count-as-of store tenant "Patient" basis))))
+
+    (testing "no-history limitation: scan reflects CURRENT state, not the basis"
+      ;; The basis was captured with p2 live; after deleting p2 and adding p3,
+      ;; scanning that OLD basis returns the CURRENT set (mock keeps no history).
+      (protocol/create-resource store tenant "Patient" "p3"
+                                {:resourceType "Patient" :name [{:family "C"}]})
+      (is (= #{"p1" "p3"} (set (map :id (protocol/scan-type-as-of store tenant "Patient" basis))))))))

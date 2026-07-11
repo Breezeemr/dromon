@@ -734,3 +734,55 @@
           (is (apply < (map :tx-id bases))
               "tx-ids must be strictly increasing across sequential writes"))
         (finally (close-store-nodes! store))))))
+
+(deftest current-basis-and-as-of-scan
+  ;; Point-in-time snapshot reads backing the lazy bulk export: pin a basis,
+  ;; then scan/count a type AS OF that basis. Writes committed AFTER the basis
+  ;; must be invisible to the snapshot.
+  (let [store  (core-db/create-xtdb-store {})
+        tenant "as-of-probe"]
+    (try
+      ;; Five patients live at the basis.
+      (doseq [i (range 5)]
+        (db/create-resource store tenant :Patient (str "p" i)
+                            {:resourceType "Patient" :active true}))
+      (let [basis (db/current-basis store tenant)]
+        (testing "current-basis captures a usable snapshot token"
+          (is (int? (:tx-id basis)))
+          (is (instance? java.time.Instant (:system-time basis))))
+
+        ;; Two more patients committed AFTER the basis.
+        (db/create-resource store tenant :Patient "p5" {:resourceType "Patient" :active true})
+        (db/create-resource store tenant :Patient "p6" {:resourceType "Patient" :active true})
+
+        (testing "scan-type-as-of streams exactly the snapshot's resources"
+          (let [scan (db/scan-type-as-of store tenant :Patient basis)
+                ids  (into [] (map :id) scan)]
+            (is (= 5 (count ids)) "post-basis writes are invisible to the snapshot")
+            (is (= #{"p0" "p1" "p2" "p3" "p4"} (set ids)))
+            (is (every? #(= "Patient" (:resourceType %)) (into [] scan))
+                "rows decode back to full FHIR resources")))
+
+        (testing "count-as-of matches the snapshot count"
+          (is (= 5 (db/count-as-of store tenant :Patient basis)))
+          (is (= 0 (db/count-as-of store tenant :Observation basis))))
+
+        (testing "the scan is reducible with early termination"
+          ;; A reduced accumulator halts the scan without realizing the rest.
+          (let [scan  (db/scan-type-as-of store tenant :Patient basis)
+                first-id (reduce (fn [_ r] (reduced (:id r))) nil scan)]
+            (is (string? first-id))
+            (is (contains? #{"p0" "p1" "p2" "p3" "p4"} first-id))))
+
+        (testing "keyset paging spans page boundaries (tiny page size)"
+          ;; A page size of 2 over 5 rows forces three pages; the full set must
+          ;; still come back exactly once, proving keyset paging is correct and
+          ;; only one page is held at a time (never the whole type).
+          (let [{:keys [pool]} (#'core-db/get-or-create-entry store tenant)
+                paged (core-db/scan-type-as-of-reducible
+                       pool :Patient (core-db/basis->system-time basis)
+                       (:read-decoders store) 2)
+                ids   (into [] (map :id) paged)]
+            (is (= 5 (count ids)) "no rows dropped or duplicated across pages")
+            (is (= #{"p0" "p1" "p2" "p3" "p4"} (set ids))))))
+      (finally (close-store-nodes! store)))))

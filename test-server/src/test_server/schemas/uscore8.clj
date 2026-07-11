@@ -52,6 +52,15 @@
    {:schema 'org.hl7.fhir.StructureDefinition.Appointment.v4-3-0/full-sch
     :interactions ["create" "search-type" "read" "vread"
                    "update" "patch" "delete" "history-instance" "history-type"]}
+   ;; Group: base R4B fallback (no US Core profile). Registered so the store
+   ;; builds a schema-driven encoder/decoder that round-trips
+   ;; Group.member.entity references faithfully — the :default open-map decoder
+   ;; used for unregistered types does not keywordize nested struct keys, which
+   ;; the group-level Bulk Data export relies on. Group/[id]/$export reads the
+   ;; Group directly from the store to resolve its member patients.
+   {:schema 'org.hl7.fhir.StructureDefinition.Group.v4-3-0/full-sch
+    :interactions ["create" "search-type" "read" "vread"
+                   "update" "delete" "history-instance" "history-type"]}
    {:schema 'us-core.capability.v8-0-1.ValueSet/capability
     :interactions ["create" "search-type" "read" "vread"
                    "update" "patch" "delete" "history-instance"]}

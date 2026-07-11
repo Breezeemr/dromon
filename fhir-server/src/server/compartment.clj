@@ -320,6 +320,36 @@
             (assoc registry compartment-search-param desc)]
       :deny)))
 
+(declare reference-matches?)
+
+(defn resource-in-any-compartment?
+  "In-memory (no store query) membership test for the bulk export streamer:
+   true when `resource` of `fhir-type` belongs to the `compartment-type`
+   compartment of ANY owner id in `owner-ids` (a set of bare logical ids).
+
+   The owner resource type itself matches by id (its logical id is in
+   `owner-ids`). A member type matches when one of its registered R4B link
+   columns (resolved via `registry`) holds a Reference to `compartment-type/<id>`
+   for some id in the set. A non-member type never matches. This mirrors the
+   `_compartment` push-down that `confine` applies to `db/search`, but evaluated
+   locally against an already-read resource so it can be applied while streaming
+   a `scan-type-as-of` snapshot."
+  [compartment-type owner-ids fhir-type resource registry]
+  (cond
+    (= fhir-type compartment-type)
+    (contains? owner-ids (:id resource))
+
+    (not (member? compartment-type fhir-type))
+    false
+
+    :else
+    (boolean
+     (when-let [desc (compartment-descriptor compartment-type fhir-type registry)]
+       (let [cols (:columns desc)]
+         (some (fn [owner-id]
+                 (reference-matches? resource cols (str compartment-type "/" owner-id)))
+               owner-ids))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Patient launch context and scope restriction
 ;; ---------------------------------------------------------------------------

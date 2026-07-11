@@ -11,6 +11,7 @@
    so the same `test-server.core` namespace works against any combination
    of backends present on the classpath."
   (:require [server.core :as fhir-server]
+            [server.bulk-job-store :as bulk-job-store]
             [server.logging :as logging]
             [clojure.edn :as edn]
             [integrant.core :as ig]
@@ -138,8 +139,15 @@
     (merge {:fhir/schemas {:specs specs
                            :operations extra-operations}
             :test-server/seeder    {:store store-ref}
-            ;; In-memory Bulk Data Access ($export) job registry.
-            :fhir/bulk-job-store {}
+            ;; In-memory Bulk Data Access ($export) job registry. Exports stream
+            ;; from the store at download time (no temp files), so the only
+            ;; bounded resource is concurrent download streams
+            ;; (max-concurrent-streams=4) plus a metadata ttl (ttl-ms=1h), from
+            ;; server.bulk-job-store/default-config. Override any key here per
+            ;; deployment, or via the BULK_* env vars (BULK_MAX_CONCURRENT_STREAMS,
+            ;; BULK_JOB_TTL_MS; the :fhir/bulk-job-store init-key layers env
+            ;; overrides on top).
+            :fhir/bulk-job-store bulk-job-store/default-config
             :fhir-terminology/tx-proxy {:base-url nil}
             :fhir-terminology/cached   {:delegate (ig/ref :fhir-terminology/tx-proxy)}
             :server/jetty {:port          port
@@ -187,6 +195,20 @@
     :address [{:line ["456 Oak Ave"] :city "Anytown" :state "NY"
                :postalCode "12345" :country "US"}]}])
 
+(def ^:private seed-groups
+  "Baseline Groups seeded into the default tenant. Group \"1\" exists so
+   Group-level Bulk Data Access (Group/1/$export) resolves to 202 instead of
+   404; the Inferno bulk_data suite drives group export against group_id:1. Its
+   member.entity references the two baseline Patients so the group export
+   confines its output to that cohort. This is a minimal, base-R4-valid Group
+   (required elements: type, actual)."
+  [{:resourceType "Group"
+    :id "1"
+    :type "person"
+    :actual true
+    :member [{:entity {:reference "Patient/123"}}
+             {:entity {:reference "Patient/bulk-export-2"}}]}])
+
 (defmethod ig/init-key :test-server/seeder [_ {:keys [store]}]
   (println "Provisioning default tenant...")
   (db/create-tenant store "default" {:if-exists :ignore})
@@ -207,6 +229,13 @@
            {:request  {:method "PUT" :url (str "Patient/" (:id p))}
             :resource p})
          seed-patients))
+  (println "Seeding" (count seed-groups) "baseline Groups...")
+  (db/transact-transaction
+   store "default"
+   (mapv (fn [g]
+           {:request  {:method "PUT" :url (str "Group/" (:id g))}
+            :resource g})
+         seed-groups))
   true)
 
 (defonce system (atom nil))

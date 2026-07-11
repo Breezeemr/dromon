@@ -184,6 +184,96 @@ the protocol supplies a monotonic tx-id to stamp as `transactionTime`.
   needs to be a valid Hydra token with the `system` Keto tuple. Full
   `system/*.read` scope enforcement is a nicety, not required to pass.
 
+## Requirement: streaming and bounded memory
+
+The first-cut MVP retained every export's NDJSON as in-heap strings in the job
+map (`:files {file-id ndjson-string}`) with no eviction, and a background worker
+built those strings in memory. On a large tenant this is an unbounded heap / OOM
+risk: a single system-level export materializes every resource of every type as
+one concatenated string, and completed jobs are never released. An intermediate
+revision spooled that NDJSON to temp files on disk during the worker, which
+bounds heap but adds disk pressure, an on-disk byte-cap / cleanup regime, and a
+window where every exported resource is duplicated to the filesystem.
+
+The current design removes both the worker and the disk spool: it is
+**lazy stream-at-download** against a **pinned point-in-time DB basis**. No
+resource bytes are produced and no disk is touched until (and unless) the client
+actually downloads a file; the bytes then flow store -> socket under TCP
+backpressure, so peak memory is one store page regardless of type size.
+
+1. Pin a snapshot at kickoff; produce no bytes. Kickoff captures the tenant's
+   current DB basis via `IFHIRStore/current-basis` (a `{:tx-id :system-time}`
+   snapshot token that reads no resource bytes) and derives `transactionTime`
+   from it. It computes the manifest - which types, and a per-type count via
+   `count-as-of` (system) or the exact confined filter count (patient/group) -
+   without serializing any resource. The job stores only tiny metadata:
+   `{:basis :manifest (pre-serialized string) :status :kind :params :owner-ids
+   :output :error :files ...}`, never NDJSON and never a file path. Kickoff
+   returns 202 + an absolute `Content-Location`.
+
+2. Stream from the store at download time. `$export-file` returns a Ring
+   `StreamableResponseBody` (`reify ring.core.protocols/StreamableResponseBody`)
+   whose `write-body-to-stream` scans the type AS OF the pinned basis via
+   `IFHIRStore/scan-type-as-of` - a reducible (`IReduceInit`) that keyset-
+   paginates and holds at most one page - and writes NDJSON lines to the
+   `OutputStream`, flushing per batch (every ~128 lines and at completion). A
+   backpressured Jetty socket pauses the next page pull, so a slow client bounds
+   memory rather than buffering the whole type. Compartment confinement
+   (patient/group), `_typeFilter`, `_since` and id-dedup are applied as a
+   stateful transducer WHILE streaming. The body carries an explicit
+   `Content-Type: application/fhir+ndjson`; because it is a `reify` (not a
+   map/coll), muuntaja leaves it untouched - the same bypass reason the manifest
+   and 202 are pre-serialized strings with an explicit CT. Pinning the basis at
+   kickoff and reading as-of it at download keeps snapshot consistency in the
+   async model: writes committed after kickoff are invisible to the download,
+   even though the two happen at different wall-clock times.
+
+3. Preserve the async contract and auth. Status returns 200 with the
+   `application/json` manifest (pre-serialized at kickoff) containing
+   `transactionTime` / `request` / `requiresAccessToken` / `output` / `error`;
+   output entries carry `type` + `url` (+ `count`). The `:public?` kickoff and
+   file routes yield 401 for a tokenless request (via `wrap-require-auth`, not
+   the Keto 403), and each handler then gates on the `system` read tuple inline
+   (`requiresAccessToken: true`), so an authenticated caller must hold `system`
+   read.
+
+4. Bound concurrency, not disk. There is no disk to cap and no worker to abort,
+   so the cap model becomes a **concurrent-stream limit**. The
+   `:fhir/bulk-job-store` Integrant component carries
+   `max-concurrent-streams=4` (env `BULK_MAX_CONCURRENT_STREAMS`),
+   `max-stream-ms=3600000` / 1h (env `BULK_MAX_STREAM_MS`), and
+   `ttl-ms=3600000` / 1h (env `BULK_JOB_TTL_MS`); the init-key layers the env
+   overrides over the component opts. Enforcement:
+   - Kickoff and `$export-file` both check the live active-stream count; at or
+     above `max-concurrent-streams` they return 429 with an `OperationOutcome`
+     and a `Retry-After` header. `$export-file` atomically acquires a slot (a
+     timestamped token in the `:active-streams` map) for the duration of the
+     stream and releases it by token in a `finally` once `write-body-to-stream`
+     returns. Because a client can disconnect after the 200 but before Jetty
+     writes the body (so that `finally` never runs), slots are self-healing:
+     both acquire and the count check prune any token older than `max-stream-ms`,
+     so leaked slots cannot permanently wedge the cap.
+   - TTL eviction: completed/cancelled jobs older than `ttl-ms` are dropped. The
+     records are now tiny metadata, so eviction is a plain `dissoc` - no files
+     to delete. A lazy sweep runs at the head of each bulk request.
+   - Cancel flips the job to `:cancelled` (202); there is no on-disk content to
+     reclaim.
+
+The removed machinery - the background worker, the `:files
+{file-id ndjson-string}` / on-disk file-metadata storage, the per-tenant/job
+temp-dir tree, and the on-disk byte caps `max-job-bytes` / `max-total-bytes` /
+`temp-dir` (`BULK_MAX_JOB_BYTES` / `BULK_MAX_TOTAL_BYTES` / `BULK_TEMP_DIR`) and
+`max-concurrent-jobs` (`BULK_MAX_CONCURRENT_JOBS`) - no longer exist.
+
+Note - datomic write batching (future `$import`, not this export): `$export` is
+read-only and streams a snapshot, so it never transacts. A future bulk
+`$import` that ingests uploaded NDJSON WILL write, and on the datomic backend
+those write paths must chunk their transactions to roughly 1000 datoms each
+rather than committing one giant transaction, to stay within transactor limits
+and keep memory bounded on the write side. That batching requirement is
+reserved for the import work and does not apply to the read-only export path
+described here.
+
 ## Phased plan
 
 ### Phase A - SMART Backend Services auth (mostly Ory config)
