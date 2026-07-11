@@ -27,3 +27,6 @@ fhir-defintions-to-malli/scratch/*
 !fhir-defintions-to-malli/scratch/.keep
 # Transient log from the compartment-e2e runner
 e2e-server.log
+
+# Dev TLS cert/key for the Hydra TLS terminator, minted at runtime via mkcert.
+docker/tls/

@@ -43,6 +43,69 @@
                        :stdout    out
                        :stderr    err})))))
 
+(defn hydra-run-args
+  "The `docker run` argv that starts the Hydra container from docker/hydra.yml.
+   Shared by `start!` and `restart-hydra!` so both stay in sync."
+  []
+  ["docker" "run" "-d" "--name" "hydra" "--network" network-name
+   "--memory" "128m" "--memory-swap" "128m" "--cpus" "0.5"
+   "-p" "4444:4444" "-p" "4445:4445"
+   "-v" (str pwd "/docker/hydra.yml:/etc/config/hydra/hydra.yml")
+   "-e" (str "DSN=" pg-dsn-base "hydra?sslmode=disable")
+   "docker.io/oryd/hydra:v2.2.0" "serve" "all" "-c" "/etc/config/hydra/hydra.yml" "--dev"])
+
+(defn restart-hydra!
+  "Recreates the Hydra container from the current docker/hydra.yml. Used to pick
+   up an issuer (or other config) change without a full environment teardown.
+   Idempotent: removes any existing container first, then re-runs it."
+  []
+  (println "Recreating Hydra container from docker/hydra.yml...")
+  (when (container-exists? "hydra")
+    (shell "docker" "rm" "-f" "hydra"))
+  (apply shell (hydra-run-args))
+  (assert-container-up! "hydra"))
+
+;; ── Hydra TLS terminator ──────────────────────────────────────────────────────
+;; SMART Backend Services requires the token endpoint over TLS. Hydra keeps
+;; serving plain HTTP on 4444; this nginx terminator presents HTTPS on
+;; https://fhir.local:4443 and proxies to hydra:4444 (see docker/hydra-tls.conf).
+
+(def ^:private tls-cert-dir (str pwd "/docker/tls"))
+
+(defn ensure-hydra-tls-cert!
+  "Mints the fhir.local dev TLS cert/key (via mkcert, using the same CA the
+   Inferno container trusts) for the Hydra TLS terminator, if not already
+   present."
+  []
+  (let [cert (java.io.File. tls-cert-dir "fhir.local.pem")
+        key  (java.io.File. tls-cert-dir "fhir.local-key.pem")]
+    (when-not (and (.isFile cert) (.isFile key))
+      (println "Minting fhir.local TLS cert for Hydra terminator via mkcert...")
+      (.mkdirs (java.io.File. tls-cert-dir))
+      (shell "mkcert" "-cert-file" (.getPath cert) "-key-file" (.getPath key) "fhir.local"))))
+
+(defn hydra-tls-run-args
+  "The `docker run` argv for the nginx TLS terminator in front of Hydra."
+  []
+  ["docker" "run" "-d" "--name" "hydra-tls" "--network" network-name
+   "--memory" "64m" "--memory-swap" "64m"
+   "-p" "4443:4443"
+   "-v" (str pwd "/docker/hydra-tls.conf:/etc/nginx/nginx.conf:ro")
+   "-v" (str tls-cert-dir ":/etc/nginx/certs:ro")
+   "docker.io/library/nginx:latest"])
+
+(defn ensure-hydra-tls-terminator!
+  "Ensures the nginx TLS terminator (https://fhir.local:4443 -> hydra:4444),
+   which serves the SMART token endpoint over TLS, is running. Idempotent:
+   mints the cert if missing and (re)creates the container if not running."
+  []
+  (ensure-hydra-tls-cert!)
+  (when-not (container-running? "hydra-tls")
+    (when (container-exists? "hydra-tls")
+      (shell "docker" "rm" "-f" "hydra-tls"))
+    (apply shell (hydra-tls-run-args))
+    (assert-container-up! "hydra-tls")))
+
 (defn start! []
   (println "Starting local integration environment...")
   (when-not (network-exists?)
@@ -113,12 +176,7 @@
     (when (container-exists? "hydra")
       (println "hydra exists but is stopped — removing and recreating...")
       (shell "docker" "rm" "-f" "hydra"))
-    (shell "docker" "run" "-d" "--name" "hydra" "--network" network-name
-           "--memory" "128m" "--memory-swap" "128m" "--cpus" "0.5"
-           "-p" "4444:4444" "-p" "4445:4445"
-           "-v" (str pwd "/docker/hydra.yml:/etc/config/hydra/hydra.yml")
-           "-e" (str "DSN=" pg-dsn-base "hydra?sslmode=disable")
-           "docker.io/oryd/hydra:v2.2.0" "serve" "all" "-c" "/etc/config/hydra/hydra.yml" "--dev")
+    (apply shell (hydra-run-args))
     (assert-container-up! "hydra"))
 
   ;; Jaeger all-in-one (only when DROMON_OTEL=1). Provides OTLP ingest on
@@ -141,7 +199,7 @@
 
 (defn stop! []
   (println "Stopping local integration environment...")
-  (doseq [c ["jaeger" "keto" "hydra" "ory-pg"]]
+  (doseq [c ["jaeger" "hydra-tls" "keto" "hydra" "ory-pg"]]
     (when (container-exists? c)
       (println "Removing container" c)
       (shell "docker" "rm" "-f" c)))
