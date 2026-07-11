@@ -30,8 +30,19 @@ strategies:
 
 urls:
   self:
-    issuer: http://127.0.0.1:4444/
-    
+    # SMART Backend Services requires the token endpoint over TLS. Hydra itself
+    # keeps serving plain HTTP on 4444 (used for JWKS and host-side flows); an
+    # additive nginx TLS terminator (docker/hydra-tls.conf) presents HTTPS on
+    # https://fhir.local:4443 and proxies to hydra:4444. The issuer is therefore
+    # the HTTPS terminator URL: Hydra validates the `private_key_jwt`
+    # client-assertion `aud` against this issuer's token endpoint
+    # (https://fhir.local:4443/oauth2/token), which Inferno both signs and posts
+    # to over TLS. `fhir.local` resolves to 127.0.0.1 on the host and to the host
+    # gateway inside the Inferno container, and the terminator's mkcert cert is
+    # trusted there (SSL_CERT_FILE=rootCA.pem). dromon validates access tokens
+    # via JWKS (not `iss`), so the issuer change is transparent to authorization.
+    issuer: https://fhir.local:4443/
+
   consent: http://127.0.0.1:3000/consent
   login: http://127.0.0.1:3000/login
   logout: http://127.0.0.1:3000/logout
