@@ -190,18 +190,33 @@
      capability data map (e.g. `us-core.capability.v8-0-1.Patient/capability`
      (named `capability`) or a pre-compiled malli `:multi` schema
      (legacy/base-resource Vars); OR
-   - a map `{:schema <fq-sym> :interactions [..]}` where :interactions,
-     when provided, override the schema-declared interactions before
-     conversion."
+   - a map `{:schema <fq-sym> :interactions [..] :search-params [..]
+     :extra-search-params [..]}` where :interactions and :search-params,
+     when provided, override the schema-declared values before conversion
+     (base-resource schemas declare neither, so raw full-sch entries need
+     them spelled out to be searchable). :extra-search-params APPENDS to
+     the schema-declared list instead -- for capability schemas that
+     already carry params but need deployment-specific additions (e.g.
+     furl's nonstandard managingOrganization name on Location)."
   ([spec] (resolve-schema spec nil))
   ([spec {:keys [operations]}]
-   (let [{:keys [schema interactions]} (if (map? spec) spec {:schema spec})
+   (let [{:keys [schema interactions search-params extra-search-params]}
+         (if (map? spec) spec {:schema spec})
          resolved @(resolve-sym schema)
          registry (when (cap-data? resolved) (sibling-registry-var schema))
-         resolved (if interactions
+         override (cond-> {}
+                    interactions (assoc :interactions interactions)
+                    search-params (assoc :search-params search-params))
+         resolved (if (seq override)
                     (if (cap-data? resolved)
-                      (assoc resolved :interactions interactions)
-                      (mu/update-properties resolved into {:interactions interactions}))
+                      (merge resolved override)
+                      (mu/update-properties resolved into override))
+                    resolved)
+         resolved (if (seq extra-search-params)
+                    (if (cap-data? resolved)
+                      (update resolved :search-params (fnil into []) extra-search-params)
+                      (mu/update-properties resolved update :search-params
+                                            (fnil into []) extra-search-params))
                     resolved)]
      (capability-schema->server-schema resolved registry operations))))
 
