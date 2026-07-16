@@ -68,9 +68,17 @@
    ;; classpath. Used by the compartment-e2e runner to verify enforcement
    ;; against the Datomic backend.
    :datomic {:requires '[fhir-store-datomic.core]
-             :extra    {:fhir-store/datomic-store {:resource/schemas (ig/ref :fhir/schemas)
-                                                   :storage          :mem
-                                                   :close-on-halt?   true}}
+             :extra    {:fhir-store/datomic-store
+                        (cond-> {:resource/schemas (ig/ref :fhir/schemas)
+                                 :storage          :mem
+                                 :close-on-halt?   true}
+                          ;; Contained-resource writes need a blob store; the
+                          ;; env gate keeps datomic deps off the load path for
+                          ;; non-datomic runs of this ns.
+                          (System/getenv "DATOMIC_MEM_CONTAINED_STORE")
+                          (assoc :contained-store
+                                 ((requiring-resolve
+                                   'fhir-store-datomic.blob-store/memory-blob-store))))}
              :store-ref (ig/ref :fhir-store/datomic-store)}
    ;; Persistent Datomic dev storage pointed at a pre-existing database
    ;; produced by fhir-datomic-decant. The `default` tenant is mapped to the
@@ -93,7 +101,8 @@
 (def ^:private schema-presets
   "Map of schema-package -> namespace whose `specs` Var lists the schema
    specs to feed into `:fhir/schemas`."
-  {:uscore8 'test-server.schemas.uscore8})
+  {:uscore8 'test-server.schemas.uscore8
+   :erx     'test-server.schemas.erx})
 
 (def ^:private extra-operations
   "Deployment-specific FHIR operations merged over the fhir-server built-ins
@@ -214,14 +223,20 @@
   (db/create-tenant store "default" {:if-exists :ignore})
   (println "Warming up default tenant (cold-path init)...")
   (db/warmup-tenant store "default")
-  (println "Seeding" (count sp/search-parameters) "SearchParameters in one transaction...")
-  ;; Batched into a single transact-transaction so the per-tx fixed cost is
-  ;; paid once instead of N times. See docs/proposals/xtdb2-create-per-tx-floor.md.
-  (let [entries (mapv (fn [p]
-                        {:request  {:method "PUT" :url (str "SearchParameter/" (:id p))}
-                         :resource p})
-                      sp/search-parameters)]
-    (db/transact-transaction store "default" entries))
+  (if (System/getenv "SKIP_SEARCHPARAM_SEED")
+    ;; The search registry is built from the classpath JSONs, so skipping the
+    ;; store seed only removes /SearchParameter read-back (memory-constrained
+    ;; local runs; also required when the schema preset omits SearchParameter).
+    (println "Skipping SearchParameter seeding (SKIP_SEARCHPARAM_SEED set)")
+    (do
+      (println "Seeding" (count sp/search-parameters) "SearchParameters in one transaction...")
+      ;; Batched into a single transact-transaction so the per-tx fixed cost is
+      ;; paid once instead of N times. See docs/proposals/xtdb2-create-per-tx-floor.md.
+      (let [entries (mapv (fn [p]
+                            {:request  {:method "PUT" :url (str "SearchParameter/" (:id p))}
+                             :resource p})
+                          sp/search-parameters)]
+        (db/transact-transaction store "default" entries))))
   (println "Seeding" (count seed-patients) "baseline Patients...")
   (db/transact-transaction
    store "default"
