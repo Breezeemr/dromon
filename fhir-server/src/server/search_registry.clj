@@ -126,16 +126,22 @@
     (catch Exception _ {})))
 
 (defn- extract-field-map-from-cap-schema
-  "Extracts field type information from a compiled capability :multi schema.
-   Merges fields from ALL variants so profile-added extension fields are included."
+  "Extracts field type information from a compiled capability schema.
+   :multi capability schemas merge fields from ALL variants so
+   profile-added extension fields are included; a plain resource schema
+   (raw full-sch spec with hand-declared :search-params) is introspected
+   directly -- treating its map entries as :multi variants yielded an
+   empty field map and silently made every search on the type unsupported."
   [cap-schema]
   (try
-    (let [variants (m/children cap-schema)]
-      (reduce
-       (fn [acc [_key _props variant-schema]]
-         (merge acc (extract-field-map variant-schema)))
-       {}
-       variants))
+    (if (= :multi (m/type cap-schema))
+      (let [variants (m/children cap-schema)]
+        (reduce
+         (fn [acc [_key _props variant-schema]]
+           (merge acc (extract-field-map variant-schema)))
+         {}
+         variants))
+      (extract-field-map cap-schema))
     (catch Exception _ {})))
 
 ;; ---------------------------------------------------------------------------
