@@ -20,13 +20,16 @@
 ;; Definition loading
 ;; ---------------------------------------------------------------------------
 
-(def ^:private generatable-kinds
+(def ^:dynamic *generatable-kinds*
   "StructureDefinition kinds we generate Malli schemas for. Primitive types are
-   handled separately via fhir-primitives. Logical models are documentation /
-   template constructs that don't correspond to wire-format resources, and R4B
-   does not even define a `Base` root for them, so any logical model that bases
-   on `Base` would be permanently unreachable in this pipeline."
+   handled separately via fhir-primitives.
+
+   Default is FHIR wire packages only (complex-type + resource). Logical models
+   (e.g. CDA datatype SDs) are excluded by default because R4B has no usable Base
+   root for them; bind this to include \"logical\" from a CDA driver that seeds
+   an ANY/Base entry first."
   #{"complex-type" "resource"})
+
 
 (defn- read-bundle
   "Read StructureDefinition entries from a FHIR bundle JSON file.
@@ -46,7 +49,7 @@
         (into []
               (comp (map :resource)
                     (filter #(= "StructureDefinition" (:resourceType %)))
-                    (filter (comp generatable-kinds :kind)))
+                    (filter (comp *generatable-kinds* :kind)))
               (:entry json))))))
 
 (defn- read-directory
@@ -61,7 +64,7 @@
                                (str/ends-with? (.getName f) ".json"))
                       (let [json (charred/read-json (io/reader f) :key-fn keyword)]
                         (when (and (= "StructureDefinition" (:resourceType json))
-                                   (generatable-kinds (:kind json)))
+                                   (*generatable-kinds* (:kind json)))
                           json)))))
             (file-seq dir)))))
 

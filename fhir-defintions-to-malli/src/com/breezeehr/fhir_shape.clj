@@ -12,19 +12,25 @@
   ([element-type max-val]
    (field-info element-type max-val nil))
   ([element-type max-val ref-kw]
-   (let [code (:code element-type)]
+   (let [code (:code element-type)
+         url-code? (and (string? code)
+                        (or (clojure.string/starts-with? code "http://")
+                            (clojure.string/starts-with? code "https://")))
+         ;; Short FHIR complex type names are Capitalized; full SD URLs are refs too
+         ;; (CDA type codes are full URLs and would otherwise look "lowercase").
+         complex-ref?
+         (and code
+              (not (#{"BackboneElement" "Element" "Extension" "Resource"} code))
+              (or url-code?
+                  (not (Character/isLowerCase (.charAt ^String code 0)))))]
      (cond-> {:type code}
        max-val (assoc :max max-val)
        (or (= max-val "*")
            (and max-val (not= max-val "0") (not= max-val "1")))
        (assoc :seq-field? true)
        (#{"BackboneElement" "Element"} code) (assoc :complex? true)
-       (and code
-            (not (#{"BackboneElement" "Element" "Extension" "Resource"} code))
-            (not (Character/isLowerCase (.charAt ^String code 0))))
-       (assoc :ref? true)
+       complex-ref? (assoc :ref? true)
        ref-kw (assoc :ref-kw ref-kw)))))
-
 (defn seq-field?
   "Is this field sequential (max > 1)?"
   [info]

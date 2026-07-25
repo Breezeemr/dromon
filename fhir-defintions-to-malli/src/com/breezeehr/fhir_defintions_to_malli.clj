@@ -185,10 +185,56 @@
       (swap! *base-refs* assoc fn-name k))
     (list (symbol fn-name))))
 
+(defn- url-type-code?
+  "True when element type code is a full StructureDefinition (or similar) URL."
+  [code]
+  (and (string? code)
+       (or (str/starts-with? code "http://")
+           (str/starts-with? code "https://"))))
+
 (defn- lookup-schema-kw
-  "Look up a type code in the schema atom, returning the keyword."
+  "Look up a type code in the schema atom, returning the keyword.
+
+  Short FHIR codes (e.g. \"CodeableConcept\") resolve via type-name match under
+  the FHIR StructureDefinition prefix. Full URLs (CDA / external SDs) resolve
+  via uri->kw2 so registry keys match StructureDefinition :url conversion."
   [code version]
-  (lookup-kw @*schema-atom* (munge-ns (str/replace code "." "-")) base-ns-prefix version))
+  (if (url-type-code? code)
+    (let [kw (uri->kw2 code version)]
+      (or (when (contains? @*schema-atom* kw) kw)
+          (first (filter #(= (kw->type-name %) (kw->type-name kw)) (keys @*schema-atom*)))
+          kw))
+    (lookup-kw @*schema-atom* (munge-ns (str/replace code "." "-")) base-ns-prefix version)))
+
+(def ^:private xml-choice-group-url
+  "http://hl7.org/fhir/tools/StructureDefinition/xml-choice-group")
+
+(defn representation-props
+  "Map ElementDefinition.representation codes to malli entry properties.
+
+  FHIR and CDA use the same codes on ElementDefinition:
+    xmlAttr  — attribute on the parent element
+    xmlText  — character data / simple content
+    typeAttr — xsi:type (or equivalent) type discriminator
+    xhtml    — xhtml content (Narrative)
+
+  Also detects the tools xml-choice-group extension (CDA AD.item / PN.item)."
+  [{:keys [representation extension] :as _main-attr}]
+  (let [reps (set (map name (or representation [])))
+        choice? (some (fn [x]
+                        (and (= xml-choice-group-url (:url x))
+                             (true? (or (:valueBoolean x)
+                                        (get-in x [:valueBoolean])
+                                        (:value x)))))
+                      (or extension []))]
+    (cond-> {}
+      (contains? reps "xmlAttr") (assoc :xml/attr true)
+      (contains? reps "xmlText") (assoc :xml/text true)
+      (contains? reps "typeAttr") (assoc :xml/type-attr true)
+      (contains? reps "xhtml") (assoc :xml/xhtml true)
+      ;; Preserve raw codes for tooling that wants the FHIR set
+      (seq reps) (assoc :fhir/representation (vec (sort reps)))
+      choice? (assoc :xml/choice-group true))))
 
 (defn- requiring-resolve-registry
   "A malli registry that resolves schema keywords by requiring-resolve of
@@ -1253,7 +1299,8 @@
         ;; Choice type variants (medication[x] → medicationCodeableConcept, medicationReference)
         ;; are individually optional — the min constraint applies to the group, not each variant
         choice-type? (and _id (str/includes? (str _id) "[x]"))
-        props (cond-> (select-keys main-attr [:isSummary :short :definition :comment :binding])
+        props (cond-> (merge (select-keys main-attr [:isSummary :short :definition :comment :binding])
+                             (representation-props main-attr))
                 choice-type? (assoc :optional true)
                 (and (not choice-type?) min-val (or field-info (zero? min-val))) (assoc :optional (zero? min-val)))]
     (if slice-name
