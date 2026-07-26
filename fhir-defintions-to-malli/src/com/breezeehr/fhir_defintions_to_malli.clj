@@ -487,6 +487,29 @@
   [elem]
   (first (extract-pattern-value elem)))
 
+(defn- clean-profile-url
+  "Strip |version from a FHIR profile canonical."
+  [p]
+  (when (string? p)
+    (let [idx (.indexOf ^String p "|")]
+      (if (pos? idx) (.substring ^String p 0 idx) p))))
+
+(defn- extract-profile-url
+  "First type.profile canonical on an ElementDefinition, if any.
+   Used for slicing discriminators with type=profile."
+  [elem]
+  (when elem
+    (some (fn [t]
+            (when-let [ps (:profile t)]
+              (some clean-profile-url (if (sequential? ps) ps [ps]))))
+          (:type elem))))
+
+(defn- extract-type-code
+  "First type.code on an ElementDefinition (for type discriminators)."
+  [elem]
+  (when elem
+    (some :code (:type elem))))
+
 (defn- extract-this-discriminator-path
   "For $this discriminators, determine the get-in path from the slice root's pattern.
    e.g. patternIdentifier: {system: ...} => [:system]"
@@ -498,32 +521,100 @@
   (let [idx (str/index-of seg ":")]
     (if idx (subs seg 0 idx) seg)))
 
+(defn- find-discriminator-match
+  "Find the sub-element matching a relative discriminator path under slice-path."
+  [sub-elements slice-path disc-path]
+  (let [disc-segs (str/split disc-path #"\.")]
+    (first
+     (filter
+      (fn [elem]
+        (let [suffix (when (> (count (:path elem)) (count slice-path))
+                       (subvec (:path elem) (count slice-path)))
+              cleaned (when suffix (mapv clean-path-segment suffix))]
+          (= cleaned (vec disc-segs))))
+      sub-elements))))
+
+(defn- discriminator-match-value
+  "Value for one discriminator against a matched element.
+   profile → type.profile URL; type → type.code; else fixed/pattern."
+  [disc-type match]
+  (case disc-type
+    "profile" (extract-profile-url match)
+    "type" (extract-type-code match)
+    ;; value, exists, and unknown — use fixed/pattern scalars
+    (extract-fixed-value match)))
+
+(defn- finalize-dispatch-value
+  "Ensure multi arm keys are unique and usable.
+   All-nil vectors (failed profile extraction historically) fall back to slice-name."
+  [dispatch-value slice-name]
+  (cond
+    (nil? dispatch-value)
+    (keyword slice-name)
+
+    (and (vector? dispatch-value) (every? nil? dispatch-value))
+    (keyword slice-name)
+
+    :else dispatch-value))
+
 (defn- extract-dispatch-value
-  "Extract the dispatch value for a slice. Returns a map with :value and optionally
-   :this-path (for $this discriminators, the get-in path to the discriminating field)."
-  [discriminators sub-elements slice-path]
-  (let [results (mapv
-                 (fn [{disc-path :path}]
-                   (if (= disc-path "$this")
-                     (let [slice-root (first (filter #(= (count (:path %)) (count slice-path))
-                                                     sub-elements))]
-                       {:value (extract-fixed-value slice-root)
-                        :this-path (extract-this-discriminator-path slice-root)})
-                     (let [disc-segs (str/split disc-path #"\.")
-                           match (first
-                                  (filter
-                                   (fn [elem]
-                                     (let [suffix (when (> (count (:path elem)) (count slice-path))
-                                                    (subvec (:path elem) (count slice-path)))
-                                           cleaned (when suffix (mapv clean-path-segment suffix))]
-                                       (= cleaned (vec disc-segs))))
-                                   sub-elements))]
-                       {:value (extract-fixed-value match)})))
-                 discriminators)
-        vals (mapv :value results)
-        this-path (some :this-path results)]
-    {:dispatch-value (if (= (count vals) 1) (first vals) vals)
-     :this-path this-path}))
+  "Extract the dispatch value for a slice. Returns a map with :dispatch-value and optionally
+   :this-path (for $this discriminators, the get-in path to the discriminating field).
+
+   Honors discriminator :type:
+   - profile: type.profile on the element at path
+   - type: type.code on the element at path
+   - value / default: fixed*/pattern* scalars
+   - $this path: fixed/pattern on the slice root"
+  ([discriminators sub-elements slice-path]
+   (extract-dispatch-value discriminators sub-elements slice-path nil))
+  ([discriminators sub-elements slice-path slice-name]
+   (let [results (mapv
+                  (fn [{disc-path :path disc-type :type}]
+                    (if (= disc-path "$this")
+                      (let [slice-root (first (filter #(= (count (:path %)) (count slice-path))
+                                                      sub-elements))]
+                        {:value (discriminator-match-value disc-type slice-root)
+                         :this-path (when-not (#{"type" "profile"} disc-type)
+                                      (extract-this-discriminator-path slice-root))})
+                      (let [match (find-discriminator-match sub-elements slice-path disc-path)]
+                        {:value (discriminator-match-value disc-type match)})))
+                  discriminators)
+         vals (mapv :value results)
+         this-path (some :this-path results)
+         raw (if (= (count vals) 1) (first vals) vals)]
+     {:dispatch-value (finalize-dispatch-value raw slice-name)
+      :this-path this-path})))
+
+(defn- standalone-dispatch-value
+  "When a slice is applied without pending-slicing (profile-on-profile), derive a
+   unique multi key from the slice body: prefer a single profile URL, then fixed/
+   pattern values, else the slice name."
+  [sub-elements slice-path slice-name]
+  (let [deeper (filter #(> (count (:path %)) (count slice-path)) sub-elements)
+        profiles (into [] (comp (map extract-profile-url) (filter some?) (distinct)) deeper)
+        fixeds (into [] (comp (map extract-fixed-value) (filter some?)) deeper)]
+    (finalize-dispatch-value
+     (cond
+       (= 1 (count profiles)) (first profiles)
+       (seq profiles) profiles
+       (= 1 (count fixeds)) (first fixeds)
+       (seq fixeds) fixeds
+       :else nil)
+     slice-name)))
+
+(defn- as-sequential-multi
+  "If sch is :multi or [:sequential multi], return [sequential? multi-sch], else nil."
+  [sch]
+  (when sch
+    (let [t (try (m/type sch) (catch Exception _ nil))]
+      (cond
+        (= t :multi) [false sch]
+        (= t :sequential)
+        (let [inner (first (m/children sch))
+              it (when inner (try (m/type inner) (catch Exception _ nil)))]
+          (when (= it :multi) [true inner]))
+        :else nil))))
 
 (defn- find-and-remove-base-form
   [form-vec base-k]
@@ -602,7 +693,7 @@
                             :else f))
                base-element-form (fix-base raw-base-form)
                entries (mapv
-                        (fn [{:keys [dispatch-value form]}]
+                        (fn [{:keys [dispatch-value slice-name form]}]
                           (let [unwrap-mu-update-0 (fn [f]
                                                      (when (and (seq? f) (= 'mu/update (first f)))
                                                        (cond
@@ -651,8 +742,9 @@
                                   (if (and (seq? base-element-form) (= '-> (first base-element-form)))
                                     `(~'-> ~@(rest base-element-form) ~@fixed-forms)
                                     `(~'-> ~base-element-form ~@fixed-forms))
-                                  :else base-element-form)]
-                            [dispatch-value constrained]))
+                                  :else base-element-form)
+                                dv (finalize-dispatch-value dispatch-value slice-name)]
+                            [dv constrained]))
                         slices)
                default-entry (when (not= rules "closed")
                                [:malli.core/default base-element-form])
@@ -1201,60 +1293,132 @@
   [old-acc {:keys [effective-k final-props new-sch update-fn-form override-form assoc-form]}]
   (apply-keyed-update old-acc effective-k update-fn-form new-sch final-props (or override-form assoc-form)))
 
+(defn- slice-arm-form
+  "Build the constrained arm schema form from prepare-slice-context output."
+  [new-sub-form]
+  (let [slice-forms (if (and (= (count new-sub-form) 1)
+                             (seq? (first new-sub-form))
+                             (= '-> (first (first new-sub-form))))
+                      (let [[_ _base & steps] (first new-sub-form)] steps)
+                      new-sub-form)
+        is-replacement? (and (= (count slice-forms) 1) (not (seq? (first slice-forms))))]
+    {:slice-forms slice-forms
+     :is-replacement? is-replacement?
+     :arm-form (cond
+                 is-replacement? (first slice-forms)
+                 (seq slice-forms) `(~'-> ~'base-arm ~@slice-forms)
+                 :else 'base-arm)}))
+
+(defn- merge-slice-into-multi-form
+  "Emit form code that adds or replaces one multi arm on an already-sliced field.
+   Reconstructs the multi from children (mu/assoc treats vector dispatch keys as paths).
+   If the live field is not yet a multi (shape marked sliced but sch is still the
+   element map), wraps it as open multi with a default arm first.
+
+   Note: do not use `->` to thread into an `(fn …)` form — macroexpansion becomes
+   `(fn x [inner] …)` which is a syntax error."
+  [base-k dispatch-value arm-form is-sequential?]
+  (let [ensure-body
+        `(~'let [~'inner (~'-> ~'inner (~'m/schema ~'options) ~'m/deref)
+                 ~'multi (~'if (= :multi (~'m/type ~'inner))
+                           ~'inner
+                           (~'m/schema [:multi {:closed false}
+                                        [:malli.core/default ~'inner]]
+                                       ~'options))
+                 ~'props (~'or (~'m/properties ~'multi) {})
+                 ~'kids (~'vec (~'m/children ~'multi))
+                 ~'base-arm (~'or (~'some (~'fn [~'c]
+                                            (~'when (= ~dispatch-value (~'first ~'c))
+                                              (~'second ~'c)))
+                                          ~'kids)
+                                  (~'some (~'fn [~'c]
+                                            (~'when (= :malli.core/default (~'first ~'c))
+                                              (~'second ~'c)))
+                                          ~'kids)
+                                  [:map {:closed false}])
+                 ~'arm ~arm-form
+                 ~'idx (~'first (~'keep-indexed (~'fn [~'i ~'c]
+                                                  (~'when (= ~dispatch-value (~'first ~'c)) ~'i))
+                                                ~'kids))
+                 ~'kids' (~'if ~'idx
+                           (~'assoc ~'kids ~'idx [~dispatch-value ~'arm])
+                           (~'conj ~'kids [~dispatch-value ~'arm]))]
+           (~'m/schema (~'into [:multi ~'props] ~'kids') ~'options))]
+    (if is-sequential?
+      `(~'mu/update ~base-k
+                    (~'fn [~'sch]
+                      (~'let [~'inner (~'mu/get ~'sch 0)]
+                        [:sequential ~ensure-body])))
+      `(~'mu/update ~base-k
+                    (~'fn [~'inner] ~ensure-body)))))
+
 (defn- apply-non-extension-slice
-  "Non-extension slices: collect into :pending-slicing or fall back to direct threading."
+  "Non-extension slices: collect into :pending-slicing, merge into an existing multi,
+   or fall back to direct threading on the element schema."
   [old-acc base-sch sub-elements main-path slice-name
    {:keys [base-field-name effective-k final-props new-sub-sch new-sub-form new-sch update-fn-form]}]
   (let [base-k base-field-name]
     (if-let [pending (get-in old-acc [:pending-slicing base-k])]
-      (let [{:keys [dispatch-value this-path]} (extract-dispatch-value (:discriminators pending) sub-elements main-path)]
+      (let [{:keys [dispatch-value this-path]}
+            (extract-dispatch-value (:discriminators pending) sub-elements main-path slice-name)]
         (update-in old-acc [:pending-slicing base-k :slices] conj
                    {:slice-name slice-name
                     :dispatch-value dispatch-value
                     :this-path this-path
                     :sch new-sub-sch
                     :form new-sub-form}))
-      ;; No slicing info: fallback to direct threading
-      (let [is-base-seq? (some-> base-sch m/type (= :sequential))
-            ;; When base-sch is a :ref/:lazy-ref, resolve it so slice-forms
-            ;; can modify the actual map schema (not the opaque ref wrapper).
-            base-ref-kw (when base-sch
-                          (let [t (try (m/type base-sch) (catch Exception _ nil))]
-                            (when (#{:ref :lazy-ref} t)
-                              (let [raw (first (m/children base-sch))]
-                                (when (keyword? raw) raw)))))
-            slice-forms (if (and (= (count new-sub-form) 1) (seq? (first new-sub-form)) (= '-> (first (first new-sub-form))))
-                          (let [[_ _base & steps] (first new-sub-form)] steps)
-                          new-sub-form)
-            ;; If slice-forms is a single bare value (not threading ops), use it as replacement
-            is-replacement? (and (= (count slice-forms) 1) (not (seq? (first slice-forms))))]
-        (when base-ref-kw
-          (swap! *references-atom* conj base-ref-kw))
-        (if (seq slice-forms)
-          (-> old-acc
-              (update :form conj
-                      (if is-replacement?
-                        `(~'mu/update ~base-k (~'fn [~'sch] ~(first slice-forms)))
-                        (if is-base-seq?
-                          `(~'mu/update ~base-k
-                                        (~'fn [~'sch]
-                                              (~'mu/update ~'sch 0
-                                                           (~'fn [~'inner]
-                                                                 (~'-> ~'inner ~@slice-forms)))))
-                          (if base-ref-kw
-                            `(~'mu/update ~base-k
-                                          (~'fn [~'sch]
-                                                (~'-> ~'sch
-                                                      (~'m/schema ~'options)
-                                                      ~'m/deref
-                                                      ~@slice-forms)))
-                            `(~'mu/update ~base-k
-                                          (~'fn [~'sch]
-                                                (~'-> ~'sch ~@slice-forms))))))))
-          ;; No slice forms and no pending-slicing: skip the slice entirely.
-          ;; The slice key (e.g. :us-core) doesn't exist on the base schema,
-          ;; and without slicing context there's no `:multi` to host it.
-          old-acc)))))
+      ;; No pending-slicing: if the base field is already a multi (or parent shape
+      ;; marked it sliced — profile-on-profile), add/replace one arm. Otherwise
+      ;; fall back to direct threading on the element schema.
+      ;; Only merge when base field is already a multi. shape/sliced? alone is not
+      ;; enough: flush can mark sliced yet skip multi when dispatch is nil.
+      (let [seq-multi (as-sequential-multi base-sch)
+            is-base-seq? (boolean (or (when seq-multi (first seq-multi))
+                                      (some-> base-sch m/type (= :sequential))))
+            {:keys [slice-forms is-replacement?]} (slice-arm-form new-sub-form)]
+        (cond
+          seq-multi
+          (let [dv (standalone-dispatch-value sub-elements main-path slice-name)
+                final-arm (if is-replacement?
+                            (first slice-forms)
+                            (if (seq slice-forms)
+                              `(~'-> ~'base-arm ~@slice-forms)
+                              'base-arm))]
+            (-> old-acc
+                (update :form conj (merge-slice-into-multi-form base-k dv final-arm (first seq-multi)))
+                (update :shape shape/mark-sliced base-k)))
+
+          :else
+          (let [base-ref-kw (when base-sch
+                              (let [t (try (m/type base-sch) (catch Exception _ nil))]
+                                (when (#{:ref :lazy-ref} t)
+                                  (let [raw (first (m/children base-sch))]
+                                    (when (keyword? raw) raw)))))]
+            (when base-ref-kw
+              (swap! *references-atom* conj base-ref-kw))
+            (if (seq slice-forms)
+              (-> old-acc
+                  (update :form conj
+                          (if is-replacement?
+                            `(~'mu/update ~base-k (~'fn [~'sch] ~(first slice-forms)))
+                            (if is-base-seq?
+                              `(~'mu/update ~base-k
+                                            (~'fn [~'sch]
+                                                  (~'mu/update ~'sch 0
+                                                               (~'fn [~'inner]
+                                                                     (~'-> ~'inner ~@slice-forms)))))
+                              (if base-ref-kw
+                                `(~'mu/update ~base-k
+                                              (~'fn [~'sch]
+                                                    (~'-> ~'sch
+                                                          (~'m/schema ~'options)
+                                                          ~'m/deref
+                                                          ~@slice-forms)))
+                                `(~'mu/update ~base-k
+                                              (~'fn [~'sch]
+                                                    (~'-> ~'sch ~@slice-forms))))))))
+              ;; No slice forms and no multi host: skip
+              old-acc)))))))
 
 (defn- apply-regular-element
   "Non-slice element: update or create, then capture slicing info if present."

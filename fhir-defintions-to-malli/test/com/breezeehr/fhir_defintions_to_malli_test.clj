@@ -44,3 +44,35 @@
   (is (not (contains? gen/*generatable-kinds* "logical")))
   (binding [gen/*generatable-kinds* (conj gen/*generatable-kinds* "logical")]
     (is (contains? gen/*generatable-kinds* "logical"))))
+
+(deftest profile-discriminator-dispatch-value-test
+  (testing "type=profile reads type.profile, not fixed/pattern"
+    (let [slice-path ["Observation" "entryRelationship"]
+          sub-elements [{:path ["Observation" "entryRelationship" "observation"]
+                         :type [{:code "http://hl7.org/cda/stds/core/StructureDefinition/Observation"
+                                 :profile ["http://hl7.org/cda/us/ccda/StructureDefinition/AgeObservation"]}]}
+                        {:path ["Observation" "entryRelationship" "act"]
+                         :type [{:code "http://hl7.org/cda/stds/core/StructureDefinition/Act"}]}]
+          discs [{:type "profile" :path "observation"}
+                 {:type "profile" :path "act"}]
+          ;; #' via ns-resolve — private helpers under test
+          extract (ns-resolve 'com.breezeehr.fhir-defintions-to-malli 'extract-dispatch-value)
+          result (extract discs sub-elements slice-path "age")]
+      (is (= ["http://hl7.org/cda/us/ccda/StructureDefinition/AgeObservation" nil]
+             (:dispatch-value result)))))
+  (testing "all-nil profile extraction falls back to slice name"
+    (let [extract (ns-resolve 'com.breezeehr.fhir-defintions-to-malli 'extract-dispatch-value)
+          result (extract [{:type "profile" :path "observation"}
+                           {:type "profile" :path "act"}]
+                          []
+                          ["Observation" "entryRelationship"]
+                          "woundMeasurementObservation")]
+      (is (= :woundMeasurementObservation (:dispatch-value result)))))
+  (testing "standalone dispatch prefers single profile URL"
+    (let [standalone (ns-resolve 'com.breezeehr.fhir-defintions-to-malli 'standalone-dispatch-value)
+          v (standalone
+             [{:path ["Observation" "entryRelationship" "observation"]
+               :type [{:profile ["http://hl7.org/cda/us/ccda/StructureDefinition/WoundMeasurementObservation"]}]}]
+             ["Observation" "entryRelationship"]
+             "woundMeasurementObservation")]
+      (is (= "http://hl7.org/cda/us/ccda/StructureDefinition/WoundMeasurementObservation" v)))))
