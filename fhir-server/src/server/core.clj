@@ -183,16 +183,35 @@
                        deref)]
     v))
 
+(defn- maybe-apply-breeze-storage-overlay
+  "When the Breeze storage registry is on the classpath (breeze-ig malli
+   package), recompile `schema` so HumanName/Address resolve to USEP
+   card-one string annotations. No-op when the package is absent so
+   open-source dromon stays free of a hard breeze-ig dependency."
+  [schema]
+  (try
+    (if-let [apply-overlay (requiring-resolve
+                            'com.breezehealthplatform.breeze.storage.registry/apply-overlay)]
+      (or (apply-overlay schema) schema)
+      schema)
+    (catch Throwable _
+      schema)))
+
 (defn resolve-schema
   "Resolve a single schema spec into a server-ready capability schema.
    A spec is either:
    - a fully qualified symbol naming a Var holding either the new
      capability data map (e.g. `us-core.capability.v8-0-1.Patient/capability`
-     (named `capability`) or a pre-compiled malli `:multi` schema
-     (legacy/base-resource Vars); OR
+     or `breeze.capability.v1-0-0.Patient/capability`) or a pre-compiled
+     malli `:multi` schema (legacy/base-resource Vars); OR
    - a map `{:schema <fq-sym> :interactions [..]}` where :interactions,
      when provided, override the schema-declared interactions before
-     conversion."
+     conversion.
+
+   When `com.breezehealthplatform.breeze.storage.registry` is loadable,
+   the resolved schema is recompiled under that registry overlay so
+   ordered multi-string fields (HumanName.given/prefix/suffix,
+   Address.line) store as USEP cardinality-one strings."
   ([spec] (resolve-schema spec nil))
   ([spec {:keys [operations]}]
    (let [{:keys [schema interactions]} (if (map? spec) spec {:schema spec})
@@ -203,7 +222,8 @@
                       (assoc resolved :interactions interactions)
                       (mu/update-properties resolved into {:interactions interactions}))
                     resolved)]
-     (capability-schema->server-schema resolved registry operations))))
+     (-> (capability-schema->server-schema resolved registry operations)
+         maybe-apply-breeze-storage-overlay))))
 
 (defn resolve-schemas
   "Resolve a collection of schema specs (see [[resolve-schema]]) into the

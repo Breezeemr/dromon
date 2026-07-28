@@ -93,7 +93,10 @@
 (def ^:private schema-presets
   "Map of schema-package -> namespace whose `specs` Var lists the schema
    specs to feed into `:fhir/schemas`."
-  {:uscore8 'test-server.schemas.uscore8})
+  {:uscore8 'test-server.schemas.uscore8
+   ;; Breeze IG capabilities + storage overlays (USEP HumanName/Address).
+   ;; Requires the `:malli/breeze` deps alias (and typically `:store/datomic`).
+   :breeze  'test-server.schemas.breeze})
 
 (def ^:private extra-operations
   "Deployment-specific FHIR operations merged over the fhir-server built-ins
@@ -124,7 +127,10 @@
 
    `opts` keys:
    - :store    -- one of (keys store-presets); default :xtdb2
-   - :schemas  -- one of (keys schema-presets); default :uscore8
+   - :schemas  -- one of (keys schema-presets); default :uscore8.
+                  Use :breeze with the `:malli/breeze` alias for Breeze IG
+                  capabilities and USEP card-one name/address storage on
+                  the Datomic store.
    - :port     -- HTTP port (default 8080)
    - :ssl-port -- HTTPS port (default 8443)"
   [{:keys [store schemas port ssl-port]
