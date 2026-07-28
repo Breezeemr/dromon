@@ -23,6 +23,11 @@
   :malli/fhir-extensions {:extra-deps {com.breezeehr/fhir-malli-fhir-extensions {:local/root "../fhir/malli/fhir-extensions"}}}
   :malli/sdc             {:extra-deps {com.breezeehr/fhir-malli-sdc             {:local/root "../fhir/malli/sdc"}}}
   :malli/uscore8         {:extra-deps {com.breezeehr/fhir-malli-uscore8         {:local/root "../fhir/malli/uscore8"}}}
+  ;; Breeze IG capabilities + storage overlays (HumanName/Address USEP).
+  ;; Lives outside the dromon tree (sibling of dromon/).
+  :malli/breeze          {:extra-deps {com.breezeehr/fhir-malli-breeze          {:local/root "../../fhir-igs/breeze-ig/malli/breeze"}
+                                       com.breezeehr/fhir-malli-uscore8         {:local/root "../../fhir-igs/uscore8"}
+                                       com.breezeehr/fhir-malli-r4b             {:local/root "../../fhir-igs/r4b"}}}
 
   :dev {:extra-paths ["dev" "../fhir-server/dev"]}
   :test {:extra-paths ["test" "../fhir-server/test"]
@@ -31,7 +36,8 @@
                       fhir-store/mock        {:local/root "../fhir-store-mock"}
                       fhir-store/xtdb2       {:local/root "../fhir-store-xtdb2"}
                       com.breezeehr/fhir-malli-r4b     {:local/root "../fhir/malli/r4b"}
-                      com.breezeehr/fhir-malli-uscore8 {:local/root "../fhir/malli/uscore8"}}
+                      com.breezeehr/fhir-malli-uscore8 {:local/root "../fhir/malli/uscore8"}
+                      com.breezeehr/fhir-malli-breeze  {:local/root "../../fhir-igs/breeze-ig/malli/breeze"}}
          :main-opts ["-m" "kaocha.runner"]
          :jvm-opts ["-Xmx6g"
                     "--add-opens=java.base/java.nio=ALL-UNNAMED"
