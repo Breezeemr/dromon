@@ -1,6 +1,7 @@
 (ns server.json-patch
   "RFC 6902 JSON Patch implementation for FHIR resources.
-   Supports operations: add, remove, replace, move, copy, test.")
+   Supports operations: add, remove, replace, move, copy, test."
+  (:require [clojure.string]))
 
 (defn- parse-path
   "Parse a JSON Pointer (RFC 6901) into a sequence of keys.

@@ -20,7 +20,8 @@
 
    LOINC codes are the common Synthea vitals/labs so a 10k-resource dataset still
    produces non-empty hit sets. The base queries set `_count` high so the store
-   materializes the whole match set, which is what Blaze measures.")
+   materializes the whole match set, which is what Blaze measures."
+  (:require [clojure.string]))
 
 (def ^:private all "100000")
 

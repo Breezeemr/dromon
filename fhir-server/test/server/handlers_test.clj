@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as db]
-            [server.handlers :as handlers]))
+            [server.handlers :as handlers]
+            [clojure.string]))
 
 (def ^:private tenant "default")
 (def ^:private resource-type "Patient")
