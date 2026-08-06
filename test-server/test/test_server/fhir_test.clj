@@ -19,7 +19,8 @@
             [server.fhir-coercion :as fhir-coercion]
             [ring.middleware.head :refer [wrap-head]]
             [jsonista.core :as json]
-            [clojure.pprint]))
+            [clojure.pprint]
+            [clojure.string]))
 
 ;; ---------------------------------------------------------------------------
 ;; Test helpers

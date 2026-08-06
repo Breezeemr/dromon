@@ -5,7 +5,8 @@
    to make decisions about sequential wrapping, ref threading, etc.
 
    A shape is a map of {keyword → field-info}. A field-info is a map:
-   {:type \"CodeableConcept\" :max \"*\" :seq-field? true :ref? true :ref-kw :ns/Foo}")
+   {:type \"CodeableConcept\" :max \"*\" :seq-field? true :ref? true :ref-kw :ns/Foo}"
+  (:require [clojure.string]))
 
 (defn field-info
   "Extract shape info for a single field from its FHIR element metadata."

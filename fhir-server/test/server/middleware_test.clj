@@ -1,7 +1,8 @@
 (ns server.middleware-test
   (:require [clojure.test :refer [deftest is testing]]
             [jsonista.core :as json]
-            [server.middleware :as middleware])
+            [server.middleware :as middleware]
+            [clojure.string])
   (:import [com.fasterxml.jackson.databind ObjectMapper]))
 
 (deftest wrap-fhir-exceptions-test
