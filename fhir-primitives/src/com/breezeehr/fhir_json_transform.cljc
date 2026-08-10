@@ -13,7 +13,8 @@
    Usage:
      (m/decode schema json-value (fhir-json-transformer))
      (m/encode schema clj-value  (fhir-json-transformer))"
-  (:require [malli.core :as m]
+  (:require [clojure.string :as str]
+            [malli.core :as m]
             [malli.transform :as mt]
             [malli.experimental.time.transform :as mett]
             #?@(:cljs [["@js-joda/core" :as js-joda]]))
@@ -50,6 +51,48 @@
                 :time/year-month year-month-decoder}
      :encoders {:time/year       str
                 :time/year-month str}}))
+
+;; ---------------------------------------------------------------------------
+;; FHIR uuid: the JSON wire form is the urn:uuid: URI
+;;
+;; FHIR types `uuid` as a URI, always written `urn:uuid:<uuid>`; the schema
+;; models it as malli `:uuid`, so the Clojure-native value is a UUID. malli's
+;; json-transformer maps `:uuid` both ways already, but on FHIR's terms both
+;; directions are wrong: its decoder's regex rejects the urn: prefix (leaving
+;; a string where the schema says UUID, so a spec-valid resource fails
+;; validation), and its encoder emits a bare `<uuid>`, which is not a form
+;; FHIR admits for the type.
+;; ---------------------------------------------------------------------------
+
+(def ^:private urn-uuid-prefix "urn:uuid:")
+
+(def ^:private uuid-re
+  #"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+(defn- ->uuid [s]
+  #?(:clj  (java.util.UUID/fromString s)
+     :cljs (uuid s)))
+
+(defn- fhir-uuid-decoder
+  "urn:uuid:<uuid> -> UUID. A bare <uuid> is left to the json-transformer,
+   which already decodes it. Anything unparseable passes through unchanged
+   so validation, not the transformer, reports it (see safe-parse)."
+  [x]
+  (if (and (string? x) (str/starts-with? x urn-uuid-prefix))
+    (let [s (subs x (count urn-uuid-prefix))]
+      (if (re-matches uuid-re s) (->uuid s) x))
+    x))
+
+(defn- fhir-uuid-encoder
+  "UUID -> urn:uuid:<uuid>. Also prefixes a bare <uuid> string so the result
+   does not depend on whether the json-transformer's `:uuid` encoder has
+   already stringified the value. Idempotent: an already-prefixed string does
+   not match `uuid-re`, so it is returned unchanged."
+  [x]
+  (cond
+    (uuid? x) (str urn-uuid-prefix x)
+    (and (string? x) (re-matches uuid-re x)) (str urn-uuid-prefix x)
+    :else x))
 
 ;; ---------------------------------------------------------------------------
 ;; Shared helpers
@@ -159,16 +202,21 @@
    - :time/local-date        — ISO date string → LocalDate
    - :time/offset-date-time  — ISO datetime string → OffsetDateTime
    - :time/instant           — ISO instant string → Instant
+   - :uuid                   — urn:uuid: URI → UUID
    - :extension promotion    — FHIR extension arrays → named keys
 
    Encode handles:
    - LocalDate/OffsetDateTime → ISO strings
+   - UUID                     → urn:uuid: URI
    - named extension keys    → :extension arrays with value wrapping"
   []
   (mt/transformer
     (mt/json-transformer)
     (mett/time-transformer)
     (precision-time-transformer)
+    {:name :fhir-uuid
+     :decoders {:uuid fhir-uuid-decoder}
+     :encoders {:uuid fhir-uuid-encoder}}
     {:name :fhir-extensions
      :decoders {:map {:compile fhir-extension-decoder}}
      :encoders {:map {:compile fhir-extension-encoder}}}))
