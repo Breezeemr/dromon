@@ -157,3 +157,16 @@
   (is (= {:realms [] :roles {} :practitioners {}}
          (grant/resolve-first-party-claims [{:object "malformed"}] [{:object nil}]))
       "objects without a realm/value split are ignored"))
+
+(deftest end-user-subject-extraction
+  (testing "client_credentials payloads have no end user"
+    (is (nil? (grant/end-user-subject
+               {:session {:client_id "c1"} :request {:client_id "c1"}}))))
+  (testing "session.subject wins when present"
+    (is (= "u1" (grant/end-user-subject {:session {:subject "u1"}}))))
+  (testing "authorization_code payloads fall back to the id_token session"
+    (is (= "u2" (grant/end-user-subject
+                 {:session {:subject "" :id_token {:subject "u2"}}}))))
+  (testing "blank subjects everywhere is no end user"
+    (is (nil? (grant/end-user-subject
+               {:session {:subject "" :id_token {:subject ""}}})))))

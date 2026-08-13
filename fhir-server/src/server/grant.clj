@@ -234,6 +234,17 @@
   (boolean (some #(str/starts-with? (str %) "patient/")
                  (get-in payload [:request :granted_scopes]))))
 
+(defn end-user-subject
+  "The authenticated end user's subject, or nil for grant-based (machine)
+   token issuance. authorization_code/refresh_token hook payloads carry it
+   only inside the id_token session (observed on Hydra v2.2.0), where
+   session.subject is empty."
+  [payload]
+  (or (let [s (get-in payload [:session :subject])]
+        (when-not (str/blank? (str s)) s))
+      (let [s (get-in payload [:session :id_token :subject])]
+        (when-not (str/blank? (str s)) s))))
+
 (defn resolve-launch-patient
   "Decides the launch patient for a token issuance, from the hook payload and
    the Keto grant state. Returns
@@ -241,13 +252,7 @@
    {:deny <diagnostics>} to reject issuance. Fail-closed: a patient-scoped
    token is never issued without a Keto-backed launch patient."
   [payload granted-patients-fn launch-authorized?-fn]
-  (let [end-user (or (let [s (get-in payload [:session :subject])]
-                       (when-not (str/blank? (str s)) s))
-                     ;; authorization_code/refresh_token hook payloads carry
-                     ;; the end-user subject only inside the id_token session
-                     ;; (observed on Hydra v2.2.0).
-                     (let [s (get-in payload [:session :id_token :subject])]
-                       (when-not (str/blank? (str s)) s)))
+  (let [end-user (end-user-subject payload)
         subject (or end-user
                     (get-in payload [:request :client_id])
                     (get-in payload [:session :client_id]))
@@ -359,13 +364,7 @@
       (let [payload (:body-params req)
             client-id (or (get-in payload [:request :client_id])
                           (get-in payload [:session :client_id]))
-            ;; authorization_code/refresh_token hook payloads carry the
-            ;; end-user subject only inside the id_token session (observed
-            ;; on Hydra v2.2.0); session.subject is empty there.
-            subject (or (let [s (get-in payload [:session :subject])]
-                          (when-not (str/blank? (str s)) s))
-                        (let [s (get-in payload [:session :id_token :subject])]
-                          (when-not (str/blank? (str s)) s)))
+            subject (end-user-subject payload)
             first-party? (and subject (contains? (first-party-client-ids) client-id))
             decision (resolve-launch-patient payload granted-patients launch-authorized?)
             breeze (when (and first-party? (not (:deny decision)))
