@@ -167,8 +167,11 @@
 
    opts:
    - :login-app-base-url  base URL Hydra redirects login/consent/logout
-                          challenges to, as seen FROM the Hydra container
-                          (default http://host.docker.internal:3001)
+                          challenges to. These redirects are followed by
+                          the BROWSER, so the URL must be host-reachable
+                          (default http://127.0.0.1:3001), unlike the
+                          token hook which Hydra calls itself and
+                          therefore uses host.docker.internal.
    - :token-hook-url      when set, Hydra calls this webhook at token mint
                           time (OAUTH2_TOKEN_HOOK_URL) and allows the
                           `patient` top-level claim; point it at a running
@@ -179,7 +182,7 @@
    here instead of leaving a dead container in the pool."
   ([] (start-auth-stack! {}))
   ([{:keys [login-app-base-url token-hook-url]
-     :or   {login-app-base-url "http://host.docker.internal:3001"}}]
+     :or   {login-app-base-url "http://127.0.0.1:3001"}}]
    (start!)
    (ensure-kratos-database!)
    (println "Running kratos migrations...")
@@ -201,6 +204,12 @@
      (shell "docker" "rm" "-f" "hydra"))
    (apply shell (hydra-run-args
                   (concat ["--add-host" "host.docker.internal:host-gateway"
+                           ;; Keep the whole secondary-path flow on plain
+                           ;; HTTP: the main path's issuer is the TLS
+                           ;; terminator (fhir.local:4443), which is not
+                           ;; started here and whose mkcert CA the e2e
+                           ;; client does not trust.
+                           "-e" "URLS_SELF_ISSUER=http://127.0.0.1:4444/"
                            "-e" (str "URLS_LOGIN=" login-app-base-url "/login")
                            "-e" (str "URLS_CONSENT=" login-app-base-url "/consent")
                            "-e" (str "URLS_LOGOUT=" login-app-base-url "/logout")]
