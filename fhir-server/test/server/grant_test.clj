@@ -128,3 +128,32 @@
                 (hook-payload :client-id "c1" :scopes ["patient/*.read"])
                 (constantly [])
                 (constantly true))))))
+
+(deftest resolve-first-party-claims-shape
+  (let [role-tuples [{:object "pgoa/physcian"} {:object "pgoa/admin"}
+                     {:object "demo/admin"} {:object "no-practitioner/admin"}]
+        practitioner-tuples [{:object "pgoa/9f9e6bd2-0000-4000-8000-000000000001"}
+                             {:object "demo/aaaa6bd2-0000-4000-8000-000000000002"}
+                             {:object "no-role-realm/bbbb6bd2-0000-4000-8000-000000000003"}]
+        claims (grant/resolve-first-party-claims role-tuples practitioner-tuples)]
+    (is (= ["demo" "pgoa"] (:realms claims))
+        "realms are the role/practitioner intersection, mast's legacy rule")
+    (is (= {"pgoa" ["admin" "physcian"] "demo" ["admin"]
+            "no-practitioner" ["admin"]}
+           (:roles claims))
+        "roles keep every granted realm; the intersection only shapes :realms")
+    (is (= {"pgoa" "9f9e6bd2-0000-4000-8000-000000000001"
+            "demo" "aaaa6bd2-0000-4000-8000-000000000002"
+            "no-role-realm" "bbbb6bd2-0000-4000-8000-000000000003"}
+           (:practitioners claims)))))
+
+(deftest resolve-first-party-claims-edge-shapes
+  (is (= {:realms [] :roles {} :practitioners {}}
+         (grant/resolve-first-party-claims [] []))
+      "a subject with no relations gets empty claims, not a denial")
+  (is (= {:realms [] :roles {"pgoa" ["admin"]} :practitioners {}}
+         (grant/resolve-first-party-claims [{:object "pgoa/admin"}] []))
+      "roles without a practitioner identity grant no realm")
+  (is (= {:realms [] :roles {} :practitioners {}}
+         (grant/resolve-first-party-claims [{:object "malformed"}] [{:object nil}]))
+      "objects without a realm/value split are ignored"))
