@@ -89,3 +89,42 @@
                (hook-payload :client-id "c1" :scopes [])
                (constantly [])
                (constantly false))))))
+
+(defn- authorization-code-payload
+  "The hook payload shape Hydra v2.2.0 sends when exchanging an
+   authorization code: the end-user subject only inside the id_token
+   session and an EMPTY request.granted_scopes."
+  [subject client-id]
+  {:session {:id_token {:subject subject
+                        :id_token_claims {:sub subject}}
+             :client_id client-id
+             :consent_challenge "ch-1"}
+   :request {:client_id client-id
+             :granted_scopes []
+             :granted_audience []
+             :grant_types ["authorization_code"]
+             :payload {}}})
+
+(deftest resolve-launch-patient-authorization-code
+  (testing "single launch grant injects the patient for interactive tokens"
+    (is (= {:patient "pa"}
+           (grant/resolve-launch-patient
+            (authorization-code-payload "user-1" "c1")
+            (constantly ["pa"])
+            (constantly true)))))
+  (testing "no launch grant issues without patient context (consent-side
+            linkage already fail-closed patient-scoped grants)"
+    (is (= {} (grant/resolve-launch-patient
+               (authorization-code-payload "user-1" "c1")
+               (constantly [])
+               (constantly true)))))
+  (testing "ambiguous grants issue without patient context"
+    (is (= {} (grant/resolve-launch-patient
+               (authorization-code-payload "user-1" "c1")
+               (constantly ["pa" "pb"])
+               (constantly true)))))
+  (testing "client_credentials fail-closed behavior is unchanged"
+    (is (:deny (grant/resolve-launch-patient
+                (hook-payload :client-id "c1" :scopes ["patient/*.read"])
+                (constantly [])
+                (constantly true))))))

@@ -188,4 +188,19 @@
   compartment-e2e
   {:doc "Full-stack patient-compartment integration test against the real local Ory stack (Hydra token hook + Keto). Runs every scenario against both the XTDB2 and Datomic backends (or the stores named as args, e.g. `bb compartment-e2e datomic`). Skips if Docker is unavailable."
    :requires ([server.compartment-e2e-runner :as e2e])
-   :task (apply e2e/run! *command-line-args*)}}}
+   :task (apply e2e/run! *command-line-args*)}
+
+  auth-stack-up
+  {:doc "Starts the secondary auth stack for the interactive authorization_code flow: the main pool (ory-pg/keto/hydra) plus Kratos, with Hydra's login/consent URLs pointed at the login-consent app on the host (default http://host.docker.internal:3001; override with LOGIN_APP_BASE_URL, enable the token hook with TOKEN_HOOK_URL). Never part of setup/inferno-test."
+   :requires ([server.docker-env :as env])
+   :task (env/start-auth-stack!
+           (cond-> {}
+             (System/getenv "LOGIN_APP_BASE_URL")
+             (assoc :login-app-base-url (System/getenv "LOGIN_APP_BASE_URL"))
+             (System/getenv "TOKEN_HOOK_URL")
+             (assoc :token-hook-url (System/getenv "TOKEN_HOOK_URL"))))}
+
+  auth-stack-down
+  {:doc "Removes the Kratos container and restores Hydra to its plain docker/hydra.yml configuration. The main pool keeps running."
+   :requires ([server.docker-env :as env])
+   :task (env/stop-auth-stack!)}}}

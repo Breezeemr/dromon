@@ -241,8 +241,14 @@
    {:deny <diagnostics>} to reject issuance. Fail-closed: a patient-scoped
    token is never issued without a Keto-backed launch patient."
   [payload granted-patients-fn launch-authorized?-fn]
-  (let [subject (or (let [s (get-in payload [:session :subject])]
-                      (when-not (str/blank? (str s)) s))
+  (let [end-user (or (let [s (get-in payload [:session :subject])]
+                       (when-not (str/blank? (str s)) s))
+                     ;; authorization_code/refresh_token hook payloads carry
+                     ;; the end-user subject only inside the id_token session
+                     ;; (observed on Hydra v2.2.0).
+                     (let [s (get-in payload [:session :id_token :subject])]
+                       (when-not (str/blank? (str s)) s)))
+        subject (or end-user
                     (get-in payload [:request :client_id])
                     (get-in payload [:session :client_id]))
         req-pid (requested-patient payload)
@@ -255,6 +261,21 @@
       (if (launch-authorized?-fn subject req-pid)
         {:patient req-pid}
         {:deny (str "subject " subject " has no launch grant for Patient/" req-pid)})
+
+      ;; Interactive (end-user) tokens: Hydra v2.2.0 sends an empty
+      ;; request.granted_scopes for authorization_code and refresh_token
+      ;; issuance, so scope inspection cannot drive the decision. Patient
+      ;; context follows the subject's Keto launch grants instead: exactly
+      ;; one -> inject, zero or ambiguous -> issue without patient context.
+      ;; Fail-closed is preserved upstream: the consent provider rejects
+      ;; patient-scoped consents for identities with no linked Patient
+      ;; before any token is requested, and data access still requires
+      ;; Keto read tuples regardless of claims.
+      end-user
+      (let [granted (granted-patients-fn subject)]
+        (if (= 1 (count granted))
+          {:patient (first granted)}
+          {}))
 
       (not scoped?)
       {}
