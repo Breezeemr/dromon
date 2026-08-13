@@ -37,6 +37,16 @@
                       fhir-store/xtdb2       {:local/root "../fhir-store-xtdb2"}
                       com.breezeehr/fhir-malli-r4b     {:local/root "../fhir/malli/r4b"}
                       com.breezeehr/fhir-malli-uscore8 {:local/root "../fhir/malli/uscore8"}
+                      ;; Pinned top-level so top-dep-wins resolves the
+                      ;; otherwise-ambiguous transitive locals: the
+                      ;; fhir-malli-breeze package references the fhir-igs
+                      ;; copies of these libs while uscore8 references the
+                      ;; dromon-local ones, which fails classpath
+                      ;; resolution on a cold cache ("no known ancestor
+                      ;; relationship between local versions").
+                      com.breezeehr/fhir-malli-xver    {:local/root "../fhir/malli/xver"}
+                      com.breezeehr/fhir-malli-fhir-extensions {:local/root "../fhir/malli/fhir-extensions"}
+                      com.breezeehr/fhir-malli-sdc     {:local/root "../fhir/malli/sdc"}
                       com.breezeehr/fhir-malli-breeze  {:local/root "../../fhir-igs/breeze-ig/malli/breeze"}}
          :main-opts ["-m" "kaocha.runner"]
          :jvm-opts ["-Xmx6g"
