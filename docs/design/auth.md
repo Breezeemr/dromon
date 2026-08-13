@@ -4,10 +4,14 @@
 Runtime auth is **JWT verification (RS256/JWKS by default, HS256 for dev) + Ory Keto
 authorization**, with **Ory Hydra** providing OAuth2 tokens and a **SMART configuration
 discovery** endpoint. The **`client_credentials`** (machine-to-machine) flow works end to end
-(exercised by the Inferno suite). The interactive **`authorization_code` login/consent flow is
-not yet built** — there is no consent UI and **Ory Kratos has been removed** from the
-environment (see `docs/tasks/kratos-cipher-secret-config.md`). The advertised `authorization_code`
-grant therefore has no backing login provider today.
+(exercised by the Inferno suite) on the main path (`bb setup`, only ory-pg/keto/hydra). The
+interactive **`authorization_code`** flow is served by an opt-in **secondary auth stack**
+(`bb auth-stack-up`, see `docs/tasks/kratos-reintroduce-secondary-auth-path.md`): Ory Kratos
+v1.3.0 backs credentials/identity (recreated after its removal over the cipher-secret config
+bug, `docs/tasks/kratos-cipher-secret-config.md` — secrets now arrive via the SECRETS_* env-var
+mapping, never `$VAR` literals in YAML), and Hydra's login/consent challenges redirect to the
+login-consent app (`master-at-arms2/login-consent`, in development). Kratos failing to start
+can never affect `bb inferno-test`.
 
 ## Authentication (`server.auth/wrap-jwt-auth`)
 buddy-auth JWS token backend, two modes:

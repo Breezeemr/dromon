@@ -1,0 +1,66 @@
+# Ory Kratos v1.3.0 config for the local auth stack (start-auth-stack!).
+#
+# The cookie and cipher secrets are deliberately NOT in this file. Kratos
+# does not perform $VAR-style environment substitution in YAML config
+# values: a literal `$KRATOS_CIPHER_SECRET` placeholder is parsed as a
+# 21-character secret, fails the >= 32 character schema check, and crashes
+# the container on boot (see docs/tasks/kratos-cipher-secret-config.md).
+# The secrets are supplied through Kratos's native env-var config mapping
+# instead: SECRETS_COOKIE and SECRETS_CIPHER, set by
+# server.docker-env/start-auth-stack!. The same pattern is used in
+# production (breeze-deploy kratos manifests).
+
+serve:
+  public:
+    base_url: http://127.0.0.1:4433/
+    cors:
+      enabled: true
+      allowed_origins:
+        - http://127.0.0.1:3001
+        - http://localhost:3001
+      allowed_methods:
+        - POST
+        - GET
+        - PUT
+        - PATCH
+        - DELETE
+      allowed_headers:
+        - Authorization
+        - Cookie
+        - Content-Type
+      exposed_headers:
+        - Content-Type
+        - Set-Cookie
+  admin:
+    base_url: http://127.0.0.1:4434/
+
+selfservice:
+  # The login-consent app (Hydra login/consent challenge UI) serves the
+  # credential screens; 3001 avoids the FHIR test-server on 3000.
+  default_browser_return_url: http://127.0.0.1:3001/
+  allowed_return_urls:
+    - http://127.0.0.1:3001
+    - http://localhost:3001
+  methods:
+    password:
+      enabled: true
+  flows:
+    login:
+      ui_url: http://127.0.0.1:3001/kratos/login
+    registration:
+      ui_url: http://127.0.0.1:3001/kratos/register
+    recovery:
+      enabled: false
+    verification:
+      enabled: false
+
+log:
+  level: info
+  format: text
+  leak_sensitive_values: false
+
+identity:
+  default_schema_id: default
+  schemas:
+    - id: default
+      url: file:///etc/config/kratos/identity.schema.json

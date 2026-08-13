@@ -45,14 +45,19 @@
 
 (defn hydra-run-args
   "The `docker run` argv that starts the Hydra container from docker/hydra.yml.
-   Shared by `start!` and `restart-hydra!` so both stay in sync."
-  []
-  ["docker" "run" "-d" "--name" "hydra" "--network" network-name
-   "--memory" "128m" "--memory-swap" "128m" "--cpus" "0.5"
-   "-p" "4444:4444" "-p" "4445:4445"
-   "-v" (str pwd "/docker/hydra.yml:/etc/config/hydra/hydra.yml")
-   "-e" (str "DSN=" pg-dsn-base "hydra?sslmode=disable")
-   "docker.io/oryd/hydra:v2.2.0" "serve" "all" "-c" "/etc/config/hydra/hydra.yml" "--dev"])
+   Shared by `start!`, `restart-hydra!` and `start-auth-stack!` so all stay in
+   sync. `extra-docker-args` are spliced in before the image name (e.g. -e
+   overrides, --add-host)."
+  ([] (hydra-run-args []))
+  ([extra-docker-args]
+   (concat
+     ["docker" "run" "-d" "--name" "hydra" "--network" network-name
+      "--memory" "128m" "--memory-swap" "128m" "--cpus" "0.5"
+      "-p" "4444:4444" "-p" "4445:4445"
+      "-v" (str pwd "/docker/hydra.yml:/etc/config/hydra/hydra.yml")
+      "-e" (str "DSN=" pg-dsn-base "hydra?sslmode=disable")]
+     extra-docker-args
+     ["docker.io/oryd/hydra:v2.2.0" "serve" "all" "-c" "/etc/config/hydra/hydra.yml" "--dev"])))
 
 (defn restart-hydra!
   "Recreates the Hydra container from the current docker/hydra.yml. Used to pick
@@ -105,6 +110,117 @@
       (shell "docker" "rm" "-f" "hydra-tls"))
     (apply shell (hydra-tls-run-args))
     (assert-container-up! "hydra-tls")))
+
+;; ── Secondary auth stack: Kratos + login/consent wiring ──────────────────────
+;; Opt-in extension of the main pool for the interactive authorization_code
+;; flow (docs/tasks/kratos-reintroduce-secondary-auth-path.md). Never started
+;; by `start!`; `bb setup` / `bb inferno-test` keep only ory-pg/keto/hydra.
+
+(declare start!)
+
+(def kratos-cookie-secret
+  "Cookie-signing secret for the local dev Kratos. Kratos does not substitute
+   $VAR placeholders in YAML config values (docs/tasks/kratos-cipher-secret-config.md),
+   so docker/kratos.yml carries no secrets block and these are injected via
+   Kratos's native env-var mapping. Dev-only value, overridable, same posture
+   as the committed dev Postgres password above."
+  (or (System/getenv "KRATOS_SECRETS_COOKIE")
+      "dev-only-kratos-cookie-secret-0123456789"))
+
+(def kratos-cipher-secret
+  "Cipher secret for the local dev Kratos; see kratos-cookie-secret. Kratos
+   requires exactly 32 characters for cipher secrets."
+  (or (System/getenv "KRATOS_SECRETS_CIPHER")
+      "dev-only-kratos-cipher-secret-32"))
+
+(defn- ensure-kratos-database!
+  "Creates the kratos database on ory-pg if it does not exist. docker/init-db.sql
+   no longer creates it and only runs when the ory-pg container is first
+   created, so an existing environment would otherwise fail kratos migrations."
+  []
+  (let [{:keys [exit out]} @(process ["docker" "exec" "ory-pg" "psql" "-U" "ory" "-tAc"
+                                      "SELECT 1 FROM pg_database WHERE datname='kratos'"]
+                                     {:out :string :err :string})]
+    (when-not (and (zero? exit) (= "1" (str/trim out)))
+      (println "Creating kratos database on ory-pg...")
+      (shell "docker" "exec" "ory-pg" "psql" "-U" "ory" "-c" "CREATE DATABASE kratos")
+      (shell "docker" "exec" "ory-pg" "psql" "-U" "ory" "-c"
+             "GRANT ALL PRIVILEGES ON DATABASE kratos TO ory"))))
+
+(defn kratos-run-args
+  "The `docker run` argv that starts the Kratos container from docker/kratos.yml."
+  []
+  ["docker" "run" "-d" "--name" "kratos" "--network" network-name
+   "--memory" "128m" "--memory-swap" "128m" "--cpus" "0.5"
+   "-p" "4433:4433" "-p" "4434:4434"
+   "-v" (str pwd "/docker/kratos.yml:/etc/config/kratos/kratos.yml")
+   "-v" (str pwd "/docker/identity.schema.json:/etc/config/kratos/identity.schema.json")
+   "-e" (str "DSN=" pg-dsn-base "kratos?sslmode=disable")
+   "-e" (str "SECRETS_COOKIE=" kratos-cookie-secret)
+   "-e" (str "SECRETS_CIPHER=" kratos-cipher-secret)
+   "docker.io/oryd/kratos:v1.3.0" "serve" "-c" "/etc/config/kratos/kratos.yml" "--dev"])
+
+(defn start-auth-stack!
+  "Starts the secondary auth stack on top of the main pool: ensures
+   ory-pg/keto/hydra via `start!`, then brings up Kratos and recreates Hydra
+   with its login/consent URLs pointed at the login-consent app on the host.
+
+   opts:
+   - :login-app-base-url  base URL Hydra redirects login/consent/logout
+                          challenges to, as seen FROM the Hydra container
+                          (default http://host.docker.internal:3001)
+   - :token-hook-url      when set, Hydra calls this webhook at token mint
+                          time (OAUTH2_TOKEN_HOOK_URL) and allows the
+                          `patient` top-level claim; point it at a running
+                          dromon /auth/token-hook to exercise SMART launch
+                          claims end to end
+
+   Boot failures are loud (assert-container-up!): a broken kratos.yml fails
+   here instead of leaving a dead container in the pool."
+  ([] (start-auth-stack! {}))
+  ([{:keys [login-app-base-url token-hook-url]
+     :or   {login-app-base-url "http://host.docker.internal:3001"}}]
+   (start!)
+   (ensure-kratos-database!)
+   (println "Running kratos migrations...")
+   (shell "docker" "run" "--rm" "--network" network-name
+          "-v" (str pwd "/docker/kratos.yml:/etc/config/kratos/kratos.yml")
+          "-v" (str pwd "/docker/identity.schema.json:/etc/config/kratos/identity.schema.json")
+          "-e" (str "DSN=" pg-dsn-base "kratos?sslmode=disable")
+          "docker.io/oryd/kratos:v1.3.0"
+          "migrate" "sql" "-e" "--yes" "-c" "/etc/config/kratos/kratos.yml")
+   (println "Starting Ory Kratos...")
+   (when-not (container-running? "kratos")
+     (when (container-exists? "kratos")
+       (println "kratos exists but is stopped — removing and recreating...")
+       (shell "docker" "rm" "-f" "kratos"))
+     (apply shell (kratos-run-args))
+     (assert-container-up! "kratos"))
+   (println "Recreating Hydra with login/consent URLs at" login-app-base-url "...")
+   (when (container-exists? "hydra")
+     (shell "docker" "rm" "-f" "hydra"))
+   (apply shell (hydra-run-args
+                  (concat ["--add-host" "host.docker.internal:host-gateway"
+                           "-e" (str "URLS_LOGIN=" login-app-base-url "/login")
+                           "-e" (str "URLS_CONSENT=" login-app-base-url "/consent")
+                           "-e" (str "URLS_LOGOUT=" login-app-base-url "/logout")]
+                          (when token-hook-url
+                            ["-e" (str "OAUTH2_TOKEN_HOOK_URL=" token-hook-url)
+                             "-e" "OAUTH2_ALLOWED_TOP_LEVEL_CLAIMS=patient"]))))
+   (assert-container-up! "hydra")
+   (println "Auth stack started successfully!")))
+
+(defn stop-auth-stack!
+  "Tears down the secondary auth stack additions: removes Kratos and restores
+   Hydra to its plain docker/hydra.yml configuration. The main pool keeps
+   running."
+  []
+  (when (container-exists? "kratos")
+    (println "Removing kratos container")
+    (shell "docker" "rm" "-f" "kratos"))
+  (when (container-exists? "hydra")
+    (restart-hydra!))
+  (println "Auth stack stopped."))
 
 (defn start! []
   (println "Starting local integration environment...")
