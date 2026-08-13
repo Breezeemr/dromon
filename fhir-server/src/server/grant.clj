@@ -359,8 +359,13 @@
       (let [payload (:body-params req)
             client-id (or (get-in payload [:request :client_id])
                           (get-in payload [:session :client_id]))
-            subject (let [s (get-in payload [:session :subject])]
-                      (when-not (str/blank? (str s)) s))
+            ;; authorization_code/refresh_token hook payloads carry the
+            ;; end-user subject only inside the id_token session (observed
+            ;; on Hydra v2.2.0); session.subject is empty there.
+            subject (or (let [s (get-in payload [:session :subject])]
+                          (when-not (str/blank? (str s)) s))
+                        (let [s (get-in payload [:session :id_token :subject])]
+                          (when-not (str/blank? (str s)) s)))
             first-party? (and subject (contains? (first-party-client-ids) client-id))
             decision (resolve-launch-patient payload granted-patients launch-authorized?)
             breeze (when (and first-party? (not (:deny decision)))
