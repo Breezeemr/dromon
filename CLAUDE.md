@@ -63,7 +63,7 @@ INFERNO_SUITE=smart_stu2 INFERNO_GROUPS=all bb inferno-test
 
 The per-run report is written to `target/inferno-report-<suite>.json` (and the
 stable `target/inferno-report.json`). The datomic runner
-(`datomic-test-server`) reuses this same function, so it honors the same env
+(`dromon-datomic`) reuses this same function, so it honors the same env
 vars.
 
 ### Run with OpenTelemetry tracing (Jaeger UI)

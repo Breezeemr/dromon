@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sample JVM memory of the dromon test-server process every SAMPLE_INTERVAL seconds.
 # Writes CSV to perf-analysis/mem-samples.csv. Mirrors
-# datomic-test-server/perf-analysis/sample-mem.sh so the two runs are comparable.
+# dromon-datomic/perf-analysis/sample-mem.sh so the two runs are comparable.
 set -u
 OUT="$(dirname "$0")/mem-samples.csv"
 INTERVAL="${SAMPLE_INTERVAL:-3}"
