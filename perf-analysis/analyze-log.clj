@@ -1,7 +1,7 @@
 #!/usr/bin/env bb
 ;; Parse dromon/server.log to bucket requests by interaction type and compute
 ;; per-bucket latency stats (count, sum, avg, p50, p95, p99, max).
-;; Mirrors datomic-test-server/perf-analysis/analyze-log.clj so results from
+;; Mirrors dromon-datomic/perf-analysis/analyze-log.clj so results from
 ;; the two backends are directly comparable.
 (require '[cheshire.core :as json]
          '[clojure.string :as str]

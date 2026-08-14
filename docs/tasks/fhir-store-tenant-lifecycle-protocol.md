@@ -23,7 +23,7 @@ having no tenant lifecycle today:
    Callers that want a deterministic "hot tenant" today have to issue
    a dummy read (e.g. `GET /Patient?_count=1`) just to prime the
    backend. `dromon/bb/src/server/inferno_runner.clj` does exactly this
-   via `warmup-store!` on line 124; `datomic-test-server`'s runner
+   via `warmup-store!` on line 124; `dromon-datomic`'s runner
    delegates to the same helper. This works by accident.
 
 2. **No deterministic cleanup for tests and multi-tenant provisioning.**
@@ -33,7 +33,8 @@ having no tenant lifecycle today:
    tenant" without bouncing the process.
 
 3. **Setup and teardown are asymmetric across backends.**
-   `test-server/seeder` in both dromon and datomic-test-server has to
+   The seeder in both dromon (`:test-server/seeder`) and dromon-datomic
+   (`:dromon-datomic/seeder`) has to
    know that "seeding SearchParameters" will implicitly create the
    default tenant. Explicit lifecycle would make this intention
    visible at the seam instead of buried inside the store.
@@ -117,7 +118,8 @@ use the explicit methods:
    integrant-injected function, or an HTTP admin endpoint. The current
    warmup is out-of-protocol and duplicates logic across backends.
 
-2. **`test-server/seeder` (dromon + datomic-test-server)** — add an
+2. **The seeder (`:test-server/seeder` in dromon, `:dromon-datomic/seeder`
+   in dromon-datomic)** — add an
    explicit `(db/create-tenant store "default")` at the top of the
    `:test-server/seeder` init-key before the
    `doseq ... create-resource` loop that seeds SearchParameters. This

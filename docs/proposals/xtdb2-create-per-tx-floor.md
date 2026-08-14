@@ -106,7 +106,7 @@ component. The marginal cost of an additional INSERT op inside a tx is
 
 - **Both test-server seeders batched.**
   `dromon/test-server/src/test_server/core.clj` and
-  `datomic-test-server/src/datomic_test_server/core.clj` previously
+  `dromon-datomic/src/com/breezeehr/dromon_datomic/core.clj` previously
   did `(doseq [p sp/search-parameters] (db/create-resource ...))` —
   one tx per SearchParameter, ~109 SearchParameters in the uscore8
   package, ~1.7 s of seeder cold-start cost on xtdb2. Both now build
