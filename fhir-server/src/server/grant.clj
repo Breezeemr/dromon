@@ -234,6 +234,17 @@
   (boolean (some #(str/starts-with? (str %) "patient/")
                  (get-in payload [:request :granted_scopes]))))
 
+(defn end-user-subject
+  "The authenticated end user's subject, or nil for grant-based (machine)
+   token issuance. authorization_code/refresh_token hook payloads carry it
+   only inside the id_token session (observed on Hydra v2.2.0), where
+   session.subject is empty."
+  [payload]
+  (or (let [s (get-in payload [:session :subject])]
+        (when-not (str/blank? (str s)) s))
+      (let [s (get-in payload [:session :id_token :subject])]
+        (when-not (str/blank? (str s)) s))))
+
 (defn resolve-launch-patient
   "Decides the launch patient for a token issuance, from the hook payload and
    the Keto grant state. Returns
@@ -241,13 +252,7 @@
    {:deny <diagnostics>} to reject issuance. Fail-closed: a patient-scoped
    token is never issued without a Keto-backed launch patient."
   [payload granted-patients-fn launch-authorized?-fn]
-  (let [end-user (or (let [s (get-in payload [:session :subject])]
-                       (when-not (str/blank? (str s)) s))
-                     ;; authorization_code/refresh_token hook payloads carry
-                     ;; the end-user subject only inside the id_token session
-                     ;; (observed on Hydra v2.2.0).
-                     (let [s (get-in payload [:session :id_token :subject])]
-                       (when-not (str/blank? (str s)) s)))
+  (let [end-user (end-user-subject payload)
         subject (or end-user
                     (get-in payload [:request :client_id])
                     (get-in payload [:session :client_id]))
@@ -288,22 +293,92 @@
           {:deny (str "subject " subject " is granted multiple patients; "
                       "pass patient=<id> on the token request")})))))
 
+;; ---------------------------------------------------------------------------
+;; First-party claims (mast BFF)
+;;
+;; First-party clients (the mast backend-for-frontend) get realm/role claims
+;; resolved from the same Keto namespaces mast's cookie minting used:
+;; breezeehr-role `has-role` on "<realm>/<role>" and practitioner-id `isa` on
+;; "<realm>/<practitioner-uuid>". The claims land under `breeze` in the
+;; access token's ext, next to the SMART `patient` claim this hook already
+;; owns, so one hook serves both consumers.
+;; ---------------------------------------------------------------------------
+
+(defn first-party-client-ids
+  "Client ids that receive first-party breeze claims, from the
+   FIRST_PARTY_CLIENT_IDS env var (comma separated)."
+  []
+  (into #{}
+        (comp (map str/trim) (remove str/blank?))
+        (str/split (str (System/getenv "FIRST_PARTY_CLIENT_IDS")) #",")))
+
+(defn resolve-first-party-claims
+  "Pure: Keto relation tuples -> the `breeze` access-token claim
+   {:realms [..] :roles {realm [..]} :practitioners {realm uuid}}.
+   :realms uses the same rule as mast's legacy cookie minting: the
+   intersection of realms granted a role and realms granting a
+   practitioner identity."
+  [role-tuples practitioner-tuples]
+  (let [split2        (fn [o] (some-> o str (str/split #"/" 2)))
+        roles         (reduce (fn [acc {:keys [object]}]
+                                (let [[realm role] (split2 object)]
+                                  (cond-> acc
+                                    (and realm role)
+                                    (update realm (fnil conj (sorted-set)) role))))
+                              {}
+                              role-tuples)
+        practitioners (reduce (fn [acc {:keys [object]}]
+                                (let [[realm practitioner-uuid] (split2 object)]
+                                  (cond-> acc
+                                    (and realm practitioner-uuid)
+                                    (assoc realm practitioner-uuid))))
+                              {}
+                              practitioner-tuples)]
+    {:realms        (vec (sort (filter (set (keys roles)) (keys practitioners))))
+     :roles         (into {} (map (fn [[realm role-set]] [realm (vec role-set)])) roles)
+     :practitioners practitioners}))
+
+(defn- breeze-claims-for
+  "Fetches and shapes the first-party claims for a Kratos subject. Keto
+   subject ids carry the user:/ prefix, as mast writes them."
+  [subject]
+  (let [keto-subject (str "user:/" subject)]
+    (resolve-first-party-claims
+      (list-tuples {"namespace" "breezeehr-role"
+                    "relation" "has-role"
+                    "subject_id" keto-subject})
+      (list-tuples {"namespace" "practitioner-id"
+                    "relation" "isa"
+                    "subject_id" keto-subject}))))
+
 (defn token-hook
   "POST /auth/token-hook -- Ory Hydra token webhook (OAUTH2_TOKEN_HOOK_URL).
    Injects the SMART `patient` launch claim into the access token when Keto
-   authorizes it; rejects issuance otherwise. When TOKEN_HOOK_SECRET is set,
-   requires a matching X-Token-Hook-Secret header."
+   authorizes it, and `breeze` realm/role claims for first-party clients;
+   rejects issuance otherwise. When TOKEN_HOOK_SECRET is set, requires a
+   matching X-Token-Hook-Secret header."
   [req]
   (let [secret (System/getenv "TOKEN_HOOK_SECRET")]
     (if (and secret (not= secret (get-in req [:headers "x-token-hook-secret"])))
       {:status 401 :body {:error "invalid token hook secret"}}
       (let [payload (:body-params req)
-            decision (resolve-launch-patient payload granted-patients launch-authorized?)]
+            client-id (or (get-in payload [:request :client_id])
+                          (get-in payload [:session :client_id]))
+            subject (end-user-subject payload)
+            first-party? (and subject (contains? (first-party-client-ids) client-id))
+            decision (resolve-launch-patient payload granted-patients launch-authorized?)
+            breeze (when (and first-party? (not (:deny decision)))
+                     (breeze-claims-for subject))]
         (t/event! :grant/token-hook
-                  {:data {:client-id (get-in payload [:request :client_id])
-                          :decision decision}})
+                  {:data {:client-id client-id
+                          :decision decision
+                          :first-party (boolean first-party?)}})
         (cond
           (:deny decision) {:status 403 :body {:error (:deny decision)}}
-          (:patient decision) {:status 200
-                               :body {:session {:access_token {:patient (:patient decision)}}}}
-          :else {:status 200 :body {}})))))
+          :else
+          (let [ext (cond-> {}
+                      (:patient decision) (assoc :patient (:patient decision))
+                      breeze (assoc :breeze breeze))]
+            (if (empty? ext)
+              {:status 200 :body {}}
+              {:status 200 :body {:session {:access_token ext}}})))))))

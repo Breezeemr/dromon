@@ -10,8 +10,20 @@ serve:
     host: 0.0.0.0
     port: 4467
 
+# Static list rather than the OPL file: the production first-party
+# namespaces carry hyphens, which are not valid OPL class names. Plain
+# tuple reads/writes/checks (all this stack uses) need only the names.
 namespaces:
-  location: file:///etc/config/keto/namespaces.ts
+  - id: 0
+    name: User
+  - id: 1
+    name: Group
+  - id: 2
+    name: fhir
+  - id: 3
+    name: breezeehr-role
+  - id: 4
+    name: practitioner-id
 
 log:
   level: info
