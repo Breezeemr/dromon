@@ -12,6 +12,76 @@
             "http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient"
           ]
         },
+        "extension": [
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race",
+            "extension": [
+              {
+                "url": "ombCategory",
+                "valueCoding": {
+                  "system": "urn:oid:2.16.840.1.113883.6.238",
+                  "code": "2106-3",
+                  "display": "White"
+                }
+              },
+              {
+                "url": "detailed",
+                "valueCoding": {
+                  "system": "urn:oid:2.16.840.1.113883.6.238",
+                  "code": "2108-9",
+                  "display": "European"
+                }
+              },
+              {
+                "url": "text",
+                "valueString": "White"
+              }
+            ]
+          },
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity",
+            "extension": [
+              {
+                "url": "ombCategory",
+                "valueCoding": {
+                  "system": "urn:oid:2.16.840.1.113883.6.238",
+                  "code": "2186-5",
+                  "display": "Not Hispanic or Latino"
+                }
+              },
+              {
+                "url": "text",
+                "valueString": "Not Hispanic or Latino"
+              }
+            ]
+          },
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-tribal-affiliation",
+            "extension": [
+              {
+                "url": "tribalAffiliation",
+                "valueCodeableConcept": {
+                  "coding": [
+                    {
+                      "system": "http://terminology.hl7.org/CodeSystem/v3-TribalEntityUS",
+                      "code": "338",
+                      "display": "Native Village of Afognak"
+                    }
+                  ],
+                  "text": "Native Village of Afognak"
+                }
+              },
+              {
+                "url": "isEnrolled",
+                "valueBoolean": true
+              }
+            ]
+          },
+          {
+            "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-sex",
+            "valueCode": "248153007"
+          }
+        ],
         "text": {
           "status": "generated",
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">John Smith</div>"
@@ -2892,6 +2962,18 @@
           "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">QuestionnaireResponse: Hunger Vital Sign</div>"
         },
         "questionnaire": "http://hl7.org/fhir/us/core/Questionnaire/hunger-vital-sign",
+        "_questionnaire": {
+          "extension": [
+            {
+              "url": "http://hl7.org/fhir/StructureDefinition/display",
+              "valueString": "Hunger Vital Sign"
+            },
+            {
+              "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-extension-questionnaire-uri",
+              "valueUri": "http://hl7.org/fhir/us/core/Questionnaire/hunger-vital-sign"
+            }
+          ]
+        },
         "status": "completed",
         "subject": {
           "reference": "Patient/123"
@@ -3052,6 +3134,25 @@
             },
             "who": {
               "reference": "Organization/organization-1"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-provenance-participant-type",
+                  "code": "transmitter",
+                  "display": "Transmitter"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/organization-1",
+              "display": "Anytown General Hospital"
             }
           }
         ]
