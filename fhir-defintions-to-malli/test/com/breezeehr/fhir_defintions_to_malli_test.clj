@@ -90,8 +90,10 @@
 (def ^:private ta-kw :org.hl7.test.StructureDefinition.TA/v1-0)
 (def ^:private ta-alias-kw :org.hl7.test.StructureDefinition.TA/v2-0)
 (def ^:private tb-kw :org.hl7.test.StructureDefinition.TB/v1-0)
+(def ^:private tc-kw :org.hl7.test.StructureDefinition.TC/v1-0)
 (def ^:private ta-url "http://hl7.org/test/StructureDefinition/TA")
 (def ^:private tb-url "http://hl7.org/test/StructureDefinition/TB")
+(def ^:private tc-url "http://hl7.org/test/StructureDefinition/TC")
 
 (defn- tree-contains? [form x]
   (boolean (some #(= x %) (tree-seq coll? seq form))))
@@ -102,19 +104,22 @@
    [:sequential [:ref TA]]) to `declared-url` and constrains the narrowed
    type's child .u. Returns the emitted patch acc, the inner descent acc, the
    collected references, and the pieces needed to compile the emitted form."
-  [declared-url declared-version extra-atom-entries]
+  [declared-url declared-version extra-atom-entries & {:keys [fi-ref-kw]
+                                                       :or {fi-ref-kw ta-kw}}]
   (let [ta-sch (m/schema [:map {:closed true} [:x {:optional true} :string]]
                          fp/fhir-registry-options)
         tb-sch (m/schema [:map {:closed true} [:u {:optional true} :string]]
                          fp/fhir-registry-options)
-        atom-entries (merge {ta-kw {:sch ta-sch} tb-kw {:sch tb-sch}}
+        tc-sch (m/schema [:map {:closed true} [:u {:optional true} :string]]
+                         fp/fhir-registry-options)
+        atom-entries (merge {ta-kw {:sch ta-sch} tb-kw {:sch tb-sch} tc-kw {:sch tc-sch}}
                             (when extra-atom-entries
                               (into {} (map (fn [[k v]] [k {:sch ({:ta ta-sch :tb tb-sch} v)}]))
                                     extra-atom-entries)))
         opts (update fp/fhir-registry-options :registry
-                     #(mr/composite-registry % (mr/registry {ta-kw ta-sch tb-kw tb-sch})))
+                     #(mr/composite-registry % (mr/registry {ta-kw ta-sch tb-kw tb-sch tc-kw tc-sch})))
         sub-sch (m/schema [:sequential [:ref ta-kw]] opts)
-        field-info (shape/field-info {:code ta-url} "*" ta-kw)
+        field-info (shape/field-info {:code ta-url} "*" fi-ref-kw)
         main-attr {:id "TP.f" :max "1"}
         attr-type {:code declared-url}
         sub-elements [{:path ["TP" "f"] :max "1"}
@@ -213,6 +218,23 @@
           "golden: the pre-fix emitted form is unchanged")
       (is (contains? references ta-kw)
           "the inherited ref is still recorded"))))
+
+(deftest stale-shape-ref-choice-override-test
+  (testing "a declared type equal to the shape's stale ref still overrides when
+            the compiled entry (what runtime threads from) holds another type"
+    ;; On a multi-typed field (CDA ANY) the shape's :ref-kw records the FIRST
+    ;; declared variant while the compiled entry holds the LAST. A profile
+    ;; restating the first variant (ProblemObservation declares CD; the entry
+    ;; holds RTO_PQ_PQ) must still descend into the declared type.
+    (let [{:keys [patch-form references sub-acc]}
+          (narrowed-choice-scenario tc-url "1.0" nil :fi-ref-kw tc-kw)]
+      (is (:type-override? sub-acc))
+      (let [thread (-> patch-form (nth 2) (nth 2) (nth 3) (nth 2))]
+        (is (= '(base-TC) (second thread))
+            "the thread derives from the declared type")
+        (is (not (tree-contains? (rest thread) 'inner-sch))
+            "no fallback to the compiled entry's arbitrary variant"))
+      (is (contains? references tc-kw)))))
 
 (deftest alias-version-restatement-no-override-test
   (testing "a restated type resolving to another version alias is the same type"

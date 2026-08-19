@@ -1021,9 +1021,12 @@
                                                      resolved-old-sch
                                                      (m/schema resolved-old-sch external-registry))))
                                    (catch Exception _ false))))
-          ;; The type the descent would otherwise walk (a narrowed choice element
-          ;; inherits an arbitrary variant from its base's choice expansion).
-          inherited-kw (or (:ref-kw field-info) (ref-kw-from-sch old-sch))
+          ;; The type the emitted form threads from at runtime. Prefer the ref
+          ;; of the actual inherited schema: on a multi-typed field (the CDA ANY
+          ;; choice) the compiled entry holds the LAST declared variant, while
+          ;; the shape's :ref-kw recorded the FIRST, so the shape record is
+          ;; stale exactly where this decision matters.
+          inherited-kw (or (ref-kw-from-sch old-sch) (:ref-kw field-info))
           ;; When the differential declares a type that differs from the inherited
           ;; one, the declared type is authoritative: descend into it and emit a
           ;; base-fn thread instead of updating the inherited field schema.
