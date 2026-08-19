@@ -362,10 +362,18 @@
 
 (declare element-definition->attribute)
 
-(defn unwrap-sequential [sch]
+(defn unwrap-sequential
+  "Strip the collection wrapper off a repeating field to get the element schema.
+   A repeating primitive is [:sequential [:maybe prim]] -- the :maybe holds the
+   place of an occurrence that carries only id/extensions -- so step through it
+   too and callers keep seeing the primitive itself."
+  [sch]
   (if sch
     (case (m/type sch)
-      :sequential (mu/get sch 0)
+      :sequential (let [inner (mu/get sch 0)]
+                    (if (and inner (= :maybe (m/type inner)))
+                      (mu/get inner 0)
+                      inner))
       sch)
     sch))
 
@@ -980,9 +988,16 @@
     ;; create-new-child-schema skip the field instead of emitting one.
     (if (empty? (:form new-acc))
       new-acc
-      (assoc new-acc :form (if max-val
-                             [`[:sequential {:max ~max-val} ~@(:form new-acc)]]
-                             [`[:sequential ~@(:form new-acc)]])))
+      ;; A repeating primitive admits nil. An occurrence carrying only
+      ;; id/extensions has no value, and both wire formats hold its place with a
+      ;; null in the value array while the id/extensions go to the same index of
+      ;; the parallel _field array (Timing.event, Patient.name.given, ...).
+      (let [child-forms (if (:primitive? new-acc)
+                          [`[:maybe ~@(:form new-acc)]]
+                          (:form new-acc))]
+        (assoc new-acc :form (if max-val
+                               [`[:sequential {:max ~max-val} ~@child-forms]]
+                               [`[:sequential ~@child-forms]]))))
     (if max-val
       (assoc new-acc :form (conj (vec (:form new-acc))
                                  `(~'mu/update-properties ~'merge {:max ~max-val})))
@@ -1027,6 +1042,12 @@
                          (try (= :sequential (m/type sub-sch)) (catch Exception _ false))))
         is-sliced? (shape/sliced? field-info)
         inner-sch (unwrap-sequential sub-sch)
+        ;; unwrap-sequential hid the :maybe of a repeating primitive, so the
+        ;; emitted mu/update needs an extra level to land on the primitive
+        ;; instead of replacing the :maybe with it.
+        maybe-inner? (and is-seq? sub-sch
+                          (try (= :maybe (m/type (mu/get sub-sch 0)))
+                               (catch Exception _ false)))
         ;; When inner schema is a FHIR primitive (e.g. :string for code),
         ;; sub-elements like extension belong on the _field companion,
         ;; not on the primitive value itself. Skip deep patching.
@@ -1074,9 +1095,17 @@
                                                                `(~'-> ~target ~@new-sub-form))))
                                                          ;; Non-seq form (bare vector like [:or ...]) — use directly as replacement
                                                          (first new-sub-form))]
-                                       (if is-seq?
+                                       (cond
+                                         maybe-inner?
+                                         `(~'mu/update ~'sch 0
+                                           (~'fn [~'maybe-sch]
+                                            (~'mu/update ~'maybe-sch 0
+                                             (~'fn [~'inner-sch] ~update-expr))))
+
+                                         is-seq?
                                          `(~'mu/update ~'sch 0 (~'fn [~'inner-sch] ~update-expr))
-                                         update-expr))))
+
+                                         :else update-expr))))
             acc1 (if (seq new-sub-form)
                    (update old-acc :form conj update-form-entry)
                    old-acc)

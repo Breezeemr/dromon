@@ -54,7 +54,8 @@ unzip -q examples.zip -d /tmp/r4b-examples
 FHIR_XML_EXAMPLES=/tmp/r4b-examples clj -M:gate
 ```
 
-Current status: **1156 / 1156 round-trip clean.**
+Current status: **1156 / 1156 round-trip clean**, and all 1156 also pass
+`m/validate` after `decode-typed`.
 
 Equivalence is canonical, not byte-for-byte — the FHIR data model has no slot
 for XML comments, and 358 of the examples contain them. `fhir-xml-canonical`
@@ -93,11 +94,6 @@ out of schema order). We reproduce the input faithfully, defects included.
   into its own map key — is not covered by the gate. Such keys are written
   after the elements the order vector names, rather than at the position of the
   `extension` element they belong to.
-- Seven corpus files parse and round-trip cleanly but do not pass
-  `m/validate` after `decode-typed`: `Timing.event` is a repeating `dateTime`
-  used with extensions and no value, which FHIR represents as a null in the
-  value array. The generated schema does not admit `nil` there. That is a
-  generator nullability gap shared with the JSON path, not an XML issue.
 
 ## What the schemas must carry
 

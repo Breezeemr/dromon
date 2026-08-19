@@ -63,12 +63,14 @@
 
 (deftest primitive-may-carry-extensions-with-no-value
   ;; Timing.event is a repeating dateTime used here with only a cqf-expression.
-  (let [{:keys [data]} (round-trip (fixture "activitydefinition-valueless-primitive.xml"))]
+  (let [{:keys [data schema]} (round-trip (fixture "activitydefinition-valueless-primitive.xml"))]
     (is (= [nil] (get-in data [:timingTiming :event]))
         "a valueless repeat is nil in the value array")
     (is (= "http://hl7.org/fhir/StructureDefinition/cqf-expression"
            (get-in data [:timingTiming :_event 0 :extension 0 :url]))
-        "and its extensions live in the parallel companion array")))
+        "and its extensions live in the parallel companion array")
+    (is (m/validate schema (fx/decode-typed schema data))
+        "and the generated schema admits that nil")))
 
 (deftest contained-resources-are-named-by-their-type
   (let [{:keys [data]} (round-trip (fixture "medicationrequest-contained.xml"))]
