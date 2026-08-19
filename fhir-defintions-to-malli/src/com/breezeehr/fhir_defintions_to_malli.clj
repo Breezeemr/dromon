@@ -1008,7 +1008,27 @@
                                                      resolved-old-sch
                                                      (m/schema resolved-old-sch external-registry))))
                                    (catch Exception _ false))))
-          effective-old-sch (if (and resolved-old-sch (not old-sch-map?)) nil resolved-old-sch)]
+          ;; The type the descent would otherwise walk (a narrowed choice element
+          ;; inherits an arbitrary variant from its base's choice expansion).
+          inherited-kw (or (:ref-kw field-info) (ref-kw-from-sch old-sch))
+          ;; When the differential declares a type that differs from the inherited
+          ;; one, the declared type is authoritative: descend into it and emit a
+          ;; base-fn thread instead of updating the inherited field schema.
+          ;; Namespaces are compared instead of full keywords because the CDA
+          ;; driver registers the same type under several version keywords
+          ;; (aliases) that differ only in the keyword name; the namespace keeps
+          ;; the package path + type name and drops only the version segment.
+          declared-override? (and raw-code
+                                  (not base-primitive)
+                                  (not (#{"Element" "BackboneElement"} raw-code))
+                                  (keyword? inherited-kw)
+                                  base-kw
+                                  (not= (namespace base-kw) (namespace inherited-kw))
+                                  (some? (resolve-malli-sch base-kw)))
+          effective-old-sch (if (or declared-override?
+                                    (and resolved-old-sch (not old-sch-map?)))
+                              nil
+                              resolved-old-sch)]
       (transduce
        (map identity)
        (fn ([acc]
@@ -1018,7 +1038,11 @@
                               acc
                               (do
                                 (swap! *references-atom* conj base-kw)
-                                (update acc :form #(prepend-base-sym % (kw->base-fn-form base-kw)))))
+                                ;; :type-override? tells the caller the emitted
+                                ;; base thread is authoritative and must not be
+                                ;; re-threaded from the inherited field schema.
+                                (cond-> (update acc :form #(prepend-base-sym % (kw->base-fn-form base-kw)))
+                                  declared-override? (assoc :type-override? true))))
                             acc)]
               (if add-rt?
                 (-> acc-val
@@ -1219,12 +1243,27 @@
             ;; but shouldn't be tracked in *references-atom*
             needs-deref? (or ref-kw (shape/content-ref? field-info))]
     (if sub-acc
-      (let [_ (when ref-kw
+      (let [;; A declared-type override made the inherited ref irrelevant here;
+            ;; the declared type's keyword was already recorded in patch-element.
+            _ (when (and ref-kw (not (:type-override? sub-acc)))
                 (swap! *references-atom* conj ref-kw))
             update-form-entry
             `(~'mu/update ~k (~'fn [~'sch]
                                     ~(let [target (if is-seq? 'inner-sch 'sch)
-                                           update-expr (if (seq? (first new-sub-form))
+                                           update-expr (cond
+                                                         ;; The differential declared a type that
+                                                         ;; differs from the inherited one: the
+                                                         ;; (-> (base-X) ...) thread replaces the
+                                                         ;; inherited schema outright. Keep it
+                                                         ;; verbatim (never re-thread from target)
+                                                         ;; and flatten trailing forms onto it.
+                                                         (:type-override? sub-acc)
+                                                         (let [inner (first new-sub-form)]
+                                                           (if (= 1 (count new-sub-form))
+                                                             inner
+                                                             `(~'-> ~@(rest inner) ~@(rest new-sub-form))))
+
+                                                         (seq? (first new-sub-form))
                                                          (let [inner (first new-sub-form)
                                                                single-thread? (and (= (count new-sub-form) 1) (= '-> (first inner)))]
                                                            (if needs-deref?
@@ -1237,6 +1276,7 @@
                                                                  `(~'-> ~target ~@steps))
                                                                `(~'-> ~target ~@new-sub-form))))
                                                          ;; Non-seq form (bare vector like [:or ...]) — use directly as replacement
+                                                         :else
                                                          (first new-sub-form))]
                                        (cond
                                          maybe-inner?

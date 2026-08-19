@@ -2,7 +2,11 @@
   (:require [clojure.test :refer [deftest is testing]]
             [com.breezeehr.fhir-defintions-to-malli :as fdm]
             [com.breezeehr.fhir-shape :as shape]
-            [com.breezeehr.fhir-schema-gen :as gen]))
+            [com.breezeehr.fhir-schema-gen :as gen]
+            [com.breezeehr.fhir-primitives :as fp]
+            [malli.core :as m]
+            [malli.registry :as mr]
+            [malli.util :as mu]))
 
 (deftest representation-props-test
   (testing "xmlAttr"
@@ -76,6 +80,150 @@
              ["Observation" "entryRelationship"]
              "woundMeasurementObservation")]
       (is (= "http://hl7.org/cda/us/ccda/StructureDefinition/WoundMeasurementObservation" v)))))
+
+;; ---------------------------------------------------------------------------
+;; Narrowed choice elements: a differential that declares a type different from
+;; the inherited field schema must descend into the declared type, both in the
+;; generation-time :sch and in the emitted :form.
+;; ---------------------------------------------------------------------------
+
+(def ^:private ta-kw :org.hl7.test.StructureDefinition.TA/v1-0)
+(def ^:private ta-alias-kw :org.hl7.test.StructureDefinition.TA/v2-0)
+(def ^:private tb-kw :org.hl7.test.StructureDefinition.TB/v1-0)
+(def ^:private ta-url "http://hl7.org/test/StructureDefinition/TA")
+(def ^:private tb-url "http://hl7.org/test/StructureDefinition/TB")
+
+(defn- tree-contains? [form x]
+  (boolean (some #(= x %) (tree-seq coll? seq form))))
+
+(defn- narrowed-choice-scenario
+  "Drive update-existing-child-schema the way apply-regular-element does for a
+   profile element that narrows a choice field :f (inherited as
+   [:sequential [:ref TA]]) to `declared-url` and constrains the narrowed
+   type's child .u. Returns the emitted patch acc, the inner descent acc, the
+   collected references, and the pieces needed to compile the emitted form."
+  [declared-url declared-version extra-atom-entries]
+  (let [ta-sch (m/schema [:map {:closed true} [:x {:optional true} :string]]
+                         fp/fhir-registry-options)
+        tb-sch (m/schema [:map {:closed true} [:u {:optional true} :string]]
+                         fp/fhir-registry-options)
+        atom-entries (merge {ta-kw {:sch ta-sch} tb-kw {:sch tb-sch}}
+                            (when extra-atom-entries
+                              (into {} (map (fn [[k v]] [k {:sch ({:ta ta-sch :tb tb-sch} v)}]))
+                                    extra-atom-entries)))
+        opts (update fp/fhir-registry-options :registry
+                     #(mr/composite-registry % (mr/registry {ta-kw ta-sch tb-kw tb-sch})))
+        sub-sch (m/schema [:sequential [:ref ta-kw]] opts)
+        field-info (shape/field-info {:code ta-url} "*" ta-kw)
+        main-attr {:id "TP.f" :max "1"}
+        attr-type {:code declared-url}
+        sub-elements [{:path ["TP" "f"] :max "1"}
+                      {:path ["TP" "f" "u"] :comment "narrowed"}]
+        update-existing (ns-resolve 'com.breezeehr.fhir-defintions-to-malli
+                                    'update-existing-child-schema)
+        run (fn [f]
+              (let [refs (atom #{})]
+                (binding [fdm/*schema-atom* (atom atom-entries)
+                          fdm/*references-atom* refs
+                          fdm/*recursive-references* #{}
+                          fdm/*base-refs* (atom {})]
+                  {:result (f) :references @refs})))
+        outer (run #(update-existing {:sch nil :form []} :f attr-type main-attr {}
+                                     sub-elements ["TP" "f"] declared-version
+                                     sub-sch field-info))
+        inner (run #(fdm/attr->value-schema-patch
+                     {:sch (fdm/unwrap-sequential sub-sch) :form []
+                      :field-info field-info :new-field? false}
+                     "TP.f" attr-type main-attr sub-elements ["TP" "f"]
+                     declared-version))]
+    {:patch-form (first (:form (:result outer)))
+     :references (:references outer)
+     :sub-acc (:result inner)
+     :ta-sch ta-sch
+     :tb-sch tb-sch
+     :opts opts}))
+
+(defn- compile-patch-form
+  "Compile the emitted (mu/update :f ...) step against a parent schema whose :f
+   is the inherited [:sequential [:ref TA]], with base-TB resolvable. This is
+   the compile the generated .cljc file performs; pre-fix it threw
+   :malli.util/no-entry."
+  [{:keys [patch-form opts tb-sch]}]
+  (let [parent (m/schema [:map [:f [:sequential [:ref ta-kw]]]] opts)
+        f (binding [*ns* (the-ns 'com.breezeehr.fhir-defintions-to-malli)]
+            (eval (list 'fn '[options base-TB parent] (list '-> 'parent patch-form))))]
+    (f opts (fn [] tb-sch) parent)))
+
+(deftest declared-type-override-test
+  (testing "declared type differing from the inherited ref wins the descent"
+    (let [{:keys [patch-form references sub-acc] :as scenario}
+          (narrowed-choice-scenario tb-url "1.0" nil)]
+      (is (:type-override? sub-acc)
+          "the descent acc is flagged as a declared-type override")
+      (is (some? (mu/get (:sch sub-acc) :u))
+          "generation-time :sch walks the declared type (has :u)")
+      (is (nil? (mu/get (:sch sub-acc) :x))
+          "generation-time :sch is not the inherited type (no :x)")
+      (is (tree-contains? patch-form '(base-TB))
+          "emitted form threads from the declared type's base fn")
+      (let [thread (-> patch-form (nth 2) (nth 2) (nth 3) (nth 2))]
+        (is (= '-> (first thread)))
+        (is (= '(base-TB) (second thread))
+            "the thread starts at (base-TB), not at the inherited schema")
+        (is (not (tree-contains? (rest thread) 'inner-sch))
+            "the inherited inner-sch is not re-threaded")
+        (is (= '(mu/update-properties merge {:max 1}) (last thread))
+            "trailing forms are flattened onto the same thread"))
+      (is (contains? references tb-kw)
+          "the declared type is recorded as a reference")
+      (is (not (contains? references ta-kw))
+          "the inherited ref is not recorded as a dead dependency")
+      (let [compiled (compile-patch-form scenario)
+            inner (mu/get (mu/get compiled :f) 0)]
+        (is (= :sequential (m/type (mu/get compiled :f)))
+            "the sequential wrapper is preserved")
+        (is (some? (mu/get inner :u)))
+        (is (nil? (mu/get inner :x)))
+        (is (= {:closed true :resourceType "TP.f" :max 1}
+               (m/properties inner)))
+        (is (= {:comment "narrowed"}
+               (some (fn [[k p _]] (when (= k :u) (select-keys p [:comment])))
+                     (m/children inner)))
+            "the constraint on the narrowed type's child landed")))))
+
+(deftest restated-inherited-type-no-override-test
+  (testing "restating the inherited type keeps the inherited-schema path byte-identical"
+    (let [{:keys [patch-form references sub-acc]}
+          (narrowed-choice-scenario ta-url "1.0" nil)]
+      (is (not (:type-override? sub-acc)))
+      (is (= '(mu/update :f
+                         (fn [sch]
+                           (mu/update sch 0
+                                      (fn [inner-sch]
+                                        (-> inner-sch
+                                            (m/schema options)
+                                            m/deref
+                                            (mu/update-entry-properties :u merge {:comment "narrowed"})
+                                            (mu/update-properties
+                                             (fn [props]
+                                               (-> (or props {:closed true})
+                                                   (assoc :resourceType "TP.f"))))
+                                            (mu/update-properties merge {:max 1}))))))
+             patch-form)
+          "golden: the pre-fix emitted form is unchanged")
+      (is (contains? references ta-kw)
+          "the inherited ref is still recorded"))))
+
+(deftest alias-version-restatement-no-override-test
+  (testing "a restated type resolving to another version alias is the same type"
+    (let [{:keys [patch-form sub-acc]}
+          (narrowed-choice-scenario ta-url "2.0" {ta-alias-kw :ta})]
+      (is (not (:type-override? sub-acc))
+          "alias keywords differ only in version; namespaces match, no override")
+      (is (tree-contains? patch-form 'inner-sch)
+          "the inherited-schema thread is kept")
+      (is (not (tree-contains? patch-form '(base-TA)))
+          "no base fn is emitted for the restated alias"))))
 
 (deftest canonical-version-test
   (testing "pinned canonical"
