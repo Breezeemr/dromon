@@ -370,14 +370,33 @@
 
 (declare compute-element-patch)
 
-(defn- make-gb-xform [main-path]
-  (comp
-   (remove #(-> % :path (= main-path)))
-   (xforms/by-key (fn [{:keys [path]}]
-                    (into []
-                          (take (inc (count main-path)))
-                          path))
-                  (xforms/into []))))
+(defn- group-sub-elements
+  "Group sub-elements one level below main-path into [group-path items] pairs.
+   Groups are ordered so a base field is processed before its slices, matching
+   structure-definition->patch. Slices depend on the base having registered
+   :pending-slicing first, and map iteration order does not guarantee that."
+  [main-path sub-elements]
+  (let [depth (inc (count main-path))
+        base-name (fn [group-path]
+                    (let [seg (or (peek group-path) "")
+                          idx (str/index-of seg ":")]
+                      (if idx (subs seg 0 idx) seg)))
+        slice? (fn [group-path] (if (str/index-of (or (peek group-path) "") ":") 1 0))
+        ordered (into []
+                      (comp (remove #(-> % :path (= main-path)))
+                            (map (fn [{:keys [path]}] (into [] (take depth) path)))
+                            (distinct))
+                      sub-elements)
+        ;; Declaration order, except a base always precedes its own slices.
+        rank (into {} (map-indexed (fn [i k] [k i])) ordered)
+        base-rank (reduce (fn [m k] (update m (base-name k) (fnil min Long/MAX_VALUE) (rank k)))
+                          {} ordered)
+        grouped (reduce (fn [m {:keys [path] :as element}]
+                          (update m (into [] (take depth) path) (fnil conj []) element))
+                        {}
+                        (remove #(-> % :path (= main-path)) sub-elements))]
+    (mapv (fn [k] [k (grouped k)])
+          (sort-by (juxt #(base-rank (base-name %)) slice? rank) ordered))))
 
 ;; ---------------------------------------------------------------------------
 ;; Slicing helpers
@@ -763,15 +782,18 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- patch-with-sub-elements
-  "Shared transduction for :map/:or and :ref/:lazy-ref patches."
+  "Shared transduction for :map/:or and :ref/:lazy-ref patches.
+   Flushes at completion so slicing discovered below this level is emitted here:
+   callers only read :sch and :form off the returned acc, so an unflushed
+   :pending-slicing would be discarded along with the slice arms it holds."
   [acc sub-elements main-path version]
   (transduce
-   (make-gb-xform main-path)
-   (fn ([acc] acc)
+   (map identity)
+   (fn ([acc] (flush-pending-slicing acc))
      ([acc [_k items]]
       (element-definition->attribute acc main-path version items)))
    acc
-   sub-elements))
+   (group-sub-elements main-path sub-elements)))
 
 (defn- prepend-base-sym
   "Prepend a base schema symbol to the form vector, threading into any existing -> form."
@@ -827,7 +849,7 @@
                                    (catch Exception _ false))))
           effective-old-sch (if (and resolved-old-sch (not old-sch-map?)) nil resolved-old-sch)]
       (transduce
-       (make-gb-xform main-path)
+       (map identity)
        (fn ([acc]
             (let [acc (flush-pending-slicing acc)
                   acc-val (if-not effective-old-sch
@@ -854,13 +876,20 @@
                          :else
                          (cond-> (resolve-malli-sch base-kw)
                            add-rt? (mu/assoc :resourceType [:enum rt]))))
-       sub-elements))))
+       (group-sub-elements main-path sub-elements)))))
 
 (defn- dispatch-from-field-info
   "Derive compute-element-patch dispatch value from shape field-info when FHIR type code is nil."
   [field-info old-sch]
   (cond
-    (nil? field-info) nil
+    ;; The shape only describes the StructureDefinition's own root fields, so
+    ;; anything more than one level down has no field-info. Introspect the
+    ;; schema we are standing on instead — returning nil here drops every
+    ;; sub-element below that level, which is how nested slicing went missing.
+    (nil? field-info)
+    (let [t (some-> old-sch m/type)]
+      (when (#{:map :or :ref :lazy-ref} t) t))
+
     (shape/complex? field-info) :map
     (shape/ref? field-info) :ref
     ;; Fall back to malli introspection for edge cases (:or, :vector, etc.)
@@ -1498,7 +1527,17 @@
   (let [parent-path-count (count parent-path)
         attrs (into [] (filter (fn [{:keys [path]}]
                                  (= (- (count path) parent-path-count) 1)))
-                    items)]
+                    items)
+        ;; A differential may constrain a grandchild without restating the level
+        ;; in between (ReferralNote gives ClinicalDocument.component.structuredBody
+        ;; but never ClinicalDocument.component). Synthesize the missing level from
+        ;; the shared prefix, otherwise the whole subtree is dropped.
+        attrs (if (seq attrs)
+                attrs
+                (when-let [p (some #(let [p (:path %)]
+                                      (when (> (count p) parent-path-count) p))
+                                   items)]
+                  [{:path (into [] (take (inc parent-path-count)) p)}]))]
     (if (empty? attrs)
       acc
       (let [{attr-types :type
