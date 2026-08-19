@@ -76,3 +76,92 @@
              ["Observation" "entryRelationship"]
              "woundMeasurementObservation")]
       (is (= "http://hl7.org/cda/us/ccda/StructureDefinition/WoundMeasurementObservation" v)))))
+
+(deftest canonical-version-test
+  (testing "pinned canonical"
+    (is (= "http://hl7.org/fhir/StructureDefinition/alternate-reference"
+           (fdm/strip-canonical-version
+            "http://hl7.org/fhir/StructureDefinition/alternate-reference|5.2.0")))
+    (is (= "5.2.0"
+           (fdm/canonical-version
+            "http://hl7.org/fhir/StructureDefinition/alternate-reference|5.2.0"))))
+  (testing "unpinned canonical is returned whole"
+    (is (= "http://hl7.org/fhir/StructureDefinition/Patient"
+           (fdm/strip-canonical-version "http://hl7.org/fhir/StructureDefinition/Patient")))
+    (is (nil? (fdm/canonical-version "http://hl7.org/fhir/StructureDefinition/Patient")))))
+
+(deftest canonical-index-test
+  (let [r4b {:id "hl7.fhir.r4b.core" :version "4.3.0" :dependencies {}
+             :plan [{:url "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden" :version "4.3.0"}
+                    {:url "http://hl7.org/fhir/StructureDefinition/Patient" :version "4.3.0"}]}
+        fx  {:id "hl7.fhir.uv.extensions.r4" :version "5.3.0-ballot-tc1" :dependencies {}
+             :plan [{:url "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden" :version "5.3.0-ballot-tc1"}
+                    {:url "http://hl7.org/fhir/StructureDefinition/alternate-reference" :version "5.3.0-ballot-tc1"}]}
+        index (gen/canonical-index [r4b fx])
+        ;; xver declares extensions at 5.2.0 and gets 5.3.0-ballot-tc1 instead
+        xver  {:id "hl7.fhir.uv.xver-r5.r4" :version "0.1.0"
+               :dependencies {"hl7.fhir.r4.core" "4.0.1"
+                              "hl7.fhir.uv.extensions.r4" "5.2.0"}}]
+
+    (testing "a canonical defined by two packages records both, with the publishing package"
+      (is (= [{:pkg-id "hl7.fhir.r4b.core" :pkg-version "4.3.0" :version "4.3.0"
+               :kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0}
+              {:pkg-id "hl7.fhir.uv.extensions.r4" :pkg-version "5.3.0-ballot-tc1"
+               :version "5.3.0-ballot-tc1"
+               :kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1}]
+             (get index "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden"))))
+
+    (testing "version ordering infers the scheme when no versionAlgorithm is declared"
+      (is (neg? (fdm/compare-canonical-versions "4.3.0" "5.3.0-ballot-tc1")))
+      (is (neg? (fdm/compare-canonical-versions "5.3.0-ballot-tc1" "5.3.0"))
+          "a pre-release orders below the release it qualifies")
+      (is (pos? (fdm/compare-canonical-versions "2.10.0" "2.9.0"))
+          "numeric segments compare numerically, not lexically")
+      (is (zero? (fdm/compare-canonical-versions "4.3.0" "4.3.0"))))
+
+    (binding [fdm/*canonical-index* index
+              fdm/*schema-atom* (atom {:org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0 {}
+                                       :org.hl7.fhir.StructureDefinition.Patient/v4-3-0 {}})]
+      (testing "a pin a package publishes outright wins"
+        (binding [fdm/*current-package* xver]
+          (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden|5.3.0-ballot-tc1")))))
+
+      (testing "a pin no resource publishes resolves through the declared dependency"
+        ;; Nothing anywhere is version 5.2.0; xver declared extensions at 5.2.0 and
+        ;; this run substituted 5.3.0-ballot-tc1 for it.
+        (binding [fdm/*current-package* xver]
+          (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden|5.2.0")))))
+
+      (testing "an uninterpretable pin falls back to the latest already generated"
+        ;; No resource publishes 9.9.9 and no declared dependency names it, so the
+        ;; pin carries no information; preferring something already generated keeps
+        ;; the reference inside packages the referrer has seen.
+        (binding [fdm/*current-package* {:id "x" :version "1" :dependencies {}}]
+          (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden|9.9.9")))))
+
+      (testing "an unpinned canonical takes the latest already generated, per R4B"
+        (binding [fdm/*current-package* xver]
+          (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden")))))
+
+      (testing "a forward reference resolves to the package that will define it"
+        (binding [fdm/*current-package* xver]
+          (is (= :org.hl7.fhir.StructureDefinition.alternate-reference/v5-3-0-ballot-tc1
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/alternate-reference|5.2.0")))))
+
+      (testing "a canonical no package defines does not resolve"
+        (is (nil? (fdm/resolve-canonical-kw
+                   "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-timeout")))))
+
+    (testing "without an index bound, resolution is inert"
+      (binding [fdm/*canonical-index* nil
+                fdm/*schema-atom* (atom {})]
+        (is (nil? (fdm/resolve-canonical-kw "http://hl7.org/fhir/StructureDefinition/Patient")))))))

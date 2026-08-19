@@ -186,6 +186,51 @@
   [sources roots & {:as opts}]
   (dependency-order (load-definitions sources) roots opts))
 
+(defn read-package-descriptor
+  "Read a FHIR package manifest, returning {:id :version :dependencies}.
+
+   `dir` is a package directory; a FHIR package puts its manifest at
+   package.json with `name`, `version` and `dependencies`. Returns nil when the
+   directory has no manifest -- R4B ships as a bare bundle directory and SDC as a
+   published `site` tree, so those identities have to be supplied by the caller."
+  [dir]
+  (let [f (io/file dir "package.json")]
+    (when (.exists f)
+      (let [m (charred/read-json (io/reader f) :key-fn keyword)]
+        {:id           (:name m)
+         :version      (:version m)
+         :dependencies (into {} (map (fn [[k v]] [(name k) v])) (:dependencies m))}))))
+
+(defn canonical-index
+  "Build the canonical URL -> candidates index that `fdm/*canonical-index*` expects.
+
+   `packages` is the run's packages in pipeline order, each
+   {:id :version :dependencies :plan}. Every planned definition contributes
+   {:pkg-id :pkg-version :version :kw}, where :version is the resource's own
+   StructureDefinition.version -- the element a `|version` pin names -- which is
+   not always the package version (FHIR Extensions 5.3.0-ballot-tc1 publishes 32
+   of its 855 resources at 5.0.0).
+
+   Only planned definitions are indexed, so an entry is a promise that the
+   namespace will be written."
+  [packages]
+  (reduce
+   (fn [idx {:keys [id version plan]}]
+     (reduce (fn [idx sd]
+               (update idx (:url sd) (fnil conj [])
+                       {:pkg-id      id
+                        :pkg-version version
+                        :version     (:version sd)
+                        :kw          (fdm/uri->kw2 (:url sd) (:version sd))}))
+             idx plan))
+   {}
+   packages))
+
+(defn index-kws
+  "Every schema keyword a canonical index promises, for `fdm/*known-canonical-kws*`."
+  [index]
+  (into #{} (comp (mapcat val) (map :kw)) index))
+
 ;; ---------------------------------------------------------------------------
 ;; File writing
 ;; ---------------------------------------------------------------------------
@@ -399,10 +444,15 @@
      It will be dynamically added to the classpath if not already present.
    `out-dir` is the final output path (e.g. [\"..\" \"fhir\" ... \"src\"]).
 
+   `package` is the descriptor of the package being generated
+   ({:id :version :dependencies}); it is what makes a `|version` pin on a
+   canonical interpretable, since FHIR resolves a pin against the referencing
+   package's declared dependencies.
+
    Returns {:process {:ok n :fail n :failures [...]},
             :staging {:ok n :fail n},
             :output  {:ok n :fail n}}."
-  [schema-atom staging-dir out-dir ordered-defs]
+  [schema-atom staging-dir out-dir ordered-defs & {:keys [package]}]
   (ensure-on-classpath! staging-dir)
   (let [process-fn (fdm/structure-definition->schema schema-atom)
         process-results (atom {:ok 0 :fail 0 :failures []})
@@ -410,23 +460,25 @@
 
     ;; Phase 1+2: process each definition, write staging, require
     (println "Phase 1+2: processing" (count ordered-defs) "definitions incrementally...")
-    (binding [fdm/*schema-atom* schema-atom]
+    (binding [fdm/*schema-atom* schema-atom
+              fdm/*current-package* package]
       (doseq [sd ordered-defs]
         (let [url (:url sd)
               version (:version sd)]
           (try
-            ;; Step 1: Process
-            (process-fn sd)
-            (let [kw (fdm/uri->kw2 url version)
-                  entry (get @schema-atom kw)]
-              ;; Step 2: Write staging
-              (write-single-schema! kw entry staging-dir true)
-              ;; Step 3: Require (makes sch var available for requiring-resolve)
-              (try
-                (require (fdm/kw->ns-sym kw) :reload)
-                (swap! staging-results update :ok inc)
-                (catch Exception _
-                  (swap! staging-results update :fail inc))))
+           (binding [fdm/*current-definition* url]
+             ;; Step 1: Process
+             (process-fn sd)
+             (let [kw (fdm/uri->kw2 url version)
+                   entry (get @schema-atom kw)]
+               ;; Step 2: Write staging
+               (write-single-schema! kw entry staging-dir true)
+               ;; Step 3: Require (makes sch var available for requiring-resolve)
+               (try
+                 (require (fdm/kw->ns-sym kw) :reload)
+                 (swap! staging-results update :ok inc)
+                 (catch Exception _
+                   (swap! staging-results update :fail inc)))))
             (swap! process-results update :ok inc)
             (catch Exception e
               (swap! process-results update :fail inc)
@@ -438,7 +490,8 @@
     ;; Phase 3: write final output
     ;; Only write schemas for definitions in this batch, not upstream ones.
     (println "Phase 3: writing final output to" (str/join "/" (if (vector? out-dir) out-dir [out-dir])) "...")
-    (let [this-batch-kws (into #{}
+    (binding [fdm/*current-package* package]
+     (let [this-batch-kws (into #{}
                                (keep (fn [sd]
                                        (try (fdm/uri->kw2 (:url sd) (:version sd))
                                             (catch Exception _ nil))))
@@ -464,7 +517,7 @@
 
       {:process @process-results
        :staging @staging-results
-       :output @output-results})))
+       :output @output-results}))))
 
 (defn validate!
   "Load all generated .cljc files from `dir` and report pass/fail counts.

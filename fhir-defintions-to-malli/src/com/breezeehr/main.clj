@@ -1,6 +1,7 @@
 (ns com.breezeehr.main
   (:require [com.breezeehr.download-fhir :as download-fhir]
             [com.breezeehr.fhir-schema-gen :as gen]
+            [com.breezeehr.fhir-defintions-to-malli :as fdm]
             [com.breezeehr.capability-statement :as cs]
             [charred.api :as charred]
             [clojure.java.io :as io]
@@ -157,6 +158,23 @@
    0
    sources))
 
+(defn- report-unresolved-profiles!
+  "Print the profile canonicals no package in the run defines. Each one is a
+   slice whose narrowing was dropped: it keeps its :url discriminator but falls
+   back to the element's own type. Runs planned with :skip-missing can legitimately
+   leave some of these, so this reports rather than throws."
+  [unresolved]
+  (if (empty? unresolved)
+    (println "\nEvery profile canonical resolved to a generated schema.")
+    (let [by-profile (group-by :profile unresolved)]
+      (println "\nWARNING:" (count unresolved) "slice(s) reference"
+               (count by-profile) "profile canonical(s) no package in this run defines."
+               "Their narrowing is dropped; the slice keeps its :url and falls back to the element type.")
+      (doseq [[profile occurrences] (sort-by key by-profile)]
+        (println "  " (count occurrences) "x" profile)
+        (println "       degraded to" (:degraded-to (first occurrences)))
+        (println "       referenced by" (str/join ", " (sort (distinct (map :from occurrences)))))))))
+
 (defn -main [& [version out-dir]]
   (let [lower-version (if version (.toLowerCase ^String version) "r4b")
         prefix (case lower-version
@@ -169,21 +187,45 @@
     (println "Downloading FHIR definitions for version:" lower-version)
     (download-fhir/download lower-version)
     (println "Download complete. Generating schemas...")
-    (let [plan (gen/plan (version-sources prefix) #{nil})
-          sa (atom {})
-          result (gen/generate! sa staging-dir out-dir plan)]
+    (let [plan  (gen/plan (version-sources prefix) #{nil})
+          desc  {:id (str "hl7.fhir." lower-version ".core") :version "4.3.0" :dependencies {}}
+          index (gen/canonical-index [(assoc desc :plan plan)])
+          sa    (atom {})
+          unresolved (atom [])
+          result (binding [fdm/*canonical-index*     index
+                           fdm/*known-canonical-kws* (gen/index-kws index)
+                           fdm/*unresolved-profiles* unresolved]
+                   (gen/generate! sa staging-dir out-dir plan :package desc))]
+      (report-unresolved-profiles! @unresolved)
       (println "Generation complete:" result)
-      result)))
+      (assoc result :unresolved-profiles @unresolved))))
 
 (defn generate-uscore!
   "Generate schemas for US Core STU8, including all intermediate dependencies.
 
    Processes in order:
      1. R4B base definitions
-     2. xver-r5.r4 cross-version extensions (R5 extensions backported to R4)
-     3. SDC IG (intermediate dependency for Questionnaire/QuestionnaireResponse)
-     4. US Core STU8 profiles
-     5. US Core CapabilityStatement :multi schemas
+     2. FHIR Extensions IG (common extensions; xver and SDC both profile these)
+     3. xver-r5.r4 cross-version extensions (R5 extensions backported to R4)
+     4. SDC IG (intermediate dependency for Questionnaire/QuestionnaireResponse)
+     5. US Core STU8 profiles
+     6. US Core CapabilityStatement :multi schemas
+     7. US Core SearchParameter resources
+     8. Da Vinci CRD extensions
+
+   FHIR Extensions is generated before xver because xver profiles 27 extensions
+   that only FHIR Extensions defines (alternate-reference, the artifact-* family)
+   while FHIR Extensions references nothing from xver -- its 680 definitions all
+   derive from R4B's Extension. The old order made those 27 forward references,
+   which is what the canonical index below exists to resolve correctly, but a
+   forward reference from a resource file also emits a `:require` on a package
+   the referencing package does not depend on. Ordering by the real dependency
+   makes those references backward and the emitted deps.edn honest.
+
+   Every plan is computed before anything is generated so that
+   `fdm/*canonical-index*` can resolve a profile canonical to the package that
+   really defines it -- and to the version that package publishes -- instead of
+   stamping the referencing package's version onto it.
 
    Each package only contains its own schemas. deps.edn files are written
    with local dependencies in the correct order.
@@ -200,129 +242,172 @@
                            profiles) onto the same generation state.
 
    The return map includes :urls — the set of all StructureDefinition URLs
-   processed across the pipeline — for use as the roots of a chained package."
+   processed across the pipeline — for use as the roots of a chained package,
+   and :canonical-index, the pre-scan the run resolved against."
   [& {:keys [base-dir staging-dir force-download? schema-atom]
       :or   {base-dir         [".." "fhir" "malli"]
              staging-dir      ["target" "staging" "src"]
              force-download?  false}}]
   (println "Clearing staging directory...")
   (delete-directory-recursive! (Paths/get (first staging-dir) (into-array String (rest staging-dir))))
-  (let [sa          (or schema-atom (atom {}))
-        r4b-sources (version-sources "scratch/definitions.json/")
-        r4b-pkg     (conj base-dir "r4b")
-        xver-pkg    (conj base-dir "xver")
-        fhirext-pkg (conj base-dir "fhir-extensions")
-        sdc-pkg     (conj base-dir "sdc")
-        uscore-pkg  (conj base-dir "uscore8")
 
-        ;; --- 1. R4B base ---
-        _           (println "=== Step 1: R4B base definitions ===")
-        _           (download-fhir/download "R4B" :force? force-download?)
-        r4b-plan    (gen/plan r4b-sources #{nil})
-        r4b-result  (gen/generate! sa staging-dir (conj r4b-pkg "src") r4b-plan)
-        _           (write-deps-edn! r4b-pkg [] :extra-paths ["resources"])
-        r4b-urls    (into #{nil} (map :url) r4b-plan)
-        _           (println "  Copying R4B SearchParameters...")
-        r4b-sp      (copy-search-parameters!
-                     [{:type :bundle :path "scratch/definitions.json/search-parameters.json"}]
-                     r4b-pkg)
-        _           (println "  Copied" r4b-sp "R4B SearchParameter resources")
+  ;; --- Downloads, then every plan, before any generation ---
+  (println "=== Downloading packages ===")
+  (download-fhir/download "R4B" :force? force-download?)
+  (download-fhir/download-and-extract-fhir-extensions! "5.3.0-ballot-tc1" :force? force-download?)
+  (download-fhir/download-and-extract-xver! "0.1.0" :force? force-download?)
+  (download-fhir/download-and-extract-sdc! "STU4" :force? force-download?)
+  (download-fhir/download-and-extract-uscore! "STU8.0.1" :force? force-download?)
+  (download-fhir/download-and-extract-davinci-crd! "2.0.1" :force? force-download?)
 
-        ;; --- 2. xver-r5.r4 cross-version extensions ---
-        _           (println "\n=== Step 2: xver-r5.r4 cross-version extensions ===")
-        _           (download-fhir/download-and-extract-xver! "0.1.0" :force? force-download?)
-        xver-plan   (gen/plan [{:type :directory :path "scratch/xver/0.1.0/package"}] r4b-urls
-                              :skip-missing true)
-        xver-result (gen/generate! sa staging-dir (conj xver-pkg "src") xver-plan)
-        _           (write-deps-edn! xver-pkg [{:name "r4b" :relative-path "../r4b"}])
-        xver-urls   (into r4b-urls (map :url) xver-plan)
-        ;; xver has no SearchParameter resources
+  (println "\n=== Planning all packages ===")
+  (let [;; R4B ships as a bundle directory and SDC as a published `site` tree, so
+        ;; neither carries a package.json; their identities are declared here. The
+        ;; rest read their own manifest, which is also where the declared
+        ;; dependency versions come from -- and those are what a `|version` pin on
+        ;; a canonical is stated in.
+        ;;
+        ;; The pipeline deliberately substitutes versions: xver declares
+        ;; hl7.fhir.uv.extensions.r4 5.2.0 and gets 5.3.0-ballot-tc1, US Core
+        ;; declares hl7.fhir.uv.sdc 3.0.0 and gets STU4, Da Vinci declares US Core
+        ;; 3.1.1 and gets 8.0.1. Those pins can never match a resource version in
+        ;; what we build, so resolution has to go through the declared dependency
+        ;; to find which package was meant.
+        r4b-desc     {:id "hl7.fhir.r4b.core" :version "4.3.0" :dependencies {}}
+        sdc-desc     {:id "hl7.fhir.uv.sdc" :version "4.0.0" :dependencies {}}
+        fhirext-desc (gen/read-package-descriptor "scratch/fhir-extensions/5.3.0-ballot-tc1/package")
+        xver-desc    (gen/read-package-descriptor "scratch/xver/0.1.0/package")
+        uscore-desc  (gen/read-package-descriptor "scratch/us-core/STU8.0.1/package")
+        davinci-desc (gen/read-package-descriptor "scratch/davinci-crd/2.0.1/package")
+        r4b-plan     (gen/plan (version-sources "scratch/definitions.json/") #{nil})
+        r4b-urls     (into #{nil} (map :url) r4b-plan)
+        fhirext-plan (gen/plan [{:type :directory :path "scratch/fhir-extensions/5.3.0-ballot-tc1/package"}]
+                               r4b-urls :skip-missing true)
+        fhirext-urls (into r4b-urls (map :url) fhirext-plan)
+        xver-plan    (gen/plan [{:type :directory :path "scratch/xver/0.1.0/package"}]
+                               fhirext-urls :skip-missing true)
+        xver-urls    (into fhirext-urls (map :url) xver-plan)
+        sdc-plan     (gen/plan [{:type :directory :path "scratch/sdc/STU4/site"}]
+                               xver-urls :skip-missing true)
+        sdc-urls     (into xver-urls (map :url) sdc-plan)
+        uscore-plan  (gen/plan [{:type :directory :path "scratch/us-core/STU8.0.1/package"}] sdc-urls)
+        uscore-urls  (into sdc-urls (map :url) uscore-plan)
+        davinci-plan (filterv #(= "Extension" (:type %))
+                              (gen/plan [{:type :directory :path "scratch/davinci-crd/2.0.1/package"}]
+                                        uscore-urls :skip-missing true))
+        ;; Pipeline order; a canonical defined by two packages keeps both, and the
+        ;; reference decides which is meant.
+        index        (gen/canonical-index
+                      [(assoc r4b-desc     :plan r4b-plan)
+                       (assoc fhirext-desc :plan fhirext-plan)
+                       (assoc xver-desc    :plan xver-plan)
+                       (assoc sdc-desc     :plan sdc-plan)
+                       (assoc uscore-desc  :plan uscore-plan)
+                       (assoc davinci-desc :plan davinci-plan)])
+        unresolved   (atom [])]
+    (println "  planned" (+ (count r4b-plan) (count fhirext-plan) (count xver-plan)
+                            (count sdc-plan) (count uscore-plan) (count davinci-plan))
+             "definitions;" (count index) "distinct canonicals indexed")
 
-        ;; --- 3. FHIR Extensions IG (common extensions needed by SDC) ---
-        _              (println "\n=== Step 3: FHIR Extensions IG ===")
-        _              (download-fhir/download-and-extract-fhir-extensions! "5.3.0-ballot-tc1" :force? force-download?)
-        fhirext-plan   (gen/plan [{:type :directory :path "scratch/fhir-extensions/5.3.0-ballot-tc1/package"}]
-                                 xver-urls :skip-missing true)
-        fhirext-result (gen/generate! sa staging-dir (conj fhirext-pkg "src") fhirext-plan)
-        _              (write-deps-edn! fhirext-pkg [{:name "r4b" :relative-path "../r4b"}
-                                                      {:name "xver" :relative-path "../xver"}]
-                                                     :extra-paths ["resources"])
-        fhirext-urls   (into xver-urls (map :url) fhirext-plan)
-        _              (println "  Copying FHIR Extensions SearchParameters...")
-        fhirext-sp     (copy-search-parameters!
-                        [{:type :directory :path "scratch/fhir-extensions/5.3.0-ballot-tc1/package"}]
-                        fhirext-pkg)
-        _              (println "  Copied" fhirext-sp "FHIR Extensions SearchParameter resources")
+    (binding [fdm/*canonical-index*    index
+              fdm/*known-canonical-kws* (gen/index-kws index)
+              fdm/*unresolved-profiles* unresolved]
+      (let [sa          (or schema-atom (atom {}))
+            r4b-pkg     (conj base-dir "r4b")
+            fhirext-pkg (conj base-dir "fhir-extensions")
+            xver-pkg    (conj base-dir "xver")
+            sdc-pkg     (conj base-dir "sdc")
+            uscore-pkg  (conj base-dir "uscore8")
+            davinci-pkg (conj base-dir "davinci")
 
-        ;; --- 4. SDC IG ---
-        _           (println "\n=== Step 4: SDC IG (intermediate dependency) ===")
-        _           (download-fhir/download-and-extract-sdc! "STU4" :force? force-download?)
-        sdc-plan    (gen/plan [{:type :directory :path "scratch/sdc/STU4/site"}] fhirext-urls
-                              :skip-missing true)
-        sdc-result  (gen/generate! sa staging-dir (conj sdc-pkg "src") sdc-plan)
-        _           (write-deps-edn! sdc-pkg [{:name "r4b" :relative-path "../r4b"}
-                                               {:name "xver" :relative-path "../xver"}
-                                               {:name "fhir-extensions" :relative-path "../fhir-extensions"}]
-                                              :extra-paths ["resources"])
-        sdc-urls    (into fhirext-urls (map :url) sdc-plan)
-        _           (println "  Copying SDC SearchParameters...")
-        sdc-sp      (copy-search-parameters!
-                     [{:type :directory :path "scratch/sdc/STU4/site"}]
-                     sdc-pkg)
-        _           (println "  Copied" sdc-sp "SDC SearchParameter resources")
+            ;; --- 1. R4B base ---
+            _           (println "\n=== Step 1: R4B base definitions ===")
+            r4b-result  (gen/generate! sa staging-dir (conj r4b-pkg "src") r4b-plan :package r4b-desc)
+            _           (write-deps-edn! r4b-pkg [] :extra-paths ["resources"])
+            _           (println "  Copying R4B SearchParameters...")
+            r4b-sp      (copy-search-parameters!
+                         [{:type :bundle :path "scratch/definitions.json/search-parameters.json"}]
+                         r4b-pkg)
+            _           (println "  Copied" r4b-sp "R4B SearchParameter resources")
 
-        ;; --- 5. US Core STU8 ---
-        _           (println "\n=== Step 5: US Core STU8 profiles ===")
-        _           (download-fhir/download-and-extract-uscore! "STU8.0.1" :force? force-download?)
-        uscore-plan (gen/plan [{:type :directory :path "scratch/us-core/STU8.0.1/package"}] sdc-urls)
-        uscore-result (gen/generate! sa staging-dir (conj uscore-pkg "src") uscore-plan)
-        _           (write-deps-edn! uscore-pkg [{:name "r4b" :relative-path "../r4b"}
-                                                  {:name "xver" :relative-path "../xver"}
+            ;; --- 2. FHIR Extensions IG (common extensions needed by xver and SDC) ---
+            _              (println "\n=== Step 2: FHIR Extensions IG ===")
+            fhirext-result (gen/generate! sa staging-dir (conj fhirext-pkg "src") fhirext-plan :package fhirext-desc)
+            _              (write-deps-edn! fhirext-pkg [{:name "r4b" :relative-path "../r4b"}]
+                                            :extra-paths ["resources"])
+            _              (println "  Copying FHIR Extensions SearchParameters...")
+            fhirext-sp     (copy-search-parameters!
+                            [{:type :directory :path "scratch/fhir-extensions/5.3.0-ballot-tc1/package"}]
+                            fhirext-pkg)
+            _              (println "  Copied" fhirext-sp "FHIR Extensions SearchParameter resources")
+
+            ;; --- 3. xver-r5.r4 cross-version extensions ---
+            _           (println "\n=== Step 3: xver-r5.r4 cross-version extensions ===")
+            xver-result (gen/generate! sa staging-dir (conj xver-pkg "src") xver-plan :package xver-desc)
+            _           (write-deps-edn! xver-pkg [{:name "r4b" :relative-path "../r4b"}
+                                                   {:name "fhir-extensions" :relative-path "../fhir-extensions"}])
+            ;; xver has no SearchParameter resources
+
+            ;; --- 4. SDC IG ---
+            _           (println "\n=== Step 4: SDC IG (intermediate dependency) ===")
+            sdc-result  (gen/generate! sa staging-dir (conj sdc-pkg "src") sdc-plan :package sdc-desc)
+            _           (write-deps-edn! sdc-pkg [{:name "r4b" :relative-path "../r4b"}
                                                   {:name "fhir-extensions" :relative-path "../fhir-extensions"}
-                                                  {:name "sdc" :relative-path "../sdc"}]
-                                                 :extra-paths ["resources"])
+                                                  {:name "xver" :relative-path "../xver"}]
+                                         :extra-paths ["resources"])
+            _           (println "  Copying SDC SearchParameters...")
+            sdc-sp      (copy-search-parameters!
+                         [{:type :directory :path "scratch/sdc/STU4/site"}]
+                         sdc-pkg)
+            _           (println "  Copied" sdc-sp "SDC SearchParameter resources")
 
-        ;; --- 6. CapabilityStatement ---
-        _           (println "\n=== Step 6: US Core CapabilityStatement ===")
-        r4b-sp-dir  (io/file (str (str/join "/" r4b-pkg) "/resources/org/hl7/fhir/SearchParameter"))
-        cap-result  (cs/generate-from-capability-statement!
-                      (io/file "scratch/us-core/STU8.0.1/package/CapabilityStatement-us-core-server.json")
-                      "us-core" "8.0.1" "8.0.1" "4.3.0"
-                      (conj uscore-pkg "src")
-                      :schema-atom sa
-                      :search-param-dir r4b-sp-dir)
+            ;; --- 5. US Core STU8 ---
+            _           (println "\n=== Step 5: US Core STU8 profiles ===")
+            uscore-result (gen/generate! sa staging-dir (conj uscore-pkg "src") uscore-plan :package uscore-desc)
+            _           (write-deps-edn! uscore-pkg [{:name "r4b" :relative-path "../r4b"}
+                                                     {:name "fhir-extensions" :relative-path "../fhir-extensions"}
+                                                     {:name "xver" :relative-path "../xver"}
+                                                     {:name "sdc" :relative-path "../sdc"}]
+                                         :extra-paths ["resources"])
 
-        ;; --- 7. US Core SearchParameter resources ---
-        _           (println "\n=== Step 7: Copy SearchParameter resources ===")
-        uscore-sp   (copy-search-parameters!
-                     [{:type :directory :path "scratch/us-core/STU8.0.1/package"}]
-                     uscore-pkg)
-        _           (println "  Copied" uscore-sp "US Core SearchParameter resources")
-        uscore-urls (into sdc-urls (map :url) uscore-plan)
+            ;; --- 6. CapabilityStatement ---
+            _           (println "\n=== Step 6: US Core CapabilityStatement ===")
+            r4b-sp-dir  (io/file (str (str/join "/" r4b-pkg) "/resources/org/hl7/fhir/SearchParameter"))
+            cap-result  (cs/generate-from-capability-statement!
+                          (io/file "scratch/us-core/STU8.0.1/package/CapabilityStatement-us-core-server.json")
+                          "us-core" "8.0.1" "8.0.1" "4.3.0"
+                          (conj uscore-pkg "src")
+                          :schema-atom sa
+                          :search-param-dir r4b-sp-dir)
 
-        ;; --- 8. Da Vinci CRD extensions ---
-        ;; The decant carries the CRD ext-coverage-information extension self-describing
-        ;; (fhir-datomic-decant ig-extensions). Only the Extension StructureDefinitions are
-        ;; generated; the CRD profiles are out of scope for the decant read surface. The
-        ;; extension refs resolve against the r4b/us-core chain already generated above.
-        _           (println "\n=== Step 8: Da Vinci CRD extensions ===")
-        davinci-pkg (conj base-dir "davinci")
-        _           (download-fhir/download-and-extract-davinci-crd! "2.0.1" :force? force-download?)
-        davinci-plan-all (gen/plan [{:type :directory :path "scratch/davinci-crd/2.0.1/package"}]
-                                   uscore-urls :skip-missing true)
-        davinci-plan (filterv #(= "Extension" (:type %)) davinci-plan-all)
-        davinci-result (gen/generate! sa staging-dir (conj davinci-pkg "src") davinci-plan)
-        _           (write-deps-edn! davinci-pkg [{:name "r4b" :relative-path "../r4b"}
-                                                  {:name "xver" :relative-path "../xver"}
-                                                  {:name "fhir-extensions" :relative-path "../fhir-extensions"}
-                                                  {:name "sdc" :relative-path "../sdc"}
-                                                  {:name "uscore8" :relative-path "../uscore8"}])]
-    {:r4b            r4b-result
-     :xver           xver-result
-     :fhir-extensions fhirext-result
-     :sdc            sdc-result
-     :uscore         uscore-result
-     :davinci        davinci-result
-     :capability     cap-result
-     :search-params  {:r4b r4b-sp :fhir-extensions fhirext-sp :sdc sdc-sp :uscore uscore-sp}
-     :urls           (into uscore-urls (map :url) davinci-plan)}))
+            ;; --- 7. US Core SearchParameter resources ---
+            _           (println "\n=== Step 7: Copy SearchParameter resources ===")
+            uscore-sp   (copy-search-parameters!
+                         [{:type :directory :path "scratch/us-core/STU8.0.1/package"}]
+                         uscore-pkg)
+            _           (println "  Copied" uscore-sp "US Core SearchParameter resources")
+
+            ;; --- 8. Da Vinci CRD extensions ---
+            ;; The decant carries the CRD ext-coverage-information extension self-describing
+            ;; (fhir-datomic-decant ig-extensions). Only the Extension StructureDefinitions are
+            ;; generated; the CRD profiles are out of scope for the decant read surface. The
+            ;; extension refs resolve against the r4b/us-core chain already generated above.
+            _           (println "\n=== Step 8: Da Vinci CRD extensions ===")
+            davinci-result (gen/generate! sa staging-dir (conj davinci-pkg "src") davinci-plan :package davinci-desc)
+            _           (write-deps-edn! davinci-pkg [{:name "r4b" :relative-path "../r4b"}
+                                                      {:name "fhir-extensions" :relative-path "../fhir-extensions"}
+                                                      {:name "xver" :relative-path "../xver"}
+                                                      {:name "sdc" :relative-path "../sdc"}
+                                                      {:name "uscore8" :relative-path "../uscore8"}])]
+        (report-unresolved-profiles! @unresolved)
+        {:r4b            r4b-result
+         :xver           xver-result
+         :fhir-extensions fhirext-result
+         :sdc            sdc-result
+         :uscore         uscore-result
+         :davinci        davinci-result
+         :capability     cap-result
+         :search-params  {:r4b r4b-sp :fhir-extensions fhirext-sp :sdc sdc-sp :uscore uscore-sp}
+         :unresolved-profiles @unresolved
+         :canonical-index index
+         :urls           (into uscore-urls (map :url) davinci-plan)}))))
