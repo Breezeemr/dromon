@@ -170,6 +170,12 @@
 (def ^:dynamic *recursive-references* nil)
 (def ^:dynamic *base-refs* nil)
 
+(def ^:dynamic *element-order*
+  "Snapshot-derived XML child order for the StructureDefinition being compiled,
+   as {dotted-path -> [child-key ...]}. FHIR XML requires children in
+   StructureDefinition order; malli entry order does not preserve it."
+  nil)
+
 (defn kw->base-fn-name
   "Derive a base function name from a schema keyword.
    E.g. :org.hl7.fhir.StructureDefinition.Element/v4-3-0 → \"base-Element\""
@@ -805,12 +811,16 @@
       [`(~'-> ~base-sym (~'m/schema ~'options) ~'m/deref ~@f)])))
 
 (defn- splice-resource-type-form
-  "Splice a mu/update-properties call into a form vector to set :resourceType."
+  "Splice a mu/update-properties call into a form vector to set :resourceType,
+   and the snapshot element order when one is known for this path."
   [f rt]
-  (let [rt-form `(~'mu/update-properties
+  (let [order   (get *element-order* rt)
+        rt-form `(~'mu/update-properties
                   (~'fn [~'props]
                         (~'-> (~'or ~'props {:closed true})
-                              (~'assoc :resourceType ~rt))))]
+                              (~'assoc :resourceType ~rt)
+                              ~@(when (seq order)
+                                  [`(~'assoc :fhir/element-order ~order)]))))]
     (if (seq f)
       (let [[tf ty opts & tail] (first f)]
         (if (= tf '->)
@@ -1088,15 +1098,22 @@
         (update old-acc :form conj `(~'mu/update-entry-properties ~k ~'merge ~props))
         old-acc)
       (do (assert (<= (count new-sub-form) 1))
-          (let [element-kw (lookup-schema-kw "Element" version)]
+          (let [element-kw (lookup-schema-kw "Element" version)
+                value-form (first new-sub-form)
+                ;; A repeating primitive needs a positionally-parallel companion:
+                ;; _given[i] carries the id/extensions of given[i].
+                repeating? (and (vector? value-form) (= :sequential (first value-form)))
+                under-form (if repeating?
+                             [:sequential [:ref element-kw]]
+                             [:ref element-kw])]
             (swap! *references-atom* conj element-kw)
             (-> old-acc
-                (update :form conj `(~'mu/assoc ~k ~(first new-sub-form)))
+                (update :form conj `(~'mu/assoc ~k ~value-form))
                 (cond-> (and (not-empty props) (not fixed-enum?))
                   (update :form conj `(~'mu/update-entry-properties ~k ~'merge ~props)))
                 (cond-> primitive?
                   (update :form conj
-                          `(~'mu/assoc ~(underscore-attr k) [:ref ~element-kw])
+                          `(~'mu/assoc ~(underscore-attr k) ~under-form)
                           `(~'mu/optional-keys [~(underscore-attr k)])))
                 (update :shape shape/assoc-field k
                         (let [ref-kw (when (and (vector? new-sub-sch)
@@ -1595,6 +1612,31 @@
 ;; Structure definition properties
 ;; ---------------------------------------------------------------------------
 
+(defn- choice-variant-kw
+  "value[x] + type code -> :valueQuantity, matching element-definition->attribute."
+  [leaf code]
+  (keyword (str/replace leaf "[x]" (str (str/upper-case (subs code 0 1)) (subs code 1)))))
+
+(defn snapshot->element-order
+  "Map each complex path in an SD snapshot to its child element keys in document
+   order. Choice elements expand to one key per declared type; slices collapse
+   onto the base element name, because XML has no slice concept and every slice
+   of an element serializes under that element's name."
+  [snapshot-elements]
+  (reduce
+   (fn [acc {:keys [path type]}]
+     (let [segs (str/split path #"\.")]
+       (if (< (count segs) 2)
+         acc
+         (let [parent (str/join "." (butlast segs))
+               leaf   (last segs)
+               ks     (if (str/includes? leaf "[x]")
+                        (into [] (comp (keep :code) (map #(choice-variant-kw leaf %))) type)
+                        [(keyword leaf)])]
+           (update acc parent (fn [prev] (into (or prev []) (remove (set prev)) ks)))))))
+   {}
+   snapshot-elements))
+
 (defn- build-sd-properties
   "Build the properties map for a StructureDefinition. For a complex extension
    (type \"Extension\") the canonical :url and :fhir/value-key :complex are stamped so
@@ -1602,10 +1644,12 @@
    url->value-type registry (simple extensions get :fhir/value-key :valueX instead).
    Non-extension StructureDefinitions (profiles, resources) are unaffected."
   [{:keys [description title url] t :type} base-element]
-  (let [extension? (= t "Extension")]
+  (let [extension? (= t "Extension")
+        order      (get *element-order* t)]
     (-> {:closed true}
         (cond->
           t           (assoc :resourceType t)
+          (seq order) (assoc :fhir/element-order order)
           description (assoc :fhir.structure-definition/description description)
           title       (assoc :fhir.structure-definition/title title)
           (and extension? url) (assoc :url url)
@@ -1807,7 +1851,9 @@
              (binding [*references-atom* (atom #{})
                        *local-registry* local-registry
                        *recursive-references* recursive-references
-                       *base-refs* (atom {})]
+                       *base-refs* (atom {})
+                       *element-order* (snapshot->element-order
+                                        (get-in x [:snapshot :element]))]
                (if (and basekw (not is-simple?))
                  (do
                    (swap! *references-atom* conj basekw)
