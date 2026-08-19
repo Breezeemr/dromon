@@ -1622,13 +1622,18 @@
                                        ~'options))
                  ~'props (~'or (~'m/properties ~'multi) {})
                  ~'kids (~'vec (~'m/children ~'multi))
+                 ;; m/children of :multi are [dispatch-key props schema] triples;
+                 ;; the schema is the third element. Reading the second returned
+                 ;; the (usually nil) props, so the base arm silently fell back
+                 ;; to the bare [:map {:closed false}] vector, which carries no
+                 ;; registry and cannot host [:ref ...] constraints.
                  ~'base-arm (~'or (~'some (~'fn [~'c]
                                             (~'when (= ~dispatch-value (~'first ~'c))
-                                              (~'second ~'c)))
+                                              (~'nth ~'c 2)))
                                           ~'kids)
                                   (~'some (~'fn [~'c]
                                             (~'when (= :malli.core/default (~'first ~'c))
-                                              (~'second ~'c)))
+                                              (~'nth ~'c 2)))
                                           ~'kids)
                                   [:map {:closed false}])
                  ~'arm ~arm-form

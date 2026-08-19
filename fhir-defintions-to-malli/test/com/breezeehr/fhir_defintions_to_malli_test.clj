@@ -225,6 +225,25 @@
       (is (not (tree-contains? patch-form '(base-TA)))
           "no base fn is emitted for the restated alias"))))
 
+(deftest merge-slice-into-multi-base-arm-test
+  (testing "the matched arm's schema (not its props) seeds the slice thread"
+    (let [msim (ns-resolve 'com.breezeehr.fhir-defintions-to-malli
+                           'merge-slice-into-multi-form)
+          step (msim :f "dv" '(-> base-arm (mu/assoc :y :string)) false)
+          parent (m/schema [:map [:f [:multi {:dispatch :t}
+                                      ["dv" [:map [:x :string]]]
+                                      [:malli.core/default [:map [:d :string]]]]]]
+                           fp/fhir-registry-options)
+          f (binding [*ns* (the-ns 'com.breezeehr.fhir-defintions-to-malli)]
+              (eval (list 'fn '[options parent] (list '-> 'parent step))))
+          merged (f fp/fhir-registry-options parent)
+          arm (some (fn [[k _ s]] (when (= k "dv") s))
+                    (m/children (mu/get merged :f)))]
+      (is (some? (mu/get arm :x))
+          "the existing dv arm's fields survive (base-arm was its schema)")
+      (is (some? (mu/get arm :y))
+          "the slice constraint applied on top"))))
+
 (deftest canonical-version-test
   (testing "pinned canonical"
     (is (= "http://hl7.org/fhir/StructureDefinition/alternate-reference"
