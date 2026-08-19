@@ -565,11 +565,19 @@
     :else nil))
 
 (defn- resolve-ref-kw
-  "Resolve a ref keyword to its compiled malli schema via requiring-resolve."
+  "Resolve a ref keyword to its compiled malli schema via requiring-resolve.
+
+   A ref already names exactly one schema, so resolve that. Re-deriving it from
+   the type name discards that -- `lookup-kw` is a first-match over hash-map key
+   order, which returns an arbitrary entry among everything sharing the last
+   namespace segment and changes answer as the atom grows. It stays as a fallback
+   for a ref whose own version is not present, which is how the CDA driver's
+   cross-version aliases were being found."
   [ref-kw]
   (when (keyword? ref-kw)
-    (let [base (lookup-kw @*schema-atom* (kw->type-name ref-kw))]
-      (resolve-malli-sch (or base ref-kw)))))
+    (or (resolve-malli-sch ref-kw)
+        (when-let [base (lookup-kw @*schema-atom* (kw->type-name ref-kw))]
+          (resolve-malli-sch base)))))
 
 (defn- resolve-sch-through-refs
   "Resolve a schema through refs to get the underlying schema. Returns sch unchanged if not a ref."
