@@ -244,6 +244,37 @@
       (is (some? (mu/get arm :y))
           "the slice constraint applied on top"))))
 
+(deftest duplicate-slice-dispatch-dedupe-test
+  (testing "content-identical slices sharing a dispatch value emit one arm"
+    (let [flush-fn (ns-resolve 'com.breezeehr.fhir-defintions-to-malli
+                               'flush-pending-slicing)
+          base-sch (m/schema [:map [:code :string]] fp/fhir-registry-options)
+          acc {:form []
+               :pending-slicing
+               {:f {:discriminators [{:type "value" :path "code"}]
+                    :rules "open"
+                    :field-is-sequential? true
+                    :base-form nil
+                    :base-sch base-sch
+                    :slices [{:slice-name "s1" :dispatch-value "REFR"
+                              :form ['(mu/assoc :a :string)]}
+                             {:slice-name "s2" :dispatch-value "REFR"
+                              :form ['(mu/assoc :b :string)]}]}}}
+          step (first (:form (flush-fn acc)))
+          multi (-> step (nth 2) (nth 2) second)
+          arms (drop 2 multi)]
+      (is (= ["REFR" :malli.core/default] (mapv first arms))
+          "one arm per dispatch value plus the open default")
+      (is (tree-contains? (first arms) '(mu/assoc :b :string))
+          "the last slice wins the collided dispatch value")
+      (let [parent (m/schema [:map [:f [:sequential [:map [:code :string]]]]]
+                             fp/fhir-registry-options)
+            f (binding [*ns* (the-ns 'com.breezeehr.fhir-defintions-to-malli)]
+                (eval (list 'fn '[options parent] (list '-> 'parent step))))
+            compiled (f fp/fhir-registry-options parent)]
+        (is (= :multi (m/type (mu/get (mu/get compiled :f) 0)))
+            "the emitted :multi compiles (no :malli.core/duplicate-keys)")))))
+
 (deftest canonical-version-test
   (testing "pinned canonical"
     (is (= "http://hl7.org/fhir/StructureDefinition/alternate-reference"

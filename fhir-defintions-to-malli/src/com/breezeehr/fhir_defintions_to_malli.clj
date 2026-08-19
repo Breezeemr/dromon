@@ -922,6 +922,19 @@
                                 dv (finalize-dispatch-value dispatch-value slice-name)]
                             [dv constrained]))
                         slices)
+               ;; A source profile can carry pairwise-identical slices whose
+               ;; finalized dispatch values collide (RiskConcernAct declares
+               ;; the same REFR entryRelationship twice under two slice
+               ;; names); duplicate :multi keys fail schema compilation.
+               ;; Keep the last arm per dispatch value, at the position of
+               ;; its first occurrence.
+               entries (reduce (fn [out [dv _ :as entry]]
+                                 (let [idx (first (keep-indexed
+                                                   (fn [i [dv2 _]] (when (= dv dv2) i))
+                                                   out))]
+                                   (if idx (assoc out idx entry) (conj out entry))))
+                               []
+                               entries)
                default-entry (when (not= rules "closed")
                                [:malli.core/default base-element-form])
                all-entries (cond-> entries default-entry (conj default-entry))
