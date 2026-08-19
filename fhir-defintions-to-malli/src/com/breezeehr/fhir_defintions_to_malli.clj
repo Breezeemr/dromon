@@ -888,7 +888,15 @@
     ;; sub-element below that level, which is how nested slicing went missing.
     (nil? field-info)
     (let [t (some-> old-sch m/type)]
-      (when (#{:map :or :ref :lazy-ref} t) t))
+      (cond
+        (#{:map :or} t) t
+        ;; Only follow refs that name another generated schema. A
+        ;; contentReference ref carries a local-registry string ("#Foo.bar")
+        ;; that resolve-malli-sch cannot resolve, and descending into it emits
+        ;; mu/assoc against the ref itself.
+        (and (#{:ref :lazy-ref} t)
+             (keyword? (first (m/children old-sch))))
+        t))
 
     (shape/complex? field-info) :map
     (shape/ref? field-info) :ref
