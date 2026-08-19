@@ -211,6 +211,19 @@
    yet, so this is what tells the last-resort guard that the namespace is coming."
   #{})
 
+(def ^:dynamic *defer-unready-base*
+  "When true, a baseDefinition the canonical index says this run will generate,
+   but which is not resolvable yet, raises ::base-not-ready instead of being
+   patched against nil.
+
+   A nil base is not a partial failure -- the walk has no structure to descend
+   into, so the differential's elements are never visited and the definition is
+   emitted with almost nothing. It does not throw, so a driver that retries
+   failures never revisits it. Only enable this where reprocessing is safe:
+   the later attempt must be able to replace the earlier one everywhere it was
+   recorded, aliases included."
+  false)
+
 (def ^:dynamic *unresolved-profiles*
   "Optional atom collecting profile canonicals no package in the run defines, so
    the driver can report them instead of degrading them silently."
@@ -1985,12 +1998,12 @@
         :as x}]
     (let [kw (uri->kw2 url version)
           basekw (when baseDefinition
-                   (let [base-def (let [idx (.indexOf ^String baseDefinition "|")]
-                                    (if (pos? idx) (.substring ^String baseDefinition 0 idx) baseDefinition))
+                   (let [base-def (strip-canonical-version baseDefinition)
                          base-url ^URL (io/as-url base-def)
                          path (into [] (remove empty?) (str/split (.getPath base-url) #"\/"))
                          m-name (munge-ns (str/replace (last path) "." "-"))]
                      (or (first (filter #(= (kw->type-name %) m-name) (keys @schema-atom)))
+                         (resolve-canonical-kw baseDefinition)
                          (uri->kw2 base-def (or fhirVersion version)))))
           ;; Complex extensions should derive from Element (id + extension only)
           ;; instead of Extension (which carries all value[x] variants)
@@ -2008,7 +2021,18 @@
                                            (map #(into [] (str/split % #"\."))))
                                      element)
           local-registry (atom {})
-          is-simple? (simple-extension? x)]
+          is-simple? (simple-extension? x)
+          ;; Ask the index about the *canonical*, not about the keyword the scan
+          ;; happened to choose. Those differ whenever a driver registers aliases:
+          ;; the scan can return an alias keyword the index has never heard of,
+          ;; and testing that keyword would skip the check exactly where it is
+          ;; needed. The canonical is what says whether this run defines the base.
+          _ (when (and *defer-unready-base*
+                       basekw (not is-simple?)
+                       (contains? *canonical-index* (strip-canonical-version baseDefinition))
+                       (nil? (resolve-malli-sch basekw)))
+              (throw (ex-info (str "base schema not generated yet: " basekw)
+                              {:type ::base-not-ready :definition url :base basekw})))]
       (swap! schema-atom assoc kw
              (binding [*references-atom* (atom #{})
                        *local-registry* local-registry
