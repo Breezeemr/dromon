@@ -965,9 +965,14 @@
    Existing fields (mu/update): emit mu/update-properties to set :max if needed."
   [acc new-acc max-val]
   (if (new-field? acc)
-    (assoc new-acc :form (if max-val
-                           [`[:sequential {:max ~max-val} ~@(:form new-acc)]]
-                           [`[:sequential ~@(:form new-acc)]]))
+    ;; Nothing was computed for the element, so there is no child to wrap.
+    ;; A bare [:sequential] is not a valid schema; leaving the form empty lets
+    ;; create-new-child-schema skip the field instead of emitting one.
+    (if (empty? (:form new-acc))
+      new-acc
+      (assoc new-acc :form (if max-val
+                             [`[:sequential {:max ~max-val} ~@(:form new-acc)]]
+                             [`[:sequential ~@(:form new-acc)]])))
     (if max-val
       (assoc new-acc :form (conj (vec (:form new-acc))
                                  `(~'mu/update-properties ~'merge {:max ~max-val})))
@@ -1239,6 +1244,19 @@
                        (or (first (filter #(= (kw->type-name %) profile-name)
                                           (keys @*schema-atom*)))
                            (uri->kw2 profile version))))
+        ;; The uri->kw2 fallback above stamps the *referencing* package's version
+        ;; onto the target, which is only right when the target ships in the same
+        ;; package. Across packages it names a namespace that will never exist —
+        ;; xver is generated before fhir-extensions, so alternate-reference comes
+        ;; out as v0-1-0 while the real one is v5-3-0-ballot-tc1, and the emitted
+        ;; ref makes the file fail to load. Point at the element's own type
+        ;; instead, so the slice stays a well-formed ref to something that exists.
+        profile-kw (when profile-kw
+                     (if (or (contains? @*schema-atom* profile-kw)
+                             (some? (resolve-malli-sch profile-kw)))
+                       profile-kw
+                       (when-let [code (:code attr-type)]
+                         (lookup-schema-kw code version))))
         ;; For profile-based extension slices (no value[x] in sub-elements),
         ;; check the resolved schema for :fhir/primitive-extension to derive value-key.
         profile-value-key (when (and is-extension? profile-kw (not value-key-kw))
