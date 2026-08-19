@@ -188,13 +188,14 @@
     (download-fhir/download lower-version)
     (println "Download complete. Generating schemas...")
     (let [plan  (gen/plan (version-sources prefix) #{nil})
-          index (gen/canonical-index [plan])
+          desc  {:id (str "hl7.fhir." lower-version ".core") :version "4.3.0" :dependencies {}}
+          index (gen/canonical-index [(assoc desc :plan plan)])
           sa    (atom {})
           unresolved (atom [])
           result (binding [fdm/*canonical-index*     index
                            fdm/*known-canonical-kws* (gen/index-kws index)
                            fdm/*unresolved-profiles* unresolved]
-                   (gen/generate! sa staging-dir out-dir plan))]
+                   (gen/generate! sa staging-dir out-dir plan :package desc))]
       (report-unresolved-profiles! @unresolved)
       (println "Generation complete:" result)
       (assoc result :unresolved-profiles @unresolved))))
@@ -260,7 +261,25 @@
   (download-fhir/download-and-extract-davinci-crd! "2.0.1" :force? force-download?)
 
   (println "\n=== Planning all packages ===")
-  (let [r4b-plan     (gen/plan (version-sources "scratch/definitions.json/") #{nil})
+  (let [;; R4B ships as a bundle directory and SDC as a published `site` tree, so
+        ;; neither carries a package.json; their identities are declared here. The
+        ;; rest read their own manifest, which is also where the declared
+        ;; dependency versions come from -- and those are what a `|version` pin on
+        ;; a canonical is stated in.
+        ;;
+        ;; The pipeline deliberately substitutes versions: xver declares
+        ;; hl7.fhir.uv.extensions.r4 5.2.0 and gets 5.3.0-ballot-tc1, US Core
+        ;; declares hl7.fhir.uv.sdc 3.0.0 and gets STU4, Da Vinci declares US Core
+        ;; 3.1.1 and gets 8.0.1. Those pins can never match a resource version in
+        ;; what we build, so resolution has to go through the declared dependency
+        ;; to find which package was meant.
+        r4b-desc     {:id "hl7.fhir.r4b.core" :version "4.3.0" :dependencies {}}
+        sdc-desc     {:id "hl7.fhir.uv.sdc" :version "4.0.0" :dependencies {}}
+        fhirext-desc (gen/read-package-descriptor "scratch/fhir-extensions/5.3.0-ballot-tc1/package")
+        xver-desc    (gen/read-package-descriptor "scratch/xver/0.1.0/package")
+        uscore-desc  (gen/read-package-descriptor "scratch/us-core/STU8.0.1/package")
+        davinci-desc (gen/read-package-descriptor "scratch/davinci-crd/2.0.1/package")
+        r4b-plan     (gen/plan (version-sources "scratch/definitions.json/") #{nil})
         r4b-urls     (into #{nil} (map :url) r4b-plan)
         fhirext-plan (gen/plan [{:type :directory :path "scratch/fhir-extensions/5.3.0-ballot-tc1/package"}]
                                r4b-urls :skip-missing true)
@@ -276,9 +295,15 @@
         davinci-plan (filterv #(= "Extension" (:type %))
                               (gen/plan [{:type :directory :path "scratch/davinci-crd/2.0.1/package"}]
                                         uscore-urls :skip-missing true))
-        ;; Pipeline order, so a canonical defined by two packages prefers the earlier.
-        index        (gen/canonical-index [r4b-plan fhirext-plan xver-plan
-                                           sdc-plan uscore-plan davinci-plan])
+        ;; Pipeline order; a canonical defined by two packages keeps both, and the
+        ;; reference decides which is meant.
+        index        (gen/canonical-index
+                      [(assoc r4b-desc     :plan r4b-plan)
+                       (assoc fhirext-desc :plan fhirext-plan)
+                       (assoc xver-desc    :plan xver-plan)
+                       (assoc sdc-desc     :plan sdc-plan)
+                       (assoc uscore-desc  :plan uscore-plan)
+                       (assoc davinci-desc :plan davinci-plan)])
         unresolved   (atom [])]
     (println "  planned" (+ (count r4b-plan) (count fhirext-plan) (count xver-plan)
                             (count sdc-plan) (count uscore-plan) (count davinci-plan))
@@ -297,7 +322,7 @@
 
             ;; --- 1. R4B base ---
             _           (println "\n=== Step 1: R4B base definitions ===")
-            r4b-result  (gen/generate! sa staging-dir (conj r4b-pkg "src") r4b-plan)
+            r4b-result  (gen/generate! sa staging-dir (conj r4b-pkg "src") r4b-plan :package r4b-desc)
             _           (write-deps-edn! r4b-pkg [] :extra-paths ["resources"])
             _           (println "  Copying R4B SearchParameters...")
             r4b-sp      (copy-search-parameters!
@@ -307,7 +332,7 @@
 
             ;; --- 2. FHIR Extensions IG (common extensions needed by xver and SDC) ---
             _              (println "\n=== Step 2: FHIR Extensions IG ===")
-            fhirext-result (gen/generate! sa staging-dir (conj fhirext-pkg "src") fhirext-plan)
+            fhirext-result (gen/generate! sa staging-dir (conj fhirext-pkg "src") fhirext-plan :package fhirext-desc)
             _              (write-deps-edn! fhirext-pkg [{:name "r4b" :relative-path "../r4b"}]
                                             :extra-paths ["resources"])
             _              (println "  Copying FHIR Extensions SearchParameters...")
@@ -318,14 +343,14 @@
 
             ;; --- 3. xver-r5.r4 cross-version extensions ---
             _           (println "\n=== Step 3: xver-r5.r4 cross-version extensions ===")
-            xver-result (gen/generate! sa staging-dir (conj xver-pkg "src") xver-plan)
+            xver-result (gen/generate! sa staging-dir (conj xver-pkg "src") xver-plan :package xver-desc)
             _           (write-deps-edn! xver-pkg [{:name "r4b" :relative-path "../r4b"}
                                                    {:name "fhir-extensions" :relative-path "../fhir-extensions"}])
             ;; xver has no SearchParameter resources
 
             ;; --- 4. SDC IG ---
             _           (println "\n=== Step 4: SDC IG (intermediate dependency) ===")
-            sdc-result  (gen/generate! sa staging-dir (conj sdc-pkg "src") sdc-plan)
+            sdc-result  (gen/generate! sa staging-dir (conj sdc-pkg "src") sdc-plan :package sdc-desc)
             _           (write-deps-edn! sdc-pkg [{:name "r4b" :relative-path "../r4b"}
                                                   {:name "fhir-extensions" :relative-path "../fhir-extensions"}
                                                   {:name "xver" :relative-path "../xver"}]
@@ -338,7 +363,7 @@
 
             ;; --- 5. US Core STU8 ---
             _           (println "\n=== Step 5: US Core STU8 profiles ===")
-            uscore-result (gen/generate! sa staging-dir (conj uscore-pkg "src") uscore-plan)
+            uscore-result (gen/generate! sa staging-dir (conj uscore-pkg "src") uscore-plan :package uscore-desc)
             _           (write-deps-edn! uscore-pkg [{:name "r4b" :relative-path "../r4b"}
                                                      {:name "fhir-extensions" :relative-path "../fhir-extensions"}
                                                      {:name "xver" :relative-path "../xver"}
@@ -368,7 +393,7 @@
             ;; generated; the CRD profiles are out of scope for the decant read surface. The
             ;; extension refs resolve against the r4b/us-core chain already generated above.
             _           (println "\n=== Step 8: Da Vinci CRD extensions ===")
-            davinci-result (gen/generate! sa staging-dir (conj davinci-pkg "src") davinci-plan)
+            davinci-result (gen/generate! sa staging-dir (conj davinci-pkg "src") davinci-plan :package davinci-desc)
             _           (write-deps-edn! davinci-pkg [{:name "r4b" :relative-path "../r4b"}
                                                       {:name "fhir-extensions" :relative-path "../fhir-extensions"}
                                                       {:name "xver" :relative-path "../xver"}

@@ -190,16 +190,19 @@
   nil)
 
 (def ^:dynamic *canonical-index*
-  "Canonical StructureDefinition URL (without any `|version` pin) -> vector of
-   {:version :kw}, ordered by position in the generation pipeline.
-
-   Built by the driver from a pre-scan of every plan in the run, so a canonical
-   resolves to the package that actually defines it even when that package has
-   not been generated yet. Only definitions that will really be generated are in
-   the index, so an entry is a promise that the namespace gets written.
+  "Canonical StructureDefinition URL (no `|version` pin) -> ordered vector of
+   {:pkg-id :pkg-version :version :kw}, built by `gen/canonical-index` from a
+   pre-scan of every plan in the run.
 
    Nil when no driver supplies one; resolution then falls back to the by-name
    scan of the schema atom."
+  nil)
+
+(def ^:dynamic *current-package*
+  "The package whose definitions are being generated, as
+   {:id :version :dependencies}. FHIR resolves a canonical against the
+   *referencing* package's declared dependencies, so this is what makes a
+   `|version` pin interpretable."
   nil)
 
 (def ^:dynamic *known-canonical-kws*
@@ -217,33 +220,83 @@
   "URL of the StructureDefinition being processed, for diagnostics."
   nil)
 
+;; ---------------------------------------------------------------------------
+;; Canonical resolution
+;;
+;; FHIR does not define a normative algorithm for this; the one validators and
+;; servers converge on is: find the package holding the referencing resource,
+;; take its transitive dependency closure, collect every resource in that closure
+;; whose url matches, and pick one deterministically. HL7's own guidance is that
+;; leaving this to runtime "has proven too difficult for implementers" and that
+;; authors should pin instead -- which is what the index does, at plan time.
+;; ---------------------------------------------------------------------------
+
+(defn- version-segments
+  "Split a version string for comparison, inferring the scheme the way the FHIR
+   tooling does when a resource declares no versionAlgorithm (all R4 content):
+   numeric segments compare numerically, everything else lexically.
+
+   A pre-release suffix orders below the release it qualifies, so 5.3.0 beats
+   5.3.0-ballot-tc1, matching semver."
+  [^String v]
+  (let [[core pre] (str/split (or v "") #"-" 2)]
+    [(mapv (fn [seg] (if (re-matches #"\d+" seg) [0 (parse-long seg)] [1 seg]))
+           (str/split core #"[.]"))
+     ;; absent pre-release sorts after any present one
+     (if pre [0 pre] [1 ""])]))
+
+(defn compare-canonical-versions
+  "Order two resource versions, newest last. Used only to break a tie the
+   reference itself does not resolve, where R4B's guidance is to take the latest."
+  [a b]
+  (compare (version-segments a) (version-segments b)))
+
+(defn- pin-target-package
+  "Which package does a `|version` pin name, when no candidate publishes that
+   version outright?
+
+   The pin is a Resource.version, and for an HL7 IG that is normally the package
+   version, so the referencing package's declared dependency at that version
+   identifies the package meant. This run may have supplied a different version
+   of it than was declared -- xver declares hl7.fhir.uv.extensions.r4 5.2.0 while
+   the pipeline builds 5.3.0-ballot-tc1 -- and resolving to the substitute is the
+   whole point: no resource anywhere publishes 5.2.0, so an exact match can never
+   succeed."
+  [pin]
+  (when (and pin *current-package*)
+    (some (fn [[dep-id dep-version]] (when (= pin dep-version) dep-id))
+          (:dependencies *current-package*))))
+
 (defn resolve-canonical-kw
   "Resolve a canonical URL to the schema keyword of the StructureDefinition that
-   defines it, using *canonical-index*.
+   defines it.
 
-   A canonical may be defined by more than one package in a run (R4B core and the
-   FHIR Extensions IG share 393 of them). Preference order:
-     1. the definition whose version matches the `|version` pin, if any package
-        in the run publishes it -- an explicit pin is the source stating which
-        one it means, so it outranks the rest
-     2. otherwise a definition already generated, earliest package first, which
-        keeps the reference inside the packages the referencing one already
-        depends on
-     3. otherwise the earliest definition in the run, covering a forward
-        reference to a package not generated yet
+   In order:
+     1. a candidate publishing exactly the pinned version -- the reference says
+        which one it means and the run has it;
+     2. the candidate from the package that pin names, found through the
+        referencing package's declared dependencies, which covers a pin the run
+        cannot satisfy verbatim because it substituted a different version;
+     3. the newest candidate already generated, keeping the reference inside
+        packages the referencing one has actually seen;
+     4. the newest candidate in the run, covering a forward reference.
 
-   Note that a pin often names a version no package publishes: xver pins the
-   R5 canonical version (`|5.2.0`) while FHIR Extensions publishes the SD as
-   `5.3.0-ballot-tc1`. Those fall through to rule 2 or 3."
+   Steps 3 and 4 replace a first-match over hash-map key order, which returned an
+   arbitrary version and changed answer as the schema atom grew."
   [^String canonical]
   (when (and *canonical-index* *schema-atom*)
     (let [base    (strip-canonical-version canonical)
           pin     (canonical-version canonical)
           entries (get *canonical-index* base)]
       (when (seq entries)
-        (:kw (or (when pin (first (filter #(= pin (:version %)) entries)))
-                 (first (filter #(contains? @*schema-atom* (:kw %)) entries))
-                 (first entries)))))))
+        (let [newest    #(last (sort-by :version compare-canonical-versions %))
+              generated (filterv #(contains? @*schema-atom* (:kw %)) entries)
+              from-pkg  (when-let [pkg (pin-target-package pin)]
+                          (seq (filterv #(= pkg (:pkg-id %)) entries)))]
+          (:kw (or (when pin (first (filter #(= pin (:version %)) entries)))
+                   (when from-pkg (newest from-pkg))
+                   (when (seq generated) (newest generated))
+                   (newest entries))))))))
 
 (defn kw->base-fn-name
   "Derive a base function name from a schema keyword.
