@@ -186,6 +186,32 @@
   [sources roots & {:as opts}]
   (dependency-order (load-definitions sources) roots opts))
 
+(defn canonical-index
+  "Build the canonical URL -> [{:version :kw} ...] index that
+   `fdm/*canonical-index*` expects, from the plans of every package in a run.
+
+   `plans` must be given in pipeline order; entries for a canonical defined by
+   more than one package keep that order. Only planned definitions are indexed,
+   so an entry is a promise that the namespace will actually be written --
+   `dependency-order` has already dropped anything unreachable.
+
+   Building this before any package is generated is what lets a profile canonical
+   resolve to the package that defines it rather than to the referencing
+   package's version, which is only ever right within a single package."
+  [plans]
+  (reduce (fn [m sd]
+            (let [url (:url sd)]
+              (update m url (fnil conj [])
+                      {:version (:version sd)
+                       :kw      (fdm/uri->kw2 url (:version sd))})))
+          {}
+          (apply concat plans)))
+
+(defn index-kws
+  "Every schema keyword a canonical index promises, for `fdm/*known-canonical-kws*`."
+  [index]
+  (into #{} (comp (mapcat val) (map :kw)) index))
+
 ;; ---------------------------------------------------------------------------
 ;; File writing
 ;; ---------------------------------------------------------------------------
@@ -415,18 +441,19 @@
         (let [url (:url sd)
               version (:version sd)]
           (try
-            ;; Step 1: Process
-            (process-fn sd)
-            (let [kw (fdm/uri->kw2 url version)
-                  entry (get @schema-atom kw)]
-              ;; Step 2: Write staging
-              (write-single-schema! kw entry staging-dir true)
-              ;; Step 3: Require (makes sch var available for requiring-resolve)
-              (try
-                (require (fdm/kw->ns-sym kw) :reload)
-                (swap! staging-results update :ok inc)
-                (catch Exception _
-                  (swap! staging-results update :fail inc))))
+           (binding [fdm/*current-definition* url]
+             ;; Step 1: Process
+             (process-fn sd)
+             (let [kw (fdm/uri->kw2 url version)
+                   entry (get @schema-atom kw)]
+               ;; Step 2: Write staging
+               (write-single-schema! kw entry staging-dir true)
+               ;; Step 3: Require (makes sch var available for requiring-resolve)
+               (try
+                 (require (fdm/kw->ns-sym kw) :reload)
+                 (swap! staging-results update :ok inc)
+                 (catch Exception _
+                   (swap! staging-results update :fail inc)))))
             (swap! process-results update :ok inc)
             (catch Exception e
               (swap! process-results update :fail inc)

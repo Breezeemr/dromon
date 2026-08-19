@@ -76,3 +76,65 @@
              ["Observation" "entryRelationship"]
              "woundMeasurementObservation")]
       (is (= "http://hl7.org/cda/us/ccda/StructureDefinition/WoundMeasurementObservation" v)))))
+
+(deftest canonical-version-test
+  (testing "pinned canonical"
+    (is (= "http://hl7.org/fhir/StructureDefinition/alternate-reference"
+           (fdm/strip-canonical-version
+            "http://hl7.org/fhir/StructureDefinition/alternate-reference|5.2.0")))
+    (is (= "5.2.0"
+           (fdm/canonical-version
+            "http://hl7.org/fhir/StructureDefinition/alternate-reference|5.2.0"))))
+  (testing "unpinned canonical is returned whole"
+    (is (= "http://hl7.org/fhir/StructureDefinition/Patient"
+           (fdm/strip-canonical-version "http://hl7.org/fhir/StructureDefinition/Patient")))
+    (is (nil? (fdm/canonical-version "http://hl7.org/fhir/StructureDefinition/Patient")))))
+
+(deftest canonical-index-test
+  (let [r4b-plan [{:url "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden" :version "4.3.0"}
+                  {:url "http://hl7.org/fhir/StructureDefinition/Patient" :version "4.3.0"}]
+        fx-plan  [{:url "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden" :version "5.3.0-ballot-tc1"}
+                  {:url "http://hl7.org/fhir/StructureDefinition/alternate-reference" :version "5.3.0-ballot-tc1"}]
+        index    (gen/canonical-index [r4b-plan fx-plan])]
+    (testing "a canonical defined by two packages keeps pipeline order"
+      (is (= [{:version "4.3.0"
+               :kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0}
+              {:version "5.3.0-ballot-tc1"
+               :kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1}]
+             (get index "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden"))))
+    (testing "index-kws collects every promised keyword"
+      (is (= #{:org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0
+               :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1
+               :org.hl7.fhir.StructureDefinition.Patient/v4-3-0
+               :org.hl7.fhir.StructureDefinition.alternate-reference/v5-3-0-ballot-tc1}
+             (gen/index-kws index))))
+
+    (testing "resolution"
+      ;; Only the R4B half of the run has been generated so far.
+      (binding [fdm/*canonical-index* index
+                fdm/*schema-atom* (atom {:org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0 {}
+                                         :org.hl7.fhir.StructureDefinition.Patient/v4-3-0 {}})]
+        (testing "a pin picks the version that publishes it, not the earliest package"
+          (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden|5.3.0-ballot-tc1"))))
+        (testing "no pin prefers an already-generated definition"
+          (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden"))))
+        (testing "a forward reference resolves to the package that will define it"
+          (is (= :org.hl7.fhir.StructureDefinition.alternate-reference/v5-3-0-ballot-tc1
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/alternate-reference|5.2.0"))))
+        (testing "a pin no package publishes still resolves to a real definition"
+          (is (= :org.hl7.fhir.StructureDefinition.Patient/v4-3-0
+                 (fdm/resolve-canonical-kw
+                  "http://hl7.org/fhir/StructureDefinition/Patient|1.0.0"))))
+        (testing "a canonical no package defines does not resolve"
+          (is (nil? (fdm/resolve-canonical-kw
+                     "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-timeout")))))
+      (testing "without an index bound, resolution is inert"
+        (binding [fdm/*canonical-index* nil
+                  fdm/*schema-atom* (atom {})]
+          (is (nil? (fdm/resolve-canonical-kw
+                     "http://hl7.org/fhir/StructureDefinition/Patient"))))))))
