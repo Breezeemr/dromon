@@ -406,6 +406,12 @@
 (def ^:private xml-choice-group-url
   "http://hl7.org/fhir/tools/StructureDefinition/xml-choice-group")
 
+(def ^:private xml-name-url
+  "http://hl7.org/fhir/tools/StructureDefinition/xml-name")
+
+(def ^:private xml-namespace-url
+  "http://hl7.org/fhir/tools/StructureDefinition/xml-namespace")
+
 (defn representation-props
   "Map ElementDefinition.representation codes to malli entry properties.
 
@@ -415,15 +421,22 @@
     typeAttr — xsi:type (or equivalent) type discriminator
     xhtml    — xhtml content (Narrative)
 
-  Also detects the tools xml-choice-group extension (CDA AD.item / PN.item)."
+  Also detects the tools xml-choice-group extension (CDA AD.item / PN.item),
+  and the xml-name / xml-namespace overrides that decouple an element's key
+  from its wire name — CDA `Observation.sdtcCategory` writes as
+  `sdtc:category`, and nothing but these extensions says so."
   [{:keys [representation extension] :as _main-attr}]
   (let [reps (set (map name (or representation [])))
+        ext-value (fn [url k]
+                    (some (fn [x] (when (= url (:url x)) (get x k))) (or extension [])))
         choice? (some (fn [x]
                         (and (= xml-choice-group-url (:url x))
                              (true? (or (:valueBoolean x)
                                         (get-in x [:valueBoolean])
                                         (:value x)))))
-                      (or extension []))]
+                      (or extension []))
+        xml-name (ext-value xml-name-url :valueString)
+        xml-ns (ext-value xml-namespace-url :valueUri)]
     (cond-> {}
       (contains? reps "xmlAttr") (assoc :xml/attr true)
       (contains? reps "xmlText") (assoc :xml/text true)
@@ -431,7 +444,32 @@
       (contains? reps "xhtml") (assoc :xml/xhtml true)
       ;; Preserve raw codes for tooling that wants the FHIR set
       (seq reps) (assoc :fhir/representation (vec (sort reps)))
-      choice? (assoc :xml/choice-group true))))
+      choice? (assoc :xml/choice-group true)
+      xml-name (assoc :xml/name xml-name)
+      xml-ns (assoc :xml/namespace xml-ns))))
+
+(def ^:private wire-position-prop-keys
+  "Properties that say where a value sits on the wire, and whether it may be
+   absent — as opposed to what it is allowed to contain."
+  [:xml/attr :xml/text :xml/type-attr :xml/xhtml :xml/choice-group
+   :xml/name :xml/namespace :fhir/representation :optional])
+
+(defn- fixed-value-props
+  "Entry properties to keep once an element's value is pinned to a constant.
+
+  A fixed value fixes the CONTENT, not the wire position: `Section.classCode`
+  is still an attribute and `ST.mediaType` is still optional, and dropping that
+  leaves an XML serializer writing a fixed attribute as a child element. The
+  rest — binding, definition, short — is noise next to an `:enum` of one."
+  [props]
+  (not-empty (select-keys props wire-position-prop-keys)))
+
+(defn- entry-props-to-merge
+  "The properties an entry should carry, given whether its value is fixed."
+  [props fixed-enum?]
+  (if fixed-enum?
+    (fixed-value-props props)
+    (not-empty props)))
 
 (defn- requiring-resolve-registry
   "A malli registry that resolves schema keywords by requiring-resolve of
@@ -1623,8 +1661,8 @@
             acc1 (if (seq new-sub-form)
                    (update old-acc :form conj update-form-entry)
                    old-acc)
-            acc2 (if (and (seq props) (not (:fixed-enum? sub-acc)))
-                   (update acc1 :form conj `(~'mu/update-entry-properties ~k merge ~props))
+            acc2 (if-some [entry-props (entry-props-to-merge props (:fixed-enum? sub-acc))]
+                   (update acc1 :form conj `(~'mu/update-entry-properties ~k merge ~entry-props))
                    acc1)]
         acc2)
       (-> old-acc
@@ -1648,12 +1686,13 @@
                 repeating? (and (vector? value-form) (= :sequential (first value-form)))
                 under-form (if repeating?
                              [:sequential [:ref element-kw]]
-                             [:ref element-kw])]
+                             [:ref element-kw])
+                entry-props (entry-props-to-merge props fixed-enum?)]
             (swap! *references-atom* conj element-kw)
             (-> old-acc
                 (update :form conj `(~'mu/assoc ~k ~value-form))
-                (cond-> (and (not-empty props) (not fixed-enum?))
-                  (update :form conj `(~'mu/update-entry-properties ~k ~'merge ~props)))
+                (cond-> entry-props
+                  (update :form conj `(~'mu/update-entry-properties ~k ~'merge ~entry-props)))
                 (cond-> primitive?
                   (update :form conj
                           `(~'mu/assoc ~(underscore-attr k) ~under-form)
@@ -2216,9 +2255,14 @@
    the schema carries enough to fold/unfold the extension without an external
    url->value-type registry (simple extensions get :fhir/value-key :valueX instead).
    Non-extension StructureDefinitions (profiles, resources) are unaffected."
-  [{:keys [description title url] t :type} base-element]
+  [{:keys [description title url snapshot] t :type} base-element]
   (let [extension? (= t "Extension")
-        order      (get *element-order* t)]
+        ;; Resources and datatypes name their root path in :type, so the order
+        ;; table answers to it directly. Logical models do not: a CDA SD sets
+        ;; :type to the canonical URL while its snapshot paths are rooted at the
+        ;; id, and looking up the URL silently yields no order at all.
+        order      (or (get *element-order* t)
+                       (get *element-order* (-> snapshot :element first :path)))]
     (-> {:closed true}
         (cond->
           t           (assoc :resourceType t)

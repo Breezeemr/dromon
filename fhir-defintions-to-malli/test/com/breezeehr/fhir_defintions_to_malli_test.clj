@@ -607,3 +607,67 @@
                        :from "http://example.org/StructureDefinition/Referrer"
                        :degraded-to base-kw}]
                      @unresolved)))))))))
+
+;; ---------------------------------------------------------------------------
+;; XML wire facts the schemas have to carry
+;; ---------------------------------------------------------------------------
+
+(deftest representation-props-xml-name-test
+  (testing "xml-name and xml-namespace decouple the wire name from the key"
+    ;; CDA's sdtc extensions are the only thing that says Observation.sdtcCategory
+    ;; writes as sdtc:category; without these the element writes under its key.
+    (is (= {:xml/name "category"
+            :xml/namespace "urn:hl7-org:sdtc"}
+           (fdm/representation-props
+            {:extension [{:url "http://hl7.org/fhir/tools/StructureDefinition/xml-namespace"
+                          :valueUri "urn:hl7-org:sdtc"}
+                         {:url "http://hl7.org/fhir/tools/StructureDefinition/xml-name"
+                          :valueString "category"}]})))))
+
+(def ^:private build-sd-properties
+  (ns-resolve 'com.breezeehr.fhir-defintions-to-malli 'build-sd-properties))
+
+(deftest element-order-for-logical-models-test
+  (let [order [:realmCode :typeId :templateId :classCode]]
+    (testing "a resource names its root path in :type"
+      (binding [fdm/*element-order* {"Patient" order}]
+        (is (= order (:fhir/element-order
+                      (build-sd-properties
+                       {:type "Patient" :snapshot {:element [{:path "Patient"}]}}
+                       nil))))))
+
+    (testing "a logical model sets :type to the canonical URL, and the order table is keyed by the snapshot root"
+      ;; Looking the URL up finds nothing, which is how every CDA class shipped
+      ;; with no element order at all while FHIR XML requires one.
+      (binding [fdm/*element-order* {"Observation" order}]
+        (is (= order (:fhir/element-order
+                      (build-sd-properties
+                       {:type "http://hl7.org/cda/stds/core/StructureDefinition/Observation"
+                        :snapshot {:element [{:path "Observation"} {:path "Observation.realmCode"}]}}
+                       nil))))))
+
+    (testing "no snapshot is not an error"
+      (binding [fdm/*element-order* {"Observation" order}]
+        (is (nil? (:fhir/element-order
+                   (build-sd-properties {:type "http://example.org/X"} nil))))))))
+
+(deftest fixed-value-keeps-its-wire-position-test
+  (testing "a fixed attribute is still an attribute, and still optional"
+    ;; A fixed value pins the CONTENT. Dropping the entry properties with it
+    ;; left Section.classCode and ST.mediaType looking like required child
+    ;; elements.
+    (let [main-attr {:id "TP.classCode" :min 0 :max "1"
+                     :representation ["xmlAttr"] :fixedCode "DOCSECT"}
+          acc (binding [fdm/*schema-atom* (atom {})
+                        fdm/*references-atom* (atom #{})
+                        fdm/*recursive-references* #{}
+                        fdm/*base-refs* (atom {})]
+                (fdm/apply-element-patch
+                 {:sch (m/schema [:map {:closed true}] fp/fhir-registry-options) :shape {} :form []}
+                 "TP.classCode" :classCode {:code "code"} main-attr {} ["TP" "classCode"] "1.0"))]
+      (is (tree-contains? (:form acc) [:enum {} "DOCSECT"])
+          "the fixed value still pins the content")
+      (is (tree-contains? (:form acc) {:xml/attr true
+                                       :fhir/representation ["xmlAttr"]
+                                       :optional true})
+          "and the wire position survives with it"))))
