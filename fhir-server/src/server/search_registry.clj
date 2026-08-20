@@ -54,6 +54,12 @@
              (when inner
                (assoc inner :array? true)))
 
+           ;; Transparent nullability wrapper: a repeating primitive
+           ;; generates as [:sequential [:maybe prim]], so classify the
+           ;; child without consuming depth budget.
+           :maybe
+           (classify-schema (first (m/children field-schema)) depth)
+
            :ref
            (let [ref-key (first (m/children field-schema))]
              {:fhir-type (ref-type-name ref-key) :array? false})
