@@ -546,3 +546,64 @@
       (testing "a hook that declines is the same as no hook"
         (with-bindings {dispatch-var (constantly nil)}
           (is (nil? (compiled-multi pending :component parent))))))))
+
+;; ---------------------------------------------------------------------------
+;; type.profile on a non-slice child
+;; ---------------------------------------------------------------------------
+
+(deftest child-type-profile-narrowing-test
+  (let [pkg   {:id "test.pkg" :version "1.0.0" :dependencies {}}
+        index (gen/canonical-index
+               [{:id "test.pkg" :version "1.0.0" :dependencies {}
+                 :plan [{:url "http://example.org/StructureDefinition/Narrowed" :version "1.0.0"}]}])
+        narrowed-kw :org.example.StructureDefinition.Narrowed/v1-0-0
+        base-kw     :org.hl7.fhir.StructureDefinition.Patient/v4-3-0
+        ;; prim-or-ref is reached only for a declared type with no deeper
+        ;; constrained children -- exactly the population this narrows.
+        run   (fn [attr-type]
+                (let [refs (atom #{})]
+                  (binding [fdm/*references-atom* refs]
+                    [(:form (fdm/prim-or-ref {} attr-type "4.3.0")) @refs])))]
+    (binding [fdm/*canonical-index*   index
+              fdm/*current-package*   pkg
+              fdm/*known-canonical-kws* #{narrowed-kw}
+              fdm/*schema-atom*       (atom {base-kw {}})]
+
+      (testing "gated off, a resolvable profile changes nothing"
+        (is (= [[[:ref base-kw]] #{base-kw}]
+               (run {:code "Patient"
+                     :profile ["http://example.org/StructureDefinition/Narrowed"]}))))
+
+      (binding [fdm/*honor-child-type-profile* true]
+        (testing "one resolvable profile refs the profile, not the declared type"
+          (is (= [[[:ref narrowed-kw]] #{narrowed-kw}]
+                 (run {:code "Patient"
+                       :profile ["http://example.org/StructureDefinition/Narrowed"]})))
+          (is (= [[[:ref base-kw]] #{base-kw}]
+                 (run {:code "Patient"}))
+              "and no profile still refs the declared type"))
+
+        (testing "several profiles keep the base type -- type.profile is any-of"
+          (is (= [[[:ref base-kw]] #{base-kw}]
+                 (run {:code "Patient"
+                       :profile ["http://example.org/StructureDefinition/Narrowed"
+                                 "http://example.org/StructureDefinition/Other"]}))))
+
+        (testing "a primitive declared type is never narrowed"
+          ;; CDA puts value-domain profiles (cs-simple, bl-simple) on code and
+          ;; boolean children; narrowing there would rewrite the core datatypes.
+          (is (= [[:string {:fhir/primitive "code"}]]
+                 (first (run {:code "code"
+                              :profile ["http://example.org/StructureDefinition/Narrowed"]})))))
+
+        (testing "a canonical no package defines degrades to the base type and reports"
+          (let [unresolved (atom [])]
+            (binding [fdm/*unresolved-profiles* unresolved
+                      fdm/*current-definition* "http://example.org/StructureDefinition/Referrer"]
+              (is (= [[[:ref base-kw]] #{base-kw}]
+                     (run {:code "Patient"
+                           :profile ["http://example.org/StructureDefinition/Missing"]})))
+              (is (= [{:profile "http://example.org/StructureDefinition/Missing"
+                       :from "http://example.org/StructureDefinition/Referrer"
+                       :degraded-to base-kw}]
+                     @unresolved)))))))))

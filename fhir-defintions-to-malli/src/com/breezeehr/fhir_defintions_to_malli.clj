@@ -229,6 +229,25 @@
    the driver can report them instead of degrading them silently."
   nil)
 
+(def ^:dynamic *honor-child-type-profile*
+  "When true, a non-slice child element declaring exactly ONE type.profile refs
+   that profile's schema instead of the declared base type.
+
+   Off by default. In kind=resource packages `write-single-schema!` turns
+   transitive references into hard `:require` edges, where the reference cycles
+   this creates (a profile whose child refs a profile that refs back) are load
+   failures rather than lazy refs. CDA is kind=logical, where `[:ref kw]`
+   resolves through the requiring-resolve registry with no namespace edge, so
+   only the CDA driver binds this true.
+
+   Multi-profile types are never narrowed -- type.profile is any-of, so picking
+   the first URL would reject instances valid against the others -- and neither
+   are primitive codes, which in CDA carry value-domain profiles (cs-simple,
+   bl-simple, st-simple) that must not rewrite the core datatypes. A canonical
+   no package in the run defines degrades to the base type and reports through
+   `*unresolved-profiles*`."
+  false)
+
 (def ^:dynamic *current-definition*
   "URL of the StructureDefinition being processed, for diagnostics."
   nil)
@@ -512,8 +531,49 @@
 ;; Schema resolution
 ;; ---------------------------------------------------------------------------
 
+(defn- narrowed-child-profile-kw
+  "The schema keyword a non-slice child's single `type.profile` names, or nil to
+   keep the declared base type.
+
+   A profile on a child element is a real constraint -- C-CDA states the section
+   a document component must conform to on `component:allergies.section`, not on
+   the slice above it -- so refing the base type there loses every arm's
+   narrowing and leaves the slices indistinguishable from the default.
+
+   nil is returned, and the base type kept, whenever narrowing would be wrong or
+   unsafe: the feature is gated off, the type lists several profiles (any-of, so
+   the first URL would reject instances valid against the rest), or the
+   canonical resolves to a definition no package in the run supplies. The last
+   case is reported through `*unresolved-profiles*` rather than emitted, since a
+   dangling keyword makes the generated file fail to load.
+
+   Resolution deliberately consults only the declared canonical and the index,
+   never the target schema: the CCD references sections generated later in the
+   run, so at emission time the target does not exist yet."
+  [{:keys [profile]} base-kw version]
+  (when (and *honor-child-type-profile*
+             (= 1 (count profile)))
+    (let [canonical  (first profile)
+          profile-kw (or (resolve-canonical-kw canonical)
+                         (let [profile-clean (strip-canonical-version canonical)
+                               profile-name (munge-ns (str/replace (last (str/split profile-clean #"/")) "." "-"))]
+                           (or (first (filter #(= (kw->type-name %) profile-name)
+                                              (keys @*schema-atom*)))
+                               (uri->kw2 canonical version))))]
+      (when profile-kw
+        (if (or (contains? @*schema-atom* profile-kw)
+                (contains? *known-canonical-kws* profile-kw)
+                (some? (resolve-malli-sch profile-kw)))
+          profile-kw
+          (do (when *unresolved-profiles*
+                (swap! *unresolved-profiles* conj
+                       {:profile canonical
+                        :from *current-definition*
+                        :degraded-to base-kw}))
+              nil))))))
+
 (defn prim-or-ref
-  [acc {:keys [code]} version]
+  [acc {:keys [code] :as attr-type} version]
   (if (nil? code)
     acc
     (let [[sch primitive?]
@@ -522,7 +582,9 @@
             [(case code
                "http://hl7.org/fhirpath/System.String" :string
                "Resource" [:map {:short "Any Resource" :resourceType "Resource"}]
-               (let [kw (lookup-schema-kw code version)]
+               (let [base-kw (lookup-schema-kw code version)
+                     kw (or (narrowed-child-profile-kw attr-type base-kw version)
+                            base-kw)]
                  (swap! *references-atom* conj kw)
                  [:lazy-ref kw]))
              false])]
