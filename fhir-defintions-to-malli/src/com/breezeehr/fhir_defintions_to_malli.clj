@@ -233,6 +233,35 @@
   "URL of the StructureDefinition being processed, for diagnostics."
   nil)
 
+(def ^:dynamic *discriminator-dispatch-fn*
+  "Driver hook for profile and type slicing discriminators.
+
+   FHIR defines profile discrimination as validating the instance against each
+   candidate profile, which no dispatch fn can do. How a profile or a type is
+   recognised from an instance is a property of the serialization and the IG,
+   not of FHIR: CDA marks profiles with templateId and types with xsi:type,
+   while FHIR resources use meta.profile. The generator therefore refuses to
+   guess and asks a driver instead.
+
+   Called with {:type <\"profile\"|\"type\">
+                :path <get-in path to the discriminated child, or nil for $this>
+                :discriminator <raw discriminator map>
+                :arms [{:dispatch-value _ :slice-name _} ...] in slice order
+                :base-sch <the schema being sliced>}
+
+   In a multi-discriminator group each arm's :dispatch-value is this
+   discriminator's positional component; when extraction failed entirely for an
+   arm the stored value (a slice-name keyword) is passed whole and cannot be
+   decomposed, so a hook that does not recognise it should decline.
+
+   Returns a FORM evaluating to (fn [m] ...) yielding one of :arms'
+   dispatch-values, or nil to decline. Declining drops this discriminator from
+   the dispatch AND from the arm keys together: the group falls back to
+   whatever its remaining discriminators can still distinguish, and keeps its
+   base schema with no :multi when nothing is left or the surviving keys no
+   longer tell the arms apart."
+  nil)
+
 ;; ---------------------------------------------------------------------------
 ;; Canonical resolution
 ;;
@@ -627,19 +656,105 @@
     ;; slices are maps with :this-path from extract-dispatch-value
     (:this-path first-slice)))
 
+(defn- normalize-discriminators
+  "Dedupe a slicing :discriminator list by [type path], keeping the first
+   occurrence in declaration order. Both the arm-key side
+   (extract-dispatch-value) and the dispatch side (make-dispatch-form) consume
+   this one list, so their arities agree by construction.
+
+   The dedupe is a structural guard, not a fix for observed data: a scan of the
+   shipped CDA packages (differential and snapshot) finds no slicing group with
+   a repeated [type path] pair, so it never fires today. Same path under two
+   different types is NOT a duplicate and is deliberately kept -- CareTeamMemberAct
+   Act.entryRelationship declares observation and act under both `profile` and
+   `exists`, which are different questions about the same child. Collapsing
+   those would silently drop a declared constraint from the dispatch key."
+  [discriminators]
+  (:out (reduce (fn [{:keys [seen] :as acc} d]
+                  (let [k [(:type d) (:path d)]]
+                    (if (contains? seen k)
+                      acc
+                      (-> acc (update :seen conj k) (update :out conj d)))))
+                {:seen #{} :out []}
+                discriminators)))
+
+(defn- dispatch-component
+  "One runtime-extraction component per normalized discriminator.
+   Returns {:expr <form in terms of m>}, {:fn-form <(fn [m] ...) form>} for
+   hook-supplied dispatch, or ::no-extraction when this discriminator cannot be
+   evaluated against an instance -- which suppresses the whole :multi rather
+   than emitting one whose dispatch no arm key can match."
+  [idx n {disc-type :type disc-path :path :as disc} base-sch slices]
+  (case disc-type
+    ("profile" "type")
+    (let [hook *discriminator-dispatch-fn*
+          gpath (when (not= disc-path "$this")
+                  (discriminator-path->get-in-path base-sch disc-path))
+          arms (mapv (fn [{:keys [dispatch-value slice-name]}]
+                       {:dispatch-value
+                        (if (and (> n 1)
+                                 (vector? dispatch-value)
+                                 (= n (count dispatch-value)))
+                          (nth dispatch-value idx)
+                          dispatch-value)
+                        :slice-name slice-name})
+                     slices)
+          fn-form (when hook
+                    (hook {:type disc-type
+                           :path gpath
+                           :discriminator disc
+                           :arms arms
+                           :base-sch base-sch}))]
+      (if fn-form {:fn-form fn-form} ::no-extraction))
+
+    "exists"
+    (let [gpath (when (not= disc-path "$this")
+                  (discriminator-path->get-in-path base-sch disc-path))]
+      (if (seq gpath)
+        {:expr `(~'some? (~'get-in ~'m ~(vec gpath)))}
+        ::no-extraction))
+
+    ;; value, pattern, and unknown types -- unchanged extraction
+    (let [gpath (if (= disc-path "$this")
+                  (resolve-this-discriminator-path slices)
+                  (discriminator-path->get-in-path base-sch disc-path))]
+      (if (seq gpath)
+        {:expr `(~'get-in ~'m ~(vec gpath))}
+        ::no-extraction))))
+
 (defn- make-dispatch-form
-  ([discriminators base-sch]
-   (make-dispatch-form discriminators base-sch nil))
-  ([discriminators base-sch slices]
-   (let [paths (keep (fn [{:keys [path]}]
-                       (if (= path "$this")
-                         (resolve-this-discriminator-path slices)
-                         (discriminator-path->get-in-path base-sch path)))
-                     discriminators)]
-     (when (seq paths)
-       (if (= (count paths) 1)
-         `(~'fn [~'m] (~'get-in ~'m ~(vec (first paths))))
-         `(~'fn [~'m] ~(vec (map (fn [p] `(~'get-in ~'m ~(vec p))) paths))))))))
+  "Dispatch fn form for a sliced element, one positional component per
+   normalized discriminator that has a runtime extraction.
+
+   Returns {:form <(fn [m] ...)> :keep-idx <indices into discriminators>}, or
+   nil when no discriminator is extractable at all.
+
+   Discriminators with no extraction (a profile or type whose driver hook is
+   unbound or declined, an unresolvable path) are DROPPED rather than
+   suppressing the whole group -- but they are dropped from the arm keys too,
+   via :keep-idx, so the two sides keep the same arity by construction. A
+   dispatch built from a subset is still sound: it only has to route an
+   instance to its arm, and the dropped constraint is still enforced inside the
+   arm's own schema. dispatch-arm-keys refuses the subset when the projected
+   keys stop being distinct, so a weakened dispatch suppresses the :multi
+   instead of routing arbitrarily."
+  [discriminators base-sch slices]
+  (let [n (count discriminators)
+        comps (into []
+                    (map-indexed (fn [i d] (dispatch-component i n d base-sch slices)))
+                    discriminators)
+        keep-idx (into [] (remove #(= ::no-extraction (nth comps %))) (range n))
+        kept (mapv #(nth comps %) keep-idx)]
+    (when (seq kept)
+      {:keep-idx keep-idx
+       :form (if (= 1 (count kept))
+               (let [c (first kept)]
+                 (or (:fn-form c)
+                     `(~'fn [~'m] ~(:expr c))))
+               `(~'fn [~'m] ~(mapv (fn [c]
+                                     (or (:expr c)
+                                         `(~(:fn-form c) ~'m)))
+                                   kept)))})))
 
 (defn- extract-pattern-value
   "Extract a discriminating value from a pattern* or fixed* field on an element.
@@ -710,14 +825,46 @@
           (= cleaned (vec disc-segs))))
       sub-elements))))
 
+(defn- derive-exists-arm-key
+  "Arm key for one exists discriminator against a slice body.
+   true/false when derivable, nil when the body does not decide it:
+   max=0 at the path => false; min>=1 => true; any constraint strictly below
+   the path => true; path (and everything below it) absent => false;
+   restated at the path with none of the above => nil.
+
+   Rule order matters: max=\"0\" beats a contradictory deeper constraint, and a
+   deeper constraint beats an absent match because a differential may constrain
+   a grandchild without restating the level between."
+  [sub-elements slice-path disc-path]
+  (let [match (find-discriminator-match sub-elements slice-path disc-path)
+        disc-segs (vec (str/split disc-path #"\."))
+        n (count disc-segs)
+        below? (boolean
+                (some (fn [elem]
+                        (let [suffix (when (> (count (:path elem)) (count slice-path))
+                                       (subvec (:path elem) (count slice-path)))
+                              cleaned (when suffix (mapv clean-path-segment suffix))]
+                          (and cleaned
+                               (> (count cleaned) n)
+                               (= (subvec cleaned 0 n) disc-segs))))
+                      sub-elements))]
+    (cond
+      (and match (= "0" (str (:max match)))) false
+      (and match (some-> (:min match) str parse-long (>= 1))) true
+      below? true
+      (nil? match) false
+      :else nil)))
+
 (defn- discriminator-match-value
   "Value for one discriminator against a matched element.
-   profile → type.profile URL; type → type.code; else fixed/pattern."
+   profile → type.profile URL; type → type.code; else fixed/pattern.
+   exists never reaches here -- it is derived from the slice body's
+   cardinality by derive-exists-arm-key."
   [disc-type match]
   (case disc-type
     "profile" (extract-profile-url match)
     "type" (extract-type-code match)
-    ;; value, exists, and unknown — use fixed/pattern scalars
+    ;; value and unknown — use fixed/pattern scalars
     (extract-fixed-value match)))
 
 (defn- finalize-dispatch-value
@@ -740,19 +887,35 @@
    Honors discriminator :type:
    - profile: type.profile on the element at path
    - type: type.code on the element at path
+   - exists: true/false derived from the slice body's cardinality
    - value / default: fixed*/pattern* scalars
-   - $this path: fixed/pattern on the slice root"
+   - $this path: fixed/pattern on the slice root
+
+   :exists-underivable? marks a slice whose exists arm key the body does not
+   decide; the caller must then suppress the :multi entirely, because an arm
+   key that does not describe the slice can never be dispatched to."
   ([discriminators sub-elements slice-path]
    (extract-dispatch-value discriminators sub-elements slice-path nil))
   ([discriminators sub-elements slice-path slice-name]
    (let [results (mapv
                   (fn [{disc-path :path disc-type :type}]
-                    (if (= disc-path "$this")
+                    (cond
+                      (= disc-type "exists")
+                      (if (= disc-path "$this")
+                        {:value nil :underivable? true}
+                        (let [v (derive-exists-arm-key sub-elements slice-path disc-path)]
+                          (if (nil? v)
+                            {:value nil :underivable? true}
+                            {:value v})))
+
+                      (= disc-path "$this")
                       (let [slice-root (first (filter #(= (count (:path %)) (count slice-path))
                                                       sub-elements))]
                         {:value (discriminator-match-value disc-type slice-root)
                          :this-path (when-not (#{"type" "profile"} disc-type)
                                       (extract-this-discriminator-path slice-root))})
+
+                      :else
                       (let [match (find-discriminator-match sub-elements slice-path disc-path)]
                         {:value (discriminator-match-value disc-type match)})))
                   discriminators)
@@ -760,7 +923,8 @@
          this-path (some :this-path results)
          raw (if (= (count vals) 1) (first vals) vals)]
      {:dispatch-value (finalize-dispatch-value raw slice-name)
-      :this-path this-path})))
+      :this-path this-path
+      :exists-underivable? (boolean (some :underivable? results))})))
 
 (defn- standalone-dispatch-value
   "When a slice is applied without pending-slicing (profile-on-profile), derive a
@@ -818,6 +982,46 @@
         [(second body) true]
         [body false]))))
 
+(defn- project-dispatch-value
+  "Project a stored arm key onto the discriminators make-dispatch-form kept.
+   Returns nil when the key cannot be projected -- it was never a full-arity
+   vector (extraction failed outright and finalize-dispatch-value substituted
+   the slice name), or a kept position carries no value. Either way no
+   computable dispatch could reach this arm, so the caller suppresses."
+  [dispatch-value n keep-idx]
+  (when (and (vector? dispatch-value) (= n (count dispatch-value)))
+    (let [projected (mapv #(nth dispatch-value %) keep-idx)]
+      (when (not-any? nil? projected)
+        (if (= 1 (count projected)) (first projected) projected)))))
+
+(defn- dispatch-arm-keys
+  "Final :multi arm keys, one per slice in order, or nil to suppress the group.
+
+   When every discriminator was kept this is the historical expression
+   verbatim, so the 1489 value-discriminated groups emit byte-identical keys.
+
+   A group is held to a stricter bar when it is exists-discriminated or when
+   the dispatch dropped a discriminator: every key must be fully derived and
+   distinct from the others. Collided keys must lose the :multi here, before
+   the last-wins dedupe in flush-pending-slicing silently keeps one arbitrary
+   arm and drops the rest."
+  [discriminators slices keep-idx]
+  (let [n (count discriminators)
+        full? (= n (count keep-idx))
+        exists-group? (boolean (some #(= "exists" (:type %)) discriminators))
+        ks (if full?
+             (mapv (fn [{:keys [dispatch-value slice-name]}]
+                     (finalize-dispatch-value dispatch-value slice-name))
+                   slices)
+             (mapv (fn [{:keys [dispatch-value]}]
+                     (project-dispatch-value dispatch-value n keep-idx))
+                   slices))]
+    (when (and (not-any? nil? ks)
+               (or (not (or exists-group? (not full?)))
+                   (and (not-any? :exists-underivable? slices)
+                        (apply distinct? ks))))
+      ks)))
+
 (defn- flush-pending-slicing
   [acc]
   (if-let [pending (:pending-slicing acc)]
@@ -825,7 +1029,14 @@
      (fn [acc base-k {:keys [discriminators rules base-form base-sch field-is-sequential? slices]}]
        (if (empty? slices)
          acc
-         (let [dispatch-form (make-dispatch-form discriminators base-sch slices)]
+         ;; The dispatch fn and the arm keys are built from one shared list of
+         ;; kept discriminators, so they agree by construction; arm-keys is nil
+         ;; when that agreement cannot be reached and the :multi is dropped.
+         (let [{dispatch-form :form keep-idx :keep-idx}
+               (make-dispatch-form discriminators base-sch slices)
+               arm-keys (when dispatch-form
+                          (dispatch-arm-keys discriminators slices keep-idx))
+               dispatch-form (when arm-keys dispatch-form)]
           (if (nil? dispatch-form)
            ;; No valid discriminator paths — skip :multi wrapping, just use base-form
            (if base-form
@@ -869,7 +1080,7 @@
                             :else f))
                base-element-form (fix-base raw-base-form)
                entries (mapv
-                        (fn [{:keys [dispatch-value slice-name form]}]
+                        (fn [dv {:keys [form]}]
                           (let [unwrap-mu-update-0 (fn [f]
                                                      (when (and (seq? f) (= 'mu/update (first f)))
                                                        (cond
@@ -918,9 +1129,9 @@
                                   (if (and (seq? base-element-form) (= '-> (first base-element-form)))
                                     `(~'-> ~@(rest base-element-form) ~@fixed-forms)
                                     `(~'-> ~base-element-form ~@fixed-forms))
-                                  :else base-element-form)
-                                dv (finalize-dispatch-value dispatch-value slice-name)]
+                                  :else base-element-form)]
                             [dv constrained]))
+                        arm-keys
                         slices)
                ;; A source profile can carry pairwise-identical slices whose
                ;; finalized dispatch values collide (RiskConcernAct declares
@@ -1675,12 +1886,13 @@
    {:keys [base-field-name effective-k final-props new-sub-sch new-sub-form new-sch update-fn-form]}]
   (let [base-k base-field-name]
     (if-let [pending (get-in old-acc [:pending-slicing base-k])]
-      (let [{:keys [dispatch-value this-path]}
+      (let [{:keys [dispatch-value this-path exists-underivable?]}
             (extract-dispatch-value (:discriminators pending) sub-elements main-path slice-name)]
         (update-in old-acc [:pending-slicing base-k :slices] conj
                    {:slice-name slice-name
                     :dispatch-value dispatch-value
                     :this-path this-path
+                    :exists-underivable? exists-underivable?
                     :sch new-sub-sch
                     :form new-sub-form}))
       ;; No pending-slicing: if the base field is already a multi (or parent shape
@@ -1709,7 +1921,19 @@
                               (let [t (try (m/type base-sch) (catch Exception _ nil))]
                                 (when (#{:ref :lazy-ref} t)
                                   (let [raw (first (m/children base-sch))]
-                                    (when (keyword? raw) raw)))))]
+                                    (when (keyword? raw) raw)))))
+                ;; A sequential base whose element is a ref cannot be threaded
+                ;; directly: mu/assoc against an undereferenced [:ref ...] throws
+                ;; ::index-out-of-bounds. The :multi path derefs via its unwrap
+                ;; form; this one has to do the same.
+                inner-ref? (boolean
+                            (when is-base-seq?
+                              (let [inner (try (mu/get base-sch 0) (catch Exception _ nil))]
+                                (#{:ref :lazy-ref}
+                                 (when inner (try (m/type inner) (catch Exception _ nil)))))))
+                inner-thread (if inner-ref?
+                               `[(~'m/schema ~'options) ~'m/deref ~@slice-forms]
+                               (vec slice-forms))]
             (when base-ref-kw
               (swap! *references-atom* conj base-ref-kw))
             (if (seq slice-forms)
@@ -1722,7 +1946,7 @@
                                             (~'fn [~'sch]
                                                   (~'mu/update ~'sch 0
                                                                (~'fn [~'inner]
-                                                                     (~'-> ~'inner ~@slice-forms)))))
+                                                                     (~'-> ~'inner ~@inner-thread)))))
                               (if base-ref-kw
                                 `(~'mu/update ~base-k
                                               (~'fn [~'sch]
@@ -1754,7 +1978,7 @@
         (-> res
             (assoc :form cleaned-form)
             (assoc-in [:pending-slicing effective-k]
-                      {:discriminators (:discriminator slicing)
+                      {:discriminators (normalize-discriminators (:discriminator slicing))
                        :rules (or (:rules slicing) "open")
                        :field-is-sequential? field-is-sequential?
                        :base-form captured-base-form

@@ -385,3 +385,164 @@
       (binding [fdm/*canonical-index* nil
                 fdm/*schema-atom* (atom {})]
         (is (nil? (fdm/resolve-canonical-kw "http://hl7.org/fhir/StructureDefinition/Patient")))))))
+
+;; ---------------------------------------------------------------------------
+;; Slicing dispatch: the emitted :multi dispatch fn must agree with the arm keys
+;;
+;; These test the PAIR. profile-discriminator-dispatch-value-test above covers
+;; only extract-dispatch-value (the arm-key half) and passes even when the
+;; dispatch fn computes something no arm can match -- which is how 130 dead
+;; profile dispatches shipped.
+;; ---------------------------------------------------------------------------
+
+(defn- compiled-multi
+  "Run flush-pending-slicing over one pending entry, compile the emitted step
+   against `parent`, and return the compiled :multi under key `k` (or nil when
+   no :multi was emitted)."
+  [pending k parent]
+  (let [flush-fn (ns-resolve 'com.breezeehr.fhir-defintions-to-malli
+                             'flush-pending-slicing)
+        step (first (:form (flush-fn {:form [] :pending-slicing pending})))]
+    (when step
+      (let [f (binding [*ns* (the-ns 'com.breezeehr.fhir-defintions-to-malli)]
+                (eval (list 'fn '[options parent] (list '-> 'parent step))))
+            compiled (f fp/fhir-registry-options parent)
+            inner (mu/get (mu/get compiled k) 0)]
+        (when (= :multi (m/type inner)) inner)))))
+
+(defn- multi-dispatch [multi] (:dispatch (m/properties multi)))
+(defn- multi-arm-keys [multi] (mapv first (m/children multi)))
+
+(defn- dispatches-to-an-arm?
+  "The invariant: applying the dispatch fn to `instance` yields a key that is
+   actually one of the arms, and not the open default."
+  [multi instance]
+  (let [k ((multi-dispatch multi) instance)]
+    (and (contains? (set (multi-arm-keys multi)) k)
+         (not= :malli.core/default k))))
+
+(deftest value-dispatch-agrees-with-arm-keys-test
+  (testing "value discriminators already agree -- this pins the 1489 that work"
+    (let [base-sch (m/schema [:map [:code :string]] fp/fhir-registry-options)
+          multi (compiled-multi
+                 {:f {:discriminators [{:type "value" :path "code"}]
+                      :rules "open" :field-is-sequential? true
+                      :base-form nil :base-sch base-sch
+                      :slices [{:slice-name "s1" :dispatch-value "REFR"
+                                :form ['(mu/assoc :a :string)]}]}}
+                 :f
+                 (m/schema [:map [:f [:sequential [:map [:code :string]]]]]
+                           fp/fhir-registry-options))]
+      (is (some? multi) "a :multi is emitted for a value discriminator")
+      (is (= ["REFR" :malli.core/default] (multi-arm-keys multi)))
+      (is (dispatches-to-an-arm? multi {:code "REFR"})
+          "dispatch on a matching instance selects the REFR arm"))))
+
+(deftest exists-dispatch-agrees-with-arm-keys-test
+  (testing "USRealmHeader ClinicalDocument.informant: provider vs non-provider"
+    ;; Two exists discriminators. provider constrains assignedEntity min 1 and
+    ;; forbids relatedEntity; non-provider is the inverse. Arm keys must be
+    ;; [relatedEntity? assignedEntity?] booleans, and the dispatch must compute
+    ;; the same booleans off an instance.
+    (let [extract (ns-resolve 'com.breezeehr.fhir-defintions-to-malli
+                              'extract-dispatch-value)
+          slice-path ["ClinicalDocument" "informant"]
+          discs [{:type "exists" :path "relatedEntity"}
+                 {:type "exists" :path "assignedEntity"}]
+          provider-subs [{:path ["ClinicalDocument" "informant"] :sliceName "provider"}
+                         {:path ["ClinicalDocument" "informant" "assignedEntity"] :min 1}
+                         {:path ["ClinicalDocument" "informant" "relatedEntity"] :max "0"}]
+          non-provider-subs [{:path ["ClinicalDocument" "informant"] :sliceName "non-provider"}
+                             {:path ["ClinicalDocument" "informant" "assignedEntity"] :max "0"}
+                             {:path ["ClinicalDocument" "informant" "relatedEntity"] :min 1}]
+          provider-dv (:dispatch-value (extract discs provider-subs slice-path "provider"))
+          non-provider-dv (:dispatch-value (extract discs non-provider-subs slice-path "non-provider"))]
+      (is (= [false true] provider-dv)
+          "provider: relatedEntity absent, assignedEntity present")
+      (is (= [true false] non-provider-dv)
+          "non-provider: the inverse")
+      (let [base-sch (m/schema [:map
+                                [:assignedEntity {:optional true} [:map [:id {:optional true} :string]]]
+                                [:relatedEntity {:optional true} [:map [:id {:optional true} :string]]]]
+                               fp/fhir-registry-options)
+            multi (compiled-multi
+                   {:informant {:discriminators discs
+                                :rules "open" :field-is-sequential? true
+                                :base-form nil :base-sch base-sch
+                                :slices [{:slice-name "provider" :dispatch-value provider-dv
+                                          :form ['(mu/assoc :a :string)]}
+                                         {:slice-name "non-provider" :dispatch-value non-provider-dv
+                                          :form ['(mu/assoc :b :string)]}]}}
+                   :informant
+                   (m/schema [:map [:informant [:sequential
+                                                [:map
+                                                 [:assignedEntity {:optional true} [:map]]
+                                                 [:relatedEntity {:optional true} [:map]]]]]]
+                             fp/fhir-registry-options))]
+        (is (some? multi) "a :multi is emitted for exists discriminators")
+        (is (= [false true] ((multi-dispatch multi) {:assignedEntity {:id "x"}}))
+            "an instance with only assignedEntity dispatches to the provider key")
+        (is (dispatches-to-an-arm? multi {:assignedEntity {:id "x"}}))
+        (is (dispatches-to-an-arm? multi {:relatedEntity {:id "x"}}))))))
+
+(deftest profile-dispatch-requires-a-driver-hook-test
+  (testing "unbound hook declines: no :multi rather than one that cannot match"
+    ;; FHIR defines profile discrimination as validating against each candidate
+    ;; profile. How a profile is recognised in an instance is IG/serialization
+    ;; specific (CDA templateId, FHIR meta.profile), so the generator refuses to
+    ;; guess. Emitting (fn [m] (get-in m [:section])) against profile-URL arm
+    ;; keys is what this replaces.
+    (let [base-sch (m/schema [:map [:section [:map [:title {:optional true} :string]]]]
+                             fp/fhir-registry-options)
+          parent (m/schema [:map [:component [:sequential [:map [:section [:map]]]]]]
+                           fp/fhir-registry-options)
+          pending {:component
+                   {:discriminators [{:type "profile" :path "section"}]
+                    :rules "open" :field-is-sequential? true
+                    :base-form nil :base-sch base-sch
+                    :slices [{:slice-name "allergies"
+                              :dispatch-value "http://hl7.org/cda/us/ccda/StructureDefinition/AllergiesAndIntolerancesSection"
+                              :form ['(mu/assoc :a :string)]}]}}]
+      (is (nil? (compiled-multi pending :component parent))
+          "no hook bound -> no :multi emitted")))
+
+  (testing "a bound hook supplies the dispatch form and its arms come alive"
+    (let [dispatch-var (ns-resolve 'com.breezeehr.fhir-defintions-to-malli
+                                   '*discriminator-dispatch-fn*)
+          url "http://hl7.org/cda/us/ccda/StructureDefinition/AllergiesAndIntolerancesSection"
+          base-sch (m/schema [:map [:section [:map [:templateId {:optional true}
+                                                    [:sequential [:map
+                                                                  [:root {:optional true} :string]
+                                                                  [:extension {:optional true} :string]]]]]]]
+                             fp/fhir-registry-options)
+          parent (m/schema [:map [:component [:sequential [:map [:section [:map]]]]]]
+                           fp/fhir-registry-options)
+          pending {:component
+                   {:discriminators [{:type "profile" :path "section"}]
+                    :rules "open" :field-is-sequential? true
+                    :base-form nil :base-sch base-sch
+                    :slices [{:slice-name "allergies" :dispatch-value url
+                              :form ['(mu/assoc :a :string)]}]}}
+          ;; a stand-in for the CDA driver's templateId resolver
+          hook (fn [{:keys [type path arms]}]
+                 (when (= "profile" type)
+                   (let [pairs (mapv (fn [a] [["2.16.840.1.113883.10.20.22.2.6.1" "2015-08-01"]
+                                              (:dispatch-value a)])
+                                     arms)]
+                     `(~'fn [~'m]
+                       (let [~'tid (~'get-in ~'m ~(vec (concat path [:templateId])))
+                             ~'ks (~'into #{} (~'map (~'juxt :root :extension)) ~'tid)]
+                         (~'some (~'fn [[~'k ~'u]] (~'when (~'contains? ~'ks ~'k) ~'u))
+                                 ~pairs))))))
+          instance {:section {:templateId [{:root "2.16.840.1.113883.10.20.22.2.6.1"
+                                            :extension "2015-08-01"}]}}]
+      (with-bindings {dispatch-var hook}
+        (let [multi (compiled-multi pending :component parent)]
+          (is (some? multi) "hook bound -> :multi emitted")
+          (is (= url ((multi-dispatch multi) instance))
+              "the dispatch resolves the instance's templateId to the arm's profile URL")
+          (is (dispatches-to-an-arm? multi instance))))
+
+      (testing "a hook that declines is the same as no hook"
+        (with-bindings {dispatch-var (constantly nil)}
+          (is (nil? (compiled-multi pending :component parent))))))))
