@@ -246,13 +246,21 @@
    Called with {:type <\"profile\"|\"type\">
                 :path <get-in path to the discriminated child, or nil for $this>
                 :discriminator <raw discriminator map>
-                :arms [{:dispatch-value _ :slice-name _} ...] in slice order
+                :arms [{:dispatch-value _ :slice-name _ :profiles _} ...]
+                       in slice order
                 :base-sch <the schema being sliced>}
 
    In a multi-discriminator group each arm's :dispatch-value is this
    discriminator's positional component; when extraction failed entirely for an
    arm the stored value (a slice-name keyword) is passed whole and cannot be
    decomposed, so a hook that does not recognise it should decline.
+
+   For a profile discriminator :profiles carries EVERY type.profile canonical
+   declared at this discriminator's position, in declared order, or nil when
+   unavailable. type.profile is any-of, so a conformant instance may claim any
+   one of them while the arm key stays the first -- a hook that recognises only
+   the arm key would default every instance claiming one of the others. It is
+   nil for non-profile discriminators.
 
    Returns a FORM evaluating to (fn [m] ...) yielding one of :arms'
    dispatch-values, or nil to decline. Declining drops this discriminator from
@@ -690,14 +698,20 @@
     (let [hook *discriminator-dispatch-fn*
           gpath (when (not= disc-path "$this")
                   (discriminator-path->get-in-path base-sch disc-path))
-          arms (mapv (fn [{:keys [dispatch-value slice-name]}]
+          arms (mapv (fn [{:keys [dispatch-value slice-name profile-candidates]}]
                        {:dispatch-value
                         (if (and (> n 1)
                                  (vector? dispatch-value)
                                  (= n (count dispatch-value)))
                           (nth dispatch-value idx)
                           dispatch-value)
-                        :slice-name slice-name})
+                        :slice-name slice-name
+                        ;; Full arity by construction (extract-dispatch-value
+                        ;; maps over the same discriminator list), so the arity
+                        ;; check only guards a slice recorded by another path.
+                        :profiles (when (and (vector? profile-candidates)
+                                             (= n (count profile-candidates)))
+                                    (nth profile-candidates idx))})
                      slices)
           fn-form (when hook
                     (hook {:type disc-type
@@ -794,6 +808,23 @@
             (when-let [ps (:profile t)]
               (some clean-profile-url (if (sequential? ps) ps [ps]))))
           (:type elem))))
+
+(defn- extract-profile-urls
+  "ALL type.profile canonicals on an ElementDefinition, cleaned and distinct, in
+   declared order. The first element is what extract-profile-url returns, so an
+   arm keyed off that stays keyed off that; the rest are the alternatives a
+   conformant instance may claim instead, which only a driver hook can
+   recognise."
+  [elem]
+  (when elem
+    (not-empty
+     (into []
+           (comp (mapcat (fn [t]
+                           (let [ps (:profile t)]
+                             (if (sequential? ps) ps (when ps [ps])))))
+                 (keep clean-profile-url)
+                 (distinct))
+           (:type elem)))))
 
 (defn- extract-type-code
   "First type.code on an ElementDefinition (for type discriminators)."
@@ -893,7 +924,10 @@
 
    :exists-underivable? marks a slice whose exists arm key the body does not
    decide; the caller must then suppress the :multi entirely, because an arm
-   key that does not describe the slice can never be dispatched to."
+   key that does not describe the slice can never be dispatched to.
+
+   :profile-candidates carries the full type.profile list per discriminator
+   position for the driver hook, which the arm key alone cannot recover."
   ([discriminators sub-elements slice-path]
    (extract-dispatch-value discriminators sub-elements slice-path nil))
   ([discriminators sub-elements slice-path slice-name]
@@ -912,18 +946,26 @@
                       (let [slice-root (first (filter #(= (count (:path %)) (count slice-path))
                                                       sub-elements))]
                         {:value (discriminator-match-value disc-type slice-root)
+                         :profiles (when (= disc-type "profile")
+                                     (extract-profile-urls slice-root))
                          :this-path (when-not (#{"type" "profile"} disc-type)
                                       (extract-this-discriminator-path slice-root))})
 
                       :else
                       (let [match (find-discriminator-match sub-elements slice-path disc-path)]
-                        {:value (discriminator-match-value disc-type match)})))
+                        {:value (discriminator-match-value disc-type match)
+                         :profiles (when (= disc-type "profile")
+                                     (extract-profile-urls match))})))
                   discriminators)
          vals (mapv :value results)
          this-path (some :this-path results)
          raw (if (= (count vals) 1) (first vals) vals)]
      {:dispatch-value (finalize-dispatch-value raw slice-name)
       :this-path this-path
+      ;; Full arity, aligned index-for-index with `discriminators` (nil outside
+      ;; profile positions) so dispatch-component can index it with its own idx.
+      ;; Deliberately NOT scalarized at n=1, unlike :dispatch-value.
+      :profile-candidates (mapv :profiles results)
       :exists-underivable? (boolean (some :underivable? results))})))
 
 (defn- standalone-dispatch-value
@@ -1886,13 +1928,14 @@
    {:keys [base-field-name effective-k final-props new-sub-sch new-sub-form new-sch update-fn-form]}]
   (let [base-k base-field-name]
     (if-let [pending (get-in old-acc [:pending-slicing base-k])]
-      (let [{:keys [dispatch-value this-path exists-underivable?]}
+      (let [{:keys [dispatch-value this-path exists-underivable? profile-candidates]}
             (extract-dispatch-value (:discriminators pending) sub-elements main-path slice-name)]
         (update-in old-acc [:pending-slicing base-k :slices] conj
                    {:slice-name slice-name
                     :dispatch-value dispatch-value
                     :this-path this-path
                     :exists-underivable? exists-underivable?
+                    :profile-candidates profile-candidates
                     :sch new-sub-sch
                     :form new-sub-form}))
       ;; No pending-slicing: if the base field is already a multi (or parent shape
