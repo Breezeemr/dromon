@@ -63,7 +63,15 @@
    ;; Group: no breeze capability; base R4B for bulk export group membership
    {:schema 'org.hl7.fhir.StructureDefinition.Group.v4-3-0/full-sch
     :interactions ["create" "search-type" "read" "vread"
-                   "update" "delete" "history-instance" "history-type"]}
+                   "update" "delete" "history-instance" "history-type"]
+    :search-params [{:name "member" :type "reference"
+                     :definition "http://hl7.org/fhir/SearchParameter/Group-member"}
+                    {:name "identifier" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Group-identifier"}
+                    {:name "type" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Group-type"}
+                    {:name "code" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Group-code"}]}
    {:schema 'org.hl7.fhir.StructureDefinition.SearchParameter.v4-3-0/full-sch
     :interactions ["create" "search-type" "read" "vread"
                    "update" "patch" "delete" "history-instance"]}])

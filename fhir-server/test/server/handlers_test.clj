@@ -11,13 +11,23 @@
 (defn- make-store []
   (mock/create-mock-store {}))
 
+(def ^:private search-registry
+  "The slice of Patient's enriched search registry these tests search on.
+   Routing always injects a registry (`server.core/capability-schema->server-schema`
+   builds one for every routed type), and the search handlers reject any
+   parameter it does not declare, so the tests supply one too."
+  {"identifier" {:type "token" :columns [{:col "identifier" :array? true
+                                          :sub-col "value"}]}
+   "name"       {:type "string" :columns [{:col "name" :array? true
+                                           :sub-col "family"}]}})
+
 (defn- base-request
   "Build a minimal request map that the handlers expect."
-  [store & {:keys [id vid params body form-params headers]
-            :or   {params {} headers {}}}]
+  [store & {:keys [id vid params body form-params headers registry]
+            :or   {params {} headers {} registry search-registry}}]
   (cond-> {:fhir/store         store
            :fhir/resource-type resource-type
-           :fhir/search-registry nil
+           :fhir/search-registry registry
            :path-params        {:tenant-id tenant}
            :query-params       params
            :headers            headers}

@@ -415,3 +415,62 @@
              acc))))
      {}
      search-param-refs)))
+
+;; ---------------------------------------------------------------------------
+;; Search parameter classification
+;; ---------------------------------------------------------------------------
+
+(def result-params
+  "FHIR R4B search *result* parameters (§3.1.1.4). They shape the response
+   rather than restrict which resources match, so they are never looked up in
+   a resource type's registry."
+  #{"_count" "_skip" "_offset" "_sort" "_include" "_revinclude"
+    "_total" "_elements" "_contained" "_containedType"
+    "_summary" "_format" "_pretty" "_type"})
+
+(def resource-level-params
+  "Filter parameters every resource type accepts whatever its registry
+   declares. The store dispatches these off base bookkeeping attributes ahead
+   of the registry lookup (`fhir-store-datomic.search/build-param-clauses`),
+   so they are honoured even when the registry has no entry for them."
+  #{"_id" "_tag" "_security" "_profile"})
+
+(defn- param-base-name
+  "The parameter name with any `:modifier` suffix removed."
+  [pname]
+  (if-let [i (str/index-of pname ":")]
+    (subs pname 0 i)
+    pname))
+
+(defn result-param?
+  "True when `pname` names a search result parameter. Matched on the base name
+   so modified forms such as `_include:iterate` classify with `_include`."
+  [pname]
+  (contains? result-params (param-base-name pname)))
+
+(defn filter-params
+  "The entries of `params` that restrict which resources match, i.e. everything
+   that is not a search result parameter. Keys keep their original form."
+  [params]
+  (into {} (remove (fn [[k _]] (result-param? (name k)))) params))
+
+(defn unsupported-filter-params
+  "Names of the filter parameters in `params` that this resource type cannot
+   honour: neither a resource-level parameter nor a name `registry` declares.
+
+   Modifiers and chains are deliberately NOT stripped. The store matches a
+   registry entry by exact name, so `patient:identifier` and `subject.name`
+   constrain a query no more than a misspelling does; reporting them keeps the
+   answer aligned with what actually reaches the query builder.
+
+   Returns a sorted vector so an OperationOutcome lists issues in a stable
+   order."
+  [registry params]
+  (let [registry (or registry {})]
+    (->> (filter-params params)
+         (map (fn [[k _]] (name k)))
+         (remove #(contains? resource-level-params %))
+         (remove #(contains? registry %))
+         distinct
+         sort
+         vec)))
