@@ -51,7 +51,31 @@
    ;; member via `actor`, used by the cabotage2 home screen.
    {:schema 'org.hl7.fhir.StructureDefinition.Appointment.v4-3-0/full-sch
     :interactions ["create" "search-type" "read" "vread"
-                   "update" "patch" "delete" "history-instance" "history-type"]}
+                   "update" "patch" "delete" "history-instance" "history-type"]
+    ;; A plain resource schema carries no search parameter list, so these are
+    ;; declared here or the type gets an empty registry and every filtered
+    ;; search on it answers 400. `actor` and `patient` are the R4B Patient
+    ;; compartment links, without which /Patient/[id]/Appointment fails closed.
+    :search-params [{:name "actor" :type "reference"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-actor"}
+                    {:name "patient" :type "reference"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-patient"}
+                    {:name "practitioner" :type "reference"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-practitioner"}
+                    {:name "location" :type "reference"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-location"}
+                    {:name "slot" :type "reference"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-slot"}
+                    {:name "date" :type "date"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-date"}
+                    {:name "status" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-status"}
+                    {:name "identifier" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-identifier"}
+                    {:name "service-type" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-service-type"}
+                    {:name "appointment-type" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Appointment-appointment-type"}]}
    ;; Group: base R4B fallback (no US Core profile). Registered so the store
    ;; builds a schema-driven encoder/decoder that round-trips
    ;; Group.member.entity references faithfully — the :default open-map decoder
@@ -60,7 +84,15 @@
    ;; Group directly from the store to resolve its member patients.
    {:schema 'org.hl7.fhir.StructureDefinition.Group.v4-3-0/full-sch
     :interactions ["create" "search-type" "read" "vread"
-                   "update" "delete" "history-instance" "history-type"]}
+                   "update" "delete" "history-instance" "history-type"]
+    :search-params [{:name "member" :type "reference"
+                     :definition "http://hl7.org/fhir/SearchParameter/Group-member"}
+                    {:name "identifier" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Group-identifier"}
+                    {:name "type" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Group-type"}
+                    {:name "code" :type "token"
+                     :definition "http://hl7.org/fhir/SearchParameter/Group-code"}]}
    {:schema 'us-core.capability.v8-0-1.ValueSet/capability
     :interactions ["create" "search-type" "read" "vread"
                    "update" "patch" "delete" "history-instance"]}

@@ -204,9 +204,19 @@
      capability data map (e.g. `us-core.capability.v8-0-1.Patient/capability`
      or `breeze.capability.v1-0-0.Patient/capability`) or a pre-compiled
      malli `:multi` schema (legacy/base-resource Vars); OR
-   - a map `{:schema <fq-sym> :interactions [..]}` where :interactions,
-     when provided, override the schema-declared interactions before
-     conversion.
+   - a map `{:schema <fq-sym> :interactions [..] :search-params [..]}` where
+     :interactions and :search-params, when provided, override what the schema
+     declares before conversion.
+
+   :search-params matters for a spec pointing at a plain resource schema
+   (`...StructureDefinition.Group.v4-3-0/full-sch`) rather than a generated
+   capability namespace: only capability namespaces carry a search parameter
+   list, so a plain schema that declares the `search-type` interaction gets an
+   empty search registry, and `server.handlers/search-type` — which rejects any
+   parameter the registry does not declare — then answers every filtered search
+   on that type with a 400. Each entry is `{:name :type :definition}`, with
+   :definition the SearchParameter's canonical URL; the JSON behind it is
+   loaded off the classpath (see `server.search-registry/build-resource-registry`).
 
    When `com.breezehealthplatform.breeze.storage.registry` is loadable,
    the resolved schema is recompiled under that registry overlay so
@@ -214,13 +224,18 @@
    Address.line) store as USEP cardinality-one strings."
   ([spec] (resolve-schema spec nil))
   ([spec {:keys [operations]}]
-   (let [{:keys [schema interactions]} (if (map? spec) spec {:schema spec})
+   (let [{:keys [schema interactions search-params]} (if (map? spec) spec {:schema spec})
          resolved @(resolve-sym schema)
          registry (when (cap-data? resolved) (sibling-registry-var schema))
          resolved (if interactions
                     (if (cap-data? resolved)
                       (assoc resolved :interactions interactions)
                       (mu/update-properties resolved into {:interactions interactions}))
+                    resolved)
+         resolved (if search-params
+                    (if (cap-data? resolved)
+                      (assoc resolved :search-params search-params)
+                      (mu/update-properties resolved into {:search-params search-params}))
                     resolved)]
      (-> (capability-schema->server-schema resolved registry operations)
          maybe-apply-breeze-storage-overlay))))

@@ -7,6 +7,7 @@
             [com.breezeehr.fhir-json-transform :as fjt]
             [server.compartment :as compartment]
             [server.json-patch :as json-patch]
+            [server.search-registry :as sr]
             [taoensso.telemere :as t]))
 
 (defn- gone-response [resource-type id]
@@ -32,6 +33,79 @@
                    :code "invalid"
                    :diagnostics (str "Invalid value for " param-name ": '"
                                      value "' — " reason)}]}})
+
+;; ---------------------------------------------------------------------------
+;; Unsupported search parameters (FHIR R4B §3.1.1.4, "Handling Errors")
+;; ---------------------------------------------------------------------------
+;;
+;; A search parameter this resource type does not declare cannot be turned into
+;; a query constraint. Silently discarding it turns a filtered search into an
+;; unfiltered one, so the constraint is never dropped without saying so:
+;; type-level search rejects the request unless the client opts into
+;; `Prefer: handling=lenient`, in which case the Bundle carries an
+;; OperationOutcome warning naming what was ignored. Conditional interactions
+;; select a resource to mutate and have no lenient mode at all — they always
+;; fail closed.
+
+(defn- prefer-handling
+  "The `handling=` directive of the request's Prefer header: :strict, :lenient,
+   or nil when absent or unrecognized."
+  [req]
+  (when-let [header (get-in req [:headers "prefer"])]
+    (when-let [m (re-find #"handling=(strict|lenient)" header)]
+      (keyword (second m)))))
+
+(defn- unsupported-params-issues
+  [resource-type severity param-names]
+  (mapv (fn [p]
+          {:severity severity
+           :code "not-supported"
+           :details {:text (str "Unknown search parameter \"" p "\" for resource type "
+                                resource-type)}
+           :diagnostics (str "Search parameter \"" p "\" is not one of the parameters "
+                             resource-type " declares in the server's CapabilityStatement, "
+                             "so it cannot restrict the result set. Remove it, or resend "
+                             "with the header 'Prefer: handling=lenient' to have it "
+                             "ignored.")})
+        param-names))
+
+(defn- unsupported-params-response
+  "400 OperationOutcome naming every search parameter `resource-type` cannot
+   honour."
+  [resource-type param-names]
+  {:status 400
+   :headers {"Prefer" "handling=strict"}
+   :body {:resourceType "OperationOutcome"
+          :issue (unsupported-params-issues resource-type "error" param-names)}})
+
+(defn- unsupported-params-entry
+  "A Bundle entry carrying the `handling=lenient` warning for the parameters
+   that were ignored. FHIR R4B §3.1.1.4 requires the outcome to travel in the
+   searchset itself, with search.mode = \"outcome\"."
+  [base-url resource-type param-names]
+  {:fullUrl (str base-url "/_search-outcome")
+   :resource {:resourceType "OperationOutcome"
+              :issue (unsupported-params-issues resource-type "warning" param-names)}
+   :search {:mode "outcome"}})
+
+(defn- conditional-criteria-error
+  "The 400 response for a conditional interaction whose criteria this resource
+   type cannot honour, or nil when the criteria are fully supported. Missing
+   criteria are an error too: a conditional interaction with nothing to match
+   on would select an arbitrary resource to update or delete."
+  [resource-type registry params]
+  (let [unsupported (sr/unsupported-filter-params registry params)]
+    (cond
+      (seq unsupported)
+      (unsupported-params-response resource-type unsupported)
+
+      (empty? (sr/filter-params params))
+      {:status 400
+       :body {:resourceType "OperationOutcome"
+              :issue [{:severity "error"
+                       :code "invalid"
+                       :diagnostics (str "Conditional interactions on " resource-type
+                                         " require at least one search parameter")}]}})))
 
 (defn- parse-non-negative-int
   "Parse a string as a non-negative integer. Returns the integer on success,
@@ -342,24 +416,26 @@
       (let [search-params (parse-query-string if-none-exist)
             normalized (normalize-search-params search-params)
             lock (conditional-create-lock tenant-id resource-type normalized)]
-        (locking lock
-          (let [results (db/search store tenant-id (keyword resource-type)
-                                   (assoc search-params :_count 2 :_skip 0)
-                                   search-registry)
-                match-count (count results)]
-            (cond
-              (zero? match-count)
-              (do-create store tenant-id resource-type resource-body)
+        (or
+         (conditional-criteria-error resource-type search-registry search-params)
+         (locking lock
+           (let [results (db/search store tenant-id (keyword resource-type)
+                                    (assoc search-params :_count 2 :_skip 0)
+                                    search-registry)
+                 match-count (count results)]
+             (cond
+               (zero? match-count)
+               (do-create store tenant-id resource-type resource-body)
 
-              (= 1 match-count)
-              {:status 200 :body (first results)}
+               (= 1 match-count)
+               {:status 200 :body (first results)}
 
-              :else
-              {:status 412
-               :body {:resourceType "OperationOutcome"
-                      :issue [{:severity "error"
-                               :code "duplicate"
-                               :diagnostics "Conditional create found multiple matches"}]}}))))
+               :else
+               {:status 412
+                :body {:resourceType "OperationOutcome"
+                       :issue [{:severity "error"
+                                :code "duplicate"
+                                :diagnostics "Conditional create found multiple matches"}]}})))))
       ;; No If-None-Exist: create normally
       (do-create store tenant-id resource-type resource-body))))
 
@@ -465,12 +541,27 @@
                         :search {:mode "include"}}))))))))
 
 (defn search-type
-  "Handler for GET /[type] RESTful interaction."
+  "Handler for GET /[type] RESTful interaction.
+
+   Parameters the resource type does not declare are rejected with a 400
+   OperationOutcome. `Prefer: handling=lenient` instead ignores them and
+   returns the (correspondingly wider) result set with an OperationOutcome
+   warning entry naming each one, per FHIR R4B §3.1.1.4."
   [req]
   (let [store (:fhir/store req)
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
-        params (merge (or (:form-params req) {}) (or (:query-params req) {}))
+        raw-params (merge (or (:form-params req) {}) (or (:query-params req) {}))
+        search-registry (:fhir/search-registry req)
+        unsupported (sr/unsupported-filter-params search-registry raw-params)
+        lenient? (= :lenient (prefer-handling req))
+
+        ;; Under handling=lenient the ignored parameters are dropped from
+        ;; everything downstream — the store call and the Bundle's own links —
+        ;; so the self link describes the search that actually ran.
+        params (if (seq unsupported)
+                 (into {} (remove (fn [[k _]] (some #{(name k)} unsupported))) raw-params)
+                 raw-params)
 
         ;; Extract _include and _revinclude before passing to search
         include-param (or (get params "_include") (get params :_include))
@@ -482,64 +573,69 @@
 
         limit (parse-non-negative-int "_count" (str count-param))
         skip (parse-non-negative-int "_skip" (str skip-param))]
-    (if-let [err (or (:error limit) (:error skip))]
-      err
-      (let [search-registry (:fhir/search-registry req)
-            base-url (str "/" tenant-id "/fhir/" resource-type)]
-        (if (zero? limit)
-          ;; _count=0: return total-only Bundle with no entries and no next link
-          (let [total (db/count-resources store tenant-id (keyword resource-type)
-                                         (assoc params :_count 0 :_skip 0) search-registry)
-                build-link (fn [new-skip]
-                             (let [query-string (->> (assoc params :_count limit :_skip new-skip)
-                                                     (map (fn [[k v]] (str (name k) "=" v)))
-                                                     (clojure.string/join "&"))]
-                               (str base-url "?" query-string)))
-                self-link {:relation "self" :url (build-link skip)}]
-            {:status 200
-             :body {:resourceType "Bundle"
-                    :type "searchset"
-                    :total total
-                    :link [self-link]}})
-          ;; Normal search with pagination
-          (let [search-params (assoc params :_count limit :_skip skip)
-                results (db/search store tenant-id (keyword resource-type) search-params search-registry)
-
-                build-link (fn [new-skip]
-                             (let [query-string (->> (assoc params :_count limit :_skip new-skip)
-                                                     (map (fn [[k v]] (str (name k) "=" v)))
-                                                     (clojure.string/join "&"))]
-                               (str base-url "?" query-string)))
-
-                self-link {:relation "self" :url (build-link skip)}
-
-                next-link (when (= (count results) limit)
-                            {:relation "next" :url (build-link (+ skip limit))})
-
-                prev-link (when (> skip 0)
-                            {:relation "previous" :url (build-link (max 0 (- skip limit)))})
-
-                links (filterv some? [self-link next-link prev-link])
-
-                entries (mapv (fn [res]
-                                {:fullUrl (str base-url "/" (:id res))
-                                 :resource res
-                                 :search {:mode "match"}})
-                              results)
-
-                all-registries (:fhir/all-registries req)
-                inc-entries (resolve-includes store tenant-id results include-param all-registries)
-                revinc-entries (resolve-revincludes store tenant-id results revinclude all-registries)
-
-                all-entries (cond-> entries
-                              (seq inc-entries) (into inc-entries)
-                              (seq revinc-entries) (into revinc-entries))]
-            {:status 200
-             :body {:resourceType "Bundle"
-                    :type "searchset"
-                    :total (count results)
-                    :link links
-                    :entry all-entries}}))))))
+    (if (and (seq unsupported) (not lenient?))
+      (unsupported-params-response resource-type unsupported)
+      (if-let [err (or (:error limit) (:error skip))]
+        err
+        (let [base-url (str "/" tenant-id "/fhir/" resource-type)
+              outcome-entry (when (seq unsupported)
+                              (unsupported-params-entry base-url resource-type unsupported))]
+          (if (zero? limit)
+            ;; _count=0: return total-only Bundle with no entries and no next link
+            (let [total (db/count-resources store tenant-id (keyword resource-type)
+                                           (assoc params :_count 0 :_skip 0) search-registry)
+                  build-link (fn [new-skip]
+                               (let [query-string (->> (assoc params :_count limit :_skip new-skip)
+                                                       (map (fn [[k v]] (str (name k) "=" v)))
+                                                       (clojure.string/join "&"))]
+                                 (str base-url "?" query-string)))
+                  self-link {:relation "self" :url (build-link skip)}]
+              {:status 200
+               :body (cond-> {:resourceType "Bundle"
+                              :type "searchset"
+                              :total total
+                              :link [self-link]}
+                       outcome-entry (assoc :entry [outcome-entry]))})
+            ;; Normal search with pagination
+            (let [search-params (assoc params :_count limit :_skip skip)
+                  results (db/search store tenant-id (keyword resource-type) search-params search-registry)
+  
+                  build-link (fn [new-skip]
+                               (let [query-string (->> (assoc params :_count limit :_skip new-skip)
+                                                       (map (fn [[k v]] (str (name k) "=" v)))
+                                                       (clojure.string/join "&"))]
+                                 (str base-url "?" query-string)))
+  
+                  self-link {:relation "self" :url (build-link skip)}
+  
+                  next-link (when (= (count results) limit)
+                              {:relation "next" :url (build-link (+ skip limit))})
+  
+                  prev-link (when (> skip 0)
+                              {:relation "previous" :url (build-link (max 0 (- skip limit)))})
+  
+                  links (filterv some? [self-link next-link prev-link])
+  
+                  entries (mapv (fn [res]
+                                  {:fullUrl (str base-url "/" (:id res))
+                                   :resource res
+                                   :search {:mode "match"}})
+                                results)
+  
+                  all-registries (:fhir/all-registries req)
+                  inc-entries (resolve-includes store tenant-id results include-param all-registries)
+                  revinc-entries (resolve-revincludes store tenant-id results revinclude all-registries)
+  
+                  all-entries (cond-> entries
+                                (seq inc-entries) (into inc-entries)
+                                (seq revinc-entries) (into revinc-entries)
+                                outcome-entry (conj outcome-entry))]
+              {:status 200
+               :body {:resourceType "Bundle"
+                      :type "searchset"
+                      :total (count results)
+                      :link links
+                      :entry all-entries}})))))))
 
 (defn conditional-update
   "Handler for PUT /[type]?[search params] — conditional update."
@@ -549,39 +645,41 @@
         resource-type (:fhir/resource-type req)
         resource-body (get-in req [:parameters :body])
         search-registry (:fhir/search-registry req)
-        params (merge (or (:query-params req) {}) (or (:form-params req) {}))
-        results (db/search store tenant-id (keyword resource-type)
-                           (assoc params :_count 2 :_skip 0) search-registry)
-        match-count (count results)]
-    (cond
-      (zero? match-count)
-      ;; No matches: create
-      (let [id (or (:id resource-body) (str (java.util.UUID/randomUUID)))
-            res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
-            base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
-            vid (get-in res [:meta :versionId])]
-        {:status 201
-         :headers {"Location" (str base-url "/_history/" vid)}
-         :body res})
+        params (merge (or (:query-params req) {}) (or (:form-params req) {}))]
+    (or
+     (conditional-criteria-error resource-type search-registry params)
+     (let [results (db/search store tenant-id (keyword resource-type)
+                              (assoc params :_count 2 :_skip 0) search-registry)
+           match-count (count results)]
+       (cond
+         (zero? match-count)
+         ;; No matches: create
+         (let [id (or (:id resource-body) (str (java.util.UUID/randomUUID)))
+               res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
+               base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
+               vid (get-in res [:meta :versionId])]
+           {:status 201
+            :headers {"Location" (str base-url "/_history/" vid)}
+            :body res})
 
-      (= 1 match-count)
-      ;; One match: update it
-      (let [existing (first results)
-            id (:id existing)
-            body-id (:id resource-body)]
-        (if (and body-id (not= body-id id))
-          {:status 400
-           :body {:resourceType "OperationOutcome"
-                  :issue [{:severity "error" :code "invalid"
-                           :diagnostics (str "Resource id in body (" body-id ") does not match resolved id (" id ")")}]}}
-          (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
-            {:status 200 :body res})))
+         (= 1 match-count)
+         ;; One match: update it
+         (let [existing (first results)
+               id (:id existing)
+               body-id (:id resource-body)]
+           (if (and body-id (not= body-id id))
+             {:status 400
+              :body {:resourceType "OperationOutcome"
+                     :issue [{:severity "error" :code "invalid"
+                              :diagnostics (str "Resource id in body (" body-id ") does not match resolved id (" id ")")}]}}
+             (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
+               {:status 200 :body res})))
 
-      :else
-      {:status 412
-       :body {:resourceType "OperationOutcome"
-              :issue [{:severity "error" :code "duplicate"
-                       :diagnostics "Conditional update matched multiple resources"}]}})))
+         :else
+         {:status 412
+          :body {:resourceType "OperationOutcome"
+                 :issue [{:severity "error" :code "duplicate"
+                          :diagnostics "Conditional update matched multiple resources"}]}})))))
 
 (defn conditional-delete
   "Handler for DELETE /[type]?[search params] — conditional delete."
@@ -590,23 +688,25 @@
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
         search-registry (:fhir/search-registry req)
-        params (merge (or (:query-params req) {}) (or (:form-params req) {}))
-        results (db/search store tenant-id (keyword resource-type)
-                           (assoc params :_count 2 :_skip 0) search-registry)
-        match-count (count results)]
-    (cond
-      (zero? match-count)
-      {:status 204 :body nil}
+        params (merge (or (:query-params req) {}) (or (:form-params req) {}))]
+    (or
+     (conditional-criteria-error resource-type search-registry params)
+     (let [results (db/search store tenant-id (keyword resource-type)
+                              (assoc params :_count 2 :_skip 0) search-registry)
+           match-count (count results)]
+       (cond
+         (zero? match-count)
+         {:status 204 :body nil}
 
-      (= 1 match-count)
-      (do (db/delete-resource store tenant-id (keyword resource-type) (:id (first results)))
-          {:status 204 :body nil})
+         (= 1 match-count)
+         (do (db/delete-resource store tenant-id (keyword resource-type) (:id (first results)))
+             {:status 204 :body nil})
 
-      :else
-      {:status 412
-       :body {:resourceType "OperationOutcome"
-              :issue [{:severity "error" :code "duplicate"
-                       :diagnostics "Conditional delete matched multiple resources"}]}})))
+         :else
+         {:status 412
+          :body {:resourceType "OperationOutcome"
+                 :issue [{:severity "error" :code "duplicate"
+                          :diagnostics "Conditional delete matched multiple resources"}]}})))))
 
 (defn conditional-patch
   "Handler for PATCH /[type]?[search params] — conditional patch."
@@ -616,29 +716,31 @@
         resource-type (:fhir/resource-type req)
         patch-ops (get-in req [:parameters :body])
         search-registry (:fhir/search-registry req)
-        params (merge (or (:query-params req) {}) (or (:form-params req) {}))
-        results (db/search store tenant-id (keyword resource-type)
-                           (assoc params :_count 2 :_skip 0) search-registry)
-        match-count (count results)]
-    (cond
-      (zero? match-count)
-      {:status 404
-       :body {:resourceType "OperationOutcome"
-              :issue [{:severity "error" :code "not-found"
-                       :diagnostics "Conditional patch found no matching resources"}]}}
+        params (merge (or (:query-params req) {}) (or (:form-params req) {}))]
+    (or
+     (conditional-criteria-error resource-type search-registry params)
+     (let [results (db/search store tenant-id (keyword resource-type)
+                              (assoc params :_count 2 :_skip 0) search-registry)
+           match-count (count results)]
+       (cond
+         (zero? match-count)
+         {:status 404
+          :body {:resourceType "OperationOutcome"
+                 :issue [{:severity "error" :code "not-found"
+                          :diagnostics "Conditional patch found no matching resources"}]}}
 
-      (= 1 match-count)
-      (let [existing (first results)
-            id (:id existing)
-            patched (json-patch/apply-patch existing patch-ops)
-            result (db/update-resource store tenant-id (keyword resource-type) id patched)]
-        {:status 200 :body result})
+         (= 1 match-count)
+         (let [existing (first results)
+               id (:id existing)
+               patched (json-patch/apply-patch existing patch-ops)
+               result (db/update-resource store tenant-id (keyword resource-type) id patched)]
+           {:status 200 :body result})
 
-      :else
-      {:status 412
-       :body {:resourceType "OperationOutcome"
-              :issue [{:severity "error" :code "duplicate"
-                       :diagnostics "Conditional patch matched multiple resources"}]}})))
+         :else
+         {:status 412
+          :body {:resourceType "OperationOutcome"
+                 :issue [{:severity "error" :code "duplicate"
+                          :diagnostics "Conditional patch matched multiple resources"}]}})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Compartment search (FHIR R4 §3.3.1)
@@ -682,24 +784,29 @@
       ;; Wildcard: search all resource types in the compartment
       (= target-type "*")
       (let [params  (merge (or (:query-params req) {}) (or (:form-params req) {}))
-            entries (vec
-                      (mapcat
-                        (fn [[rt _params]]
-                          (when-let [registry (get all-registries rt)]
-                            (let [results (compartment-confined-search
-                                            store tenant-id compartment-type compartment-id rt
-                                            (assoc params :_count 50 :_skip 0) registry)]
-                              (mapv (fn [res]
-                                      {:fullUrl  (str "/" tenant-id "/fhir/" rt "/" (:id res))
-                                       :resource res
-                                       :search   {:mode "match"}})
-                                    results))))
-                        compartment-map))]
-        {:status 200
-         :body {:resourceType "Bundle"
-                :type "searchset"
-                :total (count entries)
-                :entry entries}})
+            ;; The same params are applied to every member type, so only the
+            ;; ones every type honours are accepted (see `system-search`).
+            unsupported (sr/unsupported-filter-params nil params)]
+        (if (seq unsupported)
+          (unsupported-params-response (str compartment-type " compartment search") unsupported)
+          (let [entries (vec
+                          (mapcat
+                            (fn [[rt _params]]
+                              (when-let [registry (get all-registries rt)]
+                                (let [results (compartment-confined-search
+                                                store tenant-id compartment-type compartment-id rt
+                                                (assoc params :_count 50 :_skip 0) registry)]
+                                  (mapv (fn [res]
+                                          {:fullUrl  (str "/" tenant-id "/fhir/" rt "/" (:id res))
+                                           :resource res
+                                           :search   {:mode "match"}})
+                                        results))))
+                            compartment-map))]
+            {:status 200
+             :body {:resourceType "Bundle"
+                    :type "searchset"
+                    :total (count entries)
+                    :entry entries}})))
 
       ;; Specific target resource type
       :else
@@ -712,32 +819,35 @@
                                            compartment-type " compartment")}]}}
         (let [registry  (get all-registries target-type)
               params    (merge (or (:query-params req) {}) (or (:form-params req) {}))
-              count-param (or (get params :_count) (get params "_count") "50")
-              skip-param  (or (get params :_skip) (get params "_skip") "0")
-              limit (if (string? count-param) (parse-long count-param) count-param)
-              skip  (if (string? skip-param)  (parse-long skip-param)  skip-param)
-              results (if registry
-                        (compartment-confined-search
-                          store tenant-id compartment-type compartment-id target-type
-                          (assoc params :_count limit :_skip skip) registry)
-                        [])
-              base-url (str "/" tenant-id "/fhir/" compartment-type "/" compartment-id "/" target-type)
-              entries (mapv (fn [res]
-                              {:fullUrl  (str "/" tenant-id "/fhir/" target-type "/" (:id res))
-                               :resource res
-                               :search   {:mode "match"}})
-                            results)
-              self-link {:relation "self" :url base-url}
-              next-link (when (= (count results) limit)
-                          {:relation "next"
-                           :url (str base-url "?_count=" limit "&_skip=" (+ skip limit))})
-              links (filterv some? [self-link next-link])]
-          {:status 200
-           :body {:resourceType "Bundle"
-                  :type "searchset"
-                  :total (count results)
-                  :link links
-                  :entry entries}})))))
+              unsupported (sr/unsupported-filter-params registry params)]
+          (if (seq unsupported)
+            (unsupported-params-response target-type unsupported)
+            (let [count-param (or (get params :_count) (get params "_count") "50")
+                skip-param  (or (get params :_skip) (get params "_skip") "0")
+                limit (if (string? count-param) (parse-long count-param) count-param)
+                skip  (if (string? skip-param)  (parse-long skip-param)  skip-param)
+                results (if registry
+                          (compartment-confined-search
+                            store tenant-id compartment-type compartment-id target-type
+                            (assoc params :_count limit :_skip skip) registry)
+                          [])
+                base-url (str "/" tenant-id "/fhir/" compartment-type "/" compartment-id "/" target-type)
+                entries (mapv (fn [res]
+                                {:fullUrl  (str "/" tenant-id "/fhir/" target-type "/" (:id res))
+                                 :resource res
+                                 :search   {:mode "match"}})
+                              results)
+                self-link {:relation "self" :url base-url}
+                next-link (when (= (count results) limit)
+                            {:relation "next"
+                             :url (str base-url "?_count=" limit "&_skip=" (+ skip limit))})
+                links (filterv some? [self-link next-link])]
+            {:status 200
+             :body {:resourceType "Bundle"
+                    :type "searchset"
+                    :total (count results)
+                    :link links
+                    :entry entries}})))))))
 
 ;; ---------------------------------------------------------------------------
 ;; $validate operation (FHIR R4 §3.1.0.11)
@@ -1058,34 +1168,45 @@
             :total (count all-entries)
             :entry all-entries}}))
 
-(defn system-search [req]
+(defn system-search
+  "Handler for GET|POST /_search — search across every resource type.
+
+   A system-level search can only be expressed with parameters every type
+   shares, so anything beyond the result parameters and the resource-level
+   filters (`_id`, `_tag`, `_security`, `_profile`) is rejected rather than
+   applied per type, where it would silently degrade to an unfiltered scan of
+   the types that do not declare it."
+  [req]
   (let [store (:fhir/store req)
         tenant-id (-> req :path-params :tenant-id)
         params (merge (or (:form-params req) {}) (or (:query-params req) {}))
         type-param (or (get params "_type") (get params :_type))
         all-registries (:fhir/all-registries req)
+        unsupported (sr/unsupported-filter-params nil params)
         ;; If _type specified, search only those types; otherwise search all
         types (if type-param
                 (str/split type-param #",")
-                (keys all-registries))
-        all-entries (mapcat
-                      (fn [resource-type]
-                        (let [registry (get all-registries resource-type)
-                              results (when registry
-                                        (db/search store tenant-id (keyword resource-type)
-                                                   (assoc params :_count 50 :_skip 0)
-                                                   registry))]
-                          (mapv (fn [res]
-                                  {:fullUrl (str "/" tenant-id "/fhir/" resource-type "/" (:id res))
-                                   :resource res
-                                   :search {:mode "match"}})
-                                (or results []))))
-                      types)]
-    {:status 200
-     :body {:resourceType "Bundle"
-            :type "searchset"
-            :total (count all-entries)
-            :entry (vec all-entries)}}))
+                (keys all-registries))]
+    (if (seq unsupported)
+      (unsupported-params-response "system-level search" unsupported)
+      (let [all-entries (mapcat
+                          (fn [resource-type]
+                            (let [registry (get all-registries resource-type)
+                                  results (when registry
+                                            (db/search store tenant-id (keyword resource-type)
+                                                       (assoc params :_count 50 :_skip 0)
+                                                       registry))]
+                              (mapv (fn [res]
+                                      {:fullUrl (str "/" tenant-id "/fhir/" resource-type "/" (:id res))
+                                       :resource res
+                                       :search {:mode "match"}})
+                                    (or results []))))
+                          types)]
+        {:status 200
+         :body {:resourceType "Bundle"
+                :type "searchset"
+                :total (count all-entries)
+                :entry (vec all-entries)}}))))
 
 (defn build-resource-decoders
   "Builds {resource-type-string -> decoder-fn} so a resource map can be
