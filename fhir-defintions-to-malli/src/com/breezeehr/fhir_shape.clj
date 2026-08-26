@@ -52,6 +52,13 @@
   [info]
   (:sliced? info false))
 
+(defn multi-typed?
+  "Is this a polymorphic slot - one key holding a choice over several declared
+   types, discriminated by the type the instance names? Its :ref-kw records the
+   DEFAULT arm only, so a caller that needs the whole choice reads :type-codes."
+  [info]
+  (:multi-typed? info false))
+
 (defn content-ref?
   "Is this a contentReference field (recursive/lazy ref to a BackboneElement)?"
   [info]
