@@ -631,6 +631,66 @@
                      :form [(m/form sch external-registry)])
         primitive? (assoc :primitive? true)))))
 
+;; ---------------------------------------------------------------------------
+;; Polymorphic slots discriminated by xsi:type
+;;
+;; FHIR spells a choice element `value[x]` and gives each declared type its own
+;; key. A logical model of an XML schema -- CDA is the one in use here -- keeps
+;; ONE element name and has the instance name its datatype in `xsi:type`. Both
+;; arrive as an ElementDefinition whose `type` lists several entries, so the id
+;; is what tells them apart: `[x]` present means per-type keys, absent means one
+;; key holding a choice.
+;; ---------------------------------------------------------------------------
+
+(defn- type-code->xsi-name
+  "The name an instance writes in `xsi:type` for a declared type code.
+
+   A StructureDefinition id spells an interval `IVL-TS` where the XML datatype
+   name spells it `IVL_TS`. Derived from the type code's URL rather than from
+   the element id, because HL7 uses both spellings in ids: SXPR-TS's own
+   snapshot reads `SXPR_TS.comp` while its canonical URL reads `SXPR-TS`."
+  [code]
+  (when (string? code)
+    (str/replace (peek (str/split code #"/")) "-" "_")))
+
+(def ^:private xsi-type-dispatch-form
+  "The `:multi` dispatch for a polymorphic slot, as a FORM rather than a value:
+   generated namespaces are printed to a file and read back, so this cannot be a
+   closure, and it may name nothing a generated namespace does not require.
+
+   The claim is recorded verbatim by the serde, so it can carry a namespace
+   prefix; strip one the way a type resolver does, or a prefixed claim would
+   never reach its arm. A value stating no type dispatches nil, which is what
+   makes the `::m/default` arm the declared-type arm."
+  '(fn [m]
+     (let [t (:xsi/type m)]
+       (when (string? t)
+         (let [i (count (take-while (fn [c] (not= \: c)) t))]
+           (if (< i (count t)) (subs t (inc i)) t))))))
+
+(defn- type-union-form
+  "One key for a polymorphic slot: an ordered `:multi` over the declared types,
+   dispatched on the `xsi:type` the instance states, with the FIRST declared
+   type as the `::m/default` arm.
+
+   One key and not one per type: an instance writes differently-typed siblings
+   under the same element name, so the document order between them lives in the
+   sequence under that one key and per-type buckets would lose it.
+
+   The arms stay in declaration order, and the default arm repeats the first
+   type rather than referring to it, so a consumer that reads only the arm list
+   still sees every type the element declares."
+  [{types ::type-union} version]
+  (when (> (count types) 1)
+    (let [arm (fn [t] (first (:form (prim-or-ref {:sch nil :form []} t version))))
+          entries (into [] (keep (fn [t]
+                                   (when-let [f (arm t)]
+                                     [(type-code->xsi-name (:code t)) f])))
+                        types)]
+      (when (> (count entries) 1)
+        (into [:multi {:dispatch xsi-type-dispatch-form
+                       :xml/type-union true}]
+              (conj entries [:malli.core/default (arm (first types))]))))))
 
 (declare element-definition->attribute)
 
@@ -1085,17 +1145,27 @@
        :else nil)
      slice-name)))
 
+(defn- type-union-multi?
+  "Is this `:multi` a polymorphic slot rather than a slice union? The two
+   dispatch on different things, so a slice arm can never be merged into one."
+  [sch]
+  (boolean (some-> sch m/properties :xml/type-union)))
+
 (defn- as-sequential-multi
-  "If sch is :multi or [:sequential multi], return [sequential? multi-sch], else nil."
+  "If sch is a SLICE :multi or [:sequential slice-multi], return
+   [sequential? multi-sch], else nil. A polymorphic slot is also a :multi but
+   its arms are keyed by datatype name, so merging a profile slice into it
+   would add an arm nothing can ever dispatch to."
   [sch]
   (when sch
     (let [t (try (m/type sch) (catch Exception _ nil))]
       (cond
-        (= t :multi) [false sch]
+        (= t :multi) (when-not (type-union-multi? sch) [false sch])
         (= t :sequential)
         (let [inner (first (m/children sch))
               it (when inner (try (m/type inner) (catch Exception _ nil)))]
-          (when (= it :multi) [true inner]))
+          (when (and (= it :multi) (not (type-union-multi? inner)))
+            [true inner]))
         :else nil))))
 
 (defn- find-and-remove-base-form
@@ -1380,6 +1450,14 @@
           ;; the shape's :ref-kw recorded the FIRST, so the shape record is
           ;; stale exactly where this decision matters.
           inherited-kw (or (ref-kw-from-sch old-sch) (:ref-kw field-info))
+          ;; A polymorphic slot holds a choice, not a ref: there is no single
+          ;; inherited type to compare against, and the shape's :ref-kw names
+          ;; only the default arm. A differential that declares one concrete type
+          ;; there is narrowing the choice, so it is always an override --
+          ;; threading onto the choice would patch a schema that has no entries.
+          multi-typed-inherited? (or (shape/multi-typed? field-info)
+                                     (= :multi (try (m/type old-sch)
+                                                    (catch Exception _ nil))))
           ;; When the differential declares a type that differs from the inherited
           ;; one, the declared type is authoritative: descend into it and emit a
           ;; base-fn thread instead of updating the inherited field schema.
@@ -1390,10 +1468,12 @@
           declared-override? (and raw-code
                                   (not base-primitive)
                                   (not (#{"Element" "BackboneElement"} raw-code))
-                                  (keyword? inherited-kw)
                                   base-kw
-                                  (not= (namespace base-kw) (namespace inherited-kw))
-                                  (some? (resolve-malli-sch base-kw)))
+                                  (some? (resolve-malli-sch base-kw))
+                                  (or multi-typed-inherited?
+                                      (and (keyword? inherited-kw)
+                                           (not= (namespace base-kw)
+                                                 (namespace inherited-kw)))))
           effective-old-sch (if (or declared-override?
                                     (and resolved-old-sch (not old-sch-map?)))
                               nil
@@ -1460,46 +1540,53 @@
 
 (defn compute-element-patch
   [{old-sch :sch :as acc} id {:keys [code] :as attr-type} main-attr sub-elements main-path version]
-  (let [field-info (:field-info acc)
-        dispatch (if code
-                   code
-                   (dispatch-from-field-info field-info old-sch))]
-    (case dispatch
-      (:map :or)
-      (patch-with-sub-elements (update acc :sch unwrap-sequential) sub-elements main-path version)
+  (if-let [union (type-union-form attr-type version)]
+    ;; A polymorphic slot's value schema is the choice itself. :sch is nil so the
+    ;; caller reads no single ref off it; the shape records the default arm's
+    ;; keyword explicitly instead. Intercepting here rather than in prim-or-ref
+    ;; keeps it upstream of the has-deeper-sub? split, so it stays correct if a
+    ;; package ever constrains a sub-element under such a slot.
+    (assoc acc :sch nil :form [union])
+    (let [field-info (:field-info acc)
+          dispatch (if code
+                     code
+                     (dispatch-from-field-info field-info old-sch))]
+      (case dispatch
+        (:map :or)
+        (patch-with-sub-elements (update acc :sch unwrap-sequential) sub-elements main-path version)
 
-      (:ref :lazy-ref)
-      (let [ref-target (or (:ref-kw field-info)
-                           (some-> old-sch m/children first))]
-        (patch-with-sub-elements
-         (assoc acc :sch (resolve-malli-sch ref-target))
-         sub-elements main-path version))
+        (:ref :lazy-ref)
+        (let [ref-target (or (:ref-kw field-info)
+                             (some-> old-sch m/children first))]
+          (patch-with-sub-elements
+           (assoc acc :sch (resolve-malli-sch ref-target))
+           sub-elements main-path version))
 
-      nil
-      (if-some [contentReference (:contentReference main-attr)]
-        (let [cr (if-let [idx (str/index-of contentReference "#")]
-                   (subs contentReference idx)
-                   contentReference)]
-          (assoc acc :sch [:lazy-ref cr] :form [[:ref cr]]))
-        acc)
+        nil
+        (if-some [contentReference (:contentReference main-attr)]
+          (let [cr (if-let [idx (str/index-of contentReference "#")]
+                     (subs contentReference idx)
+                     contentReference)]
+            (assoc acc :sch [:lazy-ref cr] :form [[:ref cr]]))
+          acc)
 
-      (:string :boolean :enum) acc
+        (:string :boolean :enum) acc
 
-      ("Element" "BackboneElement")
-      (patch-element acc id attr-type main-attr sub-elements main-path version)
+        ("Element" "BackboneElement")
+        (patch-element acc id attr-type main-attr sub-elements main-path version)
 
-      :vector
-      (let [inner-sch (second (:sch acc))
-            inner-acc (assoc acc :sch inner-sch)
-            patched-acc (compute-element-patch inner-acc id attr-type main-attr sub-elements main-path version)]
-        (assoc patched-acc :sch [:vector (:sch patched-acc)]))
+        :vector
+        (let [inner-sch (second (:sch acc))
+              inner-acc (assoc acc :sch inner-sch)
+              patched-acc (compute-element-patch inner-acc id attr-type main-attr sub-elements main-path version)]
+          (assoc patched-acc :sch [:vector (:sch patched-acc)]))
 
-      ;; default
-      (let [has-deeper-sub? (some #(> (count (:path %)) (count main-path)) sub-elements)
-            is-primitive? (boolean (when code (fhir-primitives code)))]
-        (if (and has-deeper-sub? (not is-primitive?))
-          (patch-element acc id attr-type main-attr sub-elements main-path version)
-          (prim-or-ref acc attr-type version))))))
+        ;; default
+        (let [has-deeper-sub? (some #(> (count (:path %)) (count main-path)) sub-elements)
+              is-primitive? (boolean (when code (fhir-primitives code)))]
+          (if (and has-deeper-sub? (not is-primitive?))
+            (patch-element acc id attr-type main-attr sub-elements main-path version)
+            (prim-or-ref acc attr-type version)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; attr->value-schema-patch
@@ -1698,16 +1785,27 @@
                           `(~'mu/assoc ~(underscore-attr k) ~under-form)
                           `(~'mu/optional-keys [~(underscore-attr k)])))
                 (update :shape shape/assoc-field k
-                        (let [ref-kw (when (and (vector? new-sub-sch)
-                                                (= :lazy-ref (first new-sub-sch))
-                                                (keyword? (second new-sub-sch)))
-                                       (second new-sub-sch))
-                              content-ref? (and (not ref-kw)
-                                                (vector? new-sub-sch)
-                                                (= :lazy-ref (first new-sub-sch))
-                                                (string? (second new-sub-sch)))]
-                          (cond-> (shape/field-info attr-type (:max main-attr) ref-kw)
-                            content-ref? (assoc :content-ref? true))))))))
+                        (if-let [union-types (::type-union attr-type)]
+                          ;; A polymorphic slot has no single value schema to
+                          ;; read a ref off, so record the default arm's type
+                          ;; explicitly: a later differential that restates the
+                          ;; element with no type code resolves the slot through
+                          ;; this :ref-kw.
+                          (let [default-type (first union-types)]
+                            (assoc (shape/field-info default-type (:max main-attr)
+                                                     (lookup-schema-kw (:code default-type) version))
+                                   :multi-typed? true
+                                   :type-codes (mapv :code union-types)))
+                          (let [ref-kw (when (and (vector? new-sub-sch)
+                                                  (= :lazy-ref (first new-sub-sch))
+                                                  (keyword? (second new-sub-sch)))
+                                         (second new-sub-sch))
+                                content-ref? (and (not ref-kw)
+                                                  (vector? new-sub-sch)
+                                                  (= :lazy-ref (first new-sub-sch))
+                                                  (string? (second new-sub-sch)))]
+                            (cond-> (shape/field-info attr-type (:max main-attr) ref-kw)
+                              content-ref? (assoc :content-ref? true)))))))))
     old-acc))
 
 ;; ---------------------------------------------------------------------------
@@ -2202,7 +2300,25 @@
                                             (>= (count path) parent-path-count)))
                                items)
             id (nth main-path parent-path-count)
-            expand? (str/includes? id "[x]")]
+            expand? (str/includes? id "[x]")
+            declared (if (nil? attr-types)
+                       (if (:contentReference main-attr)
+                         [nil]
+                         [{:code nil}])
+                       attr-types)
+            concrete (filterv :code declared)
+            ;; A choice element gets one key per declared type, so folding the
+            ;; whole list builds the choice. An element with no `[x]` that
+            ;; declares several types is not that: it is ONE polymorphic slot
+            ;; whose instances name their type in `xsi:type`. Folding it patched
+            ;; the same key once per type and left whichever the package listed
+            ;; last, so fold once over a synthetic type carrying the whole list
+            ;; and let compute-element-patch emit the choice for it.
+            passes (if (and (not expand?)
+                            (nil? (:sliceName main-attr))
+                            (> (count concrete) 1))
+                     [(assoc (first concrete) ::type-union concrete)]
+                     declared)]
         (reduce
          (fn [acc {:keys [code] :as attr-type}]
            (if (or (not expand?) code)
@@ -2214,11 +2330,7 @@
                                   attr-type main-attr sub-elements main-path version)
              acc))
          acc
-         (if (nil? attr-types)
-           (if (:contentReference main-attr)
-             [nil]
-             [{:code nil}])
-           attr-types))))))
+         passes)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Structure definition properties

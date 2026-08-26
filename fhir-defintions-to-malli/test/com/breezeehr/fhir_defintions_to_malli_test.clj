@@ -671,3 +671,131 @@
                                        :fhir/representation ["xmlAttr"]
                                        :optional true})
           "and the wire position survives with it"))))
+
+;; ---------------------------------------------------------------------------
+;; Polymorphic slots discriminated by xsi:type
+;;
+;; An element with no `[x]` that declares several types is one slot, not
+;; several fields. Folding the type list patched the same key once per type and
+;; left whichever the package listed last.
+;; ---------------------------------------------------------------------------
+
+(defn- union-scenario
+  "Drive element-definition->attribute for an element `TP.f` declaring
+   `type-urls` in that order, with cardinality `max-val`. Returns the emitted
+   :form, the collected references and the resulting shape."
+  [type-urls max-val]
+  (let [opts (update fp/fhir-registry-options :registry
+                     #(mr/composite-registry
+                       %
+                       (mr/registry {ta-kw (m/schema [:map [:x :string]] fp/fhir-registry-options)
+                                     tb-kw (m/schema [:map [:u :string]] fp/fhir-registry-options)
+                                     tc-kw (m/schema [:map [:w :string]] fp/fhir-registry-options)})))
+        refs (atom #{})
+        items [{:path ["TP" "f"] :min 0 :max max-val
+                :id "TP.f"
+                :type (mapv (fn [u] {:code u}) type-urls)}]
+        acc (binding [fdm/*schema-atom* (atom {})
+                      fdm/*references-atom* refs
+                      fdm/*recursive-references* #{}
+                      fdm/*base-refs* (atom {})]
+              (fdm/element-definition->attribute
+               {:sch (m/schema [:map {:closed true}] opts) :shape {} :form []}
+               ["TP"] "1.0" items))]
+    {:form (:form acc) :references @refs :shape (:shape acc)}))
+
+(defn- union-value-form
+  "The value form the emitted (mu/assoc :f <value>) carries."
+  [form]
+  (some (fn [f] (when (and (seq? f) (= 'mu/assoc (first f)) (= :f (second f)))
+                  (nth f 2)))
+        form))
+
+(deftest polymorphic-slot-becomes-one-xsi-type-multi-test
+  (testing "several declared types on a non-[x] element become ONE key holding an
+            ordered :multi, in declaration order, with the first declared type
+            repeated as the ::m/default arm"
+    (let [{:keys [form references shape]} (union-scenario [ta-url tb-url tc-url] "*")
+          value (union-value-form form)]
+      (is (= 1 (count (filter (fn [f] (and (seq? f) (= 'mu/assoc (first f)) (= :f (second f))))
+                              form)))
+          "one key, emitted once - not once per declared type")
+      (is (= :sequential (first value))
+          "the cardinality wrapper stays outermost, so the slot still repeats")
+      (let [multi (second value)]
+        (is (= :multi (first multi)))
+        (is (true? (:xml/type-union (second multi)))
+            "marked as a type union, so a slice union is still told apart from it")
+        (is (= ["TA" "TB" "TC" :malli.core/default]
+               (mapv first (drop 2 multi)))
+            "arm per declared type, in declaration order, then the default arm")
+        (is (= (nth (nth multi 2) 1) (nth (last multi) 1))
+            "the default arm repeats the FIRST declared type, which is what an
+             instance stating no xsi:type is an instance of"))
+      (is (= #{ta-kw tb-kw tc-kw} (into #{} (filter #{ta-kw tb-kw tc-kw}) references))
+          "every declared type is recorded as a reference, as before")
+      (is (true? (shape/multi-typed? (shape/get-field shape :f))))
+      (is (= [ta-url tb-url tc-url] (:type-codes (shape/get-field shape :f))))
+      (is (= ta-kw (:ref-kw (shape/get-field shape :f)))
+          "the shape's ref-kw names the default arm, so a later differential
+           restating the element with no type code still resolves it"))))
+
+(deftest polymorphic-slot-arm-names-are-wire-names-test
+  (testing "an arm is keyed by the name an instance writes in xsi:type, which
+            spells an interval IVL_TS where the StructureDefinition id spells
+            it IVL-TS"
+    (let [ivl "http://hl7.org/cda/stds/core/StructureDefinition/IVL-TS"
+          sxpr "http://hl7.org/cda/stds/core/StructureDefinition/SXPR-TS"
+          {:keys [form]} (union-scenario [ivl sxpr] "*")
+          multi (second (union-value-form form))]
+      (is (= ["IVL_TS" "SXPR_TS" :malli.core/default] (mapv first (drop 2 multi)))))))
+
+(deftest polymorphic-slot-dispatch-form-is-printable-and-reads-the-claim-test
+  (testing "the dispatch survives being printed to a file and read back: it is a
+            literal fn form naming nothing outside clojure.core, it strips a
+            namespace prefix the way a type resolver does, and it dispatches nil
+            for a value stating no type - which is what makes the default arm
+            reachable"
+    (let [{:keys [form]} (union-scenario [ta-url tb-url] "*")
+          multi (second (union-value-form form))
+          dispatch-form (:dispatch (second multi))
+          f (eval (read-string (pr-str dispatch-form)))]
+      (is (= 'fn (first dispatch-form)) "a form, never a closure")
+      (is (= "IVL_TS" (f {:xsi/type "IVL_TS"})))
+      (is (= "IVL_TS" (f {:xsi/type "hl7:IVL_TS"})) "a prefixed claim reaches its arm")
+      (is (nil? (f {})) "no claim dispatches to the default arm")
+      (is (nil? (f {:xsi/type 7})) "a non-string claim is not a name"))))
+
+(deftest single-typed-element-is-unchanged-test
+  (testing "one declared type emits exactly what it emitted before - the choice
+            only exists where the element declares a choice"
+    (let [{:keys [form shape]} (union-scenario [ta-url] "*")]
+      (is (= [:sequential [:ref ta-kw]] (union-value-form form)))
+      (is (not (shape/multi-typed? (shape/get-field shape :f))))
+      (is (nil? (:type-codes (shape/get-field shape :f)))))))
+
+(deftest polymorphic-slot-at-max-one-has-no-sequential-test
+  (testing "cardinality is decided where it always was, so a 0..1 slot is the
+            multi alone"
+    (let [value (union-value-form (:form (union-scenario [ta-url tb-url] "1")))]
+      (is (= :multi (first value))))))
+
+(deftest choice-element-still-expands-per-type-test
+  (testing "an element WITH [x] is FHIR's choice and still gets one key per
+            declared type - this change is about the other shape"
+    (let [opts fp/fhir-registry-options
+          refs (atom #{})
+          items [{:path ["TP" "value[x]"] :min 0 :max "1" :id "TP.value[x]"
+                  :type [{:code "string"} {:code "boolean"}]}]
+          acc (binding [fdm/*schema-atom* (atom {})
+                        fdm/*references-atom* refs
+                        fdm/*recursive-references* #{}
+                        fdm/*base-refs* (atom {})]
+                (fdm/element-definition->attribute
+                 {:sch (m/schema [:map {:closed true}] opts) :shape {} :form []}
+                 ["TP"] "1.0" items))
+          keys-assoced (into [] (comp (filter #(and (seq? %) (= 'mu/assoc (first %))))
+                                      (map second))
+                             (:form acc))]
+      (is (= [:valueString :valueBoolean] (filterv #{:valueString :valueBoolean} keys-assoced))
+          "one key per type, named after it"))))
