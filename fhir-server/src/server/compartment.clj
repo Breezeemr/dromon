@@ -493,7 +493,16 @@
   (delete-tenant [_ tenant-id] (db/delete-tenant base tenant-id))
   (delete-tenant [_ tenant-id opts] (db/delete-tenant base tenant-id opts))
   (warmup-tenant [_ tenant-id] (db/warmup-tenant base tenant-id))
-  (warmup-tenant [_ tenant-id opts] (db/warmup-tenant base tenant-id opts)))
+  (warmup-tenant [_ tenant-id opts] (db/warmup-tenant base tenant-id opts))
+
+  ;; Bulk-export snapshot reads pass through unconfined: per the protocol,
+  ;; compartment confinement of scan-type-as-of is the export layer's
+  ;; responsibility (server.bulk-export applies it while streaming).
+  (current-basis [_ tenant-id] (db/current-basis base tenant-id))
+  (scan-type-as-of [_ tenant-id resource-type basis]
+    (db/scan-type-as-of base tenant-id resource-type basis))
+  (count-as-of [_ tenant-id resource-type basis]
+    (db/count-as-of base tenant-id resource-type basis)))
 
 (defn filtering-store
   "Wraps `base` store so every query is confined to `patient-id`'s Patient
