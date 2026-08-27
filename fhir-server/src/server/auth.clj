@@ -75,7 +75,13 @@
   "Middleware that validates JWTs from the Authorization header using buddy-auth.
    Adds the :identity key to the request map if a valid token is provided.
    Supports either a static :secret (e.g. for testing/dev HS256) or a :jwks-url
-   (e.g. for Ory Hydra OIDC RS256)."
+   (e.g. for Ory Hydra OIDC RS256).
+
+   A request that already carries :identity is passed through untouched. That is
+   the BFF seam: flotilla authenticates the opaque session cookie itself and
+   injects {:identity {:sub subject}} before delegating here, and buddy's
+   authentication-request would overwrite it with nil (no Authorization header
+   accompanies a cookie-mode request)."
   [handler {:keys [secret jwks-url] :or {secret dev-secret}}]
   (when (and (nil? jwks-url) (nil? secret))
     (throw (ex-info "JWT auth requires either :jwks-url or :secret (set JWT_DEV_SECRET env var for dev)" {})))
@@ -92,25 +98,27 @@
                   (token/jws-backend {:secret secret
                                       :options {:alg :hs256}}))]
     (fn [request]
-      (let [auth-header (get-in request [:headers "authorization"])
-            token (when (and auth-header (.startsWith ^String auth-header "Bearer "))
-                    (subs auth-header 7))
-            kid (try
-                  (when token (:kid (jwt/decode-header token)))
-                  (catch Exception _ nil))
-            ;; The trace body would otherwise return the authenticated
-            ;; request, which Telemere captures as the signal's :run-val.
-            ;; Ring requests carry :reitit.core/match and :fhir/store,
-            ;; both of which can OOM the pr-str fallback serializer.
-            ;; Capture the real result via a volatile and return ::ok.
-            authed (volatile! nil)
-            _ (t/trace!
-                {:id :auth/jwt.verify
-                 :data {:kid kid
-                        :has-token (some? token)}}
-                (do (vreset! authed (auth-mw/authentication-request request backend))
-                    ::ok))]
-        (handler @authed)))))
+      (if (:identity request)
+        (handler request)
+        (let [auth-header (get-in request [:headers "authorization"])
+              token (when (and auth-header (.startsWith ^String auth-header "Bearer "))
+                      (subs auth-header 7))
+              kid (try
+                    (when token (:kid (jwt/decode-header token)))
+                    (catch Exception _ nil))
+              ;; The trace body would otherwise return the authenticated
+              ;; request, which Telemere captures as the signal's :run-val.
+              ;; Ring requests carry :reitit.core/match and :fhir/store,
+              ;; both of which can OOM the pr-str fallback serializer.
+              ;; Capture the real result via a volatile and return ::ok.
+              authed (volatile! nil)
+              _ (t/trace!
+                  {:id :auth/jwt.verify
+                   :data {:kid kid
+                          :has-token (some? token)}}
+                  (do (vreset! authed (auth-mw/authentication-request request backend))
+                      ::ok))]
+          (handler @authed))))))
 
 (defn- extract-identity [request]
   ;; buddy-auth will populate :identity in the request map if validation passes

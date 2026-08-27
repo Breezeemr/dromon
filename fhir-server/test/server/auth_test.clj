@@ -82,3 +82,24 @@
           response (wrapped {})]
       (is (= 401 (:status response)))
       (is (= "OperationOutcome" (:resourceType (:body response)))))))
+
+(deftest wrap-jwt-auth-preserves-injected-identity
+  (testing "a request whose identity was established upstream passes through
+            untouched -- this is the BFF seam: flotilla authenticates the
+            opaque session cookie and injects :identity, and there is no
+            Authorization header for buddy to derive one from, so running the
+            backend would replace it with nil"
+    (let [seen (atom nil)
+          handler (fn [req] (reset! seen (:identity req)) {:status 200 :body "OK"})
+          wrapped (auth/wrap-jwt-auth handler {:secret "test-secret"})
+          response (wrapped {:headers {} :identity {:sub "kratos-id-1"}})]
+      (is (= 200 (:status response)))
+      (is (= {:sub "kratos-id-1"} @seen))))
+
+  (testing "a request without an injected identity still runs the JWT backend"
+    (let [seen (atom ::unset)
+          handler (fn [req] (reset! seen (:identity req)) {:status 200 :body "OK"})
+          wrapped (auth/wrap-jwt-auth handler {:secret "test-secret"})
+          token (jwt/sign {:sub "token-user"} "test-secret" {:alg :hs256})]
+      (wrapped {:headers {"authorization" (str "Token " token)}})
+      (is (= {:sub "token-user"} @seen)))))

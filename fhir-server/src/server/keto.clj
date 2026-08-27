@@ -57,11 +57,36 @@
    (and subject-id
         (check-permission (or keto-url default-keto-url) "fhir" "system" "read" subject-id))))
 
+(defn unauthenticated-response
+  "The answer to a request that carries no subject at all.
+
+   401, not 403: nothing was denied, there was nobody to deny. The distinction
+   is what lets a browser client tell 'log in' from 'you may not do this', and
+   401 is the only one it can act on.
+
+   `login-url`, when the deployment configured one, tells the client where
+   authentication starts, so turning a login flow on or off stays a server
+   config change. It is the same field mast's 401 carries
+   (com.breezeehr.cookie-authentication.authentication/unauthorized-response);
+   the body stays an OperationOutcome so FHIR clients still get the shape every
+   other dromon error uses."
+  [login-url]
+  {:status 401
+   :body (cond-> {:resourceType "OperationOutcome"
+                  :issue [{:severity "error"
+                           :code "login"
+                           :diagnostics "Missing subject in identity; cannot authorize."}]}
+           (not (str/blank? login-url)) (assoc :login-url login-url))})
+
 (defn wrap-keto-authorization
   "Middleware that checks Ory Keto to see if the identity is authorized to perform the action.
-   Requires `identity` to be populated by buddy-auth.
-   Bypasses authorization if the route specifies `:public? true` in its match-data."
-  [handler {:keys [keto-url] :or {keto-url default-keto-url}}]
+   Requires `identity` to be populated by buddy-auth (or injected upstream by a
+   BFF that authenticated a session cookie -- see `server.auth/wrap-jwt-auth`).
+   Bypasses authorization if the route specifies `:public? true` in its match-data.
+
+   `:login-url` is advertised on the 401 a subject-less request receives; see
+   `unauthenticated-response`."
+  [handler {:keys [keto-url login-url] :or {keto-url default-keto-url}}]
   (fn [request]
     (let [route-data (get-in request [:reitit.core/match :data])
           public? (:public? route-data)]
@@ -106,11 +131,7 @@
 
           (log/info "Keto authz -> subject:" subject-id "relation:" relation "object:" object "uri:" uri)
           (if (not subject-id)
-            {:status 403
-             :body {:resourceType "OperationOutcome"
-                    :issue [{:severity "error"
-                             :code "forbidden"
-                             :diagnostics "Missing subject in identity; cannot authorize."}]}}
+            (unauthenticated-response login-url)
             (let [allowed? (t/trace!
                             {:id :authz/keto.check
                              :data {:subject-id subject-id

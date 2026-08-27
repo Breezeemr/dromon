@@ -165,13 +165,14 @@
         (is (= 403 (:status resp)))
         (is (nil? (get-in resp [:headers "Access-Control-Allow-Origin"])))))
 
-    (testing "an unauthenticated read is the Keto 403, not a 401: wrap-jwt-auth
-              only attaches :identity, it never rejects"
+    (testing "an unauthenticated read is the Keto 401 (missing subject answers
+              401 with a login issue; present-subject-denied stays 403):
+              wrap-jwt-auth only attaches :identity, it never rejects"
       (let [resp (app (:unauthenticated-read deterministic-requests))
             body (json-body resp)]
-        (is (= 403 (:status resp)))
+        (is (= 401 (:status resp)))
         (is (= "OperationOutcome" (get body "resourceType")))
-        (is (= "forbidden" (get-in body ["issue" 0 "code"])))))
+        (is (= "login" (get-in body ["issue" 0 "code"])))))
 
     (testing "an unauthenticated $export is a 401: that route is :public? and
               fronted with wrap-require-auth"
@@ -324,9 +325,10 @@
         (is (= 418 (:status resp)))
         (is (true? (get (json-body resp) "marked")))))
 
-    (testing "without the marker header the unchanged chain still answers 403"
+    (testing "without the marker header the unchanged chain still rejects the
+              anonymous request (401, missing subject)"
       (let [resp (app (GET (str "/" tenant "/fhir/Patient")))]
-        (is (= 403 (:status resp)))
+        (is (= 401 (:status resp)))
         (is (= "OperationOutcome" (get (json-body resp) "resourceType")))))))
 
 (deftest host-can-replace-the-cors-entry

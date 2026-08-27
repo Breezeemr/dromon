@@ -110,6 +110,50 @@
         (is (= "http://example.com" (get-in resp [:headers "Access-Control-Allow-Origin"])))
         (is (string? (get-in resp [:headers "Access-Control-Allow-Methods"])))))))
 
+(deftest wrap-cors-credentials-test
+  (let [handler (fn [_] {:status 200 :headers {} :body "OK"})
+        allowed "https://localjib3.breezeehr.com:5173"
+        wrapped (middleware/wrap-cors handler #{allowed "http://localhost:5173"})
+        preflight (fn [origin]
+                    (wrapped {:request-method :options
+                              :headers {"origin" origin
+                                        "access-control-request-method" "GET"}}))]
+
+    (testing "an allowlisted origin may send credentials, on preflight and response"
+      (let [resp (preflight allowed)]
+        (is (= 204 (:status resp)))
+        (is (= allowed (get-in resp [:headers "Access-Control-Allow-Origin"])))
+        (is (= "true" (get-in resp [:headers "Access-Control-Allow-Credentials"])))
+        (is (= "Origin" (get-in resp [:headers "Vary"]))))
+      (let [resp (wrapped {:request-method :get :headers {"origin" allowed}})]
+        (is (= allowed (get-in resp [:headers "Access-Control-Allow-Origin"])))
+        (is (= "true" (get-in resp [:headers "Access-Control-Allow-Credentials"])))))
+
+    (testing "the preflight admits the headers cookie mode and dev-token mode need"
+      (let [hdrs (get-in (preflight allowed) [:headers "Access-Control-Allow-Headers"])]
+        (doseq [h ["Authorization" "Cookie" "X-Breeze-Client" "Content-Type"]]
+          (is (clojure.string/includes? hdrs h) (str h " is not admitted")))))
+
+    (testing "an origin outside the allowlist gets neither reflection nor credentials"
+      (let [resp (preflight "https://evil.example")]
+        (is (= 403 (:status resp)))
+        (is (nil? (get-in resp [:headers "Access-Control-Allow-Origin"])))
+        (is (nil? (get-in resp [:headers "Access-Control-Allow-Credentials"]))))
+      (let [resp (wrapped {:request-method :get :headers {"origin" "https://evil.example"}})]
+        (is (nil? (get-in resp [:headers "Access-Control-Allow-Origin"])))
+        (is (nil? (get-in resp [:headers "Access-Control-Allow-Credentials"])))))
+
+    (testing "wildcard/dev mode reflects the origin but never grants credentials:
+              a browser rejects the pair, and any page could otherwise drive an
+              authenticated session"
+      (doseq [origins [nil #{} #{"*"}]]
+        (let [open (middleware/wrap-cors handler origins)
+              resp (open {:request-method :get :headers {"origin" "https://anywhere.example"}})]
+          (is (= "https://anywhere.example"
+                 (get-in resp [:headers "Access-Control-Allow-Origin"])))
+          (is (nil? (get-in resp [:headers "Access-Control-Allow-Credentials"]))
+              (str "credentials granted under " (pr-str origins))))))))
+
 (def ^:private test-mapper (json/object-mapper {}))
 
 (deftest wrap-pretty-print-test
