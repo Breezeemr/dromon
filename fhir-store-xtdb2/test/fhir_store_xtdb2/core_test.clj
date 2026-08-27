@@ -396,6 +396,131 @@
         (finally
           (close-store-nodes! store))))))
 
+(deftest test-search-string-prefix-case-insensitive
+  (testing "String search implements FHIR semantics -- case-insensitive prefix
+            match -- across HumanName, sub-col, sub-array, and Address columns,
+            mirroring the Datomic backend's lower-case + startsWith behavior."
+    (let [pt-schema (m/schema [:map {:resourceType "Patient"}
+                               [:resourceType :string]
+                               [:gender {:optional true} :string]
+                               [:name {:optional true}
+                                [:sequential
+                                 [:map
+                                  [:family {:optional true} :string]
+                                  [:given {:optional true} [:sequential :string]]]]]
+                               [:address {:optional true}
+                                [:sequential
+                                 [:map
+                                  [:city {:optional true} :string]
+                                  [:line {:optional true} [:sequential :string]]
+                                  [:postalCode {:optional true} :string]]]]])
+          store (core-db/create-xtdb-store {:resource/schemas [pt-schema]})
+          tenant "probe-str"
+          reg {"name" {:type "string" :target nil
+                       :columns [{:col "name" :fhir-type "HumanName" :array? true}]}
+               "family" {:type "string" :target nil
+                         :columns [{:col "name" :fhir-type "HumanName" :array? true
+                                    :sub-col "family" :sub-fhir-type "string"
+                                    :sub-array? false}]}
+               "given" {:type "string" :target nil
+                        :columns [{:col "name" :fhir-type "HumanName" :array? true
+                                   :sub-col "given" :sub-fhir-type "string"
+                                   :sub-array? true}]}
+               "address" {:type "string" :target nil
+                          :columns [{:col "address" :fhir-type "Address" :array? true}]}
+               "gender" {:type "token" :target nil
+                         :columns [{:col "gender" :fhir-type "code" :array? false}]}}
+          mk (fn [id doc] (db/create-resource store tenant :Patient id doc))
+          ids (fn [params] (set (map :id (db/search store tenant :Patient params reg))))]
+      (try
+        (mk "p1" {:resourceType "Patient" :gender "male"
+                  :name [{:family "Smith" :given ["John"]}]
+                  :address [{:city "Springfield" :line ["100 Main St"]
+                             :postalCode "62704"}]})
+        (mk "p2" {:resourceType "Patient" :gender "female"
+                  :name [{:family "Doe" :given ["Jane"]}]
+                  :address [{:city "Shelbyville"}]})
+        (mk "p3" {:resourceType "Patient" :gender "male"
+                  :name [{:family "Smithson" :given ["Bob"]}]})
+        (testing "prefix hit on HumanName family"
+          (is (= #{"p1" "p3"} (ids {"name" "smi"}))))
+        (testing "case-insensitive hit with upper-case needle"
+          (is (= #{"p1" "p3"} (ids {"name" "SMITH"}))))
+        (testing "given (nested string array) matches through name"
+          (is (= #{"p1"} (ids {"name" "joh"}))))
+        (testing "non-prefix substring misses"
+          (is (= #{} (ids {"name" "mith"}))))
+        (testing "sub-col within array: family param"
+          (is (= #{"p2"} (ids {"family" "do"}))))
+        (testing "sub-array within array: given param"
+          (is (= #{"p2"} (ids {"given" "JA"}))))
+        (testing "Address city prefix"
+          (is (= #{"p1"} (ids {"address" "spring"}))))
+        (testing "Address line (nested string array) prefix"
+          (is (= #{"p1"} (ids {"address" "100 m"}))))
+        (testing "Address postalCode (camelCase accessor) prefix"
+          (is (= #{"p1"} (ids {"address" "627"}))))
+        (testing "string and token params AND together"
+          (is (= #{"p3"} (ids {"gender" "male" "name" "smiths"})))
+          (is (= #{} (ids {"gender" "female" "name" "smiths"}))))
+        (finally
+          (close-store-nodes! store))))))
+
+(deftest test-search-string-simple-and-struct
+  (testing "Simple string columns, repeating string columns, and
+            single-cardinality Address structs take the same case-insensitive
+            prefix semantics; LIKE metacharacters in the value match literally."
+    (let [loc-schema (m/schema [:map {:resourceType "Location"}
+                                [:resourceType :string]
+                                [:name {:optional true} :string]
+                                [:alias {:optional true} [:sequential :string]]
+                                [:address {:optional true}
+                                 [:map
+                                  [:city {:optional true} :string]
+                                  [:line {:optional true} [:sequential :string]]]]])
+          store (core-db/create-xtdb-store {:resource/schemas [loc-schema]})
+          tenant "probe-str-loc"
+          reg {"name" {:type "string" :target nil
+                       :columns [{:col "name" :fhir-type "string" :array? false}]}
+               "alias" {:type "string" :target nil
+                        :columns [{:col "alias" :fhir-type "string" :array? true}]}
+               "address" {:type "string" :target nil
+                          :columns [{:col "address" :fhir-type "Address"
+                                     :array? false}]}
+               "address-city" {:type "string" :target nil
+                               :columns [{:col "address" :fhir-type "Address"
+                                          :array? false :sub-col "city"
+                                          :sub-fhir-type "string"
+                                          :sub-array? false}]}}
+          mk (fn [id doc] (db/create-resource store tenant :Location id doc))
+          ids (fn [params] (set (map :id (db/search store tenant :Location params reg))))]
+      (try
+        (mk "l1" {:resourceType "Location"
+                  :name "General Hospital"
+                  :alias ["GH" "The General"]
+                  :address {:city "Springfield" :line ["1 Elm St"]}})
+        (mk "l2" {:resourceType "Location"
+                  :name "100% Wellness Center"})
+        (testing "simple string prefix hit, case-insensitive"
+          (is (= #{"l1"} (ids {"name" "gen"})))
+          (is (= #{"l1"} (ids {"name" "GENERAL"}))))
+        (testing "simple string non-prefix miss"
+          (is (= #{} (ids {"name" "eneral"}))))
+        (testing "percent in the value matches literally, not as a wildcard"
+          (is (= #{"l2"} (ids {"name" "100% w"}))))
+        (testing "underscore in the value matches literally, not as a wildcard"
+          (is (= #{} (ids {"name" "1_0"}))))
+        (testing "repeating simple string column"
+          (is (= #{"l1"} (ids {"alias" "the g"}))))
+        (testing "single-struct Address: city"
+          (is (= #{"l1"} (ids {"address" "spring"}))))
+        (testing "single-struct Address: line (nested string array)"
+          (is (= #{"l1"} (ids {"address" "1 e"}))))
+        (testing "sub-col within struct: address-city param"
+          (is (= #{"l1"} (ids {"address-city" "SPRI"}))))
+        (finally
+          (close-store-nodes! store))))))
+
 (deftest test-search-sort-limit-two-phase
   (testing "_sort + _count returns the correctly ordered page of full resources
             (two-phase: sort a narrow _id projection, then fetch the page)."
