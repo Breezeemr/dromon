@@ -118,6 +118,19 @@
   (let [store (fstore (seeded-store))]
     (is (= 2 (db/count-resources store tenant :Observation {} (get registries "Observation"))))))
 
+(deftest bulk-export-basis-methods-delegate-to-base
+  (testing "current-basis / scan-type-as-of / count-as-of pass through to the
+            base store unconfined: compartment confinement of the export scan
+            is the export layer's responsibility, and a missing delegation
+            would throw AbstractMethodError here"
+    (let [store (fstore (seeded-store))
+          basis (db/current-basis store tenant)]
+      (is (instance? java.time.Instant (:system-time basis)))
+      (is (= #{"obs-mine" "obs-perf" "obs-other"}
+             (into #{} (map :id)
+                   (db/scan-type-as-of store tenant :Observation basis))))
+      (is (= 3 (db/count-as-of store tenant :Observation basis))))))
+
 (deftest read-confined-to-compartment
   (let [store (fstore (seeded-store))]
     (testing "in-compartment instance is readable (subject link)"
