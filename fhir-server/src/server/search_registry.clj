@@ -301,11 +301,18 @@
         (cond
           ;; .where(resolve() is X) - reference with target type
           (str/includes? path ".where(resolve()")
-          (let [[field-path _target-type] (parse-where-clause path)
-                info (get field-map field-path)]
-            [{:col field-path
-              :fhir-type (or (:fhir-type info) "Reference")
-              :array? (:array? info false)}])
+          (let [[field-path _target-type] (parse-where-clause path)]
+            (if (and field-path (str/includes? field-path "."))
+              ;; Dotted field path (e.g. Appointment.participant.actor):
+              ;; resolve through the nested-path machinery so the store
+              ;; receives {:col "participant" :sub-col "actor"} instead of a
+              ;; dotted column it cannot translate to Datalog. Target-type
+              ;; narrowing still comes from the SearchParameter's :target.
+              (resolve-nested-path (str/split field-path #"\.") field-map)
+              (let [info (get field-map field-path)]
+                [{:col field-path
+                  :fhir-type (or (:fhir-type info) "Reference")
+                  :array? (:array? info false)}])))
 
           ;; .as(type) cast
           (str/includes? path ".as(")

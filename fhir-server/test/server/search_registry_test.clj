@@ -66,3 +66,19 @@
   (testing "a nil registry supports only the resource-level parameters"
     (is (= [] (sr/unsupported-filter-params nil {"_id" "abc" "_count" "10"})))
     (is (= ["patient"] (sr/unsupported-filter-params nil {"patient" "Patient/1"})))))
+
+(deftest where-resolve-dotted-path-delegates-to-nested-resolution
+  (let [resolve-expression #'sr/resolve-expression
+        field-map {"participant" {:fhir-type "BackboneElement" :array? true
+                                  :children {"actor" {:fhir-type "Reference" :array? false}}}
+                   "subject" {:fhir-type "Reference" :array? false}}]
+    (testing "a dotted .where(resolve() is X) path yields a :sub-col descriptor
+              the store can translate to Datalog, not a dotted column"
+      (is (= [{:col "participant" :fhir-type "BackboneElement" :array? true
+               :sub-col "actor" :sub-fhir-type "Reference" :sub-array? false}]
+             (resolve-expression "Appointment.participant.actor.where(resolve() is Patient)"
+                                 field-map "reference"))))
+    (testing "an un-dotted path keeps the plain reference descriptor"
+      (is (= [{:col "subject" :fhir-type "Reference" :array? false}]
+             (resolve-expression "Observation.subject.where(resolve() is Patient)"
+                                 field-map "reference"))))))
