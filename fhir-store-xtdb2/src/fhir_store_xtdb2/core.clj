@@ -584,41 +584,100 @@
       :else
       (build-date-condition col-name v-str))))
 
+(defn- string-prefix-sql
+  "SQL fragment applying FHIR string-search semantics -- case-insensitive
+   prefix match -- to a single string-valued expression. Uses POSITION
+   rather than LIKE because the search value is a literal, not a pattern:
+   LIKE honours %/_ metacharacters in the parameter and XTDB's ESCAPE
+   clause silently matches nothing (2.2.0-beta1). The paired parameter
+   must be lowercased by the caller."
+  [expr]
+  (format "POSITION(? IN LOWER(%s)) = 1" expr))
+
+(defn- string-prefix-array-sql
+  "Like string-prefix-sql but for an expression evaluating to an array of
+   strings (e.g. HumanName.given, Address.line): matches when any element
+   has the prefix. Absent/null arrays UNNEST to no rows."
+  [array-expr]
+  (format "EXISTS (SELECT 1 FROM UNNEST(%s) AS sp(v) WHERE %s)"
+          array-expr (string-prefix-sql "sp.v")))
+
+(defn- human-name-prefix-sql
+  "OR-joined prefix conditions over a HumanName struct expression, searching
+   family (string) and given (array of strings) like the Datomic backend."
+  [elem-expr]
+  (str (string-prefix-sql (format "(%s).\"family\"" elem-expr))
+       " OR "
+       (string-prefix-array-sql (format "(%s).\"given\"" elem-expr))))
+
+(defn- address-prefix-sql
+  "OR-joined prefix conditions over an Address struct expression, searching
+   the same sub-fields as the Datomic backend: text, line (array), city,
+   district, state, postalCode, country. Sub-field accessors are quoted so
+   camelCase names (postalCode) are not case-folded by the SQL parser."
+  [elem-expr]
+  (str/join " OR "
+            (concat
+             (map #(string-prefix-sql (format "(%s).\"%s\"" elem-expr %))
+                  ["text" "city" "district" "state" "postalCode" "country"])
+             [(string-prefix-array-sql (format "(%s).\"line\"" elem-expr))])))
+
 (defn- build-string-col-condition
-  "Builds parameterized SQL for a single string-type column.
+  "Builds parameterized SQL for a single string-type column applying FHIR
+   string-search semantics: case- (not accent-) insensitive prefix match,
+   mirroring the Datomic backend's lower-case + startsWith clauses.
    Returns [sql-fragment params-vector].
    v-val is the raw string value."
   [col v-val]
   (let [col-name (:col col)
         fhir-type (:fhir-type col)
         array? (:array? col)
-        sub-col (:sub-col col)]
-    (cond
-      ;; Nested string in array: e.g., Patient.name.family
-      (and sub-col array?)
-      [(format "(EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS n(val) WHERE (n.val).\"%s\" = ?))"
-               col-name sub-col)
-       [v-val]]
+        sub-col (:sub-col col)
+        sub-array? (:sub-array? col false)
+        sql (cond
+              ;; Nested string in array: e.g., Patient.name.family, or a
+              ;; nested array like Patient.name.given (sub-array?).
+              (and sub-col array?)
+              (let [sub-expr (format "(n.val).\"%s\"" sub-col)]
+                (format "(EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS n(val) WHERE %s))"
+                        col-name
+                        (if sub-array?
+                          (string-prefix-array-sql sub-expr)
+                          (string-prefix-sql sub-expr))))
 
-      ;; Nested string in struct: e.g., Location.address.city
-      sub-col
-      [(format "(\"%s\").\"%s\" = ?" col-name sub-col) [v-val]]
+              ;; Nested string in struct: e.g., Location.address.city
+              sub-col
+              (let [sub-expr (format "(\"%s\").\"%s\"" col-name sub-col)]
+                (if sub-array?
+                  (string-prefix-array-sql sub-expr)
+                  (string-prefix-sql sub-expr)))
 
-      ;; HumanName array: search across family and given
-      (and (= fhir-type "HumanName") array?)
-      [(format "(EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS n(val) WHERE (n.val).family = ? OR (n.val).given = ?) OR \"%s\" = ?)"
-               col-name col-name)
-       [v-val v-val v-val]]
+              ;; HumanName: search across family and given
+              (= fhir-type "HumanName")
+              (if array?
+                (format "(EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS n(val) WHERE %s))"
+                        col-name (human-name-prefix-sql "n.val"))
+                (format "(%s)" (human-name-prefix-sql (format "\"%s\"" col-name))))
 
-      ;; Address array: search across city, state, postalCode
-      (and (= fhir-type "Address") array?)
-      [(format "(EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS a(val) WHERE (a.val).city = ? OR (a.val).state = ? OR (a.val).postalCode = ?))"
-               col-name)
-       [v-val v-val v-val]]
+              ;; Address: search across text, line, city, district, state,
+              ;; postalCode, country
+              (= fhir-type "Address")
+              (if array?
+                (format "(EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS a(val) WHERE %s))"
+                        col-name (address-prefix-sql "a.val"))
+                (format "(%s)" (address-prefix-sql (format "\"%s\"" col-name))))
 
-      ;; Simple string
-      :else
-      [(format "\"%s\" = ?" col-name) [v-val]])))
+              ;; Repeating simple string: e.g., Location.alias
+              array?
+              (string-prefix-array-sql (format "\"%s\"" col-name))
+
+              ;; Simple string
+              :else
+              (string-prefix-sql (format "\"%s\"" col-name)))
+        ;; Every placeholder binds the same lowercased needle, so the param
+        ;; vector follows directly from the placeholder count.
+        needle (str/lower-case v-val)]
+    [sql (vec (repeat (count (filter #{\?} sql)) needle))]))
 
 (defn- build-typed-condition
   "Builds parameterized SQL condition for a single value using registry search-param metadata.
