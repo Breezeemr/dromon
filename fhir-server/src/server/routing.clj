@@ -29,11 +29,13 @@
 
 (defn- resource-responses
   "Response schemas for endpoints returning a single resource (read/vread/update).
-   Validates 200 responses against cap-schema."
-  [cap-schema]
-  (if cap-schema
-    {200      {:body cap-schema}
-     201      {:body cap-schema}
+   Validates 200/201 responses against the given response schema — normally
+   cap-schema, or the lenient :fhir/response-schema when a deployment sets
+   :lenient-default-responses? (see `server.core/resolve-schema`)."
+  [response-schema]
+  (if response-schema
+    {200      {:body response-schema}
+     201      {:body response-schema}
      204      {:body :any}
      304      {:body :any}
      :default {:body fc/operation-outcome-schema}}
@@ -52,7 +54,7 @@
 
    In reitit, a route with children is a prefix only — to make it also an endpoint,
    handlers go in a \"\" (empty string) child route."
-  [fhir-type interactions handlers cap-schema search-registry all-registries decoders encoders]
+  [fhir-type interactions handlers cap-schema response-schema search-registry all-registries decoders encoders]
   (let [wrap-handler (fn [interaction config]
                        (let [handler-sym (get handlers interaction)
                              base-handler (resolve-handler handler-sym)]
@@ -67,7 +69,7 @@
         wrap-with-encode      (fn [h] (if encoders (wrap-encode-resp h encoders) h))
         base-path (str "/:tenant-id/fhir/" fhir-type)
 
-        res-responses (resource-responses cap-schema)
+        res-responses (resource-responses response-schema)
 
         ;; Type-level endpoint data (GET search, POST create)
         type-data (cond-> {}
@@ -221,9 +223,10 @@
               operations (:fhir/operations props {})]
           (if fhir-type
             (let [cap-schema (:fhir/cap-schema props)
+                  response-schema (or (:fhir/response-schema props) cap-schema)
                   search-registry (:fhir/search-registry props)
                   interaction-route (when (seq interactions)
-                                      (build-interaction-routes fhir-type interactions handlers cap-schema search-registry all-registries decoders encoders))
+                                      (build-interaction-routes fhir-type interactions handlers cap-schema response-schema search-registry all-registries decoders encoders))
                   operation-routes (when (seq operations)
                                      (build-operation-routes fhir-type operations))]
               ;; Operations before the interaction tree: the router runs with

@@ -116,6 +116,39 @@
        (contains? x :branches)
        (contains? x :resourceType)))
 
+(defn- lenient-schema
+  "Relax `schema` for response validation of externally produced (e.g.
+   decanted) resources: every inline :map becomes open and all its entries
+   optional, so undeclared promoted keys pass and base-required elements the
+   store never held do not fail the read. Keys that ARE present still
+   validate against their declared schemas. m/walk does not enter :ref
+   children, so datatype refs (CodeableConcept, Reference, ...) are
+   untouched; FHIR required cardinalities live on resource roots and
+   inlined BackboneElements, which this does reach."
+  [schema]
+  (m/walk schema
+          (m/schema-walker
+           (fn [s]
+             (if (= :map (m/type s))
+               (-> s
+                   (mu/update-properties dissoc :closed)
+                   mu/optional-keys)
+               s)))))
+
+(defn- lenient-default-branch-multi
+  "Compile cap-data's :multi with the :default branch relaxed by
+   [[lenient-schema]]. Branches keyed by concrete meta.profile URLs are kept
+   exactly as generated, so profiled resources keep strict validation."
+  [cap-data registry]
+  (let [branches (mapv (fn [branch]
+                         (if (= :default (first branch))
+                           [:default (lenient-schema
+                                      (m/schema (peek branch)
+                                                (when registry {:registry registry})))]
+                           branch))
+                       (:branches cap-data))]
+    (cap-data->multi-schema (assoc cap-data :branches branches) registry)))
+
 (defn capability-schema->server-schema
   "Convert a generated capability schema (data map or pre-compiled malli
    :multi) into a malli schema whose properties carry the metadata that
@@ -218,13 +251,20 @@
    :definition the SearchParameter's canonical URL; the JSON behind it is
    loaded off the classpath (see `server.search-registry/build-resource-registry`).
 
+   :lenient-default-responses? -- cap-data specs only (no-op for plain
+   full-sch specs); attaches :fhir/response-schema, a copy of the :multi
+   whose :default branch is open with all-optional entries; used by routing
+   for read/vread/create/update RESPONSE validation while request bodies
+   keep the strict cap-schema. For stores that hold externally produced
+   (decanted) resources without meta.profile.
+
    When `com.breezehealthplatform.breeze.storage.registry` is loadable,
    the resolved schema is recompiled under that registry overlay so
    ordered multi-string fields (HumanName.given/prefix/suffix,
    Address.line) store as USEP cardinality-one strings."
   ([spec] (resolve-schema spec nil))
   ([spec {:keys [operations]}]
-   (let [{:keys [schema interactions search-params]} (if (map? spec) spec {:schema spec})
+   (let [{:keys [schema interactions search-params lenient-default-responses?]} (if (map? spec) spec {:schema spec})
          resolved @(resolve-sym schema)
          registry (when (cap-data? resolved) (sibling-registry-var schema))
          resolved (if interactions
@@ -236,9 +276,15 @@
                     (if (cap-data? resolved)
                       (assoc resolved :search-params search-params)
                       (mu/update-properties resolved into {:search-params search-params}))
-                    resolved)]
-     (-> (capability-schema->server-schema resolved registry operations)
-         maybe-apply-breeze-storage-overlay))))
+                    resolved)
+         ;; Attach the lenient copy AFTER the overlay so the overlay's
+         ;; (m/schema (m/form stamped) opts) recompile never has to carry it.
+         server-schema (-> (capability-schema->server-schema resolved registry operations)
+                           maybe-apply-breeze-storage-overlay)]
+     (if (and lenient-default-responses? (cap-data? resolved))
+       (mu/update-properties server-schema assoc :fhir/response-schema
+                             (lenient-default-branch-multi resolved (or registry (:registry resolved))))
+       server-schema))))
 
 (defn resolve-schemas
   "Resolve a collection of schema specs (see [[resolve-schema]]) into the
