@@ -129,9 +129,11 @@
         (is (= allowed (get-in resp [:headers "Access-Control-Allow-Origin"])))
         (is (= "true" (get-in resp [:headers "Access-Control-Allow-Credentials"])))))
 
-    (testing "the preflight admits the headers cookie mode and dev-token mode need"
+    (testing "the preflight admits the headers cookie mode and dev-token mode need,
+              plus the trace-context headers an instrumented browser client sends"
       (let [hdrs (get-in (preflight allowed) [:headers "Access-Control-Allow-Headers"])]
-        (doseq [h ["Authorization" "Cookie" "X-Breeze-Client" "Content-Type"]]
+        (doseq [h ["Authorization" "Cookie" "X-Breeze-Client" "Content-Type"
+                   "traceparent" "b3"]]
           (is (clojure.string/includes? hdrs h) (str h " is not admitted")))))
 
     (testing "an origin outside the allowlist gets neither reflection nor credentials"

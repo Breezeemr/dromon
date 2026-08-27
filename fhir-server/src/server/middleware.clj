@@ -139,10 +139,15 @@
    `Authorization` carries jib3's dev-token (`Token <jwt>`) and any Bearer
    token. `Cookie` and `X-Breeze-Client` are the BFF cookie-mode pair: the
    opaque session cookie and the CSRF header that proves the request came from
-   jib3 rather than from a cross-site form."
+   jib3 rather than from a cross-site form.
+
+   `traceparent` (W3C trace context) and `b3` (Zipkin B3 single header) are what
+   an instrumented browser client attaches to a cross-origin request. Refusing
+   them fails the preflight, so the request never reaches this server at all --
+   a curl-invisible failure, since only a browser sends a preflight."
   (str "Content-Type, Authorization, Accept, X-Request-Id, If-Match, "
        "If-None-Match, If-Modified-Since, Prefer, If-None-Exist, Cookie, "
-       "X-Breeze-Client"))
+       "X-Breeze-Client, traceparent, b3"))
 
 (def ^:private expose-headers
   "Location, ETag, Last-Modified, X-Request-Id, Content-Location")
