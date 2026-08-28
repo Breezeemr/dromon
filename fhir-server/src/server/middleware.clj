@@ -118,26 +118,72 @@
       (contains? allowed-origins "*")
       (contains? allowed-origins origin)))
 
+(defn- origin-credentialed?
+  "Whether `origin` may send credentials (cookies) on a cross-origin request.
+
+   Deliberately stricter than `origin-allowed?`: the wildcard/dev modes -- nil,
+   empty, or \"*\" -- answer false. A browser refuses
+   `Access-Control-Allow-Origin: *` together with allow-credentials anyway, and
+   reflecting an arbitrary origin while allowing credentials would let any page
+   on the internet drive an authenticated session. Credentials are granted only
+   to an origin the deployment named."
+  [allowed-origins origin]
+  (boolean (and origin
+                (seq allowed-origins)
+                (not (contains? allowed-origins "*"))
+                (contains? allowed-origins origin))))
+
+(def ^:private allow-headers
+  "Request headers a browser may send cross-origin.
+
+   `Authorization` carries jib3's dev-token (`Token <jwt>`) and any Bearer
+   token. `Cookie` and `X-Breeze-Client` are the BFF cookie-mode pair: the
+   opaque session cookie and the CSRF header that proves the request came from
+   jib3 rather than from a cross-site form.
+
+   `traceparent` (W3C trace context) and `b3` (Zipkin B3 single header) are what
+   an instrumented browser client attaches to a cross-origin request. Refusing
+   them fails the preflight, so the request never reaches this server at all --
+   a curl-invisible failure, since only a browser sends a preflight."
+  (str "Content-Type, Authorization, Accept, X-Request-Id, If-Match, "
+       "If-None-Match, If-Modified-Since, Prefer, If-None-Exist, Cookie, "
+       "X-Breeze-Client, traceparent, b3"))
+
+(def ^:private expose-headers
+  "Location, ETag, Last-Modified, X-Request-Id, Content-Location")
+
 (defn wrap-cors
   "Middleware that adds CORS headers for browser-based FHIR clients.
    Handles preflight OPTIONS requests and adds Access-Control headers to all responses.
    `allowed-origins` is an optional set of origin strings. When nil, empty, or
    containing \"*\", all origins are allowed (dev mode). Otherwise, only origins
-   in the set are reflected back."
+   in the set are reflected back.
+
+   An origin named explicitly in the allowlist also gets
+   `Access-Control-Allow-Credentials: true`, on the preflight and on the actual
+   response alike -- without it a cookie-mode fetch never reaches the handler
+   and the response is discarded even when it does. Wildcard/dev modes never
+   grant credentials; see `origin-credentialed?`.
+
+   `Vary: Origin` accompanies every reflected origin so a shared cache cannot
+   hand one origin's response, and its allow-origin header, to another."
   ([handler]
    (wrap-cors handler nil))
   ([handler allowed-origins]
    (fn [request]
-     (let [origin (get-in request [:headers "origin"])]
+     (let [origin (get-in request [:headers "origin"])
+           credentialed? (origin-credentialed? allowed-origins origin)]
        (if (and (= :options (:request-method request)) origin)
          ;; Preflight response
          (if (origin-allowed? allowed-origins origin)
            {:status 204
-            :headers {"Access-Control-Allow-Origin" origin
-                      "Access-Control-Allow-Methods" "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-                      "Access-Control-Allow-Headers" "Content-Type, Authorization, Accept, X-Request-Id, If-Match, If-None-Match, If-Modified-Since, Prefer, If-None-Exist"
-                      "Access-Control-Expose-Headers" "Location, ETag, Last-Modified, X-Request-Id, Content-Location"
-                      "Access-Control-Max-Age" "86400"}
+            :headers (cond-> {"Access-Control-Allow-Origin" origin
+                              "Access-Control-Allow-Methods" "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                              "Access-Control-Allow-Headers" allow-headers
+                              "Access-Control-Expose-Headers" expose-headers
+                              "Access-Control-Max-Age" "86400"
+                              "Vary" "Origin"}
+                       credentialed? (assoc "Access-Control-Allow-Credentials" "true"))
             :body nil}
            {:status 403
             :headers {}
@@ -146,8 +192,10 @@
          (let [response (handler request)]
            (if (and origin (origin-allowed? allowed-origins origin))
              (update response :headers merge
-                     {"Access-Control-Allow-Origin" origin
-                      "Access-Control-Expose-Headers" "Location, ETag, Last-Modified, X-Request-Id, Content-Location"})
+                     (cond-> {"Access-Control-Allow-Origin" origin
+                              "Access-Control-Expose-Headers" expose-headers
+                              "Vary" "Origin"}
+                       credentialed? (assoc "Access-Control-Allow-Credentials" "true")))
              response)))))))
 
 (defn wrap-pretty-print

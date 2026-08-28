@@ -13,13 +13,15 @@
         (is (= 200 (:status response)))
         (is (= "OK" (:body response)))))
 
-    (testing "denies access when no subject-id is present"
+    (testing "a request with no subject-id is unauthenticated, not forbidden"
       (let [request {}
             response (wrapped-handler request)]
-        (is (= 403 (:status response)))
+        (is (= 401 (:status response)))
         (is (= "OperationOutcome" (:resourceType (:body response))))
         (is (= "Missing subject in identity; cannot authorize."
-               (-> response :body :issue first :diagnostics)))))
+               (-> response :body :issue first :diagnostics)))
+        (is (nil? (:login-url (:body response)))
+            "no login-url is advertised when the deployment configured none")))
 
     (testing "grants access when keto allows type-level"
       (with-redefs [hc/get (fn [url opts]
@@ -121,3 +123,34 @@
           (is (= 403 (:status response)))
           (is (= "Subject user123 is not allowed to read Patient/123"
                  (-> response :body :issue first :diagnostics))))))))
+
+(deftest unauthenticated-401-carries-login-url
+  (testing "a deployment that configured a login URL advertises it on the 401,
+            so the client learns where authentication starts instead of
+            guessing at a built-in path"
+    (let [handler (fn [_] {:status 200 :body "OK"})
+          login-url "https://localflotilla.breezeehr.com:8444/auth/hydra/login"
+          wrapped (keto/wrap-keto-authorization handler {:keto-url "http://mock-keto"
+                                                         :login-url login-url})
+          response (wrapped {:request-method :get :fhir/resource-type "Person"})]
+      (is (= 401 (:status response)))
+      (is (= login-url (:login-url (:body response))))
+      (is (= "OperationOutcome" (:resourceType (:body response))))))
+
+  (testing "a blank login-url is not advertised"
+    (let [handler (fn [_] {:status 200 :body "OK"})
+          wrapped (keto/wrap-keto-authorization handler {:keto-url "http://mock-keto"
+                                                         :login-url "  "})]
+      (is (nil? (:login-url (:body (wrapped {}))))))))
+
+(deftest present-subject-but-denied-stays-403
+  (testing "401 means 'no subject'; a subject Keto refuses is still forbidden"
+    (with-redefs [hc/get (fn [_ _] {:status 403 :body {:allowed false}})]
+      (let [handler (fn [_] {:status 200 :body "OK"})
+            wrapped (keto/wrap-keto-authorization handler {:keto-url "http://mock-keto"
+                                                           :login-url "https://example.test/login"})
+            response (wrapped {:identity {:sub "user123"}
+                               :request-method :get
+                               :fhir/resource-type "Person"})]
+        (is (= 403 (:status response)))
+        (is (nil? (:login-url (:body response))))))))

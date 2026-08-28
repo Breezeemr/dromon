@@ -141,7 +141,8 @@
    consumed by [[default-middleware]].
 
    Accepts `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
-   `:enforce-smart-scopes?` and `:bulk-job-store`; unknown keys are ignored.
+   `:enforce-smart-scopes?`, `:bulk-job-store` and `:login-url`; unknown keys
+   are ignored.
 
    This is the ONLY place the environment is consulted, so tests and hosts can
    bypass it entirely by hand-building the resolved map (for example passing a
@@ -159,12 +160,13 @@
                                only when `DROMON_DEV_TRACE_TAP=1`, so the OTel
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url terminology cors-allowed-origins
-           enforce-smart-scopes? bulk-job-store]}]
+           enforce-smart-scopes? bulk-job-store login-url]}]
   {:jwks-url              (or jwks-url
                               (System/getenv "JWKS_URL")
                               (when-not (System/getenv "JWT_DEV_SECRET")
                                 "http://localhost:4444/.well-known/jwks.json"))
    :keto-url              (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
+   :login-url             login-url
    :enforce-smart-scopes? (if (some? enforce-smart-scopes?)
                             enforce-smart-scopes?
                             (= "1" (System/getenv "ENFORCE_SMART_SCOPES")))
@@ -235,10 +237,12 @@
       `::patient-compartment` honor the `:public?` route data via
       `:reitit.core/match`.
    9. `::jwt-auth` never rejects on its own -- it only attaches `:identity`.
-      Rejection is `::keto-authorization`'s 403 (or `server.auth/wrap-require-auth`'s
-      401 on the bulk-data routes). A host inserting its own identity source
-      (a BFF session, say) must insert it before `::keto-authorization`;
-      conventionally before `::jwt-auth`.
+      Rejection is `::keto-authorization`'s: a 401 carrying `:login-url` when no
+      subject was attached at all, a 403 when a subject was attached and Keto
+      denied it (or `server.auth/wrap-require-auth`'s 401 on the bulk-data
+      routes). A host inserting its own identity source (a BFF session, say)
+      must insert it before `::keto-authorization`; conventionally before
+      `::jwt-auth`.
    10. The response-shaping group -- `::pretty-print`, `::prefer`, `::elements`,
        `::summary`, `::fhir-response-headers` -- must sit INSIDE
        `::format-response`, because every one of them rewrites a response body
@@ -262,11 +266,11 @@
        a shaping failure of its own (`_pretty` on a body Jackson cannot write,
        say) still becomes an OperationOutcome rather than a raw 500. Errors
        returned as plain response maps -- handler 404/410/412s, `server.keto`'s
-       403 -- do reach the group, which is why `server.middleware/wrap-summary`
-       and `wrap-elements` skip non-2xx and OperationOutcome bodies themselves
-       rather than relying on position."
+       401 and 403 -- do reach the group, which is why
+       `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
+       OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
-                 jwks-url enforce-smart-scopes?]}]
+                 jwks-url enforce-smart-scopes? login-url]}]
   (cond-> []
     trace-tap
     (conj {:name ::trace-tap :wrap trace-tap})
@@ -309,7 +313,7 @@
 
     :always
     (conj {:name ::keto-authorization
-           :wrap (fn [handler] (keto/wrap-keto-authorization handler {:keto-url keto-url}))})))
+           :wrap (fn [handler] (keto/wrap-keto-authorization handler {:keto-url keto-url :login-url login-url}))})))
 
 ;; ---------------------------------------------------------------------------
 ;; Recomposition helpers
