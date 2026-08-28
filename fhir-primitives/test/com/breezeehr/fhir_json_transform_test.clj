@@ -144,3 +144,75 @@
           encoded (m/encode us-core-patient/full-sch sample-patient transformer)
           re-decoded (m/decode us-core-patient/full-sch encoded transformer)]
       (is (= sample-patient re-decoded)))))
+
+;; ---------------------------------------------------------------------------
+;; Extension slice cardinality
+;;
+;; A slice's Clojure-native shape follows its schema: a [:sequential ...] child
+;; holds a vector of bare values, a scalar child holds a single one. Slices
+;; whose extension has a complex value (Reference, CodeableConcept, Address)
+;; carry a :fhir/value-key just as primitive-valued ones do, so both fold.
+;; ---------------------------------------------------------------------------
+
+(def reference-sch
+  [:map {:closed true} [:reference {:optional true} :string]])
+
+(def sliced-sch
+  "Two Reference-valued extension slices on one resource: one 0..1, one 0..*."
+  [:map {:closed true}
+   [:resourceType :string]
+   [:extension {:optional true} [:sequential [:map]]]
+   [:lockedTo {:optional       true
+               :fhir/extension true
+               :url            "https://example.org/locked-to"
+               :fhir/value-key :valueReference}
+    reference-sch]
+   [:roleLocation {:optional       true
+                   :fhir/extension true
+                   :url            "https://example.org/role-location"
+                   :fhir/value-key :valueReference}
+    [:sequential reference-sch]]])
+
+(def sliced-fhir-json
+  {:resourceType "Practitioner"
+   :extension    [{:url            "https://example.org/locked-to"
+                   :valueReference {:reference "Organization/o1"}}
+                  {:url            "https://example.org/role-location"
+                   :valueReference {:reference "Location/l1"}}
+                  {:url            "https://example.org/role-location"
+                   :valueReference {:reference "Location/l2"}}]})
+
+(deftest extension-slice-cardinality-decode-test
+  (let [decoded (m/decode sliced-sch sliced-fhir-json (fjt/fhir-json-transformer))]
+    (testing "a 0..1 slice folds to a bare value, not a one-element vector"
+      (is (= {:reference "Organization/o1"} (:lockedTo decoded))))
+    (testing "a 0..* slice folds to a vector of bare values"
+      (is (= [{:reference "Location/l1"} {:reference "Location/l2"}]
+             (:roleLocation decoded))))
+    (testing "consumed entries leave no :extension remainder"
+      (is (nil? (:extension decoded))))
+    (testing "the folded result validates against the profile declaring the slices"
+      (is (true? (m/validate sliced-sch decoded))))))
+
+(deftest extension-slice-cardinality-encode-test
+  (testing "a scalar slice unfolds to one entry, not one per key of its value"
+    (let [decoded (m/decode sliced-sch sliced-fhir-json (fjt/fhir-json-transformer))
+          encoded (m/encode sliced-sch decoded (fjt/fhir-json-transformer))]
+      (is (= sliced-fhir-json encoded)))))
+
+(deftest complex-extension-entry-preserved-test
+  (testing "a slice with no :fhir/value-key keeps its whole entry"
+    (let [sch     [:map {:closed true}
+                   [:resourceType :string]
+                   [:nested {:optional       true
+                             :fhir/extension true
+                             :url            "https://example.org/nested"}
+                    [:map {:closed true}
+                     [:url :string]
+                     [:extension [:sequential [:map]]]]]]
+          entry   {:url       "https://example.org/nested"
+                   :extension [{:url "part" :valueString "x"}]}
+          decoded (m/decode sch {:resourceType "Basic" :extension [entry]}
+                            (fjt/fhir-json-transformer))]
+      (is (= entry (:nested decoded)))
+      (is (true? (m/validate sch decoded))))))

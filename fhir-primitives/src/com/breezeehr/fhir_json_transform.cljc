@@ -98,16 +98,29 @@
 ;; Shared helpers
 ;; ---------------------------------------------------------------------------
 
+(defn- repeating-entry?
+  "True when a map entry holds a collection of bare extension values rather
+   than a single one."
+  [child-schema]
+  (= :sequential (try (m/type child-schema)
+                      (catch #?(:clj Exception :cljs :default) _ nil))))
+
 (defn- extension-fields
   "Extract extension field metadata from a map schema's children.
-   Returns a seq of {:key k :url url :value-key vk} for each child
-   that has :fhir/extension true in its entry properties."
+   Returns a seq of {:key k :url url :value-key vk :repeating? bool} for each
+   child that has :fhir/extension true in its entry properties.
+
+   :repeating? follows the child schema's own shape, so a 0..* slice folds to a
+   vector of bare values and a 0..1 slice to a single bare value. Reading the
+   cardinality off the schema rather than assuming a vector is what keeps decode
+   and encode agreeing with the cardinality the profile actually declared."
   [schema]
-  (keep (fn [[k props _child-schema]]
+  (keep (fn [[k props child-schema]]
           (when (:fhir/extension props)
-            {:key       k
-             :url       (:url props)
-             :value-key (:fhir/value-key props)}))
+            {:key        k
+             :url        (:url props)
+             :value-key  (:fhir/value-key props)
+             :repeating? (repeating-entry? child-schema)}))
         (m/children schema)))
 
 ;; ---------------------------------------------------------------------------
@@ -119,20 +132,22 @@
 
    For each extension field:
    - Finds entries in :extension matching the field's :url
-   - If :value-key is set (bare value), extracts that key from each entry
-     and collects into a vector
+   - If :value-key is set (bare value), extracts that key from the matching
+     entries — into a vector for a repeating slice, as a single value for a
+     scalar one
    - Otherwise passes the entry through as-is (single entry → map)"
   [m ext-fields]
   (if-let [ext-array (seq (:extension m))]
     (let [consumed-urls (into #{} (map :url) ext-fields)]
       (as-> m m'
-        (reduce (fn [m' {:keys [key url value-key]}]
+        (reduce (fn [m' {:keys [key url value-key repeating?]}]
                   (let [entries (filterv #(= url (:url %)) ext-array)]
                     (if (seq entries)
                       (assoc m' key
-                             (if value-key
-                               (mapv #(get % value-key) entries)
-                               (first entries)))
+                             (cond
+                               (not value-key) (first entries)
+                               repeating?      (mapv #(get % value-key) entries)
+                               :else           (get (first entries) value-key)))
                       m')))
                 m'
                 ext-fields)
@@ -160,21 +175,25 @@
   "Move named extension keys back into the :extension array.
 
    For each extension field present in the map:
-   - If :value-key is set (bare value), wraps each value in an extension entry
-     with :url and the value-key
+   - If :value-key is set (bare value), wraps the value in an extension entry
+     with :url and the value-key — one entry per element for a repeating slice,
+     exactly one for a scalar slice
    - Otherwise inserts the entry as-is into the :extension array"
   [m ext-fields]
   (let [present (filterv #(contains? m (:key %)) ext-fields)]
     (if (seq present)
       (let [ext-entries
             (into (vec (:extension m))
-                  (mapcat (fn [{:keys [key url value-key]}]
+                  (mapcat (fn [{:keys [key url value-key repeating?]}]
                             (let [v (get m key)]
-                              (if value-key
-                                ;; Bare values → wrap each in extension entry
-                                (mapv (fn [val] {:url url value-key val}) v)
+                              (cond
                                 ;; Complex extension → single entry as-is
-                                [(assoc v :url url)]))))
+                                (not value-key) [(assoc v :url url)]
+                                ;; Repeating slice → one entry per bare value
+                                repeating?      (mapv (fn [val] {:url url value-key val}) v)
+                                ;; Scalar slice → exactly one entry. mapv here would
+                                ;; walk a complex value's own entries instead.
+                                :else           [{:url url value-key v}]))))
                   present)
             ext-keys (into #{} (map :key) present)]
         (-> (apply dissoc m ext-keys)

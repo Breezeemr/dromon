@@ -1965,24 +1965,42 @@
                                    :from *current-definition*
                                    :degraded-to degraded}))
                          degraded)))
-        ;; For profile-based extension slices (no value[x] in sub-elements),
-        ;; check the resolved schema for :fhir/primitive-extension to derive value-key.
-        profile-value-key (when (and is-extension? profile-kw (not value-key-kw))
+        ;; For profile-based extension slices (no value[x] in sub-elements), read the
+        ;; value key off the resolved extension schema so the transformer can fold the
+        ;; entry down to its bare value.
+        profile-sch-props (when (and is-extension? profile-kw (not value-key-kw))
                             (let [entry (get @*schema-atom* profile-kw)
                                   resolved-sch (:sch entry)]
                               (when resolved-sch
-                                (let [sch-props (try (m/properties resolved-sch) (catch Exception _ nil))]
-                                  (when (:fhir/primitive-extension sch-props)
-                                    (let [prim-code (:fhir/primitive sch-props)]
-                                      (when prim-code
-                                        (keyword (str "value" (str/upper-case (subs prim-code 0 1))
-                                                     (subs prim-code 1))))))))))
+                                (try (m/properties resolved-sch) (catch Exception _ nil)))))
+        profile-primitive? (boolean (:fhir/primitive-extension profile-sch-props))
+        ;; A primitive extension states its type in :fhir/primitive; a complex-valued one
+        ;; (Reference, CodeableConcept, Address, Coding, ...) already carries the key
+        ;; itself. :complex marks a nested-extension definition, which has no single bare
+        ;; value and so keeps its whole-entry representation.
+        profile-value-key (when profile-sch-props
+                            (if profile-primitive?
+                              (when-let [prim-code (:fhir/primitive profile-sch-props)]
+                                (keyword (str "value" (str/upper-case (subs prim-code 0 1))
+                                              (subs prim-code 1))))
+                              (let [vk (:fhir/value-key profile-sch-props)]
+                                (when (and vk (not= :complex vk)) vk))))
         final-props (if profile-value-key
                       (assoc final-props :fhir/value-key profile-value-key)
                       final-props)
         override-form (when profile-kw
                         (swap! *references-atom* conj profile-kw)
-                        (let [is-sequential? (or profile-value-key
+                        ;; Primitive profile extensions keep the established
+                        ;; always-sequential convention. Complex-valued ones follow the
+                        ;; slice's own max, so a 0..1 slice folds to a bare value rather
+                        ;; than a one-element vector.
+                        (let [slice-repeating? (let [attr-max (:max main-attr)]
+                                                 (or (= "*" attr-max)
+                                                     (when-let [n (and (string? attr-max)
+                                                                       (parse-long attr-max))]
+                                                       (> n 1))))
+                              is-sequential? (or profile-primitive?
+                                                 (and profile-value-key slice-repeating?)
                                                  (if (vector? new-sub-sch)
                                                    (= :sequential (first new-sub-sch))
                                                    (= :sequential (try (m/type new-sub-sch) (catch Exception _ nil)))))]
