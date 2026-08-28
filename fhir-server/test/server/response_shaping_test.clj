@@ -336,18 +336,23 @@
               (is (not (subsetted? body))
                   "an error outcome is never tagged SUBSETTED"))))))))
 
-(deftest a-keto-rejection-outcome-is-not-shaped
-  (testing "keto's rejection is returned as a map body from inside the shaping
-            middleware, so it is the case a status guard has to cover"
+(deftest an-authorization-outcome-is-not-shaped
+  (testing "server.keto rejects from INSIDE the shaping group and returns its
+            OperationOutcome as a plain map rather than throwing, so it never
+            reaches ::fhir-exceptions -- this is the case the status guard on
+            wrap-summary has to cover by itself"
     (let [app  (app)
-          ;; No Authorization header: wrap-jwt-auth attaches no :identity and
-          ;; wrap-keto-authorization answers 401 for the missing subject
-          ;; (present-subject-but-denied stays 403; both are map bodies).
+          ;; No Authorization header: wrap-jwt-auth attaches no :identity, so
+          ;; wrap-keto-authorization answers with its subject-less rejection.
           resp (app {:request-method :get
                      :uri (str "/" tenant "/fhir/Patient/123")
                      :query-string "_summary=true"
                      :headers {"accept" "application/fhir+json"}})
           body (json-body resp)]
-      (is (= 401 (:status resp)))
+      (is (= 401 (:status resp))
+          "a request with no subject is unauthenticated, not forbidden")
       (is (= "OperationOutcome" (get body "resourceType")))
-      (is (= "login" (get-in body ["issue" 0 "code"]))))))
+      (is (= "login" (get-in body ["issue" 0 "code"]))
+          "the issue array survives _summary=true")
+      (is (not (subsetted? body))
+          "an error outcome is never tagged SUBSETTED"))))

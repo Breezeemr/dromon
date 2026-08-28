@@ -237,10 +237,12 @@
       `::patient-compartment` honor the `:public?` route data via
       `:reitit.core/match`.
    9. `::jwt-auth` never rejects on its own -- it only attaches `:identity`.
-      Rejection is `::keto-authorization`'s 403 (or `server.auth/wrap-require-auth`'s
-      401 on the bulk-data routes). A host inserting its own identity source
-      (a BFF session, say) must insert it before `::keto-authorization`;
-      conventionally before `::jwt-auth`.
+      Rejection is `::keto-authorization`'s: a 401 carrying `:login-url` when no
+      subject was attached at all, a 403 when a subject was attached and Keto
+      denied it (or `server.auth/wrap-require-auth`'s 401 on the bulk-data
+      routes). A host inserting its own identity source (a BFF session, say)
+      must insert it before `::keto-authorization`; conventionally before
+      `::jwt-auth`.
    10. The response-shaping group -- `::pretty-print`, `::prefer`, `::elements`,
        `::summary`, `::fhir-response-headers` -- must sit INSIDE
        `::format-response`, because every one of them rewrites a response body
@@ -264,9 +266,9 @@
        a shaping failure of its own (`_pretty` on a body Jackson cannot write,
        say) still becomes an OperationOutcome rather than a raw 500. Errors
        returned as plain response maps -- handler 404/410/412s, `server.keto`'s
-       403 -- do reach the group, which is why `server.middleware/wrap-summary`
-       and `wrap-elements` skip non-2xx and OperationOutcome bodies themselves
-       rather than relying on position."
+       401 and 403 -- do reach the group, which is why
+       `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
+       OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
                  jwks-url enforce-smart-scopes? login-url]}]
   (cond-> []
