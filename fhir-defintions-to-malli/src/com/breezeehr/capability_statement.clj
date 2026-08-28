@@ -60,7 +60,13 @@
 (defn- find-base-search-params
   "Find base FHIR SearchParameter definitions for a resource type by scanning
    a SearchParameter directory. Matches files with {ResourceType}_ prefix and
-   shared SearchParameter files where the resource type is in the base array."
+   shared SearchParameter files where the resource type is in the base array.
+
+   Sorted by [name definition] so the emitted capability namespaces are
+   reproducible: `.listFiles` returns directory order, which varies by
+   filesystem and checkout, and an unsorted result made every regeneration
+   reshuffle `:search-params` in the 30 capability files that carry base
+   params."
   [^java.io.File search-param-dir resource-type]
   (when (and search-param-dir (.isDirectory search-param-dir))
     (let [prefix (str resource-type "_")]
@@ -75,6 +81,7 @@
                        {:name       (:name sp)
                         :type       (:type sp)
                         :definition (:url sp)}))))
+           (sort-by (juxt :name :definition))
            vec))))
 
 (defn rest-resources
