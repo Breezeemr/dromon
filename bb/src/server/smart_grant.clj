@@ -30,9 +30,12 @@
 
 (def ^:private app-scope
   "Scopes registered on app clients: SMART standalone patient launch,
-   read-only. `launch/patient.*` (wildcard) lets the client select its launch
-   patient per token via `launch/patient.<id>`."
-  "openid offline_access launch/patient launch/patient.* patient/*.read")
+   read-only plus `patient/Patient.c`. `launch/patient.*` (wildcard) lets the
+   client select its launch patient per token via `launch/patient.<id>`.
+   `patient/Patient.c` is the SMART v2 create scope on Patient, which is what
+   server.scope's request->interaction derives for a POST to
+   Patient/{id}/$request-demographic-change."
+  "openid offline_access launch/patient launch/patient.* patient/*.read patient/Patient.c")
 
 ;; ── helpers ────────────────────────────────────────────────────────────────
 
@@ -163,4 +166,4 @@
             (println (str "    curl -u <client_id>:<client_secret> " hydra-public
                           "/oauth2/token -d grant_type=client_credentials"
                           " -d 'scope=launch/patient." (first patients)
-                          " patient/*.read'")))))))
+                          " patient/*.read patient/Patient.c'")))))))

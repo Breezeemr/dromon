@@ -13,10 +13,18 @@
 (def ^:private tenant "default")
 
 ;; A minimal registry mirroring how the real search registry resolves the R4B
-;; Patient-compartment link params for Observation: `subject` and `performer`.
+;; Patient-compartment link params: `subject`/`performer` for Observation, and
+;; for Task the four link params plus a non-link param the capability pack also
+;; registers. Task's `patient` and `subject` both resolve to Task.for, so the
+;; union must dedupe them.
 (def ^:private registries
   {"Observation" {"subject"   {:type "reference" :columns [{:col "subject"}]}
-                  "performer" {:type "reference" :columns [{:col "performer" :array? true}]}}})
+                  "performer" {:type "reference" :columns [{:col "performer" :array? true}]}}
+   "Task"        {"patient"   {:type "reference" :columns [{:col "for"}]}
+                  "subject"   {:type "reference" :columns [{:col "for"}]}
+                  "owner"     {:type "reference" :columns [{:col "owner"}]}
+                  "requester" {:type "reference" :columns [{:col "requester"}]}
+                  "status"    {:type "token" :columns [{:col "status"}]}}})
 
 (defn- obs [id patient-ref]
   {:resourceType "Observation" :id id :subject {:reference patient-ref}})
@@ -73,6 +81,34 @@
       (is (= :passthrough (compartment/confine "Patient" "123" "Medication" {} reg))))
     (testing "member type with no registered link param is denied"
       (is (= :deny (compartment/confine "Patient" "123" "Observation" {} {}))))))
+
+;; ---------------------------------------------------------------------------
+;; Task: a deliberate forward-port of R5's Patient/Task compartment entry, so
+;; patient-filed demographic change requests stay inside the compartment.
+;; ---------------------------------------------------------------------------
+
+(deftest task-is-a-patient-compartment-member
+  (is (compartment/patient-compartment-member? "Task"))
+  (is (= ["patient" "subject" "owner" "requester"]
+         (compartment/compartment-link-params "Patient" "Task"))))
+
+(deftest task-descriptor-unions-registered-link-params
+  (let [desc (compartment/compartment-descriptor "Patient" "Task" (get registries "Task"))]
+    (is (= "reference" (:type desc)))
+    (is (= ["Patient"] (:target desc)))
+    (testing "patient and subject collapse onto Task.for; non-link params are excluded"
+      (is (= [{:col "for"} {:col "owner"} {:col "requester"}] (:columns desc))))))
+
+(deftest confine-task-search-under-patient-token
+  (let [outcome (compartment/confine "Patient" "123" "Task" {} (get registries "Task"))]
+    (testing "a Task search is confined, never denied, once the link params resolve"
+      (is (not= :deny outcome))
+      (is (vector? outcome))
+      (let [[tag params registry] outcome]
+        (is (= :run tag))
+        (is (= "Patient/123" (get params compartment/compartment-search-param)))
+        (is (= [{:col "for"} {:col "owner"} {:col "requester"}]
+               (:columns (get registry compartment/compartment-search-param))))))))
 
 (deftest token-restriction-detection
   (testing "patient-only token is restricted"
