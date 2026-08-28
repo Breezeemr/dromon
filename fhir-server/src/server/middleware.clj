@@ -151,9 +151,14 @@
              response)))))))
 
 (defn wrap-pretty-print
-  "When _pretty=true, serializes map bodies to pretty-printed JSON,
-   bypassing Muuntaja's serialization (which passes through InputStreams).
-   Should be placed between format-negotiate-middleware and format-response-middleware."
+  "When _pretty=true, serializes map bodies to pretty-printed JSON, taking
+   Muuntaja's place: the InputStream and Content-Type it sets are exactly what
+   make Muuntaja skip re-encoding.
+
+   Belongs INSIDE format-response-middleware and outermost of the other
+   response-shaping middleware, so it serializes the final body rather than
+   one that _summary or Prefer has yet to touch. See the ordering invariants
+   on `server.router/default-middleware`."
   [handler encode-mapper]
   (fn [request]
     (let [response (handler request)
@@ -287,6 +292,21 @@
     "data" (apply-summary-data resource)
     resource))
 
+(defn- shapeable-response?
+  "Whether `_summary` / `_elements` subsetting applies to `response`.
+
+   Only a successful response carries the resource the client asked for. A
+   4xx/5xx body is an OperationOutcome diagnosing the failure, and subsetting
+   it to the summary elements would strip the very `issue` entries that say
+   what went wrong -- these middleware run inside the encoder, so error
+   responses returned as plain maps (handler 404s, keto's 403) pass through
+   them. An OperationOutcome is excluded at any status for the same reason."
+  [response]
+  (let [status (:status response)]
+    (and status
+         (<= 200 status 299)
+         (not= "OperationOutcome" (:resourceType (:body response))))))
+
 (defn wrap-summary
   "Middleware that applies _summary parameter to responses."
   [handler]
@@ -294,7 +314,7 @@
     (let [params (merge (:query-params request) (:params request))
           summary (or (get params "_summary") (get params :_summary))
           response (handler request)]
-      (if (and summary (not= summary "false"))
+      (if (and summary (not= summary "false") (shapeable-response? response))
         (let [body (:body response)]
           (cond
             ;; _summary=count on search — return Bundle with total only
@@ -337,7 +357,7 @@
     (let [params (merge (:query-params request) (:params request))
           elements-str (or (get params "_elements") (get params :_elements))
           response (handler request)]
-      (if elements-str
+      (if (and elements-str (shapeable-response? response))
         (let [elements-set (set (map keyword (str/split elements-str #",")))
               body (:body response)]
           (cond

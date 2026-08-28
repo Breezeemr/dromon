@@ -56,13 +56,16 @@
                         middleware/wrap-not-acceptable
                         middleware/wrap-unsupported-media-type
                         muuntaja/format-negotiate-middleware
-                        middleware/wrap-fhir-response-headers
-                        middleware/wrap-summary
-                        middleware/wrap-elements
-                        middleware/wrap-prefer
-                        [middleware/wrap-pretty-print core/java-time-encode-mapper]
                         muuntaja/format-response-middleware
                         middleware/wrap-fhir-exceptions
+                        ;; The response-shaping group sits inside the encoder
+                        ;; and runs innermost-first; see the ordering
+                        ;; invariants on server.router/default-middleware.
+                        [middleware/wrap-pretty-print core/java-time-encode-mapper]
+                        middleware/wrap-prefer
+                        middleware/wrap-elements
+                        middleware/wrap-summary
+                        middleware/wrap-fhir-response-headers
                         muuntaja/format-request-middleware
                         rrc/coerce-request-middleware
                         rrc/coerce-response-middleware

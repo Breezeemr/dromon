@@ -259,13 +259,13 @@
    ::router/not-acceptable
    ::router/unsupported-media-type
    ::router/format-negotiate
-   ::router/fhir-response-headers
-   ::router/summary
-   ::router/elements
-   ::router/prefer
-   ::router/pretty-print
    ::router/format-response
    ::router/fhir-exceptions
+   ::router/pretty-print
+   ::router/prefer
+   ::router/elements
+   ::router/summary
+   ::router/fhir-response-headers
    ::router/format-request
    ::router/coerce-request
    ::router/coerce-response

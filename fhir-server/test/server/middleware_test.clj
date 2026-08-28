@@ -329,6 +329,24 @@
           handler (fn [_] {:status 200 :body body})
           wrapped (middleware/wrap-summary handler)
           resp (wrapped {:query-params {"_summary" "false"}})]
+      (is (= body (:body resp)))))
+
+  (testing "an error OperationOutcome is left whole: subsetting it would drop
+            the issues that explain the failure"
+    (let [body {:resourceType "OperationOutcome"
+                :issue [{:severity "error" :code "not-found"
+                         :diagnostics "Patient/1 not found"}]}
+          handler (fn [_] {:status 404 :body body})
+          wrapped (middleware/wrap-summary handler)
+          resp (wrapped {:query-params {"_summary" "true"}})]
+      (is (= body (:body resp)))))
+
+  (testing "a 200 OperationOutcome is left whole too"
+    (let [body {:resourceType "OperationOutcome"
+                :issue [{:severity "information" :code "informational"}]}
+          handler (fn [_] {:status 200 :body body})
+          wrapped (middleware/wrap-summary handler)
+          resp (wrapped {:query-params {"_summary" "true"}})]
       (is (= body (:body resp))))))
 
 (deftest wrap-elements-test
@@ -350,4 +368,12 @@
           handler (fn [_] {:status 200 :body body})
           wrapped (middleware/wrap-elements handler)
           resp (wrapped {:query-params {}})]
+      (is (= body (:body resp)))))
+
+  (testing "an error OperationOutcome is left whole"
+    (let [body {:resourceType "OperationOutcome"
+                :issue [{:severity "error" :code "not-found"}]}
+          handler (fn [_] {:status 404 :body body})
+          wrapped (middleware/wrap-elements handler)
+          resp (wrapped {:query-params {"_elements" "id"}})]
       (is (= body (:body resp))))))
