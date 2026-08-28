@@ -14,11 +14,17 @@
                                       :disallow-trailing-zero true}]
                             fp/external-registry)]
     (testing "valid decimals"
-      (is (m/validate test-sch 1.5000000000000000000000000000M))
+      (is (m/validate test-sch 1.5M))
       (is (nil? (me/humanize (m/explain test-sch 1.5M)))))
 
     (testing "negative value fails"
-      (is (some? (m/explain test-sch -1.5000000000000000000000000000M))))
+      (is (some? (m/explain test-sch -1.5M))))
+
+    (testing "excess scale fails"
+      ;; Numerically 1.5, but 28 decimal places and 30 characters: violates
+      ;; :max-decimal-places, :disallow-trailing-zero and :max-characters.
+      ;; The schema compares the value as written; it does not strip zeros.
+      (is (some? (m/explain test-sch 1.5000000000000000000000000000M))))
 
     (testing "trailing zero fails"
       (is (some? (me/humanize (m/explain test-sch 1.000M)))))
