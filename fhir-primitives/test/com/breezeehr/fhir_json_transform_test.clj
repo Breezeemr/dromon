@@ -48,7 +48,13 @@
               :country    "US"}]})
 
 (def sample-patient
-  "A US Core Patient with race, ethnicity, birthDate and deceasedDateTime filled in."
+  "A US Core Patient with race, ethnicity, birthDate and deceasedDateTime filled in.
+
+   The race and ethnicity sub-slices follow their generated schemas: :ombCategory,
+   :detailed and :text each carry a :fhir/value-key over a [:sequential ...] child,
+   so all three fold to vectors of bare values. The outer :race and :ethnicity maps
+   have :fhir/value-key :complex -- a nested-extension definition with no single bare
+   value -- so they keep their whole-entry shape, including :url."
   {:resourceType "Patient"
    :id "example-1"
    :meta {:profile ["http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient|8.0.1"]}
@@ -71,8 +77,7 @@
                         {:system  "urn:oid:2.16.840.1.113883.6.238"
                          :code    "1002-5"
                          :display "American Indian or Alaska Native"}]
-          :text        {:url         "text"
-                        :valueString "White, American Indian"}}
+          :text        ["White, American Indian"]}
    :ethnicity {:url         "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity"
                :ombCategory [{:system  "urn:oid:2.16.840.1.113883.6.238"
                               :code    "2135-2"
@@ -80,8 +85,7 @@
                :detailed    [{:system  "urn:oid:2.16.840.1.113883.6.238"
                               :code    "2184-0"
                               :display "Dominican"}]
-               :text        {:url         "text"
-                             :valueString "Hispanic or Latino"}}})
+               :text        ["Hispanic or Latino"]}})
 
 
 (deftest patient-validates-test
