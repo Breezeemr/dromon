@@ -10,6 +10,8 @@
      the data-access middleware, so it grants no data access by itself.
    - {:object \"Patient/<id>\" :relation \"read\"|...} -- instance-level access
      to the Patient resource itself (checked by server.keto).
+   - {:object \"Patient/<id>\" :relation \"request-change\"} -- instance-level
+     authorization for the Patient/$request-demographic-change operation.
    - {:object <MemberType> :relation \"read\"|...} -- type-level access to the
      Patient-compartment member types. Safe in combination with a patient/
      scoped token because server.compartment confines every query to the
@@ -43,7 +45,10 @@
   "Relation recording that a subject may launch with a patient context."
   "launch")
 
-(def ^:private default-relations ["read"])
+;; "request-change" authorizes Patient/$request-demographic-change. It is only
+;; consulted on the instance tuple Patient/<id>; the type-level tuples it also
+;; mints on member types are inert.
+(def ^:private default-relations ["read" "request-change"])
 
 (defn- put-tuple! [tuple]
   (let [resp (hc/put (str (keto-admin-url) "/admin/relation-tuples")

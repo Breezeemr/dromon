@@ -22,6 +22,37 @@
     (testing "no write relations unless requested"
       (is (not-any? #(= (:relation %) "write") tuples)))))
 
+(deftest task-is-a-granted-member-type
+  (let [tuples (grant/grant-tuples "client-1" ["pa"] ["read"])]
+    (testing "Task joined the Patient compartment, so it gets a type-level tuple"
+      (is (some #(= % {:namespace "fhir" :object "Task"
+                       :relation "read" :subject_id "client-1"}) tuples)))
+    (testing "Patient is still instance-confined, with no type-level tuple"
+      (is (not-any? #(= (:object %) "Patient") tuples)))))
+
+(defn- captured-tuples
+  "Runs `f` with the Keto write stubbed out, returning the tuples it would
+   have written."
+  [f]
+  (let [tuples (atom [])]
+    (with-redefs-fn {#'grant/put-tuple! (fn [t] (swap! tuples conj t))}
+      (fn [] (f)))
+    @tuples))
+
+(deftest default-relations-authorize-request-change
+  (testing "a minted grant carries read and request-change on the patient instance"
+    (let [tuples (captured-tuples #(grant/grant-patient-set! "client-1" ["pa"]))]
+      (is (some #(= % {:namespace "fhir" :object "Patient/pa"
+                       :relation "read" :subject_id "client-1"}) tuples))
+      (is (some #(= % {:namespace "fhir" :object "Patient/pa"
+                       :relation "request-change" :subject_id "client-1"}) tuples))))
+  (testing "explicit relations override the default"
+    (let [tuples (captured-tuples
+                  #(grant/grant-patient-set! "client-1" ["pa"] :relations ["read"]))]
+      (is (some #(= % {:namespace "fhir" :object "Patient/pa"
+                       :relation "read" :subject_id "client-1"}) tuples))
+      (is (not-any? #(= (:relation %) "request-change") tuples)))))
+
 (defn- hook-payload [& {:keys [client-id scopes patient]}]
   (cond-> {:request (cond-> {:client_id client-id
                              :granted_scopes (or scopes [])}

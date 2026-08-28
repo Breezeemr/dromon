@@ -20,11 +20,12 @@
    queries. The compartment owner resource itself (the Patient record) is
    confined by `_id`.
 
-   The resource->parameter tables below are transcribed verbatim from the R4B
+   The resource->parameter tables below are transcribed from the R4B
    CompartmentDefinitions:
    https://hl7.org/fhir/R4B/compartmentdefinition-{patient,practitioner,encounter,relatedperson,device}.json
    The owner self-entry (and the non-searchable `{def}` placeholder) is omitted
-   from each table; the owner type is handled by `_id`."
+   from each table; the owner type is handled by `_id`. One entry (Patient/Task)
+   is a documented forward-port from R5; see the comment at its site."
   (:require [fhir-store.protocol :as db]
             [server.scope :as scope]
             [taoensso.telemere :as t]))
@@ -100,6 +101,11 @@
     "Specimen"                     ["subject"]
     "SupplyDelivery"               ["patient"]
     "SupplyRequest"                ["subject"]
+    ;; Deliberate forward-port from R5: R4B's Patient CompartmentDefinition
+    ;; omits Task (added in R5). Breeze files patient-authored Tasks
+    ;; (demographic change requests), which must stay inside the patient
+    ;; compartment.
+    "Task"                         ["patient" "subject" "owner" "requester"]
     "VisionPrescription"           ["patient"]}
 
    "Practitioner"
