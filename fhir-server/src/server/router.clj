@@ -209,8 +209,8 @@
       precisely because muuntaja never sees their responses.
    3. `::parameters` must precede `::format-override`, `::summary`,
       `::elements` and `::pretty-print`, which read `:query-params`.
-      (`::prefer` reads only the Prefer request header; its position merely
-      mirrors the pre-refactor stack.)
+      (`::prefer` reads only the Prefer request header, so only invariant 10
+      constrains it.)
    4. `::format-negotiate` must be outside `::format-request` and
       `::format-response`: it populates the `:muuntaja/request` and
       `:muuntaja/response` keys both consume.
@@ -239,12 +239,32 @@
       401 on the bulk-data routes). A host inserting its own identity source
       (a BFF session, say) must insert it before `::keto-authorization`;
       conventionally before `::jwt-auth`.
-   10. KNOWN CAVEAT, preserved deliberately: `::fhir-response-headers`,
-       `::summary`, `::elements`, `::prefer` and `::pretty-print` sit outside
-       `::format-response` and therefore observe response bodies muuntaja has
-       already encoded to an InputStream, so their map-body transformations do
-       not take effect through the full stack. The order is kept as-is for
-       backwards compatibility; do not \"fix\" it while recomposing."
+   10. The response-shaping group -- `::pretty-print`, `::prefer`, `::elements`,
+       `::summary`, `::fhir-response-headers` -- must sit INSIDE
+       `::format-response`, because every one of them rewrites a response body
+       that is still a resource MAP. `::format-response` encodes eagerly to an
+       InputStream, so anything outside it sees bytes: the transformations
+       silently no-op, and `::prefer`'s `return=OperationOutcome`, which swaps
+       in a fresh map unconditionally, hands Jetty a body it cannot serialize.
+
+       Within the group, remember that OUTER runs LAST on the response, so the
+       vector reads in reverse of the shaping order. Innermost first:
+       `::fhir-response-headers` derives ETag/Last-Modified from `meta` before
+       anything can drop it (notably `::prefer`'s `return=minimal`, which nils
+       the body but must still carry the ETag); `::summary` and `::elements`
+       subset the resource; `::prefer` then applies the return preference; and
+       `::pretty-print` is outermost so it re-serializes the FINAL body. Because
+       it emits an InputStream and its own Content-Type, `::format-response`
+       (outside it) skips encoding and passes those bytes through untouched.
+
+       The group also sits inside `::fhir-exceptions`, which cuts both ways: an
+       OperationOutcome synthesized from a thrown exception is never shaped, and
+       a shaping failure of its own (`_pretty` on a body Jackson cannot write,
+       say) still becomes an OperationOutcome rather than a raw 500. Errors
+       returned as plain response maps -- handler 404/410/412s, `server.keto`'s
+       403 -- do reach the group, which is why `server.middleware/wrap-summary`
+       and `wrap-elements` skip non-2xx and OperationOutcome bodies themselves
+       rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
                  jwks-url enforce-smart-scopes?]}]
   (cond-> []
@@ -262,14 +282,14 @@
            {:name ::not-acceptable :wrap middleware/wrap-not-acceptable}
            {:name ::unsupported-media-type :wrap middleware/wrap-unsupported-media-type}
            (assoc muuntaja/format-negotiate-middleware :name ::format-negotiate)
-           {:name ::fhir-response-headers :wrap middleware/wrap-fhir-response-headers}
-           {:name ::summary :wrap middleware/wrap-summary}
-           {:name ::elements :wrap middleware/wrap-elements}
-           {:name ::prefer :wrap middleware/wrap-prefer}
-           {:name ::pretty-print
-            :wrap (fn [handler] (middleware/wrap-pretty-print handler java-time-encode-mapper))}
            (assoc muuntaja/format-response-middleware :name ::format-response)
            {:name ::fhir-exceptions :wrap middleware/wrap-fhir-exceptions}
+           {:name ::pretty-print
+            :wrap (fn [handler] (middleware/wrap-pretty-print handler java-time-encode-mapper))}
+           {:name ::prefer :wrap middleware/wrap-prefer}
+           {:name ::elements :wrap middleware/wrap-elements}
+           {:name ::summary :wrap middleware/wrap-summary}
+           {:name ::fhir-response-headers :wrap middleware/wrap-fhir-response-headers}
            (assoc muuntaja/format-request-middleware :name ::format-request)
            (assoc rrc/coerce-request-middleware :name ::coerce-request)
            (assoc rrc/coerce-response-middleware :name ::coerce-response)
