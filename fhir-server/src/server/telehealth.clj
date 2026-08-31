@@ -196,3 +196,22 @@
           (end-session! k))
         {:status 200
          :body (messages->parameters messages)}))))
+
+(defn signal-operation
+  "Entry point for the OperationDefinition-bound form of this operation.
+
+   The operation catalog calls one implementation per OperationDefinition with
+   a ctx map, while signalling is two handlers because it is a mailbox: GET
+   polls the caller's inbox, POST publishes to the other one. The
+   OperationDefinition declares both methods (operation-binding/method), and
+   this dispatches to the handler each one has always used.
+
+   Deployments that register the operation directly, as test-server does, keep
+   naming `poll-signal` and `post-signal`; this only adds the catalog's shape
+   on top of them."
+  [{:keys [request]}]
+  (case (:request-method request)
+    :get  (poll-signal request)
+    :post (post-signal request)
+    (bad-request (str "$telehealth-signal answers GET and POST, not "
+                      (some-> (:request-method request) name)))))

@@ -362,9 +362,20 @@
 
 (defn launch-patient
   "The in-context SMART launch patient id (a bare Patient logical id) from the
-   validated JWT identity, or nil when absent."
+   validated JWT identity, or nil when absent.
+
+   Read from the top-level `patient` claim, falling back to `ext.patient`.
+   Hydra only promotes a claim to the top level when it is listed in
+   OAUTH2_ALLOWED_TOP_LEVEL_CLAIMS, and nests it under `ext` otherwise, so the
+   same authorization server issues one shape or the other depending on how it
+   was configured. Reading only the top level meant a token from a Hydra
+   without that setting had no launch patient here and was refused for lacking
+   one -- while the operation implementations, which already accept both
+   shapes, would have honoured it. One definition of the token's patient, used
+   by every layer that gates on it."
   [request]
-  (get-in request [:identity :patient]))
+  (let [claims (:identity request)]
+    (or (:patient claims) (get-in claims [:ext :patient]))))
 
 (defn token-patient-restricted?
   "True when the token is confined to the patient compartment: it carries at
