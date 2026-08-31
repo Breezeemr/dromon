@@ -8,6 +8,7 @@
             [server.compartment :as compartment]
             [server.json-patch :as json-patch]
             [server.search-registry :as sr]
+            [server.temporal :as tmp]
             [taoensso.telemere :as t]))
 
 (defn- gone-response [resource-type id]
@@ -54,6 +55,22 @@
   (when-let [header (get-in req [:headers "prefer"])]
     (when-let [m (re-find #"handling=(strict|lenient)" header)]
       (keyword (second m)))))
+
+(defn- operation-definition-url
+  "Canonical for a CapabilityStatement operation entry.
+
+   An operation config may state its own `:definition`, and a deployment-defined
+   operation SHOULD: it is not an HL7 operation, so advertising an hl7.org
+   canonical for it asserts conformance to a definition that does not exist.
+
+   Otherwise derive the base-spec canonical from the resource type. This used to
+   be hardcoded to ValueSet, which was invisible while ValueSet was the only
+   type carrying operations -- every other type would have advertised
+   `ValueSet-<op>` for its own operations."
+  [resource-type op-name op-config]
+  (or (:definition op-config)
+      (str "http://hl7.org/fhir/OperationDefinition/"
+           resource-type "-" (subs op-name 1))))
 
 (defn- unsupported-params-issues
   [resource-type severity param-names]
@@ -197,6 +214,83 @@
 
       :else
       {:status 200 :body res})))
+
+(defn- operation-needs-id-response [resource-type op]
+  {:status 400
+   :body {:resourceType "OperationOutcome"
+          :issue [{:severity "error"
+                   :code "invalid"
+                   :diagnostics (str op " on " resource-type
+                                 " is an instance-level operation: call it as "
+                                 resource-type "/[id]/" op ".")}]}})
+
+(defn resource-as-of
+  "Handler for GET /[type]/[id]/$as-of — the resource at a point in time.
+
+   At least one temporal selector is required. A plain `$as-of` with no
+   selectors would return current state, which is what a misspelled parameter
+   name also produces — and a silently-current answer to a historical question
+   is the failure this operation exists to make impossible. On the search path
+   the registry catches a misspelling; here this check is the equivalent."
+  [req]
+  (let [store (:fhir/store req)
+        tenant-id (-> req :path-params :tenant-id)
+        resource-type (:fhir/resource-type req)
+        id (-> req :path-params :id)
+        params (or (:query-params req) {})
+        {requested-basis :basis basis-error :error} (tmp/parse-basis params)]
+    (cond
+      (nil? id) (operation-needs-id-response resource-type "$as-of")
+      basis-error basis-error
+
+      (nil? requested-basis)
+      {:status 400
+       :body {:resourceType "OperationOutcome"
+              :issue [{:severity "error"
+                       :code "invalid"
+                       :diagnostics (str "$as-of requires at least one of _asOf "
+                                         "(system time) or _validAt (valid time). "
+                                         "For current state, read the resource directly.")}]}}
+
+      :else
+      (or (tmp/unsupported-axis-response store resource-type requested-basis)
+          (let [basis (tmp/resolve-basis store tenant-id requested-basis)
+                res (db/read-as-of store tenant-id (keyword resource-type) id basis)]
+            (if res
+              {:status 200 :body (tmp/stamp-basis res basis)}
+              (not-found-response resource-type
+                                  (str id " at the requested point in time"))))))))
+
+(defn resource-timeline
+  "Handler for GET /[type]/[id]/$timeline — every version of one resource.
+
+   Returns a history Bundle whose entries carry the temporal bounds of each
+   version as extensions. Valid-time bounds appear only on a store that has
+   that axis; see `server.temporal/timeline-entry` for why absent beats null."
+  [req]
+  (let [store (:fhir/store req)
+        tenant-id (-> req :path-params :tenant-id)
+        resource-type (:fhir/resource-type req)
+        id (-> req :path-params :id)]
+    (cond
+      (nil? id) (operation-needs-id-response resource-type "$timeline")
+
+      (not (satisfies? db/ITemporalReadStore store))
+      {:status 400
+       :body {:resourceType "OperationOutcome"
+              :issue [{:severity "error"
+                       :code "not-supported"
+                       :diagnostics (str "$timeline needs a store with point-in-time "
+                                         "reads; this deployment's store provides none.")}]}}
+
+      :else
+      (let [rows (db/resource-timeline store tenant-id (keyword resource-type) id nil)]
+        (if (seq rows)
+          {:status 200
+           :body (tmp/timeline-bundle (str "/" tenant-id "/fhir/" resource-type)
+                                      (db/temporal-axes store)
+                                      rows)}
+          (not-found-response resource-type id))))))
 
 (defn update-resource
   "Handler for PUT /[type]/:id RESTful interaction.
@@ -546,7 +640,13 @@
    Parameters the resource type does not declare are rejected with a 400
    OperationOutcome. `Prefer: handling=lenient` instead ignores them and
    returns the (correspondingly wider) result set with an OperationOutcome
-   warning entry naming each one, per FHIR R4B §3.1.1.4."
+   warning entry naming each one, per FHIR R4B §3.1.1.4.
+
+   The temporal selectors `_asOf` / `_validAt` (see `server.temporal`) run the
+   same search against a point-in-time snapshot. They are never covered by
+   handling=lenient: a snapshot the store cannot produce is refused outright,
+   because answering on the remaining axis would return a different question's
+   answer under the caller's parameters."
   [req]
   (let [store (:fhir/store req)
         tenant-id (-> req :path-params :tenant-id)
@@ -572,70 +672,88 @@
         skip-param (or (get params :_skip) (get params "_skip") "0")
 
         limit (parse-non-negative-int "_count" (str count-param))
-        skip (parse-non-negative-int "_skip" (str skip-param))]
-    (if (and (seq unsupported) (not lenient?))
-      (unsupported-params-response resource-type unsupported)
-      (if-let [err (or (:error limit) (:error skip))]
-        err
-        (let [base-url (str "/" tenant-id "/fhir/" resource-type)
-              outcome-entry (when (seq unsupported)
-                              (unsupported-params-entry base-url resource-type unsupported))]
-          (if (zero? limit)
-            ;; _count=0: return total-only Bundle with no entries and no next link
-            (let [total (db/count-resources store tenant-id (keyword resource-type)
-                                           (assoc params :_count 0 :_skip 0) search-registry)
-                  build-link (fn [new-skip]
-                               (let [query-string (->> (assoc params :_count limit :_skip new-skip)
-                                                       (map (fn [[k v]] (str (name k) "=" v)))
-                                                       (clojure.string/join "&"))]
-                                 (str base-url "?" query-string)))
-                  self-link {:relation "self" :url (build-link skip)}]
-              {:status 200
-               :body (cond-> {:resourceType "Bundle"
-                              :type "searchset"
-                              :total total
-                              :link [self-link]}
-                       outcome-entry (assoc :entry [outcome-entry]))})
-            ;; Normal search with pagination
-            (let [search-params (assoc params :_count limit :_skip skip)
-                  results (db/search store tenant-id (keyword resource-type) search-params search-registry)
+        skip (parse-non-negative-int "_skip" (str skip-param))
+
+        ;; Temporal selectors: parsed, then gated against what the store's
+        ;; engine actually has before any query runs.
+        {requested-basis :basis basis-error :error} (tmp/parse-basis raw-params)]
+    (if-let [refusal (or (when (and (seq unsupported) (not lenient?))
+                           (unsupported-params-response resource-type unsupported))
+                         basis-error
+                         (tmp/unsupported-axis-response store resource-type requested-basis)
+                         (:error limit)
+                         (:error skip))]
+      refusal
+      (let [basis (when requested-basis
+                    (tmp/resolve-basis store tenant-id requested-basis))
+            base-url (str "/" tenant-id "/fhir/" resource-type)
+            outcome-entry (when (seq unsupported)
+                            (unsupported-params-entry base-url resource-type unsupported))]
+        (if (zero? limit)
+          ;; _count=0: return total-only Bundle with no entries and no next link
+          (let [total (if basis
+                        (db/count-as-of-basis store tenant-id (keyword resource-type)
+                                              (assoc params :_count 0 :_skip 0) search-registry basis)
+                        (db/count-resources store tenant-id (keyword resource-type)
+                                            (assoc params :_count 0 :_skip 0) search-registry))
+                build-link (fn [new-skip]
+                             (let [query-string (->> (assoc params :_count limit :_skip new-skip)
+                                                     (map (fn [[k v]] (str (name k) "=" v)))
+                                                     (clojure.string/join "&"))]
+                               (str base-url "?" query-string)))
+                self-link {:relation "self" :url (build-link skip)}]
+            {:status 200
+             :body (cond-> {:resourceType "Bundle"
+                            :type "searchset"
+                            :total total
+                            :link [self-link]}
+                     outcome-entry (assoc :entry [outcome-entry])
+                     basis (tmp/stamp-basis basis))})
+          ;; Normal search with pagination
+          (let [search-params (assoc params :_count limit :_skip skip)
+                results (if basis
+                          (db/search-as-of store tenant-id (keyword resource-type)
+                                           search-params search-registry basis)
+                          (db/search store tenant-id (keyword resource-type)
+                                     search-params search-registry))
   
-                  build-link (fn [new-skip]
-                               (let [query-string (->> (assoc params :_count limit :_skip new-skip)
-                                                       (map (fn [[k v]] (str (name k) "=" v)))
-                                                       (clojure.string/join "&"))]
-                                 (str base-url "?" query-string)))
+                build-link (fn [new-skip]
+                             (let [query-string (->> (assoc params :_count limit :_skip new-skip)
+                                                     (map (fn [[k v]] (str (name k) "=" v)))
+                                                     (clojure.string/join "&"))]
+                               (str base-url "?" query-string)))
   
-                  self-link {:relation "self" :url (build-link skip)}
+                self-link {:relation "self" :url (build-link skip)}
   
-                  next-link (when (= (count results) limit)
-                              {:relation "next" :url (build-link (+ skip limit))})
+                next-link (when (= (count results) limit)
+                            {:relation "next" :url (build-link (+ skip limit))})
   
-                  prev-link (when (> skip 0)
-                              {:relation "previous" :url (build-link (max 0 (- skip limit)))})
+                prev-link (when (> skip 0)
+                            {:relation "previous" :url (build-link (max 0 (- skip limit)))})
   
-                  links (filterv some? [self-link next-link prev-link])
+                links (filterv some? [self-link next-link prev-link])
   
-                  entries (mapv (fn [res]
-                                  {:fullUrl (str base-url "/" (:id res))
-                                   :resource res
-                                   :search {:mode "match"}})
-                                results)
+                entries (mapv (fn [res]
+                                {:fullUrl (str base-url "/" (:id res))
+                                 :resource res
+                                 :search {:mode "match"}})
+                              results)
   
-                  all-registries (:fhir/all-registries req)
-                  inc-entries (resolve-includes store tenant-id results include-param all-registries)
-                  revinc-entries (resolve-revincludes store tenant-id results revinclude all-registries)
+                all-registries (:fhir/all-registries req)
+                inc-entries (resolve-includes store tenant-id results include-param all-registries)
+                revinc-entries (resolve-revincludes store tenant-id results revinclude all-registries)
   
-                  all-entries (cond-> entries
-                                (seq inc-entries) (into inc-entries)
-                                (seq revinc-entries) (into revinc-entries)
-                                outcome-entry (conj outcome-entry))]
-              {:status 200
-               :body {:resourceType "Bundle"
-                      :type "searchset"
-                      :total (count results)
-                      :link links
-                      :entry all-entries}})))))))
+                all-entries (cond-> entries
+                              (seq inc-entries) (into inc-entries)
+                              (seq revinc-entries) (into revinc-entries)
+                              outcome-entry (conj outcome-entry))]
+            {:status 200
+             :body (cond-> {:resourceType "Bundle"
+                            :type "searchset"
+                            :total (count results)
+                            :link links
+                            :entry all-entries}
+                     basis (tmp/stamp-basis basis))}))))))
 
 (defn conditional-update
   "Handler for PUT /[type]?[search params] — conditional update."
@@ -1051,10 +1169,11 @@
                                                                :type (:type sp)})
                                                             search-params))
                                   (seq operations)
-                                  (assoc :operation (mapv (fn [[op-name _]]
-                                                           {:name op-name
-                                                            :definition (str "http://hl7.org/fhir/OperationDefinition/ValueSet-" (subs op-name 1))})
-                                                         operations))))))
+                                  (assoc :operation (mapv (fn [[op-name op-config]]
+                                                            {:name op-name
+                                                             :definition (operation-definition-url
+                                                                          fhir-type op-name op-config)})
+                                                          operations))))))
                           schemas)]
       {:status 200
        :body {:resourceType "CapabilityStatement"
