@@ -538,22 +538,56 @@
   [x]
   (if (sequential? x) x [x]))
 
-(defn- extract-reference
-  "Extracts a FHIR reference string from a value that may be a Reference map,
-   a plain string, or nested within an array."
+(defn- reference-strings
+  "EVERY FHIR reference string reachable from `val`, which may be a Reference
+   map, a plain string, or an array of either.
+
+   All of them, not the first: this replaced an `extract-reference` that folded
+   an array with `some`, which is wrong for `_include`, because the columns an
+   include follows are usually repeating -- an Appointment carries one
+   participant per attendee, and only one of them was ever resolved."
   [val]
   (cond
-    (map? val)        (:reference val)
-    (string? val)     val
-    (sequential? val) (some extract-reference val)
+    (map? val)        (when-let [r (:reference val)] [r])
+    (string? val)     [val]
+    (sequential? val) (mapcat reference-strings val)
     :else             nil))
+
+(defn- column-references
+  "Reference strings one search-registry column descriptor selects out of one
+   resource.
+
+   A descriptor carrying `:sub-col` names a NESTED reference: the column is a
+   BackboneElement (`Appointment.participant`) and the reference lives on one of
+   its fields (`.actor`), which is how `search-registry/resolve-nested-path`
+   models any dotted FHIRPath. Reading `:col` alone yields the backbone elements
+   themselves, which carry no `:reference` key, so an `_include` on any nested
+   reference parameter contributed nothing at all -- `Appointment:actor` and
+   `Encounter:participant` among them."
+  [res {:keys [col sub-col]}]
+  (let [v (get res (keyword col))]
+    (if sub-col
+      (let [elements (cond
+                       (sequential? v) v
+                       (map? v)        [v]
+                       :else           nil)]
+        (mapcat #(reference-strings (get % (keyword sub-col))) elements))
+      (reference-strings v))))
 
 (defn- resolve-includes
   "For _include=SourceType:searchParam, follow reference fields in the primary results
    to include the referenced resources. Returns Bundle entries with search.mode=include.
-   Uses the search registry to map search parameter names to actual FHIR field names.
+   Uses the search registry to map search parameter names to actual FHIR field names,
+   including the nested ones -- see [[column-references]].
    Batches all referenced resource IDs by type and resolves them in bulk via db/search
-   with comma-separated _id values to avoid N+1 queries."
+   with comma-separated _id values to avoid N+1 queries.
+
+   The bulk read runs against the request's store, which for a patient-restricted
+   token is a CompartmentFilteringStore. That is deliberate and it works:
+   `server.compartment/confine` returns :passthrough for a type outside the
+   compartment, naming _include targets as the case it exists for. So a patient
+   token resolves the Practitioner and Organization names on its own appointments
+   without any widening of what it may read directly."
   [store tenant-id results include-params all-registries]
   (when (and (seq include-params) (seq results))
     (let [params (ensure-coll include-params)
@@ -564,26 +598,28 @@
               (let [[source-type search-param] (str/split include-param #":" 2)
                     source-registry (get all-registries source-type)
                     param-descriptor (when source-registry (get source-registry search-param))
-                    field-kws (if-let [columns (seq (:columns param-descriptor))]
-                                (mapv (comp keyword :col) columns)
-                                [(keyword search-param)])]
-                (if (seq field-kws)
-                  (reduce
-                    (fn [acc2 res]
-                      (reduce
-                        (fn [acc3 field-kw]
-                          (if-let [ref-val (get res field-kw)]
-                            (let [ref-str (extract-reference ref-val)]
-                              (if (and (string? ref-str) (str/includes? ref-str "/"))
-                                (let [[rt id] (str/split ref-str #"/" 2)]
-                                  (update acc3 rt (fnil conj #{}) id))
-                                acc3))
-                            acc3))
-                        acc2
-                        field-kws))
-                    acc
-                    results)
-                  acc)))
+                    ;; Whole descriptors, not just their :col: a nested column
+                    ;; is only readable with its :sub-col in hand. Absent a
+                    ;; registry entry, fall back to a top-level field named
+                    ;; after the parameter, which is what this did before.
+                    columns (or (seq (:columns param-descriptor))
+                                [{:col search-param}])]
+                (reduce
+                  (fn [acc2 res]
+                    (reduce
+                      (fn [acc3 column]
+                        (reduce
+                          (fn [acc4 ref-str]
+                            (if (and (string? ref-str) (str/includes? ref-str "/"))
+                              (let [[rt id] (str/split ref-str #"/" 2)]
+                                (update acc4 rt (fnil conj #{}) id))
+                              acc4))
+                          acc3
+                          (column-references res column)))
+                      acc2
+                      columns))
+                  acc
+                  results)))
             {}
             params)
           ;; Second pass: batch-fetch all resources per type with a single search call
@@ -633,6 +669,51 @@
                        {:fullUrl (str "/" tenant-id "/fhir/" (:resourceType res) "/" (:id res))
                         :resource res
                         :search {:mode "include"}}))))))))
+
+(defn- search-total
+  "Bundle.total for a paginated searchset: how many resources the search
+   MATCHES, not how many this page carries.
+
+   Reporting the page size was the long-standing defect here -- a patient with
+   73 Immunizations was told `total` 50, which is the `_count`.
+
+   Two cases, and only one of them costs a query:
+
+   - A short page is the last page, so `skip + page` is the exact total and no
+     store call is made. Every search that fits in one page takes this branch,
+     which is most of them, and it is why the counts asserted across the
+     handler tests do not move.
+   - A full page may or may not be the last, so the count has to be asked for.
+     `count-resources` is exact on every store, but fhir-store-datomic
+     implements it by materialising the whole match set, so this is not free on
+     a broad search.
+
+   `_total` (FHIR R4B 3.1.1.4) is the client's control over that cost, and the
+   parameter was already classified as a search result parameter without being
+   honoured. `none` omits Bundle.total and never counts. `accurate` and
+   `estimate` both count: this server has nothing cheaper to offer than the
+   exact answer, and the spec allows an estimate to be one. Absent the
+   parameter the count is made, so the default answer is a true one.
+
+   Returns nil when no total should be reported. That distinction is the point:
+   FHIR makes Bundle.total 0..1, so leaving it out asserts nothing, while a
+   wrong number asserts something false."
+  [store tenant-id resource-type params search-registry basis limit skip page-count]
+  (let [requested (or (get params "_total") (get params :_total))]
+    (cond
+      (= "none" requested)
+      nil
+
+      (< page-count limit)
+      (+ skip page-count)
+
+      basis
+      (db/count-as-of-basis store tenant-id (keyword resource-type)
+                            params search-registry basis)
+
+      :else
+      (db/count-resources store tenant-id (keyword resource-type)
+                          params search-registry))))
 
 (defn search-type
   "Handler for GET /[type] RESTful interaction.
@@ -716,6 +797,8 @@
                                            search-params search-registry basis)
                           (db/search store tenant-id (keyword resource-type)
                                      search-params search-registry))
+                total (search-total store tenant-id resource-type params
+                                    search-registry basis limit skip (count results))
   
                 build-link (fn [new-skip]
                              (let [query-string (->> (assoc params :_count limit :_skip new-skip)
@@ -725,7 +808,14 @@
   
                 self-link {:relation "self" :url (build-link skip)}
   
-                next-link (when (= (count results) limit)
+                ;; A full page is the only candidate for a next link, and a
+                ;; known total then says whether one actually follows. Without
+                ;; that second test a search whose match count is an exact
+                ;; multiple of _count advertises a next link to an empty page,
+                ;; which a client walking the links has to fetch to discover.
+                ;; `_total=none` leaves total nil and keeps the older rule.
+                next-link (when (and (= (count results) limit)
+                                     (or (nil? total) (< (+ skip limit) total)))
                             {:relation "next" :url (build-link (+ skip limit))})
   
                 prev-link (when (> skip 0)
@@ -750,9 +840,9 @@
             {:status 200
              :body (cond-> {:resourceType "Bundle"
                             :type "searchset"
-                            :total (count results)
                             :link links
                             :entry all-entries}
+                     total (assoc :total total)
                      basis (tmp/stamp-basis basis))}))))))
 
 (defn conditional-update

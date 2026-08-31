@@ -304,3 +304,170 @@
     (is (= 1 (count (get-in resp [:body :entry]))))
     (is (some #(= "next" (:relation %)) (get-in resp [:body :link]))
         "a full page yields a next link")))
+
+;; ---------------------------------------------------------------------------
+;; _include over nested reference columns (:sub-col)
+;; ---------------------------------------------------------------------------
+
+(def ^:private appointment-registries
+  "Appointment's `actor` is the R4B search parameter whose FHIRPath is
+   `Appointment.participant.actor`, so the registry resolves it to a nested
+   column. `service-provider` is the flat shape, kept here so the two paths are
+   covered by the same fixture."
+  {"Appointment"  {"actor"            {:type "reference"
+                                       :target ["Practitioner" "Location"]
+                                       :columns [{:col "participant"
+                                                  :fhir-type "BackboneElement"
+                                                  :array? true
+                                                  :sub-col "actor"
+                                                  :sub-fhir-type "Reference"
+                                                  :sub-array? false}]}
+                   "service-provider" {:type "reference"
+                                       :target ["Organization"]
+                                       :columns [{:col "serviceProvider"
+                                                  :fhir-type "Reference"
+                                                  :array? false}]}}
+   "Practitioner" {}
+   "Location"     {}
+   "Organization" {}})
+
+(defn- appointment-store
+  "One Appointment with two participants and an organization, plus the three
+   resources they reference."
+  []
+  (let [store (make-store)]
+    (db/create-resource store tenant :Practitioner "pr1"
+                        {:resourceType "Practitioner" :id "pr1"
+                         :name [{:family "Reyes"}]})
+    (db/create-resource store tenant :Location "loc1"
+                        {:resourceType "Location" :id "loc1" :name "Clinic B"})
+    (db/create-resource store tenant :Organization "org1"
+                        {:resourceType "Organization" :id "org1" :name "Breeze"})
+    (db/create-resource store tenant :Appointment "a1"
+                        {:resourceType "Appointment" :id "a1"
+                         :participant [{:actor {:reference "Practitioner/pr1"}}
+                                       {:actor {:reference "Location/loc1"}}]
+                         :serviceProvider {:reference "Organization/org1"}})
+    store))
+
+(defn- appointment-search-request
+  [store params]
+  {:fhir/store           store
+   :fhir/resource-type   "Appointment"
+   :fhir/search-registry (get appointment-registries "Appointment")
+   :fhir/all-registries  appointment-registries
+   :path-params          {:tenant-id tenant}
+   :query-params         params
+   :headers              {}})
+
+(defn- included-ids [resp]
+  (->> (get-in resp [:body :entry])
+       (filter #(= "include" (get-in % [:search :mode])))
+       (map (comp :id :resource))
+       set))
+
+(deftest include-resolves-a-nested-reference-column
+  (let [resp (handlers/search-type
+               (appointment-search-request (appointment-store)
+                                           {"_include" "Appointment:actor"}))]
+    (is (= 200 (:status resp)))
+    (is (= #{"pr1" "loc1"} (included-ids resp))
+        "Appointment.participant.actor is a :sub-col; reading the participant
+         elements alone finds no :reference and yields no include entries")))
+
+(deftest include-resolves-every-entry-of-a-repeating-column
+  (let [resp (handlers/search-type
+               (appointment-search-request (appointment-store)
+                                           {"_include" "Appointment:actor"}))]
+    (is (= 2 (count (included-ids resp)))
+        "one include entry per participant, not just the first")))
+
+(deftest include-still-resolves-a-top-level-reference-column
+  (let [resp (handlers/search-type
+               (appointment-search-request (appointment-store)
+                                           {"_include" "Appointment:service-provider"}))]
+    (is (= #{"org1"} (included-ids resp)))))
+
+(deftest include-entries-do-not-displace-the-matches
+  (let [resp (handlers/search-type
+               (appointment-search-request (appointment-store)
+                                           {"_include" "Appointment:actor"}))
+        matches (->> (get-in resp [:body :entry])
+                     (filter #(= "match" (get-in % [:search :mode])))
+                     (map (comp :id :resource)))]
+    (is (= ["a1"] (vec matches)))))
+
+(deftest column-references-reads-a-nested-reference
+  (let [column-references #'handlers/column-references
+        appt {:participant [{:actor {:reference "Practitioner/pr1"}}
+                            {:actor {:reference "Location/loc1"}}]}]
+    (is (= ["Practitioner/pr1" "Location/loc1"]
+           (vec (column-references appt {:col "participant" :sub-col "actor"}))))))
+
+(deftest column-references-tolerates-a-single-element-and-an-absent-one
+  (let [column-references #'handlers/column-references]
+    (is (= ["Practitioner/pr1"]
+           (vec (column-references {:participant {:actor {:reference "Practitioner/pr1"}}}
+                                   {:col "participant" :sub-col "actor"})))
+        "a repeating element stored as a bare map")
+    (is (empty? (column-references {} {:col "participant" :sub-col "actor"})))
+    (is (empty? (column-references {:participant [{}]} {:col "participant" :sub-col "actor"}))
+        "a participant carrying no actor")))
+
+;; ---------------------------------------------------------------------------
+;; Bundle.total on a paginated searchset
+;; ---------------------------------------------------------------------------
+
+(defn- patients! [store n]
+  (dotimes [i n]
+    (db/create-resource store tenant :Patient (str "p" i)
+                        {:resourceType "Patient" :id (str "p" i)
+                         :name [{:family (str "F" i)}]})))
+
+(defn- search-patients [store params]
+  (handlers/search-type (base-request store :params params)))
+
+(deftest search-total-is-the-match-count-not-the-page-size
+  (let [store (make-store)]
+    (patients! store 7)
+    (let [resp (search-patients store {"_count" "3"})]
+      (is (= 3 (count (get-in resp [:body :entry]))))
+      (is (= 7 (get-in resp [:body :total]))
+          "the defect this replaces reported 3, the _count"))))
+
+(deftest search-total-on-a-short-page-needs-no-count
+  (let [store (make-store)]
+    (patients! store 4)
+    (is (= 4 (get-in (search-patients store {"_count" "50"}) [:body :total])))))
+
+(deftest search-total-on-a-short-page-accounts-for-the-skip
+  (let [store (make-store)]
+    (patients! store 5)
+    (is (= 5 (get-in (search-patients store {"_count" "3" "_skip" "3"}) [:body :total]))
+        "the last page holds 2, and 3 were skipped")))
+
+(deftest search-total-none-omits-the-element
+  (let [store (make-store)]
+    (patients! store 7)
+    (let [resp (search-patients store {"_count" "3" "_total" "none"})]
+      (is (= 200 (:status resp)))
+      (is (not (contains? (:body resp) :total))
+          "Bundle.total is 0..1: omitted says nothing, a wrong number lies")
+      (is (some #(= "next" (:relation %)) (get-in resp [:body :link]))
+          "without a total the older full-page rule still drives the next link"))))
+
+(deftest search-next-link-is-withheld-on-an-exact-final-page
+  (let [store (make-store)]
+    (patients! store 4)
+    (let [resp (search-patients store {"_count" "2" "_skip" "2"})]
+      (is (= 4 (get-in resp [:body :total])))
+      (is (= 2 (count (get-in resp [:body :entry]))))
+      (is (nil? (some #(= "next" (:relation %)) (get-in resp [:body :link])))
+          "a full page that exhausts the total has nothing after it"))))
+
+(deftest search-next-link-survives-when-more-pages-remain
+  (let [store (make-store)]
+    (patients! store 5)
+    (let [resp (search-patients store {"_count" "2" "_skip" "2"})]
+      (is (= 5 (get-in resp [:body :total])))
+      (is (some #(= "next" (:relation %)) (get-in resp [:body :link]))))))

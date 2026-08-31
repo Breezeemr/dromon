@@ -59,7 +59,10 @@
   (let [k-name (name k)
         v-str (str v)]
     (if (= k-name "_id")
-      (= (:id res) v-str)
+      ;; A comma-separated list is an OR over ids, per FHIR R4B 3.1.1.5. The
+      ;; handlers' _include batching sends exactly that shape, so a mock that
+      ;; only matched a single id could never exercise it.
+      (contains? (set (str/split v-str #",")) (:id res))
       (if-let [param-desc (get search-registry k-name)]
         ;; Use registry - match if ANY column matches
         (some #(match-column res % v-str) (:columns param-desc))
