@@ -99,10 +99,16 @@
   "Takes a resource map and resource-type, builds a parameterized SQL INSERT for XTDB.
    Optional kwargs:
      :version — the monotonic version string to inject as the \"fhir_version\" column.
+     :valid-time — {:valid-from t :valid-to t-or-nil}; adds the _valid_from /
+       _valid_to columns so the row is placed on the valid-time axis instead of
+       defaulting to now-until-end-of-time. A nil :valid-to is omitted, which
+       XTDB reads as end-of-time.
    Public (no-doc) so bulk importers (fhir-datomic-decant's xtdb target) reuse the
    exact document/SQL shape the live store writes."
-  [resource-type id resource-map storage-encoders & {:keys [version]}]
-  (let [doc (encode-resource-doc resource-type id resource-map storage-encoders :version version)
+  [resource-type id resource-map storage-encoders & {:keys [version valid-time]}]
+  (let [doc (cond-> (encode-resource-doc resource-type id resource-map storage-encoders :version version)
+              (:valid-from valid-time) (assoc :_valid_from (:valid-from valid-time))
+              (:valid-to valid-time)   (assoc :_valid_to (:valid-to valid-time)))
         cols (keys doc)
         col-names (str/join ", " (map #(format "\"%s\"" (name %)) cols))
         placeholders (str/join ", " (repeat (count cols) "?"))
@@ -853,7 +859,7 @@
           stripped (-> record
                        (dissoc :xt/id :_id :fhir_version :fhir-version
                                :xt/system_from :xt/system_to :xt/system-from :xt/system-to
-                               :xt/valid_from :xt/valid_to
+                               :xt/valid_from :xt/valid_to :xt/valid-from :xt/valid-to
                                :fhir_source :fhir-source)
                        ;; Drop the denormalized token search columns so they
                        ;; never leak into the reconstructed resource. XTDB returns
@@ -1012,6 +1018,40 @@
                     (catch Throwable _ nil)))))))))))
 
 ;; ---------------------------------------------------------------------------
+;; Bitemporal clause construction.
+;;
+;; XTDB places the temporal qualifier immediately after the table name, so its
+;; bind params PRECEDE every WHERE param. Callers must concat in that order --
+;; getting it backwards silently swaps a timestamp for a search value and the
+;; query still runs. Every builder below returns [sql-fragment params] so the
+;; ordering is carried by construction rather than by convention.
+;;
+;; Verified against xtdb-core 2.2.0-beta1: both `FOR ALL VALID_TIME` and
+;; `FOR VALID_TIME ALL` parse (this ns uses the `FOR ALL ...` form already
+;; established by history-sql), `AS OF ?` binds a JDBC param on both axes, and
+;; Instant / LocalDate / ISO-string all coerce correctly as the bound value.
+;; ---------------------------------------------------------------------------
+
+(defn ^:no-doc basis->for-clause
+  "SQL temporal qualifier for `basis` ({:system-time _ :valid-time _}, either
+   key optional) as [sql params]. Returns [\"\" []] for a nil/empty basis, which
+   is the atemporal default: valid now, as best known."
+  [{:keys [system-time valid-time] :as basis}]
+  (if (or (nil? basis) (and (nil? system-time) (nil? valid-time)))
+    ["" []]
+    (let [;; valid time first, mirroring the SQL:2011 ordering XTDB documents
+          parts (cond-> []
+                  valid-time  (conj [" FOR VALID_TIME AS OF ?" valid-time])
+                  system-time (conj [" FOR SYSTEM_TIME AS OF ?" system-time]))]
+      [(apply str (map first parts))
+       (mapv second parts)])))
+
+(defn ^:no-doc all-time-clause
+  "Qualifier selecting every version on both axes, for timeline reads."
+  []
+  " FOR ALL VALID_TIME FOR ALL SYSTEM_TIME")
+
+;; ---------------------------------------------------------------------------
 ;; Simple-read SQL impls. Extracted from the protocol method bodies so the
 ;; dispatcher in XTDBStore can route to these under :query-mode :sql and to
 ;; the XTQL siblings (fhir-store-xtdb2.query-xtql) under :query-mode :xtql.
@@ -1021,10 +1061,15 @@
 ;; include xtdb's system columns, and _system_from is what inject-meta turns
 ;; into :meta :lastUpdated.
 
-(defn- read-sql [node resource-type id read-decoders]
-  (let [query (format "SELECT *, _system_from FROM %s WHERE _id = ?" (table-name resource-type))
-        results (into [] (xt/q node [query id]))]
-    (xtdb->fhir (first results) read-decoders)))
+(defn- read-sql
+  ([node resource-type id read-decoders]
+   (read-sql node resource-type id read-decoders nil))
+  ([node resource-type id read-decoders basis]
+   (let [[for-sql for-params] (basis->for-clause basis)
+         query (format "SELECT *, _system_from FROM %s%s WHERE _id = ?"
+                       (table-name resource-type) for-sql)
+         results (into [] (xt/q node (into [query] (conj for-params id))))]
+     (xtdb->fhir (first results) read-decoders))))
 
 (defn- vread-sql [node resource-type id vid read-decoders]
   (let [query (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (table-name resource-type))
@@ -1048,7 +1093,12 @@
 (def ^:private ^:no-doc result-params
   #{"_count" "_skip" "_offset" "_sort" "_include" "_revinclude"
     "_total" "_elements" "_contained" "_containedType"
-    "_summary" "_format" "_pretty"})
+    "_summary" "_format" "_pretty"
+    ;; Temporal selectors. They name a snapshot rather than restrict which
+    ;; resources match, and the basis reaches the store as its own argument, so
+    ;; they must never reach build-condition -- which would compile "_asOf" into
+    ;; a column comparison against a table that has no such column.
+    "_asOf" "_validAt"})
 
 (defn ^:no-doc prepare-search-args
   "Parses a FHIR search params map into the inputs both the SQL and XTQL
@@ -1086,23 +1136,35 @@
 
 (defn- fetch-by-ids
   "Fetches full rows for `ids` and returns them as FHIR resources in the same
-   order as `ids` (phase 2 of the two-phase sorted search)."
-  [node resource-type ids read-decoders]
+   order as `ids` (phase 2 of the two-phase sorted search).
+
+   `basis` MUST be the same basis phase 1 selected the ids under. Fetching the
+   current rows for ids that matched a historical snapshot would return today's
+   version of yesterday's result set -- a mismatch no test on either phase alone
+   would catch."
+  [node resource-type ids read-decoders basis]
   (if (empty? ids)
     []
-    (let [rows (xt/q node [(format "SELECT *, _system_from FROM %s WHERE _id = ANY(?)" (table-name resource-type))
-                           (vec ids)])
+    (let [[for-sql for-params] (basis->for-clause basis)
+          rows (xt/q node (into [(format "SELECT *, _system_from FROM %s%s WHERE _id = ANY(?)"
+                                         (table-name resource-type) for-sql)]
+                                (conj for-params (vec ids))))
           by-id (into {} (map (fn [r] [(row-id r) r])) rows)]
       (into [] (keep #(some-> (get by-id %) (xtdb->fhir read-decoders))) ids))))
 
 (defn- search-sql
-  [node resource-type {:keys [filter-params sort-specs search-registry limit offset]} read-decoders]
+  ([node resource-type args read-decoders]
+   (search-sql node resource-type args read-decoders nil))
+  ([node resource-type {:keys [filter-params sort-specs search-registry limit offset]} read-decoders basis]
   ;; LIMIT/OFFSET are bound as params (not inlined) so the SQL text is stable
   ;; across pages — repeated searches of a given shape hit XTDB's plan cache.
   (let [order-by (build-order-by-clause sort-specs search-registry)
-        [where params] (where+params filter-params search-registry)
+        [where where-params] (where+params filter-params search-registry)
+        [for-sql for-params] (basis->for-clause basis)
+        ;; Temporal params bind before WHERE params (see basis->for-clause).
+        params (into for-params where-params)
         where-sql (if where (str " WHERE " where) "")
-        rt (table-name resource-type)]
+        rt (str (table-name resource-type) for-sql)]
     (if (seq sort-specs)
       ;; Two-phase: an ORDER BY defeats LIMIT early-termination, so a single
       ;; SELECT * would materialize every matched row's full column set just to
@@ -1111,28 +1173,30 @@
       ;; full rows by id and restore the sorted order.
       (let [id-q (format "SELECT _id FROM %s%s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))
             ids (mapv row-id (xt/q node (into [id-q] (conj params limit offset))))]
-        (fetch-by-ids node resource-type ids read-decoders))
+        (fetch-by-ids node resource-type ids read-decoders basis))
       ;; No sort: a single SELECT * with LIMIT streams the first `limit` rows and
       ;; stops (early-termination), so the wide projection cost is already bounded.
       (let [q (format "SELECT *, _system_from FROM %s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))]
-        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [q] (conj params limit offset))))))))
+        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [q] (conj params limit offset)))))))))
 
 (defn- count-sql
-  [node resource-type {:keys [filter-params search-registry]}]
-  (let [[query-str all-params]
-        (if (empty? filter-params)
-          [(format "SELECT COUNT(*) AS cnt FROM %s" (table-name resource-type)) []]
-          (let [cols (keys filter-params)
-                conditions (map (fn [k]
-                                  (build-condition k (get filter-params k)
-                                                   (get search-registry (name k))))
-                                cols)
-                where-clause (str/join " AND " (map first conditions))
-                p (into [] (mapcat second) conditions)]
-            [(format "SELECT COUNT(*) AS cnt FROM %s WHERE %s"
-                     (table-name resource-type) where-clause) p]))
-        result (first (xt/q node (into [query-str] all-params)))]
-    (or (:cnt result) 0)))
+  ([node resource-type args] (count-sql node resource-type args nil))
+  ([node resource-type {:keys [filter-params search-registry]} basis]
+   (let [[for-sql for-params] (basis->for-clause basis)
+         rt (str (table-name resource-type) for-sql)
+         [query-str all-params]
+         (if (empty? filter-params)
+           [(format "SELECT COUNT(*) AS cnt FROM %s" rt) for-params]
+           (let [cols (keys filter-params)
+                 conditions (map (fn [k]
+                                   (build-condition k (get filter-params k)
+                                                    (get search-registry (name k))))
+                                 cols)
+                 where-clause (str/join " AND " (map first conditions))
+                 p (into for-params (mapcat second) conditions)]
+             [(format "SELECT COUNT(*) AS cnt FROM %s WHERE %s" rt where-clause) p]))
+         result (first (xt/q node (into [query-str] all-params)))]
+     (or (:cnt result) 0))))
 
 ;; ---------------------------------------------------------------------------
 ;; Write-side SQL impls.
@@ -1324,6 +1388,71 @@
                       (table-name resource-type) where-clause)
         results (into [] (xt/q node (into [query] (conj where-params limit))))]
     (mapv #(xtdb->fhir % read-decoders) results)))
+
+(defn ^:no-doc row->timeline-entry
+  "Splits a timeline row into its decoded resource and its four temporal bounds.
+   xtdb->fhir strips the bound columns, so they are read off the raw row first."
+  [row read-decoders]
+  {:resource    (xtdb->fhir row read-decoders)
+   :valid-from  (or (:xt/valid-from row) (:xt/valid_from row) (get row "_valid_from"))
+   :valid-to    (or (:xt/valid-to row) (:xt/valid_to row) (get row "_valid_to"))
+   :system-from (or (:xt/system-from row) (:xt/system_from row) (get row "_system_from"))
+   :system-to   (or (:xt/system-to row) (:xt/system_to row) (get row "_system_to"))})
+
+(defn- timeline-sql
+  "Every version of one resource across both axes, oldest-first. The bound
+   columns must be projected explicitly: `SELECT *` does not include them."
+  [node resource-type id read-decoders]
+  (let [query (format (str "SELECT *, _valid_from, _valid_to, _system_from, _system_to "
+                           "FROM %s%s WHERE _id = ? ORDER BY _system_from, _valid_from")
+                      (table-name resource-type) (all-time-clause))]
+    (mapv #(row->timeline-entry % read-decoders) (xt/q node [query id]))))
+
+;; ---------------------------------------------------------------------------
+;; Valid-time writes.
+;;
+;; A portion INSERT is an exact replacement over its portion: XTDB's
+;; WITHOUT-OVERLAPS handling splits the surrounding rectangles and the new
+;; version carries only the columns written, so an element absent from the new
+;; resource does not survive from the version it replaces. Verified on
+;; 2.2.0-beta1 -- writing {payer} over a [Mar,Apr) portion of a row that also
+;; had {note} yields payer-only inside the portion and the original on both
+;; sides. No preceding delete is needed, and a merge-style `UPDATE ... SET`
+;; would be WRONG here: it would leave stale columns behind.
+;;
+;; Note also that a bare INSERT (no bounds) is valid from NOW, not for all
+;; time. Backdated truth must always name its portion.
+;; ---------------------------------------------------------------------------
+
+(defn- put-valid-time-sql
+  [node resource-type id resource vt storage-encoders]
+  (let [current (current-version node resource-type id)
+        new-version (next-version current)
+        [sql args] (extract-and-build-sql resource-type id resource storage-encoders
+                                          :version new-version
+                                          :valid-time vt)
+        tx-key (xt/execute-tx node [[:sql sql args]])]
+    (with-basis
+      (-> resource
+          (assoc :id id)
+          (assoc-in [:meta :versionId] new-version))
+      tx-key)))
+
+(defn- close-valid-time-sql
+  [node resource-type id valid-from]
+  (let [sql (format "DELETE FROM %s FOR PORTION OF VALID_TIME FROM ? TO NULL WHERE _id = ?"
+                    (table-name resource-type))
+        tx-key (xt/execute-tx node [[:sql sql [valid-from id]]])]
+    (with-basis {} tx-key)))
+
+(defn- reject-xtql-temporal!
+  "The XTQL pathway has no temporal clause construction. Fail loudly instead of
+   silently answering the current-state question."
+  [query-mode]
+  (when (= :xtql query-mode)
+    (throw (ex-info "Temporal reads require :query-mode :sql"
+                    {:fhir/status 400 :fhir/code "not-supported"
+                     :query-mode query-mode}))))
 
 (defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode pool-opts]
   IFHIRStore
@@ -1809,7 +1938,69 @@
                      {:level :warn
                       :data {:resource-type (name resource-type)
                              :error (.getMessage e)}})
-           0))))))
+           0)))))
+
+  fp/ITemporalReadStore
+
+  (temporal-axes [_this] #{:system-time :valid-time})
+
+  (read-as-of [this tenant-id resource-type id basis]
+    (reject-xtql-temporal! query-mode)
+    (t/trace!
+     {:id :store/read-as-of
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+       (with-open [conn (jdbc/get-connection pool)]
+         (read-sql conn resource-type id read-decoders basis)))))
+
+  (search-as-of [this tenant-id resource-type params search-registry basis]
+    (reject-xtql-temporal! query-mode)
+    (t/trace!
+     {:id :store/search-as-of
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
+     (let [{:keys [pool]} (get-or-create-entry this tenant-id)
+           args (prepare-search-args params search-registry)]
+       (with-open [conn (jdbc/get-connection pool)]
+         (search-sql conn resource-type args read-decoders basis)))))
+
+  (count-as-of-basis [this tenant-id resource-type params search-registry basis]
+    (reject-xtql-temporal! query-mode)
+    (t/trace!
+     {:id :store/count-as-of-basis
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
+     (let [{:keys [pool]} (get-or-create-entry this tenant-id)
+           args (prepare-search-args params search-registry)]
+       (with-open [conn (jdbc/get-connection pool)]
+         (count-sql conn resource-type args basis)))))
+
+  (resource-timeline [this tenant-id resource-type id _opts]
+    (reject-xtql-temporal! query-mode)
+    (t/trace!
+     {:id :store/resource-timeline
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+       (with-open [conn (jdbc/get-connection pool)]
+         (timeline-sql conn resource-type id read-decoders)))))
+
+  fp/IValidTimeStore
+
+  (put-valid-time [this tenant-id resource-type id resource vt]
+    (reject-xtql-temporal! query-mode)
+    (t/trace!
+     {:id :store/put-valid-time
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+       (with-open [conn (jdbc/get-connection pool)]
+         (put-valid-time-sql conn resource-type id resource vt storage-encoders)))))
+
+  (close-valid-time [this tenant-id resource-type id valid-from]
+    (reject-xtql-temporal! query-mode)
+    (t/trace!
+     {:id :store/close-valid-time
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
+     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+       (with-open [conn (jdbc/get-connection pool)]
+         (close-valid-time-sql conn resource-type id valid-from))))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
   ;; In a real XTDB implementation, we'd query for codes using XTDB

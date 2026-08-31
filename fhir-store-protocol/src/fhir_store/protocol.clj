@@ -194,3 +194,83 @@
    - Implementation-specific keys (e.g., XTDB node config)"
   [impl-fn config]
   (impl-fn config))
+
+;; ---------------------------------------------------------------------------
+;; Bitemporal extension protocols.
+;;
+;; Deliberately separate from IFHIRStore, and deliberately split read from
+;; write, so a store implements exactly what its engine can honour and
+;; `satisfies?` stays a meaningful capability check:
+;;
+;;   fhir-store-xtdb2   ITemporalReadStore + IValidTimeStore  (both axes)
+;;   fhir-store-datomic ITemporalReadStore only               (system time)
+;;   fhir-store-mock    neither
+;;
+;; A store that implemented a verb it cannot honour -- even to throw -- would
+;; make the capability undiscoverable ahead of the call, which is what the
+;; server layer needs in order to answer 400 instead of a wrong number.
+;; ---------------------------------------------------------------------------
+
+(defprotocol ITemporalReadStore
+  "Point-in-time reads across one or both time axes.
+
+   A `basis` is {:system-time <Instant|nil> :valid-time <Instant|LocalDate|nil>}.
+   nil on an axis means that axis's default: as-best-known for system time,
+   valid-now for valid time. A nil basis is an ordinary current read.
+
+   Implementations MUST reject a basis naming an axis absent from
+   `temporal-axes` rather than ignoring it. Silently dropping an axis returns a
+   plausible but wrong answer -- which is precisely the failure this surface
+   exists to prevent."
+  (temporal-axes [this]
+    "The set of axes this store can honour. #{:system-time} for engines with a
+     single append-only timeline (Datomic); #{:system-time :valid-time} for a
+     bitemporal engine (XTDB v2).")
+  (read-as-of [this tenant-id resource-type id basis]
+    "The single resource as it stood at `basis`, or nil when no version of it
+     was live at that point.")
+  (search-as-of [this tenant-id resource-type params search-registry basis]
+    "As `search`, evaluated against the snapshot `basis` names. The same
+     search-registry machinery applies; only the snapshot differs.")
+  (count-as-of-basis [this tenant-id resource-type params search-registry basis]
+    "As `count-resources`, against the snapshot `basis` names.")
+  (resource-timeline [this tenant-id resource-type id opts]
+    "Every version of one resource, ordered oldest-first by system time.
+
+     Each row is {:resource <fhir-resource>
+                  :system-from <Instant> :system-to <Instant-or-nil>}
+     plus :valid-from / :valid-to ONLY when :valid-time is in `temporal-axes`.
+
+     The absence of the valid-time keys means 'this store has no such axis' --
+     it does NOT mean [beginning-of-time, end-of-time). Callers rendering a
+     timeline must branch on `temporal-axes`, never on key presence alone, and
+     must not emit a null valid period for a single-axis store. A nil
+     :system-to means 'still current', not 'deleted'."))
+
+(defprotocol IValidTimeStore
+  "Writes that place a fact on the valid-time axis: retroactive corrections and
+   future-dated changes. Requires a bitemporal engine.
+
+   Two engine behaviours make these verbs necessary rather than conveniences:
+
+   1. Valid-time DML without a portion clause applies FROM NOW ON. A correction
+      issued as a plain update is therefore a silent PROSPECTIVE change, not the
+      retroactive one the user meant. Every retroactive write must name its
+      portion, which is what these verbs enforce.
+   2. System-time backfill cannot predate already-indexed transactions. Once a
+      tenant is live there is no inserting an older system time; anything
+      learned later about the past is a valid-time write recorded now. Plan
+      historical import oldest-first, before live traffic."
+  (put-valid-time [this tenant-id resource-type id resource vt]
+    "Record `resource` as the truth over the valid-time portion
+     vt = {:valid-from <t> :valid-to <t-or-nil>}, nil :valid-to meaning
+     end-of-time.
+
+     Exact replacement over the portion: elements absent from `resource` are
+     absent from the result, never inherited from the version being replaced.
+     Still a new system-time version, so versionId advances as for any update.")
+  (close-valid-time [this tenant-id resource-type id valid-from]
+    "Retroactive termination: the resource ceases to be true from `valid-from`
+     onward, learned now. History is preserved -- reads at an earlier system
+     time still see it live, and reads valid-before `valid-from` still find it.
+     This is the retro-eligibility primitive."))

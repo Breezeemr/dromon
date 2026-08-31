@@ -435,6 +435,17 @@
     "_total" "_elements" "_contained" "_containedType"
     "_summary" "_format" "_pretty" "_type"})
 
+(def temporal-params
+  "Parameters that select a point in time rather than restrict which resources
+   match. Like the result parameters they are never looked up in a resource
+   type's registry -- but unlike them they are NOT universally available: a
+   store must advertise the corresponding axis (see
+   `fhir-store.protocol/ITemporalReadStore`), and the handler rejects the ones
+   it cannot honour. Classifying them here only stops them being reported as
+   unknown search parameters; it does not grant them."
+  {"_asOf"    :system-time
+   "_validAt" :valid-time})
+
 (def resource-level-params
   "Filter parameters every resource type accepts whatever its registry
    declares. The store dispatches these off base bookkeeping attributes ahead
@@ -455,11 +466,19 @@
   [pname]
   (contains? result-params (param-base-name pname)))
 
+(defn temporal-param?
+  "True when `pname` names a temporal selector."
+  [pname]
+  (contains? temporal-params (param-base-name pname)))
+
 (defn filter-params
   "The entries of `params` that restrict which resources match, i.e. everything
-   that is not a search result parameter. Keys keep their original form."
+   that is neither a search result parameter nor a temporal selector. Keys keep
+   their original form."
   [params]
-  (into {} (remove (fn [[k _]] (result-param? (name k)))) params))
+  (into {} (remove (fn [[k _]] (let [n (name k)]
+                                 (or (result-param? n) (temporal-param? n)))))
+        params))
 
 (defn unsupported-filter-params
   "Names of the filter parameters in `params` that this resource type cannot

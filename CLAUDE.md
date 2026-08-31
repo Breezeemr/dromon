@@ -165,6 +165,48 @@ backends or schema packages on the classpath.
 
 Each step writes to a staging directory first, then to the final output. A shared atom tracks already-generated URLs to avoid duplication across packages.
 
+### Bitemporal reads (`_asOf` / `_validAt`)
+
+Two optional protocols in `fhir-store-protocol` extend `IFHIRStore` with
+point-in-time access. They are deliberately separate, and split read from
+write, so `satisfies?` is a real capability check:
+
+| protocol | verbs | implemented by |
+|---|---|---|
+| `ITemporalReadStore` | `temporal-axes`, `read-as-of`, `search-as-of`, `count-as-of-basis`, `resource-timeline` | fhir-store-xtdb2, fhir-store-datomic |
+| `IValidTimeStore` | `put-valid-time`, `close-valid-time` | fhir-store-xtdb2 |
+
+A *basis* is `{:system-time <Instant> :valid-time <Instant>}`; nil on an axis
+means that axis's default. On the wire the selectors are `_asOf` (system time,
+"as we knew it then") and `_validAt` (valid time, "as it was true"), plus the
+`$as-of` and `$timeline` instance operations.
+
+Rules that are easy to get wrong, all enforced in `server.temporal`:
+
+- **A selector for an axis the store lacks is a 400, never a no-op.** Datomic
+  has system time only, so `_asOf` works there and `_validAt` is refused.
+  Ignoring it would answer the valid-now question while the caller believes
+  they asked a historical one. `Prefer: handling=lenient` does not excuse this.
+- **A plain `GET` is never temporal.** FHIR versions records, not facts, and
+  has no valid-time axis; time travel is a parameter or an operation.
+- **Temporal responses state their resolved basis** in `meta.tag`. An omitted
+  `_asOf` means "latest indexed transaction", a different instant per request,
+  so the response names the concrete one.
+- **A timeline omits valid-time bounds on a single-axis store** rather than
+  emitting null ones: null reads as end-of-time, absent means no such axis.
+
+XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
+
+- `FOR ALL VALID_TIME` and `FOR VALID_TIME ALL` both parse; `AS OF ?` binds a
+  JDBC param on either axis. The temporal clause sits right after the table
+  name, so **its bind params precede every WHERE param**.
+- `SELECT *` does NOT include the temporal columns; project them explicitly.
+- A bare `INSERT` is valid **from now**, not for all time.
+- An INSERT carrying `_valid_from`/`_valid_to` is an exact replacement over
+  that portion: XTDB splits the surrounding rectangles and the new version
+  carries only the columns written. A merge-style `UPDATE ... SET` would be
+  wrong -- it leaves stale columns behind.
+
 ### Auth stack
 - **JWT**: `server.auth/wrap-jwt-auth` -- HS256 with `JWT_DEV_SECRET` env var (dev) or RS256 with JWKS from `JWKS_URL` (prod)
 - **Authorization**: `server.keto/wrap-keto-authorization` -- checks Ory Keto for instance-level permissions (GET->read, POST/PUT/PATCH->write, DELETE->delete)
