@@ -56,6 +56,22 @@
     (when-let [m (re-find #"handling=(strict|lenient)" header)]
       (keyword (second m)))))
 
+(defn- operation-definition-url
+  "Canonical for a CapabilityStatement operation entry.
+
+   An operation config may state its own `:definition`, and a deployment-defined
+   operation SHOULD: it is not an HL7 operation, so advertising an hl7.org
+   canonical for it asserts conformance to a definition that does not exist.
+
+   Otherwise derive the base-spec canonical from the resource type. This used to
+   be hardcoded to ValueSet, which was invisible while ValueSet was the only
+   type carrying operations -- every other type would have advertised
+   `ValueSet-<op>` for its own operations."
+  [resource-type op-name op-config]
+  (or (:definition op-config)
+      (str "http://hl7.org/fhir/OperationDefinition/"
+           resource-type "-" (subs op-name 1))))
+
 (defn- unsupported-params-issues
   [resource-type severity param-names]
   (mapv (fn [p]
@@ -1153,10 +1169,11 @@
                                                                :type (:type sp)})
                                                             search-params))
                                   (seq operations)
-                                  (assoc :operation (mapv (fn [[op-name _]]
-                                                           {:name op-name
-                                                            :definition (str "http://hl7.org/fhir/OperationDefinition/ValueSet-" (subs op-name 1))})
-                                                         operations))))))
+                                  (assoc :operation (mapv (fn [[op-name op-config]]
+                                                            {:name op-name
+                                                             :definition (operation-definition-url
+                                                                          fhir-type op-name op-config)})
+                                                          operations))))))
                           schemas)]
       {:status 200
        :body {:resourceType "CapabilityStatement"

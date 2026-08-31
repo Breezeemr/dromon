@@ -26,6 +26,13 @@
    Moves to the rcm-ig canonical when that IG exists."
   "https://breezeehr.com/fhir/CodeSystem/temporal-basis")
 
+(def operation-definition-base
+  "Canonical base for the temporal operations. `$as-of` and `$timeline` are not
+   HL7 operations, so a deployment mounting them advertises these rather than an
+   hl7.org canonical, which would assert conformance to a definition that does
+   not exist. Moves to the rcm-ig canonical when that IG exists."
+  "https://breezeehr.com/fhir/OperationDefinition/purser-")
+
 (def extension-base
   "Base URL for the timeline's temporal-bound extensions. Moves to the rcm-ig
    canonical when that IG exists."
