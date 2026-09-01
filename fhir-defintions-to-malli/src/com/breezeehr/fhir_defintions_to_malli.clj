@@ -189,6 +189,21 @@
    StructureDefinition order; malli entry order does not preserve it."
   nil)
 
+(def ^:dynamic *element-min*
+  "Snapshot-derived minimum cardinality for the StructureDefinition being
+   compiled, as {[id-segment ...] -> min}.
+
+   The walk consumes the DIFFERENTIAL, and a differential that only restates an
+   element's type restates neither its `min` nor its `max`. Across the two CDA
+   packages, 304 of the 865 single-`type.profile` elements carry no `min` key at
+   all -- `Observation.author` and `component:allergies.section` alike -- so the
+   element the walk is holding cannot tell an optional child from a mandatory
+   one. The snapshot can, and does for every one of them. Reading `min` off the
+   ElementDefinition in hand and treating a missing key as 0 would read the
+   section and entry arms as optional and drop exactly the narrowing
+   `*honor-child-type-profile*` exists to provide."
+  nil)
+
 (def ^:dynamic *canonical-index*
   "Canonical StructureDefinition URL (no `|version` pin) -> ordered vector of
    {:pkg-id :pkg-version :version :kw}, built by `gen/canonical-index` from a
@@ -245,8 +260,33 @@
    are primitive codes, which in CDA carry value-domain profiles (cs-simple,
    bl-simple, st-simple) that must not rewrite the core datatypes. A canonical
    no package in the run defines degrades to the base type and reports through
-   `*unresolved-profiles*`."
+   `*unresolved-profiles*`.
+
+   Narrowing is additionally withheld at an optional, unsliced child pointed at
+   a profile that makes a direct child mandatory; see `honor-at-use-site?`."
   false)
+
+(def ^:dynamic *profiles-raising-child-requirement*
+  "Canonical URLs, `|version` pin stripped, of profiles that make a direct child
+   mandatory which their base type leaves optional.
+
+   Supplied by the driver, and it has to be: `narrowed-child-profile-kw` is
+   forbidden to consult the target schema, because the CCD references sections
+   generated later in the run and at emission time the target does not exist
+   yet. The driver holds every planned StructureDefinition before generation
+   starts, so it can answer for a profile the generator may not have written.
+
+   Empty means never withhold, which is the behaviour before this rule existed."
+  #{})
+
+(def ^:dynamic *suppressed-narrowings*
+  "Optional atom collecting the sites where a resolvable `type.profile` was NOT
+   honored because of `honor-at-use-site?`.
+
+   `*unresolved-profiles*` reports a narrowing that could not happen; this
+   reports one that deliberately did not. Both are otherwise invisible in the
+   emitted schema, which simply carries the base type."
+  nil)
 
 (def ^:dynamic *current-definition*
   "URL of the StructureDefinition being processed, for diagnostics."
@@ -569,6 +609,75 @@
 ;; Schema resolution
 ;; ---------------------------------------------------------------------------
 
+(defn- slice-arm-child?
+  "Does this element hang directly off a slice arm?
+
+   `structure-definition->patch` builds the path vector by splitting an
+   ElementDefinition's `:id`, not its `:path`, so a slice survives in it as a
+   `component:allergies` segment. C-CDA never states the arm's profile on the
+   slice itself: it states it on the slice's child, and the child's own
+   `sliceName` is absent -- the profile lives on
+   `component:allergies.section`, not on `component:allergies`. The colon to
+   look for is therefore on the segment directly above this element, and testing
+   `sliceName` here would find nothing at all: it is nil at every one of the 622
+   narrowing sites in the two CDA packages."
+  [path]
+  (let [n (count path)]
+    (boolean (and (>= n 2)
+                  (string? (nth path (- n 2)))
+                  (str/includes? (nth path (- n 2)) ":")))))
+
+(defn- honor-at-use-site?
+  "Can every instance that reaches this element satisfy a hard ref to
+   `canonical`?
+
+   C-CDA composes a SHOULD-shaped slot out of a SHALL-shaped profile, and where
+   it does, honoring the profile rejects documents the IG's own prose permits.
+   It declares `Observation.author 0..*` and points the type at
+   AuthorParticipation, which makes `templateId` 1..1. The sentence C-CDA writes
+   is `SHOULD contain zero or more [0..*] Author Participation (CONF:1198-31147)`;
+   the schema a ref installs there says `whatever author you write SHALL carry
+   that templateId`. A conformant document that records a plain CDA author --
+   which the SHOULD explicitly allows, and which C-CDA marks only with a
+   warning-severity `should-author` invariant -- then fails to parse. Keeping the
+   base type at those slots is the only reading that admits both halves of the
+   sentence.
+
+   Three shapes keep the narrowing, and each is load-bearing at the measured
+   scale of the two CDA packages:
+
+     - The child is mandatory (`min` >= 1), 553 of the 622 sites. The instance
+       has to supply the element, so the profile is not adding a requirement;
+       it is the only thing saying what the required element must look like.
+
+     - The child hangs off a slice arm. That arm is reached only through the
+       templateId `:multi` dispatch, so an instance lands there by claiming the
+       template, and the profile's demands are the instance's own claim. This is
+       the narrowing the flag exists for -- `component:allergies.section`,
+       `entryRelationship:goal.observation` -- and without this clause three
+       optional entry arms (EntryReference, GoalObservation,
+       SpecimenConditionObservation) collapse onto their slicing's default.
+
+     - The profile adds no requirement its base type lacks. The US Realm
+       datatype refinements -- USRealmAddress over AD, USRealmDateTime over TS,
+       USRealmDateTimeInterval over IVL-TS, the two name refinements over PN --
+       constrain vocabulary and format without making any direct child
+       mandatory, so an instance the base accepted the profile accepts too.
+       Without this clause 25 further optional sites lose a real refinement for
+       no benefit.
+
+   An unknown `min` keeps the narrowing. The gate subtracts only on positive
+   evidence, so a caller holding no ElementDefinition (the xsi:type union arms),
+   a definition shipped without a snapshot, or a driver that supplies no raising
+   set all behave exactly as they did before this rule existed."
+  [canonical {use-min :min use-path :path :as use-site}]
+  (or (nil? use-site)
+      (nil? use-min)
+      (>= use-min 1)
+      (slice-arm-child? use-path)
+      (not (contains? *profiles-raising-child-requirement*
+                      (strip-canonical-version canonical)))))
+
 (defn- narrowed-child-profile-kw
   "The schema keyword a non-slice child's single `type.profile` names, or nil to
    keep the declared base type.
@@ -580,56 +689,80 @@
 
    nil is returned, and the base type kept, whenever narrowing would be wrong or
    unsafe: the feature is gated off, the type lists several profiles (any-of, so
-   the first URL would reject instances valid against the rest), or the
-   canonical resolves to a definition no package in the run supplies. The last
-   case is reported through `*unresolved-profiles*` rather than emitted, since a
-   dangling keyword makes the generated file fail to load.
+   the first URL would reject instances valid against the rest), the use site
+   cannot satisfy the profile (`honor-at-use-site?`), or the canonical resolves
+   to a definition no package in the run supplies. The last two cases are
+   reported -- through `*suppressed-narrowings*` and `*unresolved-profiles*`
+   respectively -- rather than emitted, since a dangling keyword makes the
+   generated file fail to load and a silently withheld narrowing is invisible in
+   the output, which simply carries the base type.
 
    Resolution deliberately consults only the declared canonical and the index,
    never the target schema: the CCD references sections generated later in the
-   run, so at emission time the target does not exist yet."
-  [{:keys [profile]} base-kw version]
+   run, so at emission time the target does not exist yet. That is also why the
+   use-site gate asks a driver-supplied set rather than reading the target's own
+   cardinalities here."
+  [{:keys [profile]} base-kw version use-site]
   (when (and *honor-child-type-profile*
              (= 1 (count profile)))
-    (let [canonical  (first profile)
-          profile-kw (or (resolve-canonical-kw canonical)
-                         (let [profile-clean (strip-canonical-version canonical)
-                               profile-name (munge-ns (str/replace (last (str/split profile-clean #"/")) "." "-"))]
-                           (or (first (filter #(= (kw->type-name %) profile-name)
-                                              (keys @*schema-atom*)))
-                               (uri->kw2 canonical version))))]
-      (when profile-kw
-        (if (or (contains? @*schema-atom* profile-kw)
-                (contains? *known-canonical-kws* profile-kw)
-                (some? (resolve-malli-sch profile-kw)))
-          profile-kw
-          (do (when *unresolved-profiles*
-                (swap! *unresolved-profiles* conj
-                       {:profile canonical
-                        :from *current-definition*
-                        :degraded-to base-kw}))
-              nil))))))
+    (let [canonical (first profile)]
+      (if-not (honor-at-use-site? canonical use-site)
+        (do (when *suppressed-narrowings*
+              (swap! *suppressed-narrowings* conj
+                     {:profile canonical
+                      :from *current-definition*
+                      :at (:path use-site)
+                      :degraded-to base-kw}))
+            nil)
+        (let [profile-kw (or (resolve-canonical-kw canonical)
+                             (let [profile-clean (strip-canonical-version canonical)
+                                   profile-name (munge-ns (str/replace (last (str/split profile-clean #"/")) "." "-"))]
+                               (or (first (filter #(= (kw->type-name %) profile-name)
+                                                  (keys @*schema-atom*)))
+                                   (uri->kw2 canonical version))))]
+          (when profile-kw
+            (if (or (contains? @*schema-atom* profile-kw)
+                    (contains? *known-canonical-kws* profile-kw)
+                    (some? (resolve-malli-sch profile-kw)))
+              profile-kw
+              (do (when *unresolved-profiles*
+                    (swap! *unresolved-profiles* conj
+                           {:profile canonical
+                            :from *current-definition*
+                            :degraded-to base-kw}))
+                  nil))))))))
 
 (defn prim-or-ref
-  [acc {:keys [code] :as attr-type} version]
-  (if (nil? code)
-    acc
-    (let [[sch primitive?]
-          (if-some [prim-sch (fhir-primitives code)]
-            [prim-sch true]
-            [(case code
-               "http://hl7.org/fhirpath/System.String" :string
-               "Resource" [:map {:short "Any Resource" :resourceType "Resource"}]
-               (let [base-kw (lookup-schema-kw code version)
-                     kw (or (narrowed-child-profile-kw attr-type base-kw version)
-                            base-kw)]
-                 (swap! *references-atom* conj kw)
-                 [:lazy-ref kw]))
-             false])]
-      (cond-> (assoc acc
-                     :sch sch
-                     :form [(m/form sch external-registry)])
-        primitive? (assoc :primitive? true)))))
+  "The value schema for a declared type: a primitive inline, anything else a
+   `[:lazy-ref ...]`.
+
+   `use-site` is {:min <effective min> :path <id segments>} for the element
+   whose type this is, and only `narrowed-child-profile-kw` reads it. nil means
+   the caller holds no ElementDefinition -- `type-union-form` builds its arms
+   from the type list alone -- and narrowing then proceeds ungated, as it did
+   before the use-site rule existed. A polymorphic slot's arms are xsi:type
+   dispatched, so they are self-consistent the same way a slice arm is."
+  ([acc attr-type version]
+   (prim-or-ref acc attr-type version nil))
+  ([acc {:keys [code] :as attr-type} version use-site]
+   (if (nil? code)
+     acc
+     (let [[sch primitive?]
+           (if-some [prim-sch (fhir-primitives code)]
+             [prim-sch true]
+             [(case code
+                "http://hl7.org/fhirpath/System.String" :string
+                "Resource" [:map {:short "Any Resource" :resourceType "Resource"}]
+                (let [base-kw (lookup-schema-kw code version)
+                      kw (or (narrowed-child-profile-kw attr-type base-kw version use-site)
+                             base-kw)]
+                  (swap! *references-atom* conj kw)
+                  [:lazy-ref kw]))
+              false])]
+       (cond-> (assoc acc
+                      :sch sch
+                      :form [(m/form sch external-registry)])
+         primitive? (assoc :primitive? true))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Polymorphic slots discriminated by xsi:type
@@ -1586,7 +1719,16 @@
               is-primitive? (boolean (when code (fhir-primitives code)))]
           (if (and has-deeper-sub? (not is-primitive?))
             (patch-element acc id attr-type main-attr sub-elements main-path version)
-            (prim-or-ref acc attr-type version)))))))
+            ;; The snapshot answers first: it already folds this SD's own
+            ;; differential in, and the differential restates `min` only where
+            ;; the profile changes it, so the element in hand is silent at 304
+            ;; of the 865 narrowing sites -- including every defective one. The
+            ;; differential min is the fallback for a definition shipped
+            ;; without a snapshot, and nil there keeps the old behaviour.
+            (prim-or-ref acc attr-type version
+                         {:min  (or (get *element-min* main-path)
+                                    (some-> (:min main-attr) str parse-long))
+                          :path main-path})))))))
 
 ;; ---------------------------------------------------------------------------
 ;; attr->value-schema-patch
@@ -2379,6 +2521,22 @@
    {}
    snapshot-elements))
 
+(defn snapshot->element-min
+  "Each snapshot element's id, split into path segments, mapped to its `min`.
+
+   Keyed on `:id` and not `:path` because `structure-definition->patch` splits
+   the id when it builds the walk's path vector: a slice is visible only there,
+   as a `component:allergies` segment, and `:path` drops it -- so keying on
+   `:path` would collide a slice arm with its unsliced base element, which do
+   not share a cardinality."
+  [snapshot-elements]
+  (into {}
+        (keep (fn [{:keys [id path] mn :min}]
+                (when-some [k (or id path)]
+                  (when-some [m (some-> mn str parse-long)]
+                    [(into [] (str/split k #"\.")) m]))))
+        snapshot-elements))
+
 (defn- build-sd-properties
   "Build the properties map for a StructureDefinition. For a complex extension
    (type \"Extension\") the canonical :url and :fhir/value-key :complex are stamped so
@@ -2611,7 +2769,9 @@
                        *recursive-references* recursive-references
                        *base-refs* (atom {})
                        *element-order* (snapshot->element-order
-                                        (get-in x [:snapshot :element]))]
+                                        (get-in x [:snapshot :element]))
+                       *element-min* (snapshot->element-min
+                                      (get-in x [:snapshot :element]))]
                (if (and basekw (not is-simple?))
                  (do
                    (swap! *references-atom* conj basekw)
