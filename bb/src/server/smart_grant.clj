@@ -34,8 +34,19 @@
    client select its launch patient per token via `launch/patient.<id>`.
    `patient/Patient.c` is the SMART v2 create scope on Patient, which is what
    server.scope's request->interaction derives for a POST to
-   Patient/{id}/$request-demographic-change."
-  "openid offline_access launch/patient launch/patient.* patient/*.read patient/Patient.c")
+   Patient/{id}/$request-demographic-change.
+
+   `patient/Appointment.cu` is the same shape for telehealth: publishing a
+   signalling message is a POST to Appointment/{id}/$telehealth-signal, which
+   request->interaction likewise derives as `:create` on Appointment, and the
+   waiting room updates Appointment.reasonCode. Without it the GET long-poll
+   passes on `patient/*.read` while every publish 403s.
+
+   This list must agree with `com.breezeehr.cabotage.oauth/scopes` and the
+   `:scopes` in cabotage2's `bb/src/com/breezeehr/cabotage/dev.clj`: Hydra
+   refuses a scope the client is not registered for, so a scope added on one
+   side alone breaks the authorize redirect rather than degrading."
+  "openid offline_access launch/patient launch/patient.* patient/*.read patient/Patient.c patient/Appointment.cu")
 
 ;; ── helpers ────────────────────────────────────────────────────────────────
 
@@ -166,4 +177,4 @@
             (println (str "    curl -u <client_id>:<client_secret> " hydra-public
                           "/oauth2/token -d grant_type=client_credentials"
                           " -d 'scope=launch/patient." (first patients)
-                          " patient/*.read patient/Patient.c'")))))))
+                          " patient/*.read patient/Patient.c patient/Appointment.cu'")))))))
