@@ -121,18 +121,22 @@
     (protocol/update-resource this tenant-id resource-type id resource nil))
 
   (update-resource [_ tenant-id resource-type id resource opts]
-    (let [expected (:if-match opts)
+    (let [expected (protocol/normalize-if-match (:if-match opts))
           result (atom nil)
           swap-fn (fn [existing]
                     (let [active? (and existing (not (:deleted? existing)))
-                          current-vid (when existing (:current existing))]
+                          current-vid (when existing (:current existing))
+                          ;; `If-Match: *` guards on existence alone: any live
+                          ;; version satisfies it, so only the existence check
+                          ;; below applies to it.
+                          any? (= protocol/if-match-any expected)]
                       (when (and expected (not active?))
                         (throw (ex-info "Version conflict"
                                         {:fhir/status 412
                                          :fhir/code "conflict"
-                                         :expected expected
+                                         :expected (protocol/if-match-label expected)
                                          :actual nil})))
-                      (when (and expected active? (not= expected current-vid))
+                      (when (and expected (not any?) active? (not= expected current-vid))
                         (throw (ex-info "Version conflict"
                                         {:fhir/status 412
                                          :fhir/code "conflict"
@@ -159,18 +163,19 @@
     (protocol/delete-resource this tenant-id resource-type id nil))
 
   (delete-resource [_ tenant-id resource-type id opts]
-    (let [expected (:if-match opts)
+    (let [expected (protocol/normalize-if-match (:if-match opts))
           result (atom false)
           swap-fn (fn [existing]
                     (let [active? (and existing (not (:deleted? existing)))
-                          current-vid (when existing (:current existing))]
+                          current-vid (when existing (:current existing))
+                          any? (= protocol/if-match-any expected)]
                       (when (and expected (not active?))
                         (throw (ex-info "Version conflict"
                                         {:fhir/status 412
                                          :fhir/code "conflict"
-                                         :expected expected
+                                         :expected (protocol/if-match-label expected)
                                          :actual nil})))
-                      (when (and expected active? (not= expected current-vid))
+                      (when (and expected (not any?) active? (not= expected current-vid))
                         (throw (ex-info "Version conflict"
                                         {:fhir/status 412
                                          :fhir/code "conflict"
@@ -315,10 +320,10 @@
                       url (:url req)
                       [type id] (when url (str/split url #"/"))
                       resource (:resource entry)
-                      raw-if-match (or (:ifMatch req) (get req "ifMatch"))
-                      entry-if-match (when raw-if-match
-                                       (or (second (re-find #"W/\"(.+)\"" raw-if-match))
-                                           raw-if-match))]
+                      ;; update/delete-resource normalize the ETag spellings
+                      ;; themselves; this only decides whether the entry
+                      ;; carries a precondition at all.
+                      entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                   (case method
                     "POST"
                     (let [res (protocol/create-resource this tenant-id type nil resource)

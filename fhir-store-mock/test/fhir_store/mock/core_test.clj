@@ -88,6 +88,67 @@
     (testing "delete with matching :if-match succeeds"
       (is (true? (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "1"}))))))
 
+(deftest if-match-accepted-forms-test
+  (testing "every spelling of the current version is accepted, not just the bare id"
+    (doseq [spell [(fn [v] v) (fn [v] (str "W/\"" v "\"")) (fn [v] (str "\"" v "\""))]]
+      (let [store (mock/create-mock-store {})
+            tenant "test-tenant"
+            res {:resourceType "Patient" :name [{:family "Smith"}]}]
+        (protocol/create-resource store tenant "Patient" "pt1" res)
+        (let [updated (protocol/update-resource store tenant "Patient" "pt1"
+                                                (assoc res :active true)
+                                                {:if-match (spell "1")})]
+          (is (= "2" (get-in updated [:meta :versionId])))))))
+  (testing "a value that names no version refuses the write instead of ignoring it"
+    (doseq [bad ["99" "W/\"99\"" "garbage" "" "W/\"1"]]
+      (let [store (mock/create-mock-store {})
+            tenant "test-tenant"
+            res {:resourceType "Patient" :name [{:family "Smith"}]}]
+        (protocol/create-resource store tenant "Patient" "pt1" res)
+        (let [e (try
+                  (protocol/update-resource store tenant "Patient" "pt1"
+                                            (assoc res :active true)
+                                            {:if-match bad})
+                  nil
+                  (catch clojure.lang.ExceptionInfo ex ex))]
+          (is (some? e) (str "expected a refusal for " (pr-str bad)))
+          (is (= 412 (:fhir/status (ex-data e))))
+          (is (= "1" (get-in (protocol/read-resource store tenant "Patient" "pt1")
+                             [:meta :versionId]))
+              "the write must not have landed"))))))
+
+(deftest if-match-any-sentinel-test
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        res {:resourceType "Patient" :name [{:family "Smith"}]}]
+    (protocol/create-resource store tenant "Patient" "pt1" res)
+    (testing "* updates whatever version is current"
+      (doseq [spell [protocol/if-match-any "*"]]
+        (let [before (get-in (protocol/read-resource store tenant "Patient" "pt1")
+                             [:meta :versionId])
+              updated (protocol/update-resource store tenant "Patient" "pt1"
+                                                (assoc res :active true)
+                                                {:if-match spell})]
+          (is (not= before (get-in updated [:meta :versionId]))))))
+    (testing "* against a resource that is not there -> 412"
+      (let [e (try
+                (protocol/update-resource store tenant "Patient" "missing" res
+                                          {:if-match "*"})
+                nil
+                (catch clojure.lang.ExceptionInfo ex ex))]
+        (is (some? e))
+        (is (= 412 (:fhir/status (ex-data e))))
+        (is (nil? (protocol/read-resource store tenant "Patient" "missing"))
+            "* must not create the resource it was guarding against")))
+    (testing "* deletes whatever version is current, then has nothing left to match"
+      (is (true? (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "*"})))
+      (let [e (try
+                (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "*"})
+                nil
+                (catch clojure.lang.ExceptionInfo ex ex))]
+        (is (some? e))
+        (is (= 412 (:fhir/status (ex-data e))))))))
+
 (deftest search-test
   (let [store (mock/create-mock-store {})
         tenant "test-tenant"

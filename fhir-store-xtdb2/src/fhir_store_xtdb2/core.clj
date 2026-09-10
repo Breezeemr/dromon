@@ -1225,12 +1225,16 @@
 
 (defn- update-sql [node resource-type id resource opts storage-encoders]
   (let [rt-name (table-name resource-type)
-        if-match (:if-match opts)
+        supplied (fp/normalize-if-match (:if-match opts))
         current (current-version node resource-type id)
-        _ (when (and if-match (nil? current))
+        _ (when (and supplied (nil? current))
             (throw (ex-info "Version conflict: resource does not exist"
                             {:fhir/status 412 :fhir/code "conflict"
-                             :expected if-match :actual nil})))
+                             :expected (fp/if-match-label supplied) :actual nil})))
+        ;; `If-Match: *` guards on existence alone, so past the check above it
+        ;; resolves to whatever version is current — the ASSERT below still
+        ;; makes the write atomic against a racing writer.
+        if-match (if (= fp/if-match-any supplied) current supplied)
         _ (when (and if-match current (not= if-match current))
             (throw (ex-info "Version conflict"
                             {:fhir/status 412 :fhir/code "conflict"
@@ -1265,12 +1269,13 @@
 
 (defn- delete-sql [node resource-type id opts]
   (let [rt-name (table-name resource-type)
-        if-match (:if-match opts)
-        current (when if-match (current-version node resource-type id))
-        _ (when (and if-match (nil? current))
+        supplied (fp/normalize-if-match (:if-match opts))
+        current (when supplied (current-version node resource-type id))
+        _ (when (and supplied (nil? current))
             (throw (ex-info "Version conflict: resource does not exist"
                             {:fhir/status 412 :fhir/code "conflict"
-                             :expected if-match :actual nil})))
+                             :expected (fp/if-match-label supplied) :actual nil})))
+        if-match (if (= fp/if-match-any supplied) current supplied)
         _ (when (and if-match (not= if-match current))
             (throw (ex-info "Version conflict"
                             {:fhir/status 412 :fhir/code "conflict"
@@ -1771,10 +1776,10 @@
                       resource-type (first parts)
                       id (second parts)
                       resource (:resource entry)
-                      raw-if-match (or (:ifMatch req-map) (get req-map "ifMatch"))
-                      entry-if-match (when raw-if-match
-                                       (or (second (re-find #"W/\"(.+)\"" raw-if-match))
-                                           raw-if-match))]
+                      ;; update-sql/delete-sql normalize the ETag spellings
+                      ;; themselves; this only decides whether the entry
+                      ;; carries a precondition at all.
+                      entry-if-match (or (:ifMatch req-map) (get req-map "ifMatch"))]
                   (case method
                     "POST"
                     (let [new-id (str (java.util.UUID/randomUUID))
