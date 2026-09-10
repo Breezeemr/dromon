@@ -177,6 +177,74 @@
             (is (= 412 (:fhir/status (root-ex-data e))))))
         (finally (close-store-nodes! store))))))
 
+(deftest test-if-match-accepted-forms
+  (testing "every spelling of the current version is accepted, not just the bare id"
+    (doseq [spell [(fn [v] v) (fn [v] (str "W/\"" v "\"")) (fn [v] (str "\"" v "\""))]]
+      (let [store (core-db/create-xtdb-store {})
+            tenant-id "tenant-ifmatch-forms"
+            patient {:active true :name [{"family" "Doe"}]}]
+        (try
+          (db/create-resource store tenant-id :Patient "p1" patient)
+          (let [res (db/update-resource store tenant-id :Patient "p1"
+                                        (assoc patient :active false)
+                                        {:if-match (spell "1")})]
+            (is (= "2" (get-in res [:meta :versionId]))))
+          (finally (close-store-nodes! store))))))
+  (testing "a value that names no version refuses the write instead of ignoring it"
+    (doseq [bad ["99" "W/\"99\"" "garbage" "" "W/\"1"]]
+      (let [store (core-db/create-xtdb-store {})
+            tenant-id "tenant-ifmatch-bad"
+            patient {:active true :name [{"family" "Doe"}]}]
+        (try
+          (db/create-resource store tenant-id :Patient "p1" patient)
+          (let [e (try
+                    (db/update-resource store tenant-id :Patient "p1"
+                                        (assoc patient :active false)
+                                        {:if-match bad})
+                    nil
+                    (catch Throwable ex ex))]
+            (is (some? e) (str "expected a refusal for " (pr-str bad)))
+            (is (= 412 (:fhir/status (root-ex-data e))))
+            (is (= "1" (get-in (db/read-resource store tenant-id :Patient "p1")
+                               [:meta :versionId]))
+                "the write must not have landed"))
+          (finally (close-store-nodes! store)))))))
+
+(deftest test-if-match-any-sentinel
+  (let [store (core-db/create-xtdb-store {})
+        tenant-id "tenant-ifmatch-star"
+        patient {:active true :name [{"family" "Doe"}]}]
+    (try
+      (db/create-resource store tenant-id :Patient "p1" patient)
+      (testing "* updates whatever version is current"
+        (doseq [spell [db/if-match-any "*"]]
+          (let [before (get-in (db/read-resource store tenant-id :Patient "p1")
+                               [:meta :versionId])
+                res (db/update-resource store tenant-id :Patient "p1"
+                                        (assoc patient :active false)
+                                        {:if-match spell})]
+            (is (not= before (get-in res [:meta :versionId]))))))
+      (testing "* against a resource that is not there -> 412"
+        (let [e (try
+                  (db/update-resource store tenant-id :Patient "missing" patient
+                                      {:if-match "*"})
+                  nil
+                  (catch Throwable ex ex))]
+          (is (some? e))
+          (is (= 412 (:fhir/status (root-ex-data e))))
+          (is (nil? (db/read-resource store tenant-id :Patient "missing"))
+              "* must not create the resource it was guarding against")))
+      (testing "* deletes whatever version is current, then has nothing left to match"
+        (db/delete-resource store tenant-id :Patient "p1" {:if-match "*"})
+        (is (nil? (db/read-resource store tenant-id :Patient "p1")))
+        (let [e (try
+                  (db/delete-resource store tenant-id :Patient "p1" {:if-match "*"})
+                  nil
+                  (catch Throwable ex ex))]
+          (is (some? e))
+          (is (= 412 (:fhir/status (root-ex-data e))))))
+      (finally (close-store-nodes! store)))))
+
 (deftest test-transact-transaction
   (testing "Can transact a FHIR Bundle of type transaction (atomic)"
     (let [store (core-db/create-xtdb-store {})

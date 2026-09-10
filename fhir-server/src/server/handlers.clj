@@ -138,17 +138,82 @@
 
       :else n)))
 
+(def ^:private version-id-pattern
+  "FHIR `id`, which is what a `meta.versionId` is (R4B §4.2.1)."
+  #"[A-Za-z0-9\-\.]{1,64}")
+
+(defn- etag-version
+  "The version id carried by one ETag token — weak `W/\"7\"`, strong `\"7\"`,
+   or the bare `7` some clients send — or nil when the token is not a
+   version id at all. The weak prefix is case-sensitive per RFC 7232 §2.3."
+  [token]
+  (let [v (or (second (re-matches #"W/\"(.*)\"" token))
+              (second (re-matches #"\"(.*)\"" token))
+              token)]
+    (when (re-matches version-id-pattern v) v)))
+
+(defn- invalid-if-match-response
+  "Return a 400 OperationOutcome for an If-Match header this server cannot
+   act on."
+  [value reason]
+  {:status 400
+   :body {:resourceType "OperationOutcome"
+          :issue [{:severity "error"
+                   :code "invalid"
+                   :diagnostics (str "Invalid If-Match header: '" value "' — " reason
+                                     ". Expected a single ETag (W/\"1\" or \"1\"), "
+                                     "a bare version id (1), or *.")}]}})
+
 (defn- parse-if-match
-  "Parse W/\"[vid]\" from If-Match header. Returns version string or nil."
+  "The version guard an If-Match header asks for: a version id string,
+   `db/if-match-any` for `*`, nil when the client sent no header at all, or
+   `{:error <400 response>}` when it sent one this server cannot act on.
+
+   Never nil for a header that is present. Silently dropping a precondition
+   is worse than refusing it: the client believes it performed a conditional
+   write, so a lost update comes back looking like a success. 400 rather
+   than 412 because the fault is in the request's syntax, not in the
+   resource's state — a 412 would send the client re-reading and retrying a
+   request it can never get past."
   [request]
-  (when-let [if-match (get-in request [:headers "if-match"])]
-    (second (re-find #"W/\"(.+)\"" if-match))))
+  (when-some [raw (get-in request [:headers "if-match"])]
+    (let [value (str/trim raw)]
+      (cond
+        (str/blank? value)
+        {:error (invalid-if-match-response raw "the header is empty")}
+
+        (= "*" value)
+        db/if-match-any
+
+        ;; RFC 7232 §3.1 allows a list of ETags. A store guards on one
+        ;; version, and quietly taking the first would drop the rest of what
+        ;; the client asked for, so say so instead.
+        (str/includes? value ",")
+        {:error (invalid-if-match-response
+                  raw "this server guards on a single ETag, not a list")}
+
+        :else
+        (or (etag-version value)
+            {:error (invalid-if-match-response
+                      raw "not a well-formed ETag or version id")})))))
 
 (defn- parse-if-none-match
-  "Parse W/\"[vid]\" from If-None-Match header."
+  "The version ids an If-None-Match header would be satisfied by, as a set,
+   or `:any` for `*`. nil when the client sent no header.
+
+   Unlike If-Match this tolerates what it cannot read, and deliberately: a
+   validator this server fails to recognize costs a 304 that could have been
+   served, and answering the full 200 instead is always correct. Erroring on
+   it would break a plain cache-revalidating GET over a header that only
+   ever saves bandwidth. A list is legal here (RFC 7232 §3.2) and cheap to
+   honour — any member matching means not-modified."
   [request]
-  (when-let [header (get-in request [:headers "if-none-match"])]
-    (second (re-find #"W/\"(.+)\"" header))))
+  (when-some [raw (get-in request [:headers "if-none-match"])]
+    (let [value (str/trim raw)]
+      (if (= "*" value)
+        :any
+        (not-empty (into #{} (keep (comp etag-version str/trim))
+                         (str/split value #",")))))))
 
 (defn- parse-if-modified-since
   "Parse If-Modified-Since header as Instant."
@@ -165,7 +230,8 @@
         last-updated (get-in resource [:meta :lastUpdated])
         if-none-match (parse-if-none-match request)
         if-modified-since (parse-if-modified-since request)]
-    (or (and if-none-match vid (= if-none-match vid))
+    (or (and vid (or (= :any if-none-match)
+                     (contains? if-none-match vid)))
         (and if-modified-since last-updated
              (let [updated-instant (if (string? last-updated)
                                      (java.time.Instant/parse last-updated)
@@ -304,32 +370,41 @@
         resource-body (get-in req [:parameters :body])
         body-id (:id resource-body)
         expected-version (parse-if-match req)]
-    (if (and body-id (not= body-id id))
+    (cond
+      ;; An If-Match we cannot act on is refused before anything is written.
+      ;; Falling through to the unconditional path below would turn the
+      ;; client's guard into a lost update.
+      (:error expected-version) (:error expected-version)
+
+      (and body-id (not= body-id id))
       {:status 400
        :body {:resourceType "OperationOutcome"
               :issue [{:severity "error"
                        :code "invalid"
                        :diagnostics (str "Resource id in body (" body-id ") does not match URL id (" id ")")}]}}
-      (if expected-version
-        ;; With If-Match: delegate entirely to the store. A missing/deleted
-        ;; resource, or a version mismatch, surfaces as 412 ex-info handled
-        ;; by wrap-fhir-exceptions.
-        (let [res (db/update-resource store tenant-id (keyword resource-type) id
-                                      resource-body {:if-match expected-version})]
-          {:status 200 :body res})
-        ;; Without If-Match: preserve the create-with-client-id upsert path
-        ;; for nonexistent resources. Existing resources take the normal
-        ;; update path.
-        (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
-          (if existing
-            (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
-              {:status 200 :body res})
-            (let [res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
-                  base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
-                  vid (get-in res [:meta :versionId])]
-              {:status 201
-               :headers {"Location" (str base-url "/_history/" vid)}
-               :body res})))))))
+
+      ;; With If-Match: delegate entirely to the store. A missing/deleted
+      ;; resource, or a version mismatch, surfaces as 412 ex-info handled
+      ;; by wrap-fhir-exceptions.
+      expected-version
+      (let [res (db/update-resource store tenant-id (keyword resource-type) id
+                                    resource-body {:if-match expected-version})]
+        {:status 200 :body res})
+
+      ;; Without If-Match: preserve the create-with-client-id upsert path
+      ;; for nonexistent resources. Existing resources take the normal
+      ;; update path.
+      :else
+      (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
+        (if existing
+          (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
+            {:status 200 :body res})
+          (let [res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
+                base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
+                vid (get-in res [:meta :versionId])]
+            {:status 201
+             :headers {"Location" (str base-url "/_history/" vid)}
+             :body res}))))))
 
 (defn patch-resource
   "Handler for PATCH /[type]/:id RESTful interaction.
@@ -343,11 +418,16 @@
         expected-version (parse-if-match req)
         existing (db/read-resource store tenant-id (keyword resource-type) id)]
     (cond
+      ;; Refuse an If-Match we cannot act on before patching anything; the
+      ;; :else branch below would otherwise write unconditionally.
+      (:error expected-version) (:error expected-version)
+
       ;; Missing resource with If-Match: 412 regardless of whether the read
       ;; above sees it; we're still inside the same request so it's fine to
       ;; short-circuit here for the semantics.
       (and expected-version (nil? existing))
-      (precondition-failed-response resource-type id expected-version nil)
+      (precondition-failed-response resource-type id
+                                    (db/if-match-label expected-version) nil)
 
       (nil? existing)
       {:status 404
@@ -372,10 +452,17 @@
         resource-type (:fhir/resource-type req)
         id (-> req :path-params :id)
         expected-version (parse-if-match req)]
-    (if expected-version
+    (cond
+      ;; Refuse an If-Match we cannot act on: an unusable guard must not
+      ;; turn a client-guarded delete into an unguarded one.
+      (:error expected-version) (:error expected-version)
+
+      expected-version
       (do (db/delete-resource store tenant-id (keyword resource-type) id
                               {:if-match expected-version})
           {:status 204 :body nil})
+
+      :else
       (do (db/delete-resource store tenant-id (keyword resource-type) id)
           {:status 204 :body nil}))))
 

@@ -42,6 +42,50 @@
        (finally
          (when scope# (.close scope#))))))
 
+;; ---------------------------------------------------------------------------
+;; Optimistic concurrency (:if-match)
+;; ---------------------------------------------------------------------------
+
+(def if-match-any
+  "Sentinel `:if-match` value standing for HTTP `If-Match: *` (RFC 7232
+   §3.1): the write is guarded on the resource merely existing, whatever
+   version it currently holds, and fails 412 only when it does not. A
+   keyword because it has to be distinguishable from every possible version
+   id, which strings are not."
+  :fhir.if-match/any)
+
+(defn normalize-if-match
+  "Normalize an `:if-match` opt to a bare version id string, `if-match-any`,
+   or nil when the caller supplied no precondition.
+
+   Accepts every spelling a version guard reaches a store in: the sentinel
+   and `\"*\"` unchanged, an integer or bare id (`7`, `\"7\"`), and both
+   ETag forms clients put on the wire and in a Bundle entry's
+   `request.ifMatch` — weak (`W/\"7\"`) and strong (`\"7\"`).
+
+   A value it does not recognize is returned as its own string rather than
+   nil, so the caller's version comparison fails and the write is refused.
+   Non-nil in, non-nil out: a supplied precondition must never decay into no
+   precondition, which is the difference between a 412 and a lost update."
+  [v]
+  (cond
+    (nil? v)             nil
+    (= if-match-any v)   if-match-any
+    (integer? v)         (str v)
+    :else                (let [s (str v)]
+                           (if (= "*" s)
+                             if-match-any
+                             (or (second (re-find #"^W/\"(.*)\"$" s))
+                                 (second (re-find #"^\"(.*)\"$" s))
+                                 s)))))
+
+(defn if-match-label
+  "How an `:if-match` value should read back to a client in an
+   OperationOutcome: the sentinel as the `*` it came from, anything else as
+   itself."
+  [v]
+  (if (= if-match-any v) "*" v))
+
 (defprotocol IFHIRStore
   "Store contract for FHIR resource persistence.
 
@@ -64,15 +108,27 @@
     [this tenant-id resource-type id resource]
     [this tenant-id resource-type id resource opts]
     "Update (or conditional upsert) a resource. `opts` may contain:
-     - :if-match <expected-vid> — enforces an atomic optimistic-concurrency
-       check. On version mismatch, implementations throw ex-info with
+     - :if-match — enforces an atomic optimistic-concurrency check. On
+       version mismatch, implementations throw ex-info with
        `{:fhir/status 412 :fhir/code \"conflict\" :expected :actual}`.
-       A missing resource combined with :if-match is also a 412.")
+       A missing resource combined with :if-match is also a 412.
+
+       Accepted values, all run through `normalize-if-match` by every
+       implementation so the stores agree on what a caller may pass:
+         - a bare version id, string or integer — `\"7\"`, `7`
+         - either ETag spelling — weak `W/\"7\"`, strong `\"7\"`
+         - `if-match-any` or `\"*\"` — HTTP `If-Match: *`: guard on the
+           resource existing at all, whatever version it holds
+         - nil, or the key absent — no precondition, unconditional write
+
+       Anything else is a value no resource can hold, and fails the write
+       with a 412 rather than being ignored. An :if-match a store cannot
+       make sense of must never degrade into an unconditional write.")
   (delete-resource
     [this tenant-id resource-type id]
     [this tenant-id resource-type id opts]
     "Delete a resource. `opts` may contain :if-match for optimistic
-     concurrency; semantics match update-resource.")
+     concurrency; accepted values and semantics match update-resource.")
   (search [this tenant-id resource-type params search-registry])
   (history [this tenant-id resource-type id])
   (history-type [this tenant-id resource-type params]

@@ -3,6 +3,7 @@
             [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as db]
             [server.handlers :as handlers]
+            [server.middleware :as middleware]
             [clojure.string]))
 
 (def ^:private tenant "default")
@@ -471,3 +472,240 @@
     (let [resp (search-patients store {"_count" "2" "_skip" "2"})]
       (is (= 5 (get-in resp [:body :total])))
       (is (some #(= "next" (:relation %)) (get-in resp [:body :link]))))))
+
+
+;; ---------------------------------------------------------------------------
+;; If-Match preconditions on PUT / PATCH / DELETE
+;;
+;; The store-level :if-match tests hand the option straight to the protocol,
+;; so nothing there exercises the header. These do. The assertion that
+;; matters throughout is the version left in the store, not the status code:
+;; an If-Match the server drops on the floor answers a cheerful 200 while
+;; overwriting whatever a concurrent writer put there.
+;; ---------------------------------------------------------------------------
+
+(defn- run
+  "Invoke a handler through the same exception middleware the router wraps it
+   in, so a store's 412 ex-info arrives as a response rather than escaping."
+  [handler req]
+  ((middleware/wrap-fhir-exceptions handler) req))
+
+(defn- stored-version
+  "The versionId currently in the store, or nil if nothing is there."
+  [store id]
+  (get-in (db/read-resource store tenant (keyword resource-type) id)
+          [:meta :versionId]))
+
+(defn- seed-patient!
+  "A Patient in the store, returned as [id current-version]."
+  [store]
+  (let [id (get-in (create-patient! store
+                                    :body {:resourceType "Patient"
+                                           :gender "male"
+                                           :name [{:family "Test"}]})
+                   [:body :id])]
+    [id (stored-version store id)]))
+
+(defn- if-match-headers [if-match]
+  (if (some? if-match) {"if-match" if-match} {}))
+
+(defn- put!
+  [store id if-match]
+  (run handlers/update-resource
+       (base-request store :id id
+                     :headers (if-match-headers if-match)
+                     :body {:resourceType "Patient" :id id :gender "female"})))
+
+(defn- patch!
+  [store id if-match]
+  (run handlers/patch-resource
+       (base-request store :id id
+                     :headers (if-match-headers if-match)
+                     :body [{:op "replace" :path "/gender" :value "female"}])))
+
+(defn- delete!
+  [store id if-match]
+  (run handlers/delete-resource
+       (base-request store :id id :headers (if-match-headers if-match))))
+
+(def ^:private write-verbs
+  "The three verbs that accept a version guard, each as [label fn]."
+  [["PUT" put!] ["PATCH" patch!] ["DELETE" delete!]])
+
+(defn- deleted-or-advanced?
+  "A write that went through: the resource is gone (DELETE) or carries a
+   version other than the one guarded on."
+  [store id before]
+  (let [after (stored-version store id)]
+    (or (nil? after) (not= before after))))
+
+;; --- forms of a matching guard: all three must be honoured, not dropped ---
+
+(deftest if-match-accepts-the-weak-etag-form
+  (doseq [[verb write!] write-verbs]
+    (testing verb
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (write! store id (str "W/\"" v1 "\""))]
+        (is (contains? #{200 204} (:status resp)))
+        (is (deleted-or-advanced? store id v1))))))
+
+(deftest if-match-accepts-the-strong-etag-form
+  (doseq [[verb write!] write-verbs]
+    (testing verb
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (write! store id (str "\"" v1 "\""))]
+        (is (contains? #{200 204} (:status resp)))
+        (is (deleted-or-advanced? store id v1))))))
+
+(deftest if-match-accepts-a-bare-version-id
+  (doseq [[verb write!] write-verbs]
+    (testing verb
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (write! store id v1)]
+        (is (contains? #{200 204} (:status resp)))
+        (is (deleted-or-advanced? store id v1))))))
+
+;; --- If-Match: * (RFC 7232 §3.1) ---
+
+(deftest if-match-star-matches-any-existing-representation
+  (doseq [[verb write!] write-verbs]
+    (testing verb
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (write! store id "*")]
+        (is (contains? #{200 204} (:status resp)))
+        (is (deleted-or-advanced? store id v1))))))
+
+(deftest if-match-star-against-a-missing-resource-is-412
+  (doseq [[verb write!] write-verbs]
+    (testing verb
+      (let [store (make-store)
+            resp (write! store "no-such-patient" "*")]
+        (is (= 412 (:status resp)))
+        (is (nil? (stored-version store "no-such-patient"))
+            "* must not create the resource it was guarding against")))))
+
+(deftest if-match-star-does-not-revive-a-deleted-resource
+  (let [store (make-store)
+        [id _] (seed-patient! store)]
+    (delete! store id nil)
+    (let [resp (put! store id "*")]
+      (is (= 412 (:status resp)))
+      (is (nil? (stored-version store id))
+          "a deleted resource has no current representation for * to match"))))
+
+;; --- a guard the server cannot act on must fail, never be ignored ---
+
+(deftest malformed-if-match-is-rejected-and-writes-nothing
+  (doseq [[verb write!] write-verbs
+          bad ["not-an-etag!" "W/\"1" "\"1" "W/\"\"" "  " "W/\"a b\""]]
+    (testing (str verb " " (pr-str bad))
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (write! store id bad)]
+        (is (= 400 (:status resp))
+            "a malformed guard is a request-syntax fault, not a stale version")
+        (is (= "OperationOutcome" (get-in resp [:body :resourceType])))
+        (is (= v1 (stored-version store id))
+            "the write must not have happened")))))
+
+(deftest a-list-of-etags-is-rejected-rather-than-silently-narrowed
+  (doseq [[verb write!] write-verbs]
+    (testing verb
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (write! store id (str "W/\"" v1 "\", W/\"99\""))]
+        (is (= 400 (:status resp)))
+        (is (= v1 (stored-version store id))
+            "taking the first ETag would drop the rest of the precondition")))))
+
+(deftest stale-but-well-formed-if-match-is-412
+  (doseq [[verb write!] write-verbs
+          spelling [(fn [_] "99") (fn [_] "W/\"99\"") (fn [_] "\"99\"")]]
+    (testing verb
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (write! store id (spelling v1))]
+        (is (= 412 (:status resp)))
+        (is (= v1 (stored-version store id)))))))
+
+(deftest if-match-against-a-missing-resource-is-412
+  (doseq [[verb write!] write-verbs]
+    (testing verb
+      (let [store (make-store)
+            resp (write! store "no-such-patient" "W/\"1\"")]
+        (is (= 412 (:status resp)))
+        (is (nil? (stored-version store "no-such-patient"))
+            "PUT upserts only when the client asked for no precondition")))))
+
+;; --- the regression itself ---
+
+(deftest a-supplied-if-match-never-degrades-to-an-unconditional-write
+  (testing "every spelling of a guard on a version that is not current is refused"
+    (doseq [[verb write!] write-verbs
+            ;; Each of these once parsed to nil, which read as "no
+            ;; precondition supplied" and let the write through unguarded.
+            guard ["\"99\"" "99" "*junk*" "W/99" "etag-99"]]
+      (testing (str verb " " (pr-str guard))
+        (let [store (make-store)
+              [id v1] (seed-patient! store)
+              resp (write! store id guard)]
+          (is (not (contains? #{200 204} (:status resp)))
+              "a guard the client set must never come back as success")
+          (is (= v1 (stored-version store id))
+              "and must never let the write land"))))))
+
+(deftest no-if-match-header-still-writes-unconditionally
+  (testing "PUT upserts a resource that is not there"
+    (let [store (make-store)
+          resp (put! store "client-chosen-id" nil)]
+      (is (= 201 (:status resp)))
+      (is (some? (stored-version store "client-chosen-id")))))
+  (doseq [[verb write!] write-verbs]
+    (testing verb
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (write! store id nil)]
+        (is (contains? #{200 204} (:status resp)))
+        (is (deleted-or-advanced? store id v1))))))
+
+;; ---------------------------------------------------------------------------
+;; If-None-Match on reads
+;;
+;; Unlike If-Match this is allowed to fail open: a validator the server
+;; cannot read costs a 304 it could have served, and answering the full 200
+;; is always correct. So the reasoning here is the opposite one — breadth of
+;; what is understood, and never an error.
+;; ---------------------------------------------------------------------------
+
+(defn- read-with-if-none-match [store id header]
+  (handlers/read-resource
+    (base-request store :id id :headers (if (some? header)
+                                          {"if-none-match" header}
+                                          {}))))
+
+(deftest if-none-match-recognises-every-etag-spelling
+  (let [store (make-store)
+        [id v1] (seed-patient! store)]
+    (doseq [header [(str "W/\"" v1 "\"") (str "\"" v1 "\"") v1 "*"
+                    (str "W/\"99\", W/\"" v1 "\"")]]
+      (testing (pr-str header)
+        (is (= 304 (:status (read-with-if-none-match store id header))))))))
+
+(deftest if-none-match-that-does-not-match-serves-the-resource
+  (let [store (make-store)
+        [id _] (seed-patient! store)]
+    (doseq [header ["W/\"99\"" "\"99\"" "99" "W/\"98\", W/\"99\""]]
+      (testing (pr-str header)
+        (is (= 200 (:status (read-with-if-none-match store id header))))))))
+
+(deftest an-unreadable-if-none-match-serves-the-resource-rather-than-erroring
+  (let [store (make-store)
+        [id _] (seed-patient! store)]
+    (doseq [header ["garbage!" "W/\"1" "" "  "]]
+      (testing (pr-str header)
+        (is (= 200 (:status (read-with-if-none-match store id header)))
+            "a cache validator is not worth failing a GET over")))))
