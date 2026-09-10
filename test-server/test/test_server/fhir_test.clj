@@ -506,6 +506,46 @@
             resp (app (request :delete "/default/fhir/Patient/pt-4"))]
         (is (= 204 (:status resp)))))))
 
+(deftest if-match-spellings-end-to-end-test
+  (testing "every ETag spelling reaches the store as a guard, over the real stack"
+    (doseq [[label header] [["weak"   "W/\"1\""]
+                            ["strong" "\"1\""]
+                            ["bare"   "1"]
+                            ["star"   "*"]]]
+      (testing label
+        (let [store (mock/create-mock-store {})
+              app (test-app store)
+              _ (db/create-resource store "default" :Patient "pt-1"
+                                    {:resourceType "Patient" :name [{:family "Doe"}]})
+              resp (app (-> (request :put "/default/fhir/Patient/pt-1"
+                                     {:resourceType "Patient" :name [{:family "Updated"}]})
+                            (assoc-in [:headers "if-match"] header)))]
+          (is (= 200 (:status resp)))
+          (is (= "2" (get-in (db/read-resource store "default" :Patient "pt-1")
+                             [:meta :versionId])))))))
+  (testing "a guard the server cannot honour never becomes an unconditional write"
+    (doseq [[label header expected] [["strong stale" "\"99\""       412]
+                                     ["bare stale"   "99"          412]
+                                     ["star missing" "*"           412]
+                                     ["malformed"    "junk!"       400]
+                                     ["etag list"    "\"1\", \"2\""  400]]]
+      (testing label
+        (let [store (mock/create-mock-store {})
+              app (test-app store)
+              exists? (not= "star missing" label)
+              _ (when exists?
+                  (db/create-resource store "default" :Patient "pt-1"
+                                      {:resourceType "Patient" :name [{:family "Doe"}]}))
+              resp (app (-> (request :put "/default/fhir/Patient/pt-1"
+                                     {:resourceType "Patient" :name [{:family "Overwritten"}]})
+                            (assoc-in [:headers "if-match"] header)))]
+          (is (= expected (:status resp)))
+          (is (= "OperationOutcome" (:resourceType (parse-body (:body resp)))))
+          (is (= (when exists? "1")
+                 (get-in (db/read-resource store "default" :Patient "pt-1")
+                         [:meta :versionId]))
+              "the resource must be exactly as it was before the refused write"))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Conditional read (If-None-Match / If-Modified-Since) tests
 ;; ---------------------------------------------------------------------------
