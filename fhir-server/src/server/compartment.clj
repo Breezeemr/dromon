@@ -28,7 +28,8 @@
    is a documented forward-port from R5; see the comment at its site."
   (:require [fhir-store.protocol :as db]
             [server.scope :as scope]
-            [taoensso.telemere :as t]))
+            [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace]))
 
 ;; ---------------------------------------------------------------------------
 ;; R4B compartment definitions (https://hl7.org/fhir/R4B/compartmentdefinition.html)
@@ -603,7 +604,7 @@
                             "a patient/ scope cannot access it."))
 
             :else
-            (t/trace!
+            (ftrace/trace!
               {:id :authz/patient-compartment.confine
                :data {:fhir-type fhir-type :patient pid}}
               (handler (wrap-store request)))))))))

@@ -11,6 +11,7 @@
   (:require [xtdb.api :as xt]
             [clojure.string :as str]
             [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace]
             [fhir-store-xtdb2.core :as core]))
 
 ;; ---------------------------------------------------------------------------
@@ -31,7 +32,7 @@
   (list 'from rt-k (assoc opts :bind '[xt/system-from *])))
 
 (defn read-xtql [node resource-type id read-decoders]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/read
     :data {:resource-type (name resource-type) :id id}}
    (let [q (list '-> (from-star (rt-kw resource-type))
@@ -47,7 +48,7 @@
     :else nil))
 
 (defn vread-xtql [node resource-type id vid read-decoders]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/vread
     :data {:resource-type (name resource-type) :id id :vid (str vid)}}
    (let [inst (parse-vid-instant vid)
@@ -61,7 +62,7 @@
      (core/xtdb->fhir (first rows) read-decoders))))
 
 (defn deleted?-xtql [node resource-type id]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/deleted?
     :data {:resource-type (name resource-type) :id id}}
    (let [rt-k (rt-kw resource-type)
@@ -78,7 +79,7 @@
          (boolean (seq history)))))))
 
 (defn history-xtql [node resource-type id read-decoders]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/history
     :data {:resource-type (name resource-type) :id id}}
    (let [q (list '-> (from-star-opts (rt-kw resource-type)
@@ -196,7 +197,7 @@
 (defn search-xtql
   [node resource-type {:keys [filter-params sort-specs search-registry limit offset]}
    read-decoders sql-fallback]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/search
     :data {:resource-type (name resource-type)}}
    (let [order-by-fallback? (and (seq sort-specs)
@@ -231,7 +232,7 @@
 
 (defn count-resources-xtql
   [node resource-type {:keys [filter-params search-registry]} sql-fallback]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/count
     :data {:resource-type (name resource-type)}}
    (let [conditions (when (seq filter-params)
@@ -267,7 +268,7 @@
 ;; ---------------------------------------------------------------------------
 
 (defn create-xtql [node resource-type id resource storage-encoders]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/create
     :data {:resource-type (name resource-type) :id id}}
    (let [version "1"
@@ -292,7 +293,7 @@
        tx-key))))
 
 (defn update-xtql [node resource-type id resource opts storage-encoders]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/update
     :data {:resource-type (name resource-type) :id id}}
    (let [rt-name (name resource-type)
@@ -337,7 +338,7 @@
        tx-key))))
 
 (defn delete-xtql [node resource-type id opts]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/delete
     :data {:resource-type (name resource-type) :id id}}
    (let [rt-name (name resource-type)
@@ -373,7 +374,7 @@
      (core/with-basis {} tx-key))))
 
 (defn history-type-xtql [node resource-type params read-decoders]
-  (t/trace!
+  (ftrace/trace!
    {:id :xtql/history-type
     :data {:resource-type (name resource-type)}}
    (let [raw-count (or (get params :_count) (get params "_count") "50")

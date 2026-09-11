@@ -9,7 +9,8 @@
             [server.json-patch :as json-patch]
             [server.search-registry :as sr]
             [server.temporal :as tmp]
-            [taoensso.telemere :as t]))
+            [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace]))
 
 (defn- gone-response [resource-type id]
   {:status 410
@@ -1632,7 +1633,7 @@
           ;; holds a ring request (which carries :reitit.core/match and
           ;; :fhir/store, both of which can OOM pr-str fallback).
           decoded (volatile! nil)
-          _ (t/trace!
+          _ (ftrace/trace!
               {:id :fhir/decode
                :data {:resource-type resource-type}}
               (do (vreset! decoded
@@ -1656,7 +1657,7 @@
            parts (when url (str/split url #"/"))
            entry-rt (first parts)
            entry-id (second parts)]
-       (t/trace!
+       (ftrace/trace!
         {:id :bundle/entry
          :data {:index idx
                 :method method
@@ -1681,7 +1682,7 @@
         (if (= bundle-type "transaction")
           ;; Transaction: atomic — all succeed or all fail
           (try
-            (let [entries (t/trace!
+            (let [entries (ftrace/trace!
                            {:id :bundle/transaction
                             :data {:tenant-id tenant-id
                                    :entry-count (count raw-entries)}}

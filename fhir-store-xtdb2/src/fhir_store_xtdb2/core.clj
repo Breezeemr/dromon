@@ -6,6 +6,7 @@
             [clojure.set :as set]
             [clojure.walk :as walk]
             [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace]
             [cheshire.core :as json]
             [cheshire.generate :as json-gen]
             [integrant.core :as ig]
@@ -954,7 +955,7 @@
   (let [nodes (:nodes store)
         tid (str tenant-id)]
     (or (get @nodes tid)
-        (t/trace!
+        (ftrace/trace!
          {:id :store/node.start
           :data {:tenant-id tid}}
          (let [new-node (xtn/start-node (:node-config store))
@@ -1463,7 +1464,7 @@
   IFHIRStore
 
   (create-resource [this tenant-id resource-type id resource]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
@@ -1473,7 +1474,7 @@
            (create-sql conn resource-type id resource storage-encoders))))))
 
   (read-resource [this tenant-id resource-type id]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/read
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
@@ -1483,7 +1484,7 @@
            (read-sql conn resource-type id read-decoders))))))
 
   (vread-resource [this tenant-id resource-type id vid]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/vread
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id :vid vid}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
@@ -1496,7 +1497,7 @@
     (fp/update-resource this tenant-id resource-type id resource nil))
 
   (update-resource [this tenant-id resource-type id resource opts]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
@@ -1509,7 +1510,7 @@
     (fp/delete-resource this tenant-id resource-type id nil))
 
   (delete-resource [this tenant-id resource-type id opts]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
@@ -1520,7 +1521,7 @@
 
   (resource-deleted? [this tenant-id resource-type id]
     ;; A resource is "deleted" if it has history (existed in the past) but no current row
-    (t/trace!
+    (ftrace/trace!
      {:id :store/resource-deleted?
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
@@ -1530,7 +1531,7 @@
            (deleted?-sql conn resource-type id))))))
 
   (search [this tenant-id resource-type params search-registry]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/search
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)
@@ -1554,7 +1555,7 @@
            [])))))
 
   (count-resources [this tenant-id resource-type params search-registry]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/count
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)
@@ -1569,13 +1570,15 @@
         (catch Exception e
           (t/event! ::count-query-failed
                     {:level :warn
+                     ;; Parameter names only: the values are the search terms,
+                     ;; e.g. the name and birth date being searched for.
                      :data {:resource-type (name resource-type)
-                            :params (:filter-params args)
+                            :params (vec (keys (:filter-params args)))
                             :error (.getMessage e)}})
           0)))))
 
   (history [this tenant-id resource-type id]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/history
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
@@ -1585,7 +1588,7 @@
            (history-sql conn resource-type id read-decoders))))))
 
   (history-type [this tenant-id resource-type params]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/history-type
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
@@ -1598,14 +1601,14 @@
     ;; Pre-compute entry metadata (method, resource-type, id) for use in both
     ;; building tx-ops and constructing the response afterward.
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
-    (t/trace!
+    (ftrace/trace!
      {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
      (with-open [conn (jdbc/get-connection pool)]
       (let [node conn
           entry-metas
-          (t/trace!
+          (ftrace/trace!
            {:id :store/transact-transaction.build-tx
             :data {:entry-count (count entries)}}
            (let [metas (->> (mapv (fn [entry]
@@ -1635,7 +1638,7 @@
           ;; Bulk-fetch current versions for every PUT in one query per
           ;; distinct resource type, replacing N sequential round-trips.
           put-versions-by-type
-          (t/trace!
+          (ftrace/trace!
            {:id :store/transact-transaction.current-versions
             :data {:entry-count (count entry-metas)}}
            (reduce (fn [acc [rt metas]]
@@ -1673,7 +1676,7 @@
                 [:sql (format "DELETE FROM %s WHERE _id = ?" (table-name resource-type))
                  [id]])))
           {:keys [tx-ops entry-results]}
-          (t/trace!
+          (ftrace/trace!
            {:id :store/transact-transaction.sql-encode
             :data {:entry-count (count entry-metas) :query-mode query-mode}}
            (reduce (fn [acc {:keys [method resource-type id] :as em}]
@@ -1708,14 +1711,14 @@
                        (update acc :entry-results conj em)))
                    {:tx-ops [] :entry-results []}
                    entry-metas))]
-      (let [tx-key (t/trace!
+      (let [tx-key (ftrace/trace!
                     {:id :store/transact-transaction.execute-tx
                      :data {:op-count (count tx-ops)}}
                     (xt/execute-tx node tx-ops))]
       ;; Build the response. Writes return from in-memory metadata (no
       ;; round-trips). GET/HEAD entries, if any, still need a read — batched
       ;; per resource-type to avoid N sequential SELECTs.
-      (t/trace!
+      (ftrace/trace!
        {:id :store/transact-transaction.build-response
         :data {:entry-count (count entry-results)}}
        (let [read-needed (filter (fn [{:keys [method]}]
@@ -1762,7 +1765,7 @@
     ;; single-resource CRUD methods on this store. Per-entry failures
     ;; are captured as OperationOutcome responses and do NOT affect
     ;; other entries. Returns a batch-response Bundle in input order.
-    (t/trace!
+    (ftrace/trace!
      {:id :store/transact-bundle
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
      (let [results
@@ -1845,7 +1848,7 @@
   (create-tenant [this tenant-id]
     (fp/create-tenant this tenant-id nil))
   (create-tenant [this tenant-id opts]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/create-tenant
       :data {:tenant-id (str tenant-id) :opts opts}}
      (let [tid       (str tenant-id)
@@ -1873,7 +1876,7 @@
   (delete-tenant [this tenant-id]
     (fp/delete-tenant this tenant-id nil))
   (delete-tenant [this tenant-id opts]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/delete-tenant
       :data {:tenant-id (str tenant-id) :opts opts}}
      (let [tid       (str tenant-id)
@@ -1899,7 +1902,7 @@
   (warmup-tenant [this tenant-id]
     (fp/warmup-tenant this tenant-id nil))
   (warmup-tenant [this tenant-id opts]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/warmup-tenant
       :data {:tenant-id (str tenant-id)}}
      (let [tid (str tenant-id)
@@ -1912,7 +1915,7 @@
        nil)))
 
   (current-basis [this tenant-id]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/current-basis
       :data {:tenant-id (str tenant-id)}}
      (let [{:keys [node]} (get-or-create-entry this tenant-id)]
@@ -1923,7 +1926,7 @@
     ;; same lowercased tables, so `FOR SYSTEM_TIME AS OF` reads are valid
     ;; regardless of the write pathway). The reducible borrows a pooled
     ;; connection lazily inside its reduce, i.e. at download/consumption time.
-    (t/trace!
+    (ftrace/trace!
      {:id :store/scan-type-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
@@ -1931,7 +1934,7 @@
                                   read-decoders scan-page-size))))
 
   (count-as-of [this tenant-id resource-type basis]
-    (t/trace!
+    (ftrace/trace!
      {:id :store/count-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
@@ -1951,7 +1954,7 @@
 
   (read-as-of [this tenant-id resource-type id basis]
     (reject-xtql-temporal! query-mode)
-    (t/trace!
+    (ftrace/trace!
      {:id :store/read-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
@@ -1960,7 +1963,7 @@
 
   (search-as-of [this tenant-id resource-type params search-registry basis]
     (reject-xtql-temporal! query-mode)
-    (t/trace!
+    (ftrace/trace!
      {:id :store/search-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)
@@ -1970,7 +1973,7 @@
 
   (count-as-of-basis [this tenant-id resource-type params search-registry basis]
     (reject-xtql-temporal! query-mode)
-    (t/trace!
+    (ftrace/trace!
      {:id :store/count-as-of-basis
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)
@@ -1980,7 +1983,7 @@
 
   (resource-timeline [this tenant-id resource-type id _opts]
     (reject-xtql-temporal! query-mode)
-    (t/trace!
+    (ftrace/trace!
      {:id :store/resource-timeline
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
@@ -1991,7 +1994,7 @@
 
   (put-valid-time [this tenant-id resource-type id resource vt]
     (reject-xtql-temporal! query-mode)
-    (t/trace!
+    (ftrace/trace!
      {:id :store/put-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
@@ -2000,7 +2003,7 @@
 
   (close-valid-time [this tenant-id resource-type id valid-from]
     (reject-xtql-temporal! query-mode)
-    (t/trace!
+    (ftrace/trace!
      {:id :store/close-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)]

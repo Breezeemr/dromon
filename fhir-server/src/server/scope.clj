@@ -17,7 +17,8 @@
    compartment prefix (patient/user/system) is treated as granting access to
    the named resource type."
   (:require [clojure.string :as str]
-            [taoensso.telemere :as t]))
+            [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace]))
 
 (def ^:private all-permissions #{\c \r \u \d \s})
 
@@ -166,7 +167,7 @@
             (forbidden "No SMART scopes present in token; insufficient scope.")
 
             :else
-            (let [allowed? (t/trace!
+            (let [allowed? (ftrace/trace!
                              {:id :authz/smart-scope.check
                               :data {:fhir-type fhir-type
                                      :interaction interaction

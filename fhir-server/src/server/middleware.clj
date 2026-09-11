@@ -3,6 +3,7 @@
             [clojure.tools.logging :as log]
             [jsonista.core :as json]
             [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace]
             [fhir-store.protocol :as fp])
   (:import [com.fasterxml.jackson.databind ObjectMapper SerializationFeature]
            [java.time Instant ZonedDateTime ZoneOffset]
@@ -76,7 +77,7 @@
   (fn [request]
     (let [{:keys [request-method uri]} request
           start-ns (System/nanoTime)]
-      (t/trace!
+      (ftrace/trace!
        {:id :http/request
         :data {:method request-method
                :uri uri}}

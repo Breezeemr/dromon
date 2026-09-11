@@ -224,3 +224,14 @@ telemere trace -> wrap-params -> muuntaja format -> fhir-exceptions -> fhir-deco
 - Test patient ID is `Patient/123` (hardcoded in inferno runner)
 - Docker network `ory-net` connects all Ory service containers
 - The server uses virtual threads (ring-jetty9-adapter)
+- **Spans use `fhir-store.trace/trace!`, never `taoensso.telemere/trace!`.**
+  Telemere's `trace!` records the traced form's return value in the signal's
+  `:run-val` and in the "<form> => <value>" message it builds by default, at
+  its default `:info` level, with a console handler installed out of the box --
+  no `init-logging!` required. Store verbs return FHIR resources and handlers
+  return ring responses, so the bare macro writes patient names, birth dates
+  and member ids to stdout, and from there to a log sink. The wrapper records a
+  shape summary (`Patient/p1`, `Bundle/searchset entries=3`, `#Response[200]`)
+  instead; identifying detail goes in the span's hand-written `:data`.
+  `fhir-store.trace-lint-test` fails if a namespace goes back to the bare macro.
+  `t/event!` and `t/log!` need no wrapper -- they carry no return value.
