@@ -39,7 +39,8 @@
             [server.compartment :as compartment]
             [server.handlers :as handlers]
             [server.keto :as keto]
-            [taoensso.telemere :as t])
+            [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace])
   (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]
            [java.io OutputStream OutputStreamWriter BufferedWriter Writer]
@@ -530,7 +531,7 @@
                    {"Retry-After" "120"})
 
       :else
-      (t/trace!
+      (ftrace/trace!
        {:id :bulk/export.kickoff
         :data {:tenant tenant-id :kind kind}}
        (let [job-id       (str (random-uuid))
@@ -678,7 +679,7 @@
     (reify ring-protocols/StreamableResponseBody
       (write-body-to-stream [_ _response out]
         (try
-          (t/trace!
+          (ftrace/trace!
            {:id :bulk/export.stream
             :data {:tenant (:tenant job) :job-id (:id job) :type type}}
            (if (= :error (:kind descriptor))

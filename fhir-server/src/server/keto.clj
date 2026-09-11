@@ -2,7 +2,8 @@
   (:require [hato.client :as hc]
             [clojure.tools.logging :as log]
             [clojure.string :as str]
-            [taoensso.telemere :as t]))
+            [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace]))
 
 ;; Default Keto read API URL. In production this should come from configuration.
 (def ^:private default-keto-url "http://localhost:4466")
@@ -132,7 +133,7 @@
           (log/info "Keto authz -> subject:" subject-id "relation:" relation "object:" object "uri:" uri)
           (if (not subject-id)
             (unauthenticated-response login-url)
-            (let [allowed? (t/trace!
+            (let [allowed? (ftrace/trace!
                             {:id :authz/keto.check
                              :data {:subject-id subject-id
                                     :namespace "fhir"

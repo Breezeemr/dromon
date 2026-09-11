@@ -5,7 +5,8 @@
             [buddy.core.keys :as bkeys]
             [hato.client :as hc]
             [clojure.tools.logging :as log]
-            [taoensso.telemere :as t]))
+            [taoensso.telemere :as t]
+            [fhir-store.trace :as ftrace]))
 
 (def ^:private dev-secret
   (when-let [s (System/getenv "JWT_DEV_SECRET")]
@@ -112,7 +113,7 @@
               ;; both of which can OOM the pr-str fallback serializer.
               ;; Capture the real result via a volatile and return ::ok.
               authed (volatile! nil)
-              _ (t/trace!
+              _ (ftrace/trace!
                   {:id :auth/jwt.verify
                    :data {:kid kid
                           :has-token (some? token)}}
