@@ -67,6 +67,43 @@
     (is (= [] (sr/unsupported-filter-params nil {"_id" "abc" "_count" "10"})))
     (is (= ["patient"] (sr/unsupported-filter-params nil {"patient" "Patient/1"})))))
 
+(deftest text-param-classification
+  (is (sr/text-param? "_text"))
+  (testing "a modified _text is not the parameter an index answers"
+    (is (not (sr/text-param? "_text:exact")))
+    (is (not (sr/text-param? "_text:contains"))))
+  (testing "_text is neither a result parameter nor a resource-level one"
+    (is (not (sr/result-param? "_text")))
+    (is (contains? (sr/filter-params {"_text" "smith" "_count" "5"}) "_text"))))
+
+(deftest unsupported-filter-params-grants-text-only-when-told-to
+  (testing "by default _text is reported like any name the registry lacks"
+    (is (= ["_text"] (sr/unsupported-filter-params registry {"_text" "smith"})))
+    (is (= ["_text"] (sr/unsupported-filter-params registry {"_text" "smith"} {})))
+    (is (= ["_text"] (sr/unsupported-filter-params registry {"_text" "smith"}
+                                                   {:text-search? false}))))
+  (testing "the 2-arity and the opts-less 3-arity agree byte for byte"
+    (let [params {"_text" "smith" "subject" "Patient/1" "status" "active" "_count" "3"}]
+      (is (= (sr/unsupported-filter-params registry params)
+             (sr/unsupported-filter-params registry params {})
+             (sr/unsupported-filter-params registry params {:text-search? false})
+             ["_text" "subject"]))))
+  (testing "with the store's grant _text drops out and nothing else changes"
+    (is (= [] (sr/unsupported-filter-params registry {"_text" "smith"}
+                                            {:text-search? true})))
+    (is (= ["subject"]
+           (sr/unsupported-filter-params registry {"_text" "smith" "subject" "Patient/1"}
+                                         {:text-search? true}))))
+  (testing "the grant covers bare _text only; a modified form stays unsupported"
+    (is (= ["_text:exact"]
+           (sr/unsupported-filter-params registry {"_text:exact" "smith"}
+                                         {:text-search? true}))))
+  (testing "a keyword key classifies by name like every other parameter"
+    (is (= [] (sr/unsupported-filter-params registry {:_text "smith"} {:text-search? true})))
+    (is (= ["_text"] (sr/unsupported-filter-params registry {:_text "smith"}))))
+  (testing "the grant does not need a registry"
+    (is (= [] (sr/unsupported-filter-params nil {"_text" "smith"} {:text-search? true})))))
+
 (deftest where-resolve-dotted-path-delegates-to-nested-resolution
   (let [resolve-expression #'sr/resolve-expression
         field-map {"participant" {:fhir-type "BackboneElement" :array? true

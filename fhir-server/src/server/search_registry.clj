@@ -482,6 +482,19 @@
    so they are honoured even when the registry has no entry for them."
   #{"_id" "_tag" "_security" "_profile"})
 
+(def text-params
+  "Filter parameters answered by a full-text index rather than the registry.
+
+   Like the resource-level parameters, no registry ever declares `_text`: its
+   SearchParameter (Resource-text) has no expression, so
+   `build-resource-registry` can never resolve it to a column. Unlike them it
+   is NOT universally granted. Only a store fronting a full-text index can
+   honour it (see `fhir-store.protocol/ITextSearchStore`), and the handler
+   grants it per request, only when the store advertises that capability for
+   the tenant and type in hand. Classifying it here gives the handler a way to
+   say so; it does not stop `_text` being reported as unsupported by default."
+  #{"_text"})
+
 (defn- param-base-name
   "The parameter name with any `:modifier` suffix removed."
   [pname]
@@ -499,6 +512,14 @@
   "True when `pname` names a temporal selector."
   [pname]
   (contains? temporal-params (param-base-name pname)))
+
+(defn text-param?
+  "True when `pname` is a full-text parameter, by exact name. A modifier is
+   NOT stripped: a text index answers bare `_text`, and `_text:exact` or
+   `_text:contains` would reach it as a name it does not match, so they stay
+   unsupported like any other modified filter parameter."
+  [pname]
+  (contains? text-params pname))
 
 (defn filter-params
   "The entries of `params` that restrict which resources match, i.e. everything
@@ -518,14 +539,26 @@
    constrain a query no more than a misspelling does; reporting them keeps the
    answer aligned with what actually reaches the query builder.
 
+   `opts` may carry `:text-search?`: true when the store answering this
+   request advertises a full-text index for the resource type
+   (`fhir-store.protocol/ITextSearchStore`), in which case `_text` is not
+   reported. Absent or false, `_text` is reported like any other name the
+   registry lacks, because a store without an index would silently ignore it.
+   The grant is per request rather than a registry entry so that a registry
+   built once per type never says more than the store behind a given tenant
+   can honour.
+
    Returns a sorted vector so an OperationOutcome lists issues in a stable
    order."
-  [registry params]
-  (let [registry (or registry {})]
-    (->> (filter-params params)
-         (map (fn [[k _]] (name k)))
-         (remove #(contains? resource-level-params %))
-         (remove #(contains? registry %))
-         distinct
-         sort
-         vec)))
+  ([registry params]
+   (unsupported-filter-params registry params {}))
+  ([registry params {:keys [text-search?]}]
+   (let [registry (or registry {})]
+     (->> (filter-params params)
+          (map (fn [[k _]] (name k)))
+          (remove #(contains? resource-level-params %))
+          (remove #(and text-search? (text-param? %)))
+          (remove #(contains? registry %))
+          distinct
+          sort
+          vec))))

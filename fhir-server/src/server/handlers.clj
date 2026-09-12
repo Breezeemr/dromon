@@ -758,6 +758,24 @@
                         :resource res
                         :search {:mode "include"}}))))))))
 
+(def ^:private paging-params
+  "The parameters a searchset link states for itself. Whatever the request
+   spelled them as, the link is built from the numbers the handler parsed."
+  #{"_count" "_skip"})
+
+(defn- link-params
+  "The request's parameters with the paging pair removed, ready for the link
+   builder to put its own back.
+
+   The raw parameters are keyed by STRING (`\"_count\"`), and the link builder
+   assocs the parsed values under KEYWORDS (`:_count`), so without this a
+   request that sent `_count` at all produced `_count=25&_count=25` in its own
+   self and next links. Following such a link hands the parameters middleware
+   a vector of two values, which `parse-non-negative-int` refuses: the next
+   link -- the only way a client is meant to reach page two -- answered 400."
+  [params]
+  (into {} (remove (fn [[k _]] (contains? paging-params (name k)))) params))
+
 (defn- search-total
   "Bundle.total for a paginated searchset: how many resources the search
    MATCHES, not how many this page carries.
@@ -771,6 +789,14 @@
      store call is made. Every search that fits in one page takes this branch,
      which is most of them, and it is why the counts asserted across the
      handler tests do not move.
+
+     `text-search?` is the one search that breaks that inference, so it never
+     takes this branch. A full-text store answers from an index and then reads
+     each hit back from the record store, dropping any whose resource is gone
+     (flotilla's `com.breezeehr.flotilla.search.store/read-page`), so its page
+     can be short while the match set goes on. Reporting `skip + page` there
+     would state a total the index knows to be wrong AND, through the next
+     link's own short-page rule, strand every later page.
    - A full page may or may not be the last, so the count has to be asked for.
      `count-resources` is exact on every store, but fhir-store-datomic
      implements it by materialising the whole match set, so this is not free on
@@ -786,13 +812,14 @@
    Returns nil when no total should be reported. That distinction is the point:
    FHIR makes Bundle.total 0..1, so leaving it out asserts nothing, while a
    wrong number asserts something false."
-  [store tenant-id resource-type params search-registry basis limit skip page-count]
+  [store tenant-id resource-type params search-registry basis limit skip page-count
+   text-search?]
   (let [requested (or (get params "_total") (get params :_total))]
     (cond
       (= "none" requested)
       nil
 
-      (< page-count limit)
+      (and (< page-count limit) (not text-search?))
       (+ skip page-count)
 
       basis
@@ -815,14 +842,29 @@
    same search against a point-in-time snapshot. They are never covered by
    handling=lenient: a snapshot the store cannot produce is refused outright,
    because answering on the remaining axis would return a different question's
-   answer under the caller's parameters."
+   answer under the caller's parameters.
+
+   `_text` is a capability of the store rather than of the registry: it is
+   accepted only when the store advertises a full-text index for this tenant
+   and type (`fhir-store.protocol/ITextSearchStore`), and otherwise treated as
+   any other unsupported parameter, lenient handling included. Only this
+   interaction grants it; conditional interactions and compartment search keep
+   refusing it."
   [req]
   (let [store (:fhir/store req)
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
         raw-params (merge (or (:form-params req) {}) (or (:query-params req) {}))
         search-registry (:fhir/search-registry req)
-        unsupported (sr/unsupported-filter-params search-registry raw-params)
+        ;; The capability is consulted only when the request actually
+        ;; carries `_text`, so an ordinary search never pays for a store
+        ;; round trip it does not need.
+        text-search? (boolean
+                      (and (some #(sr/text-param? (name (key %))) raw-params)
+                           (satisfies? db/ITextSearchStore store)
+                           (db/text-searchable? store tenant-id (keyword resource-type))))
+        unsupported (sr/unsupported-filter-params search-registry raw-params
+                                                  {:text-search? text-search?})
         lenient? (= :lenient (prefer-handling req))
 
         ;; Under handling=lenient the ignored parameters are dropped from
@@ -866,7 +908,8 @@
                         (db/count-resources store tenant-id (keyword resource-type)
                                             (assoc params :_count 0 :_skip 0) search-registry))
                 build-link (fn [new-skip]
-                             (let [query-string (->> (assoc params :_count limit :_skip new-skip)
+                             (let [query-string (->> (assoc (link-params params)
+                                                            :_count limit :_skip new-skip)
                                                      (map (fn [[k v]] (str (name k) "=" v)))
                                                      (clojure.string/join "&"))]
                                (str base-url "?" query-string)))
@@ -886,24 +929,32 @@
                           (db/search store tenant-id (keyword resource-type)
                                      search-params search-registry))
                 total (search-total store tenant-id resource-type params
-                                    search-registry basis limit skip (count results))
+                                    search-registry basis limit skip (count results)
+                                    text-search?)
   
                 build-link (fn [new-skip]
-                             (let [query-string (->> (assoc params :_count limit :_skip new-skip)
+                             (let [query-string (->> (assoc (link-params params)
+                                                            :_count limit :_skip new-skip)
                                                      (map (fn [[k v]] (str (name k) "=" v)))
                                                      (clojure.string/join "&"))]
                                (str base-url "?" query-string)))
   
                 self-link {:relation "self" :url (build-link skip)}
   
-                ;; A full page is the only candidate for a next link, and a
-                ;; known total then says whether one actually follows. Without
-                ;; that second test a search whose match count is an exact
-                ;; multiple of _count advertises a next link to an empty page,
-                ;; which a client walking the links has to fetch to discover.
+                ;; A known total is what says whether a page follows this one,
+                ;; and it is asked of the match set rather than of the rows
+                ;; that came back. Without it a search whose match count is an
+                ;; exact multiple of _count advertises a next link to an empty
+                ;; page, which a client walking the links has to fetch to
+                ;; discover; and reading a SHORT page as the last one strands
+                ;; the remainder of a search whose store drops rows from a page
+                ;; it filled (a full-text hit whose resource is gone). The page
+                ;; after this one starts at `skip + limit` whatever survived in
+                ;; it, because that is the window the store was asked for.
                 ;; `_total=none` leaves total nil and keeps the older rule.
-                next-link (when (and (= (count results) limit)
-                                     (or (nil? total) (< (+ skip limit) total)))
+                next-link (when (if total
+                                  (< (+ skip limit) total)
+                                  (= (count results) limit))
                             {:relation "next" :url (build-link (+ skip limit))})
   
                 prev-link (when (> skip 0)

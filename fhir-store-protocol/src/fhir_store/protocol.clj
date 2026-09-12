@@ -330,3 +330,47 @@
      onward, learned now. History is preserved -- reads at an earlier system
      time still see it live, and reads valid-before `valid-from` still find it.
      This is the retro-eligibility primitive."))
+
+;; ---------------------------------------------------------------------------
+;; Full-text search extension protocol.
+;;
+;; Same reasoning as the bitemporal split above: `_text` is answered by a
+;; full-text index, not by the resource store's own query engine, and only a
+;; store that fronts such an index can honour it. Keeping the verb off
+;; IFHIRStore means a store implements it exactly when it can answer, so
+;; `satisfies?` is a capability check the handler makes BEFORE the call and
+;; turns into a 400 rather than a wrong number. Were `_text` instead let
+;; through to every store's `search`, a store without an index would ignore
+;; it and run an unfiltered search under a filtered request's parameters,
+;; which is the failure the whole unsupported-parameter surface exists to
+;; prevent.
+;;
+;;   flotilla's IndexedStore  ITextSearchStore, per realm and per type
+;;   fhir-store-datomic       not implemented
+;;   fhir-store-xtdb2         not implemented
+;;   fhir-store-mock          not implemented
+;;   CompartmentFilteringStore (fhir-server) not implemented: a patient
+;;                            token never reaches the index
+;; ---------------------------------------------------------------------------
+
+(defprotocol ITextSearchStore
+  "The standard `_text` search parameter (Resource-text) served from a
+   full-text index the store fronts.
+
+   The protocol is per tenant and per resource type because the index is: a
+   realm may have no index configured at all, and one that does indexes only
+   the types it was told to. `satisfies?` says the store CAN front an index;
+   `text-searchable?` says whether it does for this tenant and type. The
+   handler needs both answers ahead of the call, since `_text` never reaches
+   the registry (the SearchParameter has no expression) and would otherwise
+   be reported as unknown.
+
+   A store answering true takes `_text` through its ordinary `search` and
+   `count-resources` in `params`, alongside whatever other parameters it
+   chooses to combine it with; the contract for how the value is matched, and
+   which other parameters may accompany it, belongs to the implementation."
+  (text-searchable? [this tenant-id resource-type]
+    "Whether `_text` on `resource-type` is answered by a full-text index here
+     for `tenant-id`. `resource-type` is a keyword, as `search` receives it.
+     False means the handler refuses the parameter as not-supported; it must
+     not mean the store will quietly ignore it."))

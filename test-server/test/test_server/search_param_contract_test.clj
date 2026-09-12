@@ -37,6 +37,7 @@
             [server.fhir-coercion :as fhir-coercion]
             [server.middleware :as middleware]
             [server.routing :as routing]
+            [server.search-registry :as sr]
             [test-server.schemas.breeze :as breeze]))
 
 (def ^:private tenant "t1")
@@ -277,11 +278,77 @@
 
     (testing "nothing the CapabilityStatement advertises would be rejected by
               the search handler: every advertised parameter resolves in the
-              registry the same schema carries"
+              registry the same schema carries, except `_text`, which no
+              registry can resolve (its SearchParameter has no expression) and
+              which the handler grants from the store instead"
       (doseq [rt @served-types
               :when (searchable? rt)]
         (let [advertised (into #{} (map :name) (:searchParam (get by-type rt)))
-              registry (or (registry-for rt) {})]
-          (is (empty? (remove registry advertised))
-              (str rt " advertises " (pr-str (vec (sort (remove registry advertised))))
-                   ", which the registry does not resolve, so search would answer 400")))))))
+              registry (or (registry-for rt) {})
+              unresolved (remove registry advertised)]
+          (is (empty? (remove sr/text-param? unresolved))
+              (str rt " advertises " (pr-str (vec (sort (remove sr/text-param? unresolved))))
+                   ", which the registry does not resolve, so search would answer 400")))))
+
+    (testing "_text is advertised exactly where the design puts a full-text
+              index: the directory types jib3 searches by name"
+      (is (= #{"Organization" "Person" "Practitioner"}
+             (into #{}
+                   (filter #(some (comp sr/text-param? :name)
+                                  (:searchParam (get by-type %))))
+                   @served-types))))))
+
+;; ---------------------------------------------------------------------------
+;; _text: advertised by the CapabilityStatement, granted by the store
+;; ---------------------------------------------------------------------------
+
+;; A store fronting a full-text index for the types in `indexed-types`,
+;; standing in for flotilla's IndexedStore behind a realm whose index is
+;; configured. The searches themselves go to the mock store underneath.
+(defrecord TextIndexedStore [base indexed-types]
+  db/IFHIRStore
+  (create-resource [_ tenant-id resource-type id resource]
+    (db/create-resource base tenant-id resource-type id resource))
+  (read-resource [_ tenant-id resource-type id]
+    (db/read-resource base tenant-id resource-type id))
+  (search [_ tenant-id resource-type params search-registry]
+    (db/search base tenant-id resource-type params search-registry))
+  (count-resources [_ tenant-id resource-type params search-registry]
+    (db/count-resources base tenant-id resource-type params search-registry))
+  db/ITextSearchStore
+  (text-searchable? [_ _tenant-id resource-type]
+    (contains? indexed-types resource-type)))
+
+(def ^:private directory-types
+  "The types the design puts a full-text index on."
+  ["Person" "Practitioner" "Organization"])
+
+(deftest text-is-refused-unless-the-store-fronts-an-index
+  (testing "over a store with no index the advertised _text is a 400, never a
+            search that quietly ignores it"
+    (let [handler (app (mock/create-mock-store {}))]
+      (doseq [rt directory-types]
+        (testing rt
+          (let [resp (send! handler :get (str "/" tenant "/fhir/" rt "?_text=smith"))]
+            (is (= 400 (:status resp)))
+            (is (= ["not-supported"] (mapv :code (outcome-issues resp))))
+            (is (some #(str/includes? (:diagnostics %) "\"_text\"") (outcome-issues resp))))))))
+
+  (testing "over a store that advertises the index the same request runs,
+            through the whole ring stack"
+    (let [handler (app (->TextIndexedStore (mock/create-mock-store {})
+                                           (into #{} (map keyword) directory-types)))]
+      (doseq [rt directory-types]
+        (testing rt
+          (let [resp (send! handler :get (str "/" tenant "/fhir/" rt "?_text=smith"))]
+            (is (= 200 (:status resp)))
+            (is (= "searchset" (get-in resp [:body :type])))
+            (is (empty? (outcome-issues resp)) "a granted parameter is not an ignored one"))))))
+
+  (testing "the grant is the store's answer for the type in hand: a type the
+            index does not cover is refused over the same store"
+    (let [handler (app (->TextIndexedStore (mock/create-mock-store {})
+                                           (into #{} (map keyword) directory-types)))
+          resp (send! handler :get (str "/" tenant "/fhir/Consent?_text=smith"))]
+      (is (= 400 (:status resp)))
+      (is (= ["not-supported"] (mapv :code (outcome-issues resp)))))))
