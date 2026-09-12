@@ -4,6 +4,7 @@
             [fhir-store.protocol :as db]
             [server.handlers :as handlers]
             [server.middleware :as middleware]
+            [jsonista.core :as json]
             [clojure.string]))
 
 (def ^:private tenant "default")
@@ -671,6 +672,221 @@
             resp (write! store id nil)]
         (is (contains? #{200 204} (:status resp)))
         (is (deleted-or-advanced? store id v1))))))
+
+;; ---------------------------------------------------------------------------
+;; Preconditions inside a transaction Bundle
+;;
+;; Everything above routes through parse-if-match, so an instance-level
+;; guard either holds or the write is refused. A Bundle entry carries its
+;; guard in `entry.request.ifMatch` and has to answer for it the same way.
+;;
+;; The failure mode this section pins is narrower than a wrong status code:
+;; the transaction handler wraps whatever the store hands back in a 200, so
+;; a store that RETURNS a conflict OperationOutcome instead of throwing gets
+;; that refusal delivered under a success status line. A client that reads
+;; the status — the ordinary thing to do — records a write that was refused.
+;; ---------------------------------------------------------------------------
+
+(defn- transaction!
+  "POST a Bundle to the system-level transaction endpoint."
+  [store bundle]
+  (run (handlers/transaction {})
+       {:fhir/store store
+        :path-params {:tenant-id tenant}
+        :body-params bundle}))
+
+(defn- put-bundle
+  "A one-entry transaction Bundle that PUTs `id`, optionally guarded."
+  [id if-match]
+  {:resourceType "Bundle"
+   :type "transaction"
+   :entry [{:resource {:resourceType "Patient" :id id :gender "female"}
+            :request (cond-> {:method "PUT" :url (str resource-type "/" id)}
+                       if-match (assoc :ifMatch if-match))}]})
+
+(def ^:private cas-conflict-outcome
+  "The value fhir-store-datomic's transact-transaction returns when a
+   Bundle entry's compare-and-set fails."
+  {:resourceType "OperationOutcome"
+   :issue [{:severity "error"
+            :code "conflict"
+            :diagnostics "Transaction conflict: :db.error/cas-failed"}]})
+
+(defn- outcome-returning-store
+  "A store whose transact-transaction RETURNS `outcome` rather than
+   throwing — the shape fhir-store-datomic produces on a failed
+   precondition. Reproduces it here without putting Datomic on this
+   module's classpath."
+  [outcome]
+  (reify db/IFHIRStore
+    (transact-transaction [_ _ _] outcome)))
+
+(deftest a-conflict-outcome-from-the-store-is-not-answered-as-success
+  (let [resp (transaction! (outcome-returning-store cas-conflict-outcome)
+                           (put-bundle "p1" "W/\"1\""))]
+    (is (not= 200 (:status resp))
+        "a conflict OperationOutcome under a 200 status line is a refused
+         write that every 2xx-means-success client records as saved")
+    (is (= 412 (:status resp))
+        "a failed precondition is the same 412 the instance-level paths give")
+    (is (= "OperationOutcome" (get-in resp [:body :resourceType])))))
+
+(deftest a-non-conflict-failure-outcome-is-not-answered-as-success
+  (testing "the `exception` code takes the same path as `conflict`"
+    (let [outcome {:resourceType "OperationOutcome"
+                   :issue [{:severity "error"
+                            :code "exception"
+                            :diagnostics "Transaction failed: boom"}]}
+          resp (transaction! (outcome-returning-store outcome)
+                             (put-bundle "p1" nil))]
+      (is (not= 200 (:status resp)))
+      (is (<= 400 (:status resp) 599)))))
+
+(deftest a-bundle-entry-guard-is-honoured-end-to-end
+  (testing "a stale guard on a Bundle entry refuses the write"
+    (let [store (make-store)
+          [id v1] (seed-patient! store)
+          resp (transaction! store (put-bundle id "W/\"99\""))]
+      (is (not= 200 (:status resp))
+          "the entry asked for a precondition and it did not hold")
+      (is (= v1 (stored-version store id))
+          "a Bundle entry's ifMatch must not decay into an unconditional
+           write any more than the header form may")))
+  (testing "a matching guard still lets the write through"
+    (let [store (make-store)
+          [id v1] (seed-patient! store)
+          resp (transaction! store (put-bundle id (str "W/\"" v1 "\"")))]
+      (is (= 200 (:status resp)))
+      (is (not= v1 (stored-version store id))))))
+
+;; ---------------------------------------------------------------------------
+;; PATCH inside a Bundle
+;;
+;; No store has a PATCH arm in its Bundle path, so a PATCH entry used to
+;; contribute no tx data and then be reported as a 200 carrying the
+;; unchanged resource. It is resolved here into a guarded PUT instead. The
+;; assertion that matters is the resource in the store, not the status:
+;; "200 OK" over an untouched resource is the shape being ruled out.
+;; ---------------------------------------------------------------------------
+
+(def ^:private patch-ops
+  [{:op "replace" :path "/gender" :value "female"}])
+
+(defn- base64 [^String s]
+  (.encodeToString (java.util.Base64/getEncoder)
+                   (.getBytes s java.nio.charset.StandardCharsets/UTF_8)))
+
+(defn- patch-binary
+  "The shape FHIR puts a patch document in a Bundle entry, and the one jib3's
+   session transport sends: a Binary carrying the base64 patch body."
+  [ops]
+  {:resourceType "Binary"
+   :contentType "application/json-patch+json"
+   :data (base64 (json/write-value-as-string ops))})
+
+(defn- patch-bundle [bundle-type id resource if-match]
+  {:resourceType "Bundle"
+   :type bundle-type
+   :entry [{:resource resource
+            :request (cond-> {:method "PATCH" :url (str resource-type "/" id)}
+                       if-match (assoc :ifMatch if-match))}]})
+
+(defn- stored-gender [store id]
+  (:gender (db/read-resource store tenant (keyword resource-type) id)))
+
+(deftest a-patch-entry-carried-as-a-binary-is-applied
+  (doseq [bundle-type ["transaction" "batch"]]
+    (testing bundle-type
+      (let [store (make-store)
+            [id v1] (seed-patient! store)
+            resp (transaction! store (patch-bundle bundle-type id
+                                                   (patch-binary patch-ops) nil))]
+        (is (= 200 (:status resp)))
+        (is (= "female" (stored-gender store id))
+            "the patch has to reach the store, not be reported as applied")
+        (is (not= v1 (stored-version store id)))))))
+
+(deftest a-patch-entry-carried-as-a-bare-operations-array-is-applied
+  (let [store (make-store)
+        [id _] (seed-patient! store)
+        resp (transaction! store (patch-bundle "transaction" id patch-ops nil))]
+    (is (= 200 (:status resp)))
+    (is (= "female" (stored-gender store id)))))
+
+(deftest a-patch-entry-is-anchored-to-the-version-it-read
+  (testing "the rewritten PUT carries a guard, so a concurrent writer loses
+            the race instead of being clobbered"
+    (let [store (make-store)
+          [id _] (seed-patient! store)
+          entry (first (:entry (patch-bundle "transaction" id
+                                             (patch-binary patch-ops) nil)))
+          resolved (#'handlers/resolve-patch-entry store tenant entry)]
+      (is (= "PUT" (get-in resolved [:request :method])))
+      (is (= "W/\"1\"" (get-in resolved [:request :ifMatch]))
+          "anchored to the version just read")
+      (is (= "female" (:gender (:resource resolved)))))))
+
+(deftest a-client-supplied-guard-on-a-patch-entry-is-not-replaced
+  (testing "a stale guard the client sent is refused, not swapped for the
+            version the server just read"
+    (let [store (make-store)
+          [id v1] (seed-patient! store)
+          resp (transaction! store (patch-bundle "transaction" id
+                                                 (patch-binary patch-ops)
+                                                 "W/\"99\""))]
+      (is (= 412 (:status resp)))
+      (is (= "male" (stored-gender store id)))
+      (is (= v1 (stored-version store id))))))
+
+(deftest a-patch-entry-against-a-missing-resource-is-refused
+  (testing "transaction: the whole Bundle fails"
+    (let [store (make-store)
+          resp (transaction! store (patch-bundle "transaction" "no-such-patient"
+                                                 (patch-binary patch-ops) nil))]
+      (is (= 404 (:status resp)))))
+  (testing "batch: the entry fails on its own"
+    (let [store (make-store)
+          resp (transaction! store (patch-bundle "batch" "no-such-patient"
+                                                 (patch-binary patch-ops) nil))]
+      (is (= 200 (:status resp)))
+      (is (clojure.string/starts-with?
+           (get-in resp [:body :entry 0 :response :status]) "404")))))
+
+(deftest an-unreadable-patch-document-is-refused-rather-than-ignored
+  (doseq [[label resource] [["no document" nil]
+                            ["a resource, not a patch"
+                             {:resourceType "Patient" :gender "female"}]
+                            ["a Binary of the wrong media type"
+                             {:resourceType "Binary"
+                              :contentType "text/plain"
+                              :data (base64 "nope")}]]]
+    (testing label
+      (let [store (make-store)
+            [id _] (seed-patient! store)
+            resp (transaction! store (patch-bundle "transaction" id resource nil))]
+        (is (= 400 (:status resp)))
+        (is (= "male" (stored-gender store id))
+            "an unexecuted patch must never report success")))))
+
+(deftest a-failed-patch-entry-does-not-fail-its-batch-siblings
+  (let [store (make-store)
+        [good _] (seed-patient! store)
+        resp (transaction! store
+                           {:resourceType "Bundle"
+                            :type "batch"
+                            :entry [{:resource (patch-binary patch-ops)
+                                     :request {:method "PATCH"
+                                               :url (str resource-type "/no-such-patient")}}
+                                    {:resource (patch-binary patch-ops)
+                                     :request {:method "PATCH"
+                                               :url (str resource-type "/" good)}}]})
+        statuses (mapv #(get-in % [:response :status]) (get-in resp [:body :entry]))]
+    (is (= 200 (:status resp)))
+    (is (= 2 (count statuses)) "every input entry gets a response, in order")
+    (is (clojure.string/starts-with? (first statuses) "404"))
+    (is (clojure.string/starts-with? (second statuses) "200"))
+    (is (= "female" (stored-gender store good))
+        "the resolvable sibling still lands")))
 
 ;; ---------------------------------------------------------------------------
 ;; If-None-Match on reads

@@ -7,6 +7,7 @@
             [com.breezeehr.fhir-json-transform :as fjt]
             [server.compartment :as compartment]
             [server.json-patch :as json-patch]
+            [jsonista.core :as json]
             [server.search-registry :as sr]
             [server.temporal :as tmp]
             [taoensso.telemere :as t]
@@ -1670,6 +1671,148 @@
    (range)
    raw-entries))
 
+;; ---------------------------------------------------------------------------
+;; PATCH inside a Bundle
+;;
+;; No store executes a PATCH entry: their Bundle paths build tx data per
+;; method and none has a PATCH arm. Rather than push a patch engine into
+;; every backend, a PATCH entry is resolved here into the guarded PUT that
+;; performs it — read the current resource, apply the operations, write the
+;; result back under a precondition anchored to the version just read. The
+;; anchor is what keeps the read-modify-write atomic: a writer who commits
+;; in between fails the compare-and-set instead of being clobbered.
+;; ---------------------------------------------------------------------------
+
+(def ^:private json-patch-media-type "application/json-patch+json")
+
+(defn- decode-patch-document
+  "The JSON Patch operations a Bundle PATCH entry carries.
+
+   FHIR's way of putting a patch document in a Bundle is a Binary whose
+   contentType is the patch media type and whose `data` is the base64 body;
+   that is what jib3's session transport sends. A bare operations array is
+   accepted too, since a client holding the ops has nowhere else to put
+   them. Returns nil for anything else, which the caller refuses."
+  [resource]
+  (cond
+    (sequential? resource)
+    (vec resource)
+
+    (and (map? resource)
+         (= "Binary" (:resourceType resource))
+         (= json-patch-media-type (:contentType resource))
+         (string? (:data resource)))
+    (try
+      (let [decoded (String. (.decode (java.util.Base64/getDecoder)
+                                      ^String (:data resource))
+                             java.nio.charset.StandardCharsets/UTF_8)
+            ops (json/read-value decoded (json/object-mapper {:decode-key-fn keyword}))]
+        (when (sequential? ops) (vec ops)))
+      (catch Exception _ nil))
+
+    :else nil))
+
+(defn- patch-entry? [entry]
+  (= "PATCH" (some-> (get-in entry [:request :method]) str/upper-case)))
+
+(defn- resolve-patch-entry
+  "Rewrite a PATCH entry into the guarded PUT that performs it. Throws an
+   ex-info carrying :fhir/status for a patch this server cannot execute —
+   never returns the entry unchanged, because an unexecuted PATCH handed to
+   a store comes back as a 200 over an untouched resource."
+  [store tenant-id entry]
+  (let [request (:request entry)
+        url (or (:url request) "")
+        [type id] (str/split url #"/")
+        ops (decode-patch-document (:resource entry))]
+    (cond
+      (str/starts-with? url "urn:")
+      (throw (ex-info (str "PATCH cannot target a bundle-local reference: " url)
+                      {:fhir/status 422 :fhir/code "not-supported"}))
+
+      (or (str/blank? (str type)) (str/blank? (str id)))
+      (throw (ex-info (str "PATCH entry needs a Type/id url, got: " (pr-str url))
+                      {:fhir/status 400 :fhir/code "invalid"}))
+
+      (nil? ops)
+      (throw (ex-info (str "PATCH entry carries no readable " json-patch-media-type
+                           " document")
+                      {:fhir/status 400 :fhir/code "invalid"}))
+
+      :else
+      (let [existing (db/read-resource store tenant-id (keyword type) id)]
+        (when (nil? existing)
+          (throw (ex-info (str type "/" id " not found")
+                          {:fhir/status 404 :fhir/code "not-found"})))
+        (let [patched (json-patch/apply-patch existing ops)
+              version (get-in existing [:meta :versionId])]
+          (assoc entry
+                 :resource patched
+                 ;; A guard the client sent wins over the anchor: theirs is
+                 ;; the stricter claim, and replacing it with the version we
+                 ;; just read would answer a precondition they never made.
+                 :request (cond-> (assoc request :method "PUT")
+                            (and version (nil? (:ifMatch request)))
+                            (assoc :ifMatch (str "W/\"" version "\"")))))))))
+
+(defn- resolve-patch-entries
+  "Every PATCH entry resolved into a guarded PUT. Any refusal throws, which
+   is the atomic answer a transaction Bundle wants: one entry the server
+   cannot execute fails the whole Bundle."
+  [store tenant-id entries]
+  (mapv (fn [entry]
+          (if (patch-entry? entry)
+            (resolve-patch-entry store tenant-id entry)
+            entry))
+        entries))
+
+(defn- entry-error-response
+  "A batch entry's own error response, built from a resolution failure."
+  [e]
+  (let [{:fhir/keys [status code]} (ex-data e)
+        status (or status 400)]
+    {:response {:status (str status " " (case (long status)
+                                          400 "Bad Request"
+                                          404 "Not Found"
+                                          409 "Conflict"
+                                          412 "Precondition Failed"
+                                          422 "Unprocessable Entity"
+                                          "Error"))
+                :outcome {:resourceType "OperationOutcome"
+                          :issue [{:severity "error"
+                                   :code (or code "processing")
+                                   :diagnostics (ex-message e)}]}}}))
+
+(defn- entries-guarded?
+  "Whether any entry asked for a precondition. Which entry's write lost a
+   race is not recoverable from a whole-Bundle failure, so the guard the
+   caller supplied is what decides whether that failure is named a
+   precondition failure (412) or a plain concurrent-write conflict (409)."
+  [entries]
+  (boolean (some #(or (get-in % [:request :ifMatch])
+                      (get-in % [:request "ifMatch"]))
+                 entries)))
+
+(defn- outcome-failure-status
+  "The HTTP status for an OperationOutcome a store RETURNED in place of a
+   response Bundle. Backends are contracted to throw instead, so this is the
+   backstop for one that does not: answering 200 would hand the client a
+   refusal under a success status line."
+  [outcome guarded?]
+  (let [codes (set (map :code (:issue outcome)))]
+    (cond
+      (contains? codes "conflict") (if guarded? 412 409)
+      (seq codes) 500)))
+
+(defn- bundle-response
+  "The store's Bundle under a 200, unless it handed back an OperationOutcome
+   instead — see outcome-failure-status."
+  [res entries]
+  (if-let [status (and (= "OperationOutcome" (:resourceType res))
+                       (outcome-failure-status res (entries-guarded? entries)))]
+    {:status status :body res}
+    {:status 200 :body res}))
+
 (defn transaction [decoders]
   (fn [req]
     (let [store (:fhir/store req)
@@ -1680,27 +1823,42 @@
           raw-entries (:entry body)]
       (if (and (= resource-type "Bundle") (#{"transaction" "batch"} bundle-type))
         (if (= bundle-type "transaction")
-          ;; Transaction: atomic — all succeed or all fail
-          (try
-            (let [entries (ftrace/trace!
-                           {:id :bundle/transaction
-                            :data {:tenant-id tenant-id
-                                   :entry-count (count raw-entries)}}
-                           (decode-bundle-entries decoders raw-entries))
-                  res (db/transact-transaction store tenant-id entries)]
-              {:status 200 :body res})
-            (catch Exception e
-              {:status 400
-               :body {:resourceType "OperationOutcome"
-                      :issue [{:severity "error"
-                               :code "transient"
-                               :diagnostics (str "Transaction failed: " (ex-message e))}]}}))
+          ;; Transaction: atomic — all succeed or all fail. Store failures
+          ;; carry a :fhir/status that wrap-fhir-exceptions turns into the
+          ;; right response, so they are deliberately NOT caught here: a
+          ;; blanket catch flattened every one of them — a failed
+          ;; precondition included — into the same 400.
+          (let [entries (ftrace/trace!
+                         {:id :bundle/transaction
+                          :data {:tenant-id tenant-id
+                                 :entry-count (count raw-entries)}}
+                         (decode-bundle-entries decoders raw-entries))
+                entries (resolve-patch-entries store tenant-id entries)]
+            (bundle-response (db/transact-transaction store tenant-id entries) entries))
           ;; Batch: each entry independent. Decode entries (with per-entry
           ;; spans), then hand off to the store's batch impl which emits
-          ;; :store/transact-bundle around its work.
-          (let [entries (decode-bundle-entries decoders raw-entries)
-                res (db/transact-bundle store tenant-id entries)]
-            {:status 200 :body res}))
+          ;; :store/transact-bundle around its work. A PATCH this server
+          ;; cannot resolve becomes that entry's own error response rather
+          ;; than failing its siblings.
+          (let [decoded (decode-bundle-entries decoders raw-entries)
+                resolved (mapv (fn [entry]
+                                 (if (patch-entry? entry)
+                                   (try {:entry (resolve-patch-entry store tenant-id entry)}
+                                        (catch Exception e {:error (entry-error-response e)}))
+                                   {:entry entry}))
+                               decoded)
+                res (db/transact-bundle store tenant-id
+                                        (into [] (keep :entry) resolved))
+                ;; Weave the store's responses back into input order around
+                ;; the entries it never saw.
+                from-store (volatile! (seq (:entry res)))
+                woven (mapv (fn [{:keys [error]}]
+                              (or error
+                                  (let [[head & tail] @from-store]
+                                    (vreset! from-store tail)
+                                    head)))
+                            resolved)]
+            (bundle-response (assoc res :entry woven) decoded)))
         {:status 400
          :body {:resourceType "OperationOutcome"
                 :issue [{:severity "error"
