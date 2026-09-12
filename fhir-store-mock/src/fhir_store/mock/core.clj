@@ -269,9 +269,23 @@
                                      method (:method req)
                                      url (:url req)
                                      resource (:resource entry)
-                                     [type id] (str/split url #"/")]
+                                     [type id] (str/split url #"/")
+                                     ;; State is keyed by whatever the caller
+                                     ;; passed, and every other verb is called
+                                     ;; with the keyword form. Splitting the
+                                     ;; url yields a string, so without this
+                                     ;; the whole Bundle wrote into a parallel
+                                     ;; bucket no read would ever look in.
+                                     rt (keyword type)
+                                     ;; update/delete-resource normalize the
+                                     ;; ETag spellings themselves; this only
+                                     ;; decides whether the entry carries a
+                                     ;; precondition at all. Dropping it would
+                                     ;; turn a guarded write into an
+                                     ;; unconditional one.
+                                     entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                                  (case method
-                                   "POST" (let [res (protocol/create-resource this tenant-id type nil resource)
+                                   "POST" (let [res (protocol/create-resource this tenant-id rt nil resource)
                                                 vid (get-in res [:meta :versionId])
                                                 last-mod (str (get-in res [:meta :lastUpdated]))]
                                             {:resource res
@@ -279,16 +293,22 @@
                                                         :location (str type "/" (:id res) "/_history/" vid)
                                                         :etag (str "W/\"" vid "\"")
                                                         :lastModified last-mod}})
-                                   "PUT" (let [res (protocol/update-resource this tenant-id type id resource)
+                                   "PUT" (let [res (if entry-if-match
+                                                     (protocol/update-resource this tenant-id rt id resource
+                                                                               {:if-match entry-if-match})
+                                                     (protocol/update-resource this tenant-id rt id resource))
                                                vid (get-in res [:meta :versionId])
                                                last-mod (str (get-in res [:meta :lastUpdated]))]
                                            {:resource res
                                             :response {:status "200 OK"
                                                        :etag (str "W/\"" vid "\"")
                                                        :lastModified last-mod}})
-                                   "DELETE" (do (protocol/delete-resource this tenant-id type id)
+                                   "DELETE" (do (if entry-if-match
+                                                  (protocol/delete-resource this tenant-id rt id
+                                                                            {:if-match entry-if-match})
+                                                  (protocol/delete-resource this tenant-id rt id))
                                                 {:response {:status "204 No Content"}})
-                                   "GET" (let [res (protocol/read-resource this tenant-id type id)]
+                                   "GET" (let [res (protocol/read-resource this tenant-id rt id)]
                                            (if res
                                              (let [vid (get-in res [:meta :versionId])
                                                    last-mod (str (get-in res [:meta :lastUpdated]))]
@@ -296,7 +316,12 @@
                                                 :response {:status "200 OK"
                                                            :etag (when vid (str "W/\"" vid "\""))
                                                            :lastModified last-mod}})
-                                             {:response {:status "404 Not Found"}})))))
+                                             {:response {:status "404 Not Found"}}))
+                                   (throw (ex-info (str "Bundle entry method not supported: " method)
+                                                   {:fhir/status 405
+                                                    :fhir/code "not-supported"
+                                                    :method method
+                                                    :url url})))))
                              ordered)]
            {:resourceType "Bundle"
             :type "transaction-response"
@@ -320,6 +345,10 @@
                       method (some-> (:method req) str/upper-case)
                       url (:url req)
                       [type id] (when url (str/split url #"/"))
+                      ;; Keyword, for the same reason as transact-transaction:
+                      ;; state is keyed by what the caller passes, and every
+                      ;; other verb passes the keyword form.
+                      rt (when type (keyword type))
                       resource (:resource entry)
                       ;; update/delete-resource normalize the ETag spellings
                       ;; themselves; this only decides whether the entry
@@ -327,7 +356,7 @@
                       entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                   (case method
                     "POST"
-                    (let [res (protocol/create-resource this tenant-id type nil resource)
+                    (let [res (protocol/create-resource this tenant-id rt nil resource)
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -338,9 +367,9 @@
 
                     "PUT"
                     (let [res (if entry-if-match
-                                (protocol/update-resource this tenant-id type id resource
+                                (protocol/update-resource this tenant-id rt id resource
                                                           {:if-match entry-if-match})
-                                (protocol/update-resource this tenant-id type id resource))
+                                (protocol/update-resource this tenant-id rt id resource))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -350,13 +379,13 @@
 
                     "DELETE"
                     (do (if entry-if-match
-                          (protocol/delete-resource this tenant-id type id
+                          (protocol/delete-resource this tenant-id rt id
                                                     {:if-match entry-if-match})
-                          (protocol/delete-resource this tenant-id type id))
+                          (protocol/delete-resource this tenant-id rt id))
                         {:response {:status "204 No Content"}})
 
                     "GET"
-                    (let [res (protocol/read-resource this tenant-id type id)]
+                    (let [res (protocol/read-resource this tenant-id rt id)]
                       (if res
                         (let [vid (get-in res [:meta :versionId])
                               last-mod (str (get-in res [:meta :lastUpdated]))]
