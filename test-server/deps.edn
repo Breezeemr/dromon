@@ -35,6 +35,10 @@
                       lambdaisland/kaocha    {:mvn/version "1.91.1392"}
                       fhir-store/mock        {:local/root "../fhir-store-mock"}
                       fhir-store/xtdb2       {:local/root "../fhir-store-xtdb2"}
+                      ;; datomic-search-compile-test asks the Datomic store's
+                      ;; query builder whether every declared parameter
+                      ;; compiles; the store lives outside the dromon tree.
+                      fhir-store/datomic     {:local/root "../../fhir-store-datomic"}
                       com.breezeehr/fhir-malli-r4b     {:local/root "../fhir/malli/r4b"}
                       com.breezeehr/fhir-malli-uscore8 {:local/root "../fhir/malli/uscore8"}
                       ;; Pinned top-level so top-dep-wins resolves the

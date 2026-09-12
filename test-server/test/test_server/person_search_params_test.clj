@@ -67,7 +67,26 @@
     (testing "every entry carries the columns the query builder needs"
       (doseq [pname (sort person-search-params)]
         (is (seq (:columns (get registry pname)))
-            (str pname " resolved to no columns"))))))
+            (str pname " resolved to no columns"))))
+
+    (testing "no column carries an unparsed FHIRPath fragment as its name"
+      ;; `phone` once resolved to `:sub-col \"where(system='phone')\"`: a
+      ;; column that exists, so the check above passed, and that no store can
+      ;; translate, so the parameter silently degraded to an in-memory match.
+      (doseq [pname (sort person-search-params)
+              col (:columns (get registry pname))]
+        (is (not (re-find #"\(" (str (:col col) (:sub-col col))))
+            (str pname " resolved to an untranslatable column " (pr-str col)))))
+
+    (testing "phone and email are telecom narrowed by a fixed system"
+      (is (= [{:col "telecom" :fhir-type "ContactPoint" :array? true
+               :fixed {:system "phone"}}]
+             (:columns (get registry "phone"))))
+      (is (= [{:col "telecom" :fhir-type "ContactPoint" :array? true
+               :fixed {:system "email"}}]
+             (:columns (get registry "email"))))
+      (is (= [{:col "telecom" :fhir-type "ContactPoint" :array? true}]
+             (:columns (get registry "telecom")))))))
 
 (deftest person-rejects-parameters-r4b-does-not-define-for-person
   (let [registry (person-registry)]

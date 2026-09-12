@@ -168,6 +168,14 @@
   (when-let [match (re-find #"^(.+?)\.where\(resolve\(\) is (\w+)\)$" expr)]
     [(nth match 1) (nth match 2)]))
 
+(defn- parse-where-system
+  "Parses `path.where(system='X')` returning [field-path system] or nil.
+   This is the shape of the `phone` and `email` SearchParameters:
+   `Patient.telecom.where(system='phone')`."
+  [expr]
+  (when-let [match (re-find #"^(.+?)\.where\(system\s*=\s*'([^']+)'\)$" expr)]
+    [(nth match 1) (nth match 2)]))
+
 (defn- parse-as-cast
   "Parses .as(type) returning [base-name cast-type] or nil."
   [expr]
@@ -314,6 +322,23 @@
                   :fhir-type (or (:fhir-type info) "Reference")
                   :array? (:array? info false)}])))
 
+          ;; .where(system='X') - a ContactPoint narrowed to one system
+          ;; (`phone`, `email`). The column is the telecom field itself; the
+          ;; system rides along as a fixed constraint the store ANDs in.
+          ;; Without this branch the expression fell through to the nested
+          ;; path case and emitted `:sub-col "where(system='phone')"`, a
+          ;; column no store can translate, so the parameter silently
+          ;; degraded to an in-memory match that ignored the system.
+          (str/includes? path ".where(system")
+          (when-let [[field-path system] (parse-where-system path)]
+            (mapv #(assoc % :fixed {:system system})
+                  (if (str/includes? field-path ".")
+                    (resolve-nested-path (str/split field-path #"\.") field-map)
+                    (let [info (get field-map field-path)]
+                      [{:col field-path
+                        :fhir-type (or (:fhir-type info) "ContactPoint")
+                        :array? (:array? info false)}]))))
+
           ;; .as(type) cast
           (str/includes? path ".as(")
           (when-let [[base-name cast-type] (parse-as-cast path)]
@@ -397,7 +422,11 @@
    {:type     \"token\"|\"reference\"|\"date\"|\"string\"
     :target   [\"Patient\"] or nil
     :columns  [{:col \"fieldName\" :fhir-type \"CodeableConcept\" :array? true
-                :sub-col \"subField\" :sub-fhir-type \"...\" :sub-array? bool} ...]}"
+                :sub-col \"subField\" :sub-fhir-type \"...\" :sub-array? bool
+                :fixed {:system \"phone\"}} ...]}
+
+   `:fixed` is present only on columns a `.where(system='X')` expression
+   narrows (`phone`, `email`): the store ANDs that system into the match."
   [search-param-refs cap-schema]
   (let [field-map (if cap-schema
                     (extract-field-map-from-cap-schema cap-schema)

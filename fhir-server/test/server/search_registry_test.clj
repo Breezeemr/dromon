@@ -82,3 +82,34 @@
       (is (= [{:col "subject" :fhir-type "Reference" :array? false}]
              (resolve-expression "Observation.subject.where(resolve() is Patient)"
                                  field-map "reference"))))))
+
+(deftest where-system-resolves-to-a-fixed-system-constraint
+  ;; `phone` and `email` are `telecom.where(system='phone')` and
+  ;; `telecom.where(system='email')`. Before this branch existed the
+  ;; expression fell into the nested-path case and emitted
+  ;; `:sub-col "where(system='phone')"`, a column no store could translate,
+  ;; so both parameters silently degraded to an in-memory match that
+  ;; ignored the system.
+  (let [resolve-expression #'sr/resolve-expression
+        field-map {"telecom" {:fhir-type "ContactPoint" :array? true}
+                   "contact" {:fhir-type "BackboneElement" :array? true
+                              :children {"telecom" {:fhir-type "ContactPoint" :array? true}}}}]
+    (testing "the telecom column carries the system as a fixed constraint"
+      (is (= [{:col "telecom" :fhir-type "ContactPoint" :array? true
+               :fixed {:system "phone"}}]
+             (resolve-expression "Person.telecom.where(system='phone')" field-map "token"))))
+    (testing "whitespace around the equals sign is tolerated"
+      (is (= [{:col "telecom" :fhir-type "ContactPoint" :array? true
+               :fixed {:system "email"}}]
+             (resolve-expression "Patient.telecom.where(system = 'email')" field-map "token"))))
+    (testing "a dotted path resolves through the nested machinery and keeps the constraint"
+      (is (= [{:col "contact" :fhir-type "BackboneElement" :array? true
+               :sub-col "telecom" :sub-fhir-type "ContactPoint" :sub-array? true
+               :fixed {:system "phone"}}]
+             (resolve-expression "Patient.contact.telecom.where(system='phone')" field-map "token"))))
+    (testing "the un-narrowed telecom parameter is unchanged"
+      (is (= [{:col "telecom" :fhir-type "ContactPoint" :array? true}]
+             (resolve-expression "Person.telecom" field-map "token"))))
+    (testing "no descriptor leaks an unparsed FHIRPath fragment as a column name"
+      (doseq [col (resolve-expression "Person.telecom.where(system='phone')" field-map "token")]
+        (is (not (re-find #"\(" (str (:col col) (:sub-col col)))))))))
