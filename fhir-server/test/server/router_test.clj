@@ -56,6 +56,7 @@
    :cors-origins          #{allowed-origin}
    :trace-tap             nil
    :terminology           nil
+   :narrative             nil
    :bulk-job-store        nil})
 
 (def ^:private keypair
@@ -273,6 +274,7 @@
    ::router/coerce-exceptions
    ::router/fhir-store
    ::router/terminology
+   ::router/narrative
    ::router/bulk-job-store
    ::router/keto-url
    ::router/jwt-auth

@@ -1,6 +1,7 @@
 (ns server.handlers
   (:require [fhir-store.protocol :as db]
             [fhir-terminology.protocol :as terminology]
+            [server.narrative :as narrative]
             [malli.core :as m]
             [malli.transform :as mt]
             [clojure.string :as str]
@@ -369,7 +370,13 @@
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
         id (-> req :path-params :id)
-        resource-body (get-in req [:parameters :body])
+        ;; Narrative is derived at the BINDING, not at each db/... call, so all
+        ;; three write branches below (If-Match update, plain update,
+        ;; upsert-create) are covered by one edit -- and so is any branch added
+        ;; later.
+        resource-body (narrative/ensure-narrative (:fhir/narrative req)
+                                                  resource-type
+                                                  (get-in req [:parameters :body]))
         body-id (:id resource-body)
         expected-version (parse-if-match req)]
     (cond
@@ -439,7 +446,14 @@
                        :diagnostics (str resource-type "/" id " not found")}]}}
 
       :else
-      (let [patched (json-patch/apply-patch existing patch-ops)
+      ;; Derived from the server's read-modify-write RESULT, never from the
+      ;; client's RFC 6902 ops: a client op targeting /text or /text/div
+      ;; therefore has no effect on the saved narrative, because the kernel
+      ;; dissocs :text before rendering and re-assocs its own.
+      (let [patched (narrative/ensure-narrative
+                     (:fhir/narrative req)
+                     resource-type
+                     (json-patch/apply-patch existing patch-ops))
             opts (when expected-version {:if-match expected-version})
             result (if opts
                      (db/update-resource store tenant-id (keyword resource-type) id patched opts)
@@ -573,8 +587,12 @@
 
 (defn- do-create
   "Perform the actual resource creation, returning a 201 response."
-  [store tenant-id resource-type resource-body]
-  (let [id (str (java.util.UUID/randomUUID))
+  [store tenant-id resource-type resource-body narrative-fn]
+  ;; One edit covers both callers: create-resource's plain path and its
+  ;; If-None-Exist zero-match branch. The one-match branch returns an existing
+  ;; resource without writing and must NOT be touched.
+  (let [resource-body (narrative/ensure-narrative narrative-fn resource-type resource-body)
+        id (str (java.util.UUID/randomUUID))
         res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
         base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
         vid (get-in res [:meta :versionId])]
@@ -608,7 +626,8 @@
                  match-count (count results)]
              (cond
                (zero? match-count)
-               (do-create store tenant-id resource-type resource-body)
+               (do-create store tenant-id resource-type resource-body
+                          (:fhir/narrative req))
 
                (= 1 match-count)
                {:status 200 :body (first results)}
@@ -620,7 +639,8 @@
                                 :code "duplicate"
                                 :diagnostics "Conditional create found multiple matches"}]}})))))
       ;; No If-None-Exist: create normally
-      (do-create store tenant-id resource-type resource-body))))
+      (do-create store tenant-id resource-type resource-body
+                 (:fhir/narrative req)))))
 
 (defn- ensure-coll
   "Coerce a value to a collection. If already sequential, return as-is; otherwise wrap in a vector."
@@ -991,7 +1011,10 @@
   (let [store (:fhir/store req)
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
-        resource-body (get-in req [:parameters :body])
+        ;; At the binding: covers both the create branch and the update branch.
+        resource-body (narrative/ensure-narrative (:fhir/narrative req)
+                                                  resource-type
+                                                  (get-in req [:parameters :body]))
         search-registry (:fhir/search-registry req)
         params (merge (or (:query-params req) {}) (or (:form-params req) {}))]
     (or
@@ -1080,7 +1103,10 @@
          (= 1 match-count)
          (let [existing (first results)
                id (:id existing)
-               patched (json-patch/apply-patch existing patch-ops)
+               patched (narrative/ensure-narrative
+                        (:fhir/narrative req)
+                        resource-type
+                        (json-patch/apply-patch existing patch-ops))
                result (db/update-resource store tenant-id (keyword resource-type) id patched)]
            {:status 200 :body result})
 
@@ -1884,13 +1910,22 @@
                           :data {:tenant-id tenant-id
                                  :entry-count (count raw-entries)}}
                          (decode-bundle-entries decoders raw-entries))
-                entries (resolve-patch-entries store tenant-id entries)]
+                ;; ORDERING PIN: the narrative pass runs AFTER
+                ;; `resolve-patch-entries`, never before. That rewrite turns a
+                ;; PATCH entry into a guarded PUT, so deriving from the
+                ;; pre-patch body would persist prose describing the resource
+                ;; as it used to be — silently, with no failed write.
+                entries (narrative/ensure-bundle-narrative
+                         (:fhir/narrative req)
+                         (resolve-patch-entries store tenant-id entries))]
             (bundle-response (db/transact-transaction store tenant-id entries) entries))
           ;; Batch: each entry independent. Decode entries (with per-entry
           ;; spans), then hand off to the store's batch impl which emits
           ;; :store/transact-bundle around its work. A PATCH this server
           ;; cannot resolve becomes that entry's own error response rather
           ;; than failing its siblings.
+          ;; Batch, not just transaction: same handler, same client-visible
+          ;; write, so it gets the same narrative pass, on resolved entries.
           (let [decoded (decode-bundle-entries decoders raw-entries)
                 resolved (mapv (fn [entry]
                                  (if (patch-entry? entry)
@@ -1899,7 +1934,9 @@
                                    {:entry entry}))
                                decoded)
                 res (db/transact-bundle store tenant-id
-                                        (into [] (keep :entry) resolved))
+                                        (narrative/ensure-bundle-narrative
+                                         (:fhir/narrative req)
+                                         (into [] (keep :entry) resolved)))
                 ;; Weave the store's responses back into input order around
                 ;; the entries it never saw.
                 from-store (volatile! (seq (:entry res)))

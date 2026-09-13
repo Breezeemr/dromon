@@ -100,6 +100,17 @@
   (fn [req]
     (handler (assoc req :fhir/store store))))
 
+(defn wrap-narrative
+  "Inject the host's `Resource.text` derivation function, mirroring
+   wrap-fhir-store. The write handlers read it from :fhir/narrative via
+   `server.narrative`.
+
+   dromon renders no clinical prose of its own. A host that injects nothing
+   gets no narrative -- not an empty one -- which is also the kill switch."
+  [handler narrative-fn]
+  (fn [req]
+    (handler (assoc req :fhir/narrative narrative-fn))))
+
 (defn wrap-terminology [handler terminology]
   (fn [req]
     (handler (assoc req :fhir/terminology terminology))))
@@ -270,7 +281,7 @@
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
-                 jwks-url enforce-smart-scopes? login-url]}]
+                 jwks-url enforce-smart-scopes? login-url narrative]}]
   (cond-> []
     trace-tap
     (conj {:name ::trace-tap :wrap trace-tap})
@@ -300,6 +311,7 @@
            (assoc rrc/coerce-exceptions-middleware :name ::coerce-exceptions)
            {:name ::fhir-store :wrap (fn [handler] (wrap-fhir-store handler store))}
            {:name ::terminology :wrap (fn [handler] (wrap-terminology handler terminology))}
+           {:name ::narrative :wrap (fn [handler] (wrap-narrative handler narrative))}
            {:name ::bulk-job-store
             :wrap (fn [handler] (wrap-bulk-job-store handler bulk-job-store))}
            {:name ::keto-url :wrap (fn [handler] (wrap-keto-url handler keto-url))}
