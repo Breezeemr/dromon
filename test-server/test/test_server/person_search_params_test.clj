@@ -3,10 +3,17 @@
 
    Person declares no `searchParam` block in
    `fhir-igs/breeze-ig/package/CapabilityStatement-breeze-server.json`; its 19
-   parameters arrive through the automatic base-R4B merge in
+   R4B parameters arrive through the automatic base-R4B merge in
    `com.breezeehr.capability-statement/rest-resources` and are baked into the
    generated `breeze.capability.v1-0-0.Person/capability`. Nothing at runtime
    reads the authored JSON for parameters, so the declaration is not the risk.
+
+   The twentieth, `_text`, is the exception to everything below: it is
+   authored in the CapabilityStatement, its SearchParameter (Resource-text)
+   has no expression, so the registry can never resolve it, and the search
+   handler grants it from the store (`fhir-store.protocol/ITextSearchStore`)
+   rather than from the registry. It is pinned as declared and pinned as
+   absent from the registry, so a change on either side shows up.
 
    The risk is downstream: `server.search-registry/build-resource-registry`
    silently drops any parameter whose FHIRPath expression fails to resolve to
@@ -28,25 +35,28 @@
 
 (def ^:private declared-params
   "Every parameter `breeze.capability.v1-0-0.Person/capability` declares."
-  #{"address" "address-city" "address-country" "address-postalcode"
+  #{"_text"
+    "address" "address-city" "address-country" "address-postalcode"
     "address-state" "address-use" "birthdate" "email" "gender" "identifier"
     "link" "name" "organization" "patient" "phone" "phonetic" "practitioner"
     "relatedperson" "telecom"})
 
 (def ^:private person-search-params
-  "The parameters that survive registry resolution. Pinned as a literal: a
-   silent drop in `build-resource-registry` is the failure this test exists to
-   catch, and it can only be seen as a difference from a known-good set."
-  declared-params)
+  "The parameters that survive registry resolution: everything declared except
+   `_text`, which is answered by a full-text index rather than a column.
+   Pinned as a literal: a silent drop in `build-resource-registry` is the
+   failure this test exists to catch, and it can only be seen as a difference
+   from a known-good set."
+  (into #{} (remove sr/text-param?) declared-params))
 
 (def ^:private person-search-minimum
   "The subset person-search grows into. Called out separately from the pinned
    set so a failure says which page breaks, not just that a set changed."
   #{"name" "birthdate" "gender" "identifier" "telecom" "address"})
 
-(deftest person-declares-nineteen-search-params
+(deftest person-declares-twenty-search-params
   (let [declared (into #{} (map :name) (:search-params (person-properties)))]
-    (is (= 19 (count declared)))
+    (is (= 20 (count declared)))
     (is (= declared-params declared)
         "the generated capability's declared set changed; regenerate expectations
          only after confirming the base-R4B merge really did change")))
@@ -62,7 +72,10 @@
       (is (= person-search-params (set (keys registry)))
           (str "declared but dropped: "
                (pr-str (vec (sort (remove (set (keys registry)) declared-params))))))
-      (is (= 19 (count registry))))
+      (is (= 19 (count registry)))
+      (is (not (contains? registry "_text"))
+          "_text is a store capability, not a registry entry; a registry that
+           resolved it would let a store without an index run it unfiltered"))
 
     (testing "every entry carries the columns the query builder needs"
       (doseq [pname (sort person-search-params)]
@@ -96,4 +109,10 @@
     (testing "family/given are HumanName parts, not Person parameters in R4B;
               the page must search on `name`"
       (is (= ["family"] (sr/unsupported-filter-params registry {"family" "smith"})))
-      (is (= ["given"] (sr/unsupported-filter-params registry {"given" "ann"}))))))
+      (is (= ["given"] (sr/unsupported-filter-params registry {"given" "ann"}))))
+
+    (testing "_text is refused by the registry alone and granted only with the
+              store's say-so"
+      (is (= ["_text"] (sr/unsupported-filter-params registry {"_text" "smith"})))
+      (is (= [] (sr/unsupported-filter-params registry {"_text" "smith"}
+                                              {:text-search? true}))))))
