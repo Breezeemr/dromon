@@ -30,6 +30,10 @@
   "Moved to server.router; alias kept for external consumers."
   router/wrap-fhir-store)
 
+(def wrap-narrative
+  "See `server.router/wrap-narrative`."
+  router/wrap-narrative)
+
 (def wrap-terminology
   "Moved to server.router; alias kept for external consumers."
   router/wrap-terminology)
