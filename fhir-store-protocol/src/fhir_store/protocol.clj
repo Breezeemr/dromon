@@ -325,11 +325,34 @@
      Exact replacement over the portion: elements absent from `resource` are
      absent from the result, never inherited from the version being replaced.
      Still a new system-time version, so versionId advances as for any update.")
-  (close-valid-time [this tenant-id resource-type id valid-from]
-    "Retroactive termination: the resource ceases to be true from `valid-from`
-     onward, learned now. History is preserved -- reads at an earlier system
-     time still see it live, and reads valid-before `valid-from` still find it.
-     This is the retro-eligibility primitive."))
+  (close-valid-time
+    [this tenant-id resource-type id valid-from]
+    [this tenant-id resource-type id valid-from valid-to]
+    "Retroactive termination over a portion of the valid-time axis, learned now:
+     the resource ceases to be true over [valid-from, valid-to), and from
+     `valid-to` onward it is again whatever was separately stated for it. This
+     is the retro-eligibility primitive.
+
+     `valid-to` is EXCLUSIVE, and nil means end-of-time: the five-argument form
+     IS the six-argument form with nil. The axis is half-open throughout --
+     `put-valid-time`'s vt bounds and the timeline's bounds are exclusive too --
+     so a `valid-to` equal to a later portion's valid-from leaves that portion
+     untouched, its system time included, while a `valid-to` falling inside a
+     portion SPLITS it: what lies before `valid-from` stands, [valid-from,
+     valid-to) is retracted, and what lies from `valid-to` on stands.
+
+     The portion is a cut, not a lookup. Neither bound need coincide with an
+     existing boundary, and a portion that overlaps nothing writes nothing and
+     is not an error. `valid-to` must be later than `valid-from`: an empty or
+     inverted portion is REFUSED, with nothing written, which is neither a
+     no-op nor a close to end-of-time. Both bounds are Instants, and a FHIR
+     Period.end is inclusive, so the caller converts it, to the start of the
+     following day, before calling. `valid-from` is required: a nil there reads
+     as beginning-of-time and erases the whole run.
+
+     History is preserved: reads at an earlier system time still see the
+     retracted portion live, and reads valid-outside the portion still find
+     it."))
 
 ;; ---------------------------------------------------------------------------
 ;; Full-text search extension protocol.

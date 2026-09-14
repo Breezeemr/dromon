@@ -154,3 +154,257 @@
         (testing "the store advertises both axes"
           (is (= #{:system-time :valid-time} (db/temporal-axes store))))
         (finally (close-store-nodes! store))))))
+
+;; ---------------------------------------------------------------------------
+;; A bounded close.
+;;
+;; `close-valid-time` takes a `valid-to`, so a retroactive termination can
+;; shorten the run it is about instead of erasing everything after its start.
+;; The tests below are the boundary matrix: nil, inside a rectangle, exactly on
+;; the next rectangle's valid-from, in a gap, over nothing, and inverted.
+;; ---------------------------------------------------------------------------
+
+(def ^:private feb (inst "2026-02-01T00:00:00Z"))
+(def ^:private mar (inst "2026-03-01T00:00:00Z"))
+(def ^:private apr (inst "2026-04-01T00:00:00Z"))
+(def ^:private may (inst "2026-05-01T00:00:00Z"))
+(def ^:private jun (inst "2026-06-01T00:00:00Z"))
+(def ^:private jul (inst "2026-07-01T00:00:00Z"))
+(def ^:private long-after   (inst "2030-01-01T00:00:00Z"))
+(def ^:private prior-mid    (inst "2025-06-01T00:00:00Z"))
+(def ^:private prior-start  (inst "2025-01-01T00:00:00Z"))
+
+(defn- current-rows
+  "Timeline rows still believed. A nil :system-to is what 'currently' means."
+  [store tid id]
+  (filter #(nil? (:system-to %)) (db/resource-timeline store tid :Coverage id nil)))
+
+(defn- current-rects
+  "The currently believed rectangles as [valid-from valid-to payor], oldest
+   first. A nil valid-to is end-of-time."
+  [store tid id]
+  (->> (current-rows store tid id)
+       (map (fn [row]
+              [(some-> (:valid-from row) .toInstant str)
+               (some-> (:valid-to row) .toInstant str)
+               (first (payors (:resource row)))]))
+       (sort-by first)
+       vec))
+
+(defn- row-starting-at [store tid id t]
+  (first (filter #(= (str t) (some-> (:valid-from %) .toInstant str))
+                 (current-rows store tid id))))
+
+(defn- payor-at [store tid id t]
+  (first (payors (db/read-as-of store tid :Coverage id {:valid-time t}))))
+
+(defn- covers? [row ^Instant t]
+  (let [from (some-> (:valid-from row) .toInstant)
+        to   (some-> (:valid-to row) .toInstant)]
+    (and (or (nil? from) (not (.isAfter ^Instant from t)))
+         (or (nil? to) (.isBefore t ^Instant to)))))
+
+(defn- refusal-code
+  "The invalid-portion code, wherever in the chain it sits. The store raises it
+   itself before issuing the statement, so it is on the top-level ex-data; when
+   the engine raises it instead, a store span rethrows that wrapped and the
+   code sits on a cause. Walking the chain covers both."
+  [t]
+  (some #(:xtdb.error/code (ex-data %))
+        (take-while some? (iterate ex-cause t))))
+
+(defn- close-failure [f]
+  (try (f) nil (catch Throwable t t)))
+
+(deftest bounded-close-with-nil-is-the-unbounded-close
+  (testing "the five-argument close IS the six-argument close with nil"
+    ;; Backward compatibility, and the reason there is only one code path: the
+    ;; shorter arity delegates rather than keeping a second statement alive.
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-nil-bound"]
+      (try
+        (doseq [id ["cov-5" "cov-6"]]
+          (db/put-valid-time store tid :Coverage id (coverage "aetna")
+                             {:valid-from year-start}))
+        (Thread/sleep 10)
+        (db/close-valid-time store tid :Coverage "cov-5" term-date)
+        (db/close-valid-time store tid :Coverage "cov-6" term-date nil)
+
+        (is (= (current-rects store tid "cov-5") (current-rects store tid "cov-6"))
+            "both arities land on the same timeline")
+        (is (= [[(str year-start) (str term-date) "aetna"]]
+               (current-rects store tid "cov-6"))
+            "which is today's outcome: one rectangle ending at the termination")
+        (doseq [t [mar dos long-after]]
+          (is (= (payor-at store tid "cov-5" t) (payor-at store tid "cov-6" t))
+              (str "the two arities agree at " t)))
+
+        (testing "nil is end-of-time, not now"
+          (is (nil? (payor-at store tid "cov-6" long-after))
+              "a read years past today still finds nothing, so the close ran to
+               the end of the axis rather than stopping at the present"))
+        (finally (close-store-nodes! store))))))
+
+(deftest a-bound-inside-a-rectangle-splits-it
+  (testing "the portion is erased and what lies beyond it stands"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-split"]
+      (try
+        (db/put-valid-time store tid :Coverage "cov" (coverage "aetna")
+                           {:valid-from year-start})
+        (Thread/sleep 10)
+        (db/close-valid-time store tid :Coverage "cov" mar jun)
+
+        (is (= [[(str year-start) (str mar) "aetna"]
+                [(str jun) nil "aetna"]]
+               (current-rects store tid "cov"))
+            "one rectangle became two, not none")
+        (is (= "aetna" (payor-at store tid "cov" feb)) "before the portion")
+        (is (nil? (payor-at store tid "cov" apr)) "inside it")
+        (is (= "aetna" (payor-at store tid "cov" jul)) "after it")
+        (finally (close-store-nodes! store))))))
+
+(deftest a-bound-equal-to-the-next-start-leaves-it-untouched
+  (testing "a termination shortens the run it is about, and a separately stated later period stands"
+    ;; The half-open axis at its sharpest: the bound is the next rectangle's
+    ;; own valid-from, and that rectangle must not be touched at all.
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-boundary"]
+      (try
+        (db/put-valid-time store tid :Coverage "cov" (coverage "aetna")
+                           {:valid-from year-start})
+        (Thread/sleep 10)
+        (db/put-valid-time store tid :Coverage "cov" (coverage "cigna")
+                           {:valid-from jul})
+        (let [cigna-before (:system-from (row-starting-at store tid "cov" jul))]
+          (is (some? cigna-before) "the later period is there to be left alone")
+          (Thread/sleep 10)
+          (db/close-valid-time store tid :Coverage "cov" apr jul)
+
+          (is (= [[(str year-start) (str apr) "aetna"]
+                  [(str jul) nil "cigna"]]
+                 (current-rects store tid "cov")))
+          (is (= cigna-before (:system-from (row-starting-at store tid "cov" jul)))
+              "the later period was not rewritten: its system time is unchanged")
+          (is (= "aetna" (payor-at store tid "cov" mar)) "before the termination")
+          (is (nil? (payor-at store tid "cov" may)) "inside the terminated run")
+          (is (= "cigna" (payor-at store tid "cov" jul))
+              "and the bound itself belongs to the later period"))
+        (finally (close-store-nodes! store))))))
+
+(deftest a-portion-is-a-cut-not-a-lookup
+  (testing "neither bound need coincide with an existing boundary"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-cut"]
+      (try
+        (doseq [id ["cov-on" "cov-before"]]
+          (db/put-valid-time store tid :Coverage id (coverage "aetna")
+                             {:valid-from year-start}))
+        (Thread/sleep 10)
+        (db/close-valid-time store tid :Coverage "cov-on" year-start mar)
+        (db/close-valid-time store tid :Coverage "cov-before" prior-mid mar)
+
+        (is (= [[(str mar) nil "aetna"]] (current-rects store tid "cov-on"))
+            "a portion starting exactly at the rectangle's start")
+        (is (= [[(str mar) nil "aetna"]] (current-rects store tid "cov-before"))
+            "and one starting before it reach the same place")
+        (finally (close-store-nodes! store))))))
+
+(deftest a-bound-in-a-gap-erases-only-the-intersection
+  (testing "a portion needs no rectangle under it"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-gap"]
+      (try
+        (db/put-valid-time store tid :Coverage "cov" (coverage "aetna")
+                           {:valid-from year-start :valid-to apr})
+        (Thread/sleep 10)
+        (db/put-valid-time store tid :Coverage "cov" (coverage "cigna")
+                           {:valid-from jul})
+        (Thread/sleep 10)
+        ;; Feb to May spans the end of the first period, the gap, and nothing else.
+        (db/close-valid-time store tid :Coverage "cov" feb may)
+
+        (is (= [[(str year-start) (str feb) "aetna"]
+                [(str jul) nil "cigna"]]
+               (current-rects store tid "cov"))
+            "exactly the intersection went, and the gap was not an error")
+        (finally (close-store-nodes! store))))))
+
+(deftest a-portion-touching-nothing-writes-nothing
+  (testing "a close over a stretch no version occupies is a no-op, not an error"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-untouched"]
+      (try
+        (db/put-valid-time store tid :Coverage "cov" (coverage "aetna")
+                           {:valid-from year-start})
+        (let [rects-before (current-rects store tid "cov")
+              rows-before  (count (db/resource-timeline store tid :Coverage "cov" nil))]
+          (Thread/sleep 10)
+          (db/close-valid-time store tid :Coverage "cov" prior-start prior-mid)
+
+          (is (= rects-before (current-rects store tid "cov")))
+          (is (= rows-before (count (db/resource-timeline store tid :Coverage "cov" nil)))
+              "no phantom version: nothing was written at all"))
+        (finally (close-store-nodes! store))))))
+
+(deftest an-inverted-or-empty-portion-is-refused
+  (testing "a valid-to at or before valid-from is refused with nothing written"
+    ;; The rule this pins is that such a portion is neither a no-op nor a close
+    ;; to end-of-time. Reading it as `TO NULL` would turn a zero-width close
+    ;; into an unbounded one, silently.
+    ;;
+    ;; The fixture is BOUNDED and half the portions fall outside it on purpose.
+    ;; The engine validates a portion only for the rows its DELETE selects, so
+    ;; over one open-ended rectangle every portion overlaps and the refusal
+    ;; fires whoever owns the rule -- a fixture that cannot tell the store's
+    ;; rule from the engine's incidental one, and so proves neither. The
+    ;; selecting-nothing pair is where the engine falls silent, and is what
+    ;; makes this a test of the guarantee the protocol states rather than of
+    ;; the rows that happened to overlap.
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-refused"]
+      (try
+        (db/put-valid-time store tid :Coverage "cov" (coverage "aetna")
+                           {:valid-from year-start :valid-to jun})
+        (let [rects-before (current-rects store tid "cov")
+              rows-before  (count (db/resource-timeline store tid :Coverage "cov" nil))]
+          (doseq [[label from to] [["inverted, overlapping the rectangle" apr feb]
+                                   ["empty, overlapping the rectangle" mar mar]
+                                   ["inverted, selecting nothing" long-after jul]
+                                   ["empty, selecting nothing" jul jul]]]
+            (testing label
+              (let [failure (close-failure
+                             #(db/close-valid-time store tid :Coverage "cov" from to))]
+                (is (some? failure) "the write must not be accepted")
+                (is (= :xtdb.indexer/invalid-valid-times (refusal-code failure))
+                    "and the refusal names the portion, whoever raised it")
+                (is (= rects-before (current-rects store tid "cov"))
+                    "the resource is untouched")
+                (is (= rows-before
+                       (count (db/resource-timeline store tid :Coverage "cov" nil)))
+                    "and no version was written")))))
+        (finally (close-store-nodes! store))))))
+
+(deftest a-bounded-close-preserves-history
+  (testing "the bounded form is a retraction on the system axis, not a rewrite"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-bounded-history"]
+      (try
+        (db/put-valid-time store tid :Coverage "cov" (coverage "aetna")
+                           {:valid-from year-start})
+        (let [before (:system-time (db/current-basis store tid))]
+          (Thread/sleep 10)
+          (db/close-valid-time store tid :Coverage "cov" mar jun)
+
+          (is (= ["aetna"] (payors (db/read-as-of store tid :Coverage "cov"
+                                                  {:valid-time apr :system-time before})))
+              "what we believed about April before the news is still readable")
+          (is (nil? (db/read-as-of store tid :Coverage "cov" {:valid-time apr}))
+              "while what we now know about April is that nothing covered it")
+          (is (= "aetna" (payor-at store tid "cov" jul))
+              "and July, past the bound, was never in question")
+          (is (some #(and (some? (:system-to %)) (covers? % apr))
+                    (db/resource-timeline store tid :Coverage "cov" nil))
+              "and the retracted portion is still in the timeline, closed on the
+               system axis rather than deleted"))
+        (finally (close-store-nodes! store))))))
