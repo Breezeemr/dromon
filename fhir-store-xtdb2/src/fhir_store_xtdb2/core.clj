@@ -1428,6 +1428,24 @@
 ;;
 ;; Note also that a bare INSERT (no bounds) is valid from NOW, not for all
 ;; time. Backdated truth must always name its portion.
+;;
+;; A portion DELETE is a cut, not a lookup, and the same rectangle splitting
+;; applies. Verified on 2.2.0-beta1: `FROM ? TO ?` erases exactly the
+;; intersection of the portion with what is there, so a bound inside a
+;; rectangle leaves the part beyond it standing, a bound equal to a later
+;; rectangle's valid-from leaves that rectangle and its _system_from untouched
+;; (the axis is half-open), and a portion overlapping nothing writes no row at
+;; all rather than erroring. Binding nil to `TO ?` is end-of-time, byte-for-byte
+;; the old `TO NULL` result, which is why one format string serves both the
+;; bounded and the unbounded close and the plan-cache key stays stable. Binding
+;; nil to `FROM ?` is beginning-of-time and erases the whole run.
+;;
+;; An empty or inverted portion is REFUSED and nothing is written. It is neither
+;; a no-op nor a close to end-of-time. The STORE refuses it, not the engine: the
+;; engine validates a portion only for the rows the DELETE selects, so a
+;; malformed portion overlapping no live rectangle of that resource would
+;; otherwise be accepted silently -- the guarantee holding for the rows that
+;; happen to overlap and not for the call.
 ;; ---------------------------------------------------------------------------
 
 (defn- put-valid-time-sql
@@ -1444,11 +1462,32 @@
           (assoc-in [:meta :versionId] new-version))
       tx-key)))
 
+(defn- refuse-empty-portion!
+  "Refuses an empty or inverted portion before the statement is issued.
+
+   The engine validates a portion only for the rows the DELETE actually
+   selects, so a malformed portion overlapping no live rectangle of this
+   resource is accepted and writes nothing -- indistinguishable from a portion
+   that legitimately touched nothing, and the opposite of what the protocol
+   promises. The store owns the rule instead, so `valid-to` later than
+   `valid-from` holds for EVERY call rather than for the ones that happen to
+   overlap. Non-Instant bounds are left to the engine, which coerces them."
+  [resource-type id valid-from valid-to]
+  (when (and (instance? Instant valid-from)
+             (instance? Instant valid-to)
+             (not (.isBefore ^Instant valid-from ^Instant valid-to)))
+    (throw (ex-info "Invalid valid times: valid-to must be later than valid-from"
+                    {:fhir/status 400 :fhir/code "invalid"
+                     :xtdb.error/code :xtdb.indexer/invalid-valid-times
+                     :resource-type (name resource-type) :id id
+                     :valid-from valid-from :valid-to valid-to}))))
+
 (defn- close-valid-time-sql
-  [node resource-type id valid-from]
-  (let [sql (format "DELETE FROM %s FOR PORTION OF VALID_TIME FROM ? TO NULL WHERE _id = ?"
+  [node resource-type id valid-from valid-to]
+  (refuse-empty-portion! resource-type id valid-from valid-to)
+  (let [sql (format "DELETE FROM %s FOR PORTION OF VALID_TIME FROM ? TO ? WHERE _id = ?"
                     (table-name resource-type))
-        tx-key (xt/execute-tx node [[:sql sql [valid-from id]]])]
+        tx-key (xt/execute-tx node [[:sql sql [valid-from valid-to id]]])]
     (with-basis {} tx-key)))
 
 (defn- reject-xtql-temporal!
@@ -2002,13 +2041,16 @@
          (put-valid-time-sql conn resource-type id resource vt storage-encoders)))))
 
   (close-valid-time [this tenant-id resource-type id valid-from]
+    (fp/close-valid-time this tenant-id resource-type id valid-from nil))
+
+  (close-valid-time [this tenant-id resource-type id valid-from valid-to]
     (reject-xtql-temporal! query-mode)
     (ftrace/trace!
      {:id :store/close-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
        (with-open [conn (jdbc/get-connection pool)]
-         (close-valid-time-sql conn resource-type id valid-from))))))
+         (close-valid-time-sql conn resource-type id valid-from valid-to))))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
   ;; In a real XTDB implementation, we'd query for codes using XTDB

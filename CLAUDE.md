@@ -206,6 +206,25 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   that portion: XTDB splits the surrounding rectangles and the new version
   carries only the columns written. A merge-style `UPDATE ... SET` would be
   wrong -- it leaves stale columns behind.
+- `DELETE ... FOR PORTION OF VALID_TIME FROM ? TO ?` erases exactly the
+  intersection of the portion with what is there, splitting rectangles the same
+  way an INSERT does. A bound equal to a later rectangle's `_valid_from` leaves
+  that rectangle and its `_system_from` untouched -- the axis is half-open --
+  and a portion overlapping nothing writes no row rather than erroring.
+- Binding nil to `TO ?` is end-of-time, identical to a literal `TO NULL`, so
+  one statement serves both the bounded and the unbounded close and the plan
+  cache keeps one entry. Binding nil to `FROM ?` is beginning-of-time and
+  erases the whole run.
+- An empty or inverted valid-time portion is REFUSED with nothing written --
+  neither a no-op nor a close to end-of-time. The STORE refuses it before
+  issuing the statement (`:fhir/status 400`, `:xtdb.error/code
+  :xtdb.indexer/invalid-valid-times` on the top-level `ex-data`), because the
+  engine validates a portion only for the rows the DELETE selects: a malformed
+  portion overlapping no live rectangle of that resource is otherwise accepted
+  silently, so the guarantee would hold for the rows that happen to overlap
+  rather than for the call. Where the engine does raise, it is
+  `xtdb.error.Incorrect` and a store span rethrows it wrapped, so that code
+  sits on the cause.
 
 ### Auth stack
 - **JWT**: `server.auth/wrap-jwt-auth` -- HS256 with `JWT_DEV_SECRET` env var (dev) or RS256 with JWKS from `JWKS_URL` (prod)
