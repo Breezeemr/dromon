@@ -177,18 +177,25 @@ A `batch` Bundle gives no such guarantee: `transact-bundle` processes entries
 independently, so the resource can land while its provenance fails. Use
 `transaction` whenever the attribution has to hold.
 
-Two limits worth knowing:
+What the store contributes on its own is system time: every version records the
+instant its transaction was indexed, which dates the attribution without a
+caller-supplied clock.
+
+Two things to know about the current state:
 
 - **The server does not synthesize `Provenance` from the authenticated
   principal.** A writer that wants attribution includes it in the Bundle. The
   JWT identity is used for authorization, not for generating provenance
   records.
-- **There is no store-level transaction metadata API.** Provenance is carried
-  as FHIR data rather than as annotations on the underlying transaction, which
-  keeps it portable across backends and searchable through the normal FHIR
-  surface. What the store contributes is system time: every version records the
-  instant its transaction was indexed, which dates the attribution without a
-  caller-supplied clock.
+- **XTDB's transaction metadata is available but unused.** Since v2.1 the
+  engine accepts a `:metadata` key in the `submit-tx` / `execute-tx` opts map
+  and stores it in the `user_metadata` column of the `xt.txs` table, which the
+  XTDB API documents for request IDs, correlation IDs, and data lineage.
+  `fhir-store-xtdb2` calls `xt/execute-tx` without an opts map, so nothing is
+  written there today. It is the natural seam for engine-level lineage (the
+  request or agent-run id behind a commit) sitting underneath the FHIR-level
+  `Provenance` record, and it is backend-specific: the key is XTDB's, and the
+  `IFHIRStore` protocol does not expose it.
 
 ## Conformance-Driven Configuration
 
