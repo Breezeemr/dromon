@@ -55,11 +55,29 @@ admission" extracted from current state includes the diagnosis added three
 weeks after discharge. Nothing errors; the numbers are just better than they
 should be.
 
-And a correction stops rewriting the past. Fix a record retroactively on a
-forgetting database and the system looks as though it had always been right.
-Valid time keeps the two statements apart: true from Friday, learned from this
-run on Tuesday. Monday's decision stays explicable, and the run that changed
-the record stays visible. Mechanics are in
+And a correction stops rewriting the past. On the twentieth the payer reports
+that the coverage above ended on the first. On a forgetting database you set an
+end date and the system looks as though it had always known. Here the fix is a
+retroactive close, a store verb that names the portion of valid time it covers:
+
+```clojure
+(db/close-valid-time store "default" :Coverage "cov-1"
+                     (Instant/parse "2026-03-01T00:00:00Z"))
+```
+
+The same instant now answers differently depending on which question you ask.
+
+```
+GET /default/fhir/Coverage/cov-1/$as-of?_asOf=2026-03-10T00:00:00Z&_validAt=2026-03-10T00:00:00Z
+  -> 200, active: what was true on the tenth, as we knew it on the tenth
+
+GET /default/fhir/Coverage/cov-1/$as-of?_validAt=2026-03-10T00:00:00Z
+  -> 404: what was true on the tenth, as we know it now
+```
+
+The claim adjudicated on the tenth stays explicable, and the correction stays
+dated to the twentieth. Valid-time writes are store verbs today, not HTTP; the
+reads are. Mechanics are in
 [Getting Started](docs/getting-started.md#point-in-time-reads).
 
 ### It keeps provenance
@@ -108,12 +126,17 @@ backend's storage model without forking the server.
 
 A server whose behaviour is spread by hand across route tables and validators
 has no single place where a requirement lives, so a model editing it is editing
-a dozen loosely coupled guesses. Here a specification change is mechanical:
-point the generator at the revised guide, regenerate, run the suite. A
-tightened cardinality fails validation, a changed search expression fails its
-contract test, and a new type shows up as a route with no handler. That loop
-runs in CI, where an AI-assisted change should be judged, and `bb inferno-test`
-gates US Core compliance the same way. TypeScript types for profiled resources
+a dozen loosely coupled guesses. Here a schema upgrade is mechanical.
+The generator pins the guide (`download-and-extract-uscore! "STU8.0.1"`) and
+emits namespaces that carry the version (`us-core.capability.v8-0-1.Patient`),
+which the server's spec vector names. To take the next US Core release you
+change the pin, regenerate, repoint the spec vector, and run the suite.
+`validator-compile-test` requires those namespaces by name and fails to load
+until it is repointed; a search parameter the new guide dropped fails
+`search-param-contract-test`, which insists every declared parameter is
+honoured or reported; a newly declared type shows up as a route with no
+handler. That loop runs in CI, where an AI-assisted change should be judged,
+and `bb inferno-test` gates US Core compliance the same way. TypeScript types for profiled resources
 and operations are planned, not shipped. Details in
 [Conformance-Driven Configuration](docs/getting-started.md#conformance-driven-configuration).
 
