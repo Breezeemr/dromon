@@ -136,18 +136,9 @@ until it is repointed; a search parameter the new guide dropped fails
 `search-param-contract-test`, which insists every declared parameter is
 honoured or reported; a newly declared type shows up as a route with no
 handler. That loop runs in CI, where an AI-assisted change should be judged,
-and `bb inferno-test` gates US Core compliance the same way. TypeScript types for profiled resources
-and operations are planned, not shipped. Details in
+and `bb inferno-test` gates US Core compliance the same way. TypeScript types
+for profiled resources and operations are planned, not shipped. Details in
 [Conformance-Driven Configuration](docs/getting-started.md#conformance-driven-configuration).
-
-### What it costs
-
-Storage grows with every version, not every record. Retroactive writes must
-name the valid-time portion they cover, because DML without one applies from
-now on and a plain update becomes a silent prospective change. System time
-cannot be backfilled once a tenant is live, so historical imports run
-oldest-first. Dromon encodes each of these in the API: a request naming an axis
-its store lacks is a `400`, never a silently-current answer.
 
 ## Project Structure
 
