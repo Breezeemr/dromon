@@ -13,215 +13,132 @@ server, architecture, schema generation, and the test and compliance tasks.
 
 ## A FHIR Server Well Adapted to AI
 
-A growing share of decisions against a clinical record are now made by
-something that reads the record, acts on it, and cannot be asked afterward what
-it was thinking. Two properties of Dromon carry most of the weight there.
+A growing share of decisions against a clinical record are made by something
+that reads the record, acts on it, and cannot be asked afterward what it was
+thinking. Dromon is built for that setting on three properties: it never
+forgets, it keeps provenance, and it is malleable.
 
-The store never overwrites. XTDB v2 is the primary backend and Datomic is kept
-as a benchmarked alternative; a write adds a version and nothing is destroyed.
-Nobody has to switch history on, because there is no mode in which the database
-discards it.
+### It never forgets
 
-The server is also malleable. Its FHIR surface comes from conformance
-resources rather than hand-written routing and validation code, so reshaping
-what it serves and what it enforces is a data change with a test suite
-attached.
+The store never overwrites. XTDB v2 is the primary backend and Datomic a
+benchmarked alternative; a write adds a version and nothing is destroyed. Every
+version carries two timestamps.
 
-Neither property was invented for machine learning. Both matter more now.
-
-### A decision cannot be debugged against a database that moved on
-
-A model's output is a function of its input. When that input was assembled from
-database reads (the problem list, the last six months of encounters, the
-eligibility on file) and the database has since moved on, the input is gone.
-You still have the output and the prompt template, but not the data the
-template was filled with.
-
-That gap collapses two very different failures into one indistinguishable
-event: the model reasoned badly over correct data, or it reasoned correctly
-over data that was wrong at the time and has since been quietly fixed. The
-first is worth retraining over. The second is a data pipeline incident. On a
-forgetting database you cannot tell them apart, and teams end up arguing from
-intuition about which one they are looking at.
-
-With a system-time read, the input is addressable again. Re-read at the
-transaction the request ran against and you get the exact context back, so the
-disagreement becomes something a person can actually check.
-
-### Point-in-time reads keep the future out of training data
-
-Build a feature by querying current state and you have leaked the future into
-the past. The "diagnosis at admission" extracted last night includes the
-diagnosis that was added three weeks after discharge. The model learns from
-information no deployed version of it will ever see at inference time, scores
-well offline, and underperforms in production.
-
-Look-ahead bias is difficult to catch because nothing fails. No query errors
-and no test goes red; the numbers are just better than they should be. A store
-that can reconstruct the record at an arbitrary instant makes honest feature
-extraction the default, so it no longer rests on the discipline of whoever
-wrote the query.
-
-### Agents write, and they write with confidence
-
-A read-only assistant is the easy case. An agent that updates records, closes
-coverage, or files corrections is acting on the system of record, where a
-mistake is a wrong row, not a wrong paragraph, with payments and care decisions
-sitting downstream of it.
-
-On a forgetting database the remedy for a bad agent run is another `UPDATE`,
-which destroys the evidence of what the run did. On an immutable one the run is
-still fully present: what the agent read, what it wrote, in what order, and
-what the record looked like immediately before it touched anything. You can
-reconstruct the whole run with a query instead of piecing it together from
-whatever the logs happened to keep.
-
-Immutability records that a row changed and when it changed. It does not on its
-own record who changed it or why. FHIR answers that with the `Provenance`
-resource, which Dromon treats as a first-class type: routed, validated, and
-compartment-indexed by `agent`. Everything a given run touched is one search
-away, with no grep through application logs.
-
-A `transaction` Bundle carrying the changed resource and its `Provenance`
-together commits atomically, so either both land or neither does. Attribution
-recorded afterward, in a separate call, can fail on its own and leave a change
-sitting in the record with nothing to account for it. Committing the two as one
-transaction removes that failure mode, and the system time the store stamps on
-that transaction dates the attribution without anyone supplying a clock. The
-shape of that Bundle, and what the server does not do for you, are in
-[Provenance and Attribution](docs/getting-started.md#provenance-and-attribution).
-
-### A correction should not rewrite the past
-
-When an agent retroactively fixes a record, the naive implementation makes the
-system look as though it had been right all along. Two separate statements get
-flattened into one. Valid time keeps them apart: the fact was true from Friday,
-and we learned it from this run on Tuesday. The record still shows what it said
-on Monday, so the decision made on Monday remains explicable, and the agent's
-contribution stays attributable to the agent.
-
-Without that separation, every correction erases exactly the evidence you would
-need in order to judge whether the agent should be trusted with the next one.
-An automated system that quietly improves its own history cannot be audited,
-and an unauditable system has no business making decisions that carry a cost.
-
-### The malleability of the server
-
-Nothing about the server's FHIR surface is compiled in. Which resource types
-exist, what they validate, what they can be searched by, and which operations
-they expose all come from the conformance resources of whichever implementation
-guide is on the classpath:
-
-| FHIR artifact | What it determines |
-|---|---|
-| CapabilityStatement | Which resource types exist and which interactions each one supports. Routes are emitted from it, so a type that does not declare `read` has no read route. |
-| StructureDefinition | The Malli schema for every profiled resource: the typed validator that decodes requests and checks responses on the way out. |
-| SearchParameter | The search registry. Each parameter is combined with schema introspection to build SQL conditions, so no field name is hardcoded in the store layer. |
-| OperationDefinition | The custom operations mounted on each type, and what the served CapabilityStatement then advertises. |
-
-The CapabilityStatement is both input and output. It decides which routes exist,
-and the statement served at `/{tenant-id}/fhir/metadata` is generated from the
-same source, so the server's description of itself cannot drift away from its
-behaviour. What each artifact drives is detailed in
-[Conformance-Driven Configuration](docs/getting-started.md#conformance-driven-configuration).
-
-Two choices happen at startup, not at build time. The schema package comes
-from an alias (`:malli/r4b`, `:malli/uscore8`, `:malli/sdc` and others,
-including a private Breeze IG that lives outside this repository), and the
-store backend comes from another (`:store/xtdb2`, `:store/mock`,
-`:store/datomic`). `fhir-server` carries a static dependency on neither, so the
-same server code serves a different FHIR surface over a different database
-depending on what you put on the classpath.
-
-The seam is finer than whole packages. When a private guide ships a storage
-registry, `server.core/resolve-schema` recompiles the resolved schema under it,
-which is how the Breeze guide stores ordered multi-string fields
-(`HumanName.given`, `Address.line`) as cardinality-one strings on Datomic. The
-hook is classpath-detected and does nothing when the package is absent, so a
-profile can adapt itself to a backend's storage model without forking the
-server or leaking into the open-source build.
-
-That malleability is what makes the server a reasonable target for automated
-change. A server whose behaviour is spread by hand across route tables,
-validation functions, and per-parameter search code has no single place where a
-requirement lives, so a model editing it is really editing a dozen loosely
-coupled guesses, and nothing catches the one it missed.
-
-Here a specification change propagates mechanically. Point the generator at a
-revised implementation guide, regenerate the schemas and validators, and run the
-suite. Whatever breaks is the work: a profile that tightened a cardinality fails
-validation, a search parameter that changed expression fails its contract test,
-a resource type added to the CapabilityStatement shows up as a route with no
-handler. None of that depends on anyone remembering what the revision touched.
-
-That loop is short enough to run in CI, which is the right place to judge an
-AI-assisted change. The model proposes a guide revision; the generator and the
-test suite decide whether it holds. Compliance is checked the same way, since
-`bb inferno-test` runs the Inferno US Core suite headlessly against a real
-server and writes a report a build can gate on.
-
-TypeScript type generation for profiled resources and operations is planned but
-not yet implemented. The StructureDefinitions that produce the Malli validators
-already carry what those declarations would need, which would give a client the
-same profile-accurate types the server validates against.
-
-### The questions are going to be asked
-
-Healthcare and payment decisions have to be explainable after the fact, and
-"the model said so" has never been a sufficient answer. The defensible answer
-names the evidence: this is what the record said at the moment of the decision,
-this is who or what wrote each part of it, and this is when we learned the part
-we learned late. That answer requires a database that kept all of it.
-
-## Two Kinds of Time
-
-- **Valid time** is when a fact was true in the world.
+- **Valid time** is when the fact was true in the world.
 - **System time** is when the system learned it.
 
 A lab specimen drawn on Friday and corrected on Tuesday is valid from Friday
 and known from Tuesday. A coverage termination backdated to the first of the
-month was true from the first and recorded on the twentieth.
+month was true from the first and recorded on the twentieth. Keep one axis and
+you can reconstruct one of those. You will not find out which one you needed
+until somebody asks why a claim was denied.
 
-Keep one axis and you can reconstruct one of those. You will not find out which
-one you needed until somebody asks why a claim was denied.
-
-FHIR versions records, not facts. `_history` and `vread` give you system time,
-and the specification has no valid-time axis at all. Dromon adds one as an
-explicit selector a store must advertise support for, so an unqualified `GET`
-still means current state.
-
-## What It Costs
-
-Storage grows with every version rather than every record.
-
-Retroactive writes have to name the portion of the valid-time axis they apply
-to. Valid-time DML without a portion clause applies from now on, so a
-correction issued as a plain update is a silent prospective change, not the
-retroactive one its author meant.
-
-System time cannot be backfilled once a tenant is live, so historical imports
-have to run oldest-first, before live traffic.
-
-Dromon encodes each of these in the API surface so none of them survive as
-folklore. A store advertises which axes it has, and a request naming an axis
-the store lacks is a `400`, never a silently-current answer.
-
-## How Dromon Exposes It
+FHIR versions records, not facts: `_history` gives you system time, and the
+specification has no valid-time axis at all. Dromon adds one as a selector a
+store must advertise, so a plain `GET` still means current state.
 
 | Surface | Question it answers |
 |---|---|
-| `_asOf` | As the server knew it then (system time) |
-| `_validAt` | As it was true in the world (valid time) |
-| `$as-of` | One resource at a point in time |
-| `$timeline` | Every version of one resource, with its temporal bounds |
+| `_asOf` | As the server knew it then |
+| `_validAt` | As it was true in the world |
+| `$as-of`, `$timeline` | One resource at an instant, or every version with its bounds |
 
-Temporal responses state the basis they were computed at, since an omitted
-`_asOf` resolves to a different instant on every request. A store declares
-which axes it supports, and the server refuses a selector it cannot honour
-instead of returning a plausible wrong number.
+This is what makes a model's decision debuggable. When its input was database
+reads and the database has since moved on, you have the prompt template but not
+the data it was filled with, and a model that reasoned badly over correct data
+looks identical to one that reasoned correctly over data since quietly fixed.
+Re-read at the transaction the request ran against and the disagreement becomes
+something a person can check.
 
-The wire format, the protocols behind it, and the rules the server enforces are
-documented in [Getting Started](docs/getting-started.md#point-in-time-reads).
+The same read keeps the future out of training data. A "diagnosis at
+admission" extracted from current state includes the diagnosis added three
+weeks after discharge. Nothing errors; the numbers are just better than they
+should be.
+
+And a correction stops rewriting the past. On the twentieth the payer reports
+that the coverage above ended on the first. On a forgetting database you set an
+end date and the system looks as though it had always known. Here the fix is a
+retroactive close, a store verb that names the portion of valid time it covers:
+
+```clojure
+(db/close-valid-time store "default" :Coverage "cov-1"
+                     (Instant/parse "2026-03-01T00:00:00Z"))
+```
+
+The same instant now answers differently depending on which question you ask.
+
+```
+GET /default/fhir/Coverage/cov-1/$as-of?_asOf=2026-03-10T00:00:00Z&_validAt=2026-03-10T00:00:00Z
+  -> 200, active: what was true on the tenth, as we knew it on the tenth
+
+GET /default/fhir/Coverage/cov-1/$as-of?_validAt=2026-03-10T00:00:00Z
+  -> 404: what was true on the tenth, as we know it now
+```
+
+The claim adjudicated on the tenth stays explicable, and the correction stays
+dated to the twentieth. Valid-time writes are store verbs today, not HTTP; the
+reads are. Mechanics are in
+[Getting Started](docs/getting-started.md#point-in-time-reads).
+
+### It keeps provenance
+
+Immutability records that a row changed and when. It does not record who or
+why. FHIR's answer is the `Provenance` resource, and Dromon treats it as a
+first-class type: routed, validated, and compartment-indexed by `agent`.
+Everything a given run touched is one search away.
+
+Write it in the same transaction as the change. A `transaction` Bundle carrying
+the resource and its `Provenance` commits atomically, so either both land or
+neither does. Attribution written afterward can fail on its own and leave a
+change with nothing to account for it. Underneath, XTDB stamps system time on
+every commit and accepts a `:metadata` map per transaction for request or
+agent-run ids, a seam `fhir-store-xtdb2` does not use yet. See
+[Provenance and Attribution](docs/getting-started.md#provenance-and-attribution).
+
+An agent that updates records or closes coverage is acting on the system of
+record, where a mistake is a wrong row with payments downstream of it. On a
+forgetting database the remedy is another `UPDATE`, which destroys the
+evidence. Here the run is fully present: what it read, what it wrote, and what
+the record looked like before it touched anything. An automated system that
+quietly improves its own history cannot be audited, and an unauditable system
+has no business making decisions that carry a cost.
+
+### It is malleable
+
+Nothing about the server's FHIR surface is compiled in. It comes from the
+conformance resources of whichever implementation guide is on the classpath.
+
+| Artifact | Determines |
+|---|---|
+| CapabilityStatement | Which types exist and which interactions each supports. A type that does not declare `read` has no read route. |
+| StructureDefinition | The Malli validator for each profiled resource. |
+| SearchParameter | The search registry, combined with schema introspection so no field name is hardcoded in the store. |
+| OperationDefinition | The operations mounted per type, and what `/metadata` advertises. |
+
+The served CapabilityStatement is generated from the same source as the routes,
+so the server's description of itself cannot drift from its behaviour. The
+schema package (`:malli/uscore8`, `:malli/r4b`, a private Breeze IG outside
+this repository) and the store backend (`:store/xtdb2`, `:store/datomic`,
+`:store/mock`) are both aliases chosen at startup, and `fhir-server` depends
+statically on neither. A private guide can even ship a storage registry that
+`server.core/resolve-schema` recompiles schemas under, adapting a profile to a
+backend's storage model without forking the server.
+
+A server whose behaviour is spread by hand across route tables and validators
+has no single place where a requirement lives, so a model editing it is editing
+a dozen loosely coupled guesses. Here a schema upgrade is mechanical.
+The generator pins the guide (`download-and-extract-uscore! "STU8.0.1"`) and
+emits namespaces that carry the version (`us-core.capability.v8-0-1.Patient`),
+which the server's spec vector names. To take the next US Core release you
+change the pin, regenerate, repoint the spec vector, and run the suite.
+`validator-compile-test` requires those namespaces by name and fails to load
+until it is repointed; a search parameter the new guide dropped fails
+`search-param-contract-test`, which insists every declared parameter is
+honoured or reported; a newly declared type shows up as a route with no
+handler. That loop runs in CI, where an AI-assisted change should be judged,
+and `bb inferno-test` gates US Core compliance the same way. TypeScript types
+for profiled resources and operations are planned, not shipped. Details in
+[Conformance-Driven Configuration](docs/getting-started.md#conformance-driven-configuration).
 
 ## Project Structure
 
