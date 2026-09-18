@@ -154,3 +154,121 @@
                                :fhir/resource-type "Person"})]
         (is (= 403 (:status response)))
         (is (nil? (:login-url (:body response))))))))
+
+(deftest request-objects-are-realm-scoped
+  (testing "the realm is the object's first segment, matching the convention
+            breezeehr-role and practitioner-id already use"
+    (is (= ["r1/Patient"] (keto/request-objects "r1" "Patient" nil false)))
+    (is (= ["r1/Patient" "r1/Patient/123"]
+           (keto/request-objects "r1" "Patient" "123" false)))
+    (is (= ["r1/system"] (keto/request-objects "r1" nil nil false))))
+
+  (testing "the legacy realm-blind objects come AFTER the scoped ones, so once
+            the backfill has run the first check answers and the extra calls
+            stop being made"
+    (is (= ["r1/Patient" "Patient"] (keto/request-objects "r1" "Patient" nil true)))
+    (is (= ["r1/Patient" "r1/Patient/123" "Patient" "Patient/123"]
+           (keto/request-objects "r1" "Patient" "123" true))))
+
+  (testing "a request with no realm keeps the bare object: /auth/grants and the
+            token hook are global surfaces, not unscoped ones, and an empty
+            realm segment would ask Keto about an object nothing ever wrote"
+    (is (= ["Patient"] (keto/request-objects nil "Patient" nil true)))
+    (is (= ["system"] (keto/request-objects "" nil nil true)))))
+
+(deftest realm-scoped-check-precedes-the-legacy-one
+  (testing "a subject holding only the realm's tuple is allowed, and the legacy
+            object is never asked about"
+    (let [asked (atom [])]
+      (with-redefs [hc/get (fn [_ opts]
+                             (let [object (get-in opts [:query-params "object"])]
+                               (swap! asked conj object)
+                               {:status 200 :body {:allowed (= "r1/Patient" object)}}))]
+        (let [handler (fn [_] {:status 200 :body "OK"})
+              wrapped (keto/wrap-keto-authorization handler {:keto-url "http://mock-keto"})
+              response (wrapped {:identity {:sub "user123"}
+                                 :request-method :get
+                                 :path-params {:tenant-id "r1"}
+                                 :fhir/resource-type "Patient"})]
+          (is (= 200 (:status response)))
+          (is (= ["r1/Patient"] @asked))))))
+
+  (testing "a grant written before realm-scoping still authorizes while the
+            fallback is on -- this is what keeps the deploy from locking
+            everyone out before the backfill runs"
+    (with-redefs [hc/get (fn [_ opts]
+                           {:status 200
+                            :body {:allowed (= "Patient"
+                                               (get-in opts [:query-params "object"]))}})]
+      (let [handler (fn [_] {:status 200 :body "OK"})
+            wrapped (keto/wrap-keto-authorization handler {:keto-url "http://mock-keto"})]
+        (is (= 200 (:status (wrapped {:identity {:sub "user123"}
+                                      :request-method :get
+                                      :path-params {:tenant-id "r1"}
+                                      :fhir/resource-type "Patient"})))))))
+
+  (testing "with the fallback off, a realm-blind grant authorizes nothing --
+            which is the whole point of the migration, and what step 4 turns on"
+    (with-redefs [hc/get (fn [_ opts]
+                           {:status 200
+                            :body {:allowed (= "Patient"
+                                               (get-in opts [:query-params "object"]))}})]
+      (let [handler (fn [_] {:status 200 :body "OK"})
+            wrapped (keto/wrap-keto-authorization
+                      handler {:keto-url "http://mock-keto"
+                               :legacy-realm-blind-fallback? false})
+            response (wrapped {:identity {:sub "user123"}
+                               :request-method :get
+                               :path-params {:tenant-id "r1"}
+                               :fhir/resource-type "Patient"})]
+        (is (= 403 (:status response)))
+        (is (= "Subject user123 is not allowed to read r1/Patient"
+               (-> response :body :issue first :diagnostics)))))))
+
+(deftest a-grant-in-one-realm-does-not-reach-another
+  (testing "the defect this work closes: a subject granted Patient read in r1
+            is refused in r2, where before realm-scoping the same tuple
+            authorized every realm the server hosts"
+    (with-redefs [hc/get (fn [_ opts]
+                           {:status 200
+                            :body {:allowed (= "r1/Patient"
+                                               (get-in opts [:query-params "object"]))}})]
+      (let [handler (fn [_] {:status 200 :body "OK"})
+            wrapped (keto/wrap-keto-authorization
+                      handler {:keto-url "http://mock-keto"
+                               :legacy-realm-blind-fallback? false})
+            in-realm (fn [realm]
+                       (wrapped {:identity {:sub "user123"}
+                                 :request-method :get
+                                 :path-params {:tenant-id realm}
+                                 :fhir/resource-type "Patient"}))]
+        (is (= 200 (:status (in-realm "r1"))))
+        (is (= 403 (:status (in-realm "r2"))))))))
+
+(deftest denial-names-the-object-the-request-was-about
+  (testing "an instance request denied on both objects reports the instance,
+            not the type it happened to check first"
+    (with-redefs [hc/get (fn [_ _] {:status 403 :body {:allowed false}})]
+      (let [handler (fn [_] {:status 200 :body "OK"})
+            wrapped (keto/wrap-keto-authorization handler {:keto-url "http://mock-keto"})
+            response (wrapped {:identity {:sub "user123"}
+                               :request-method :get
+                               :path-params {:tenant-id "r1" :id "123"}
+                               :fhir/resource-type "Patient"})]
+        (is (= "Subject user123 is not allowed to read r1/Patient/123"
+               (-> response :body :issue first :diagnostics)))))))
+
+(deftest system-read-is-checked-per-realm
+  (testing "the :public? bulk-data gate scopes to the realm in the path: a
+            full-tenant export is the widest read the server offers, and these
+            routes bypass both the Keto middleware and flotilla's realm check"
+    (with-redefs [hc/get (fn [_ opts]
+                           {:status 200
+                            :body {:allowed (= "r1/system"
+                                               (get-in opts [:query-params "object"]))}})]
+      (is (keto/system-read-allowed? "http://mock-keto" "r1" "user123" false))
+      (is (not (keto/system-read-allowed? "http://mock-keto" "r2" "user123" false)))))
+
+  (testing "a subject with no id is never allowed, whatever Keto would say"
+    (with-redefs [hc/get (fn [_ _] {:status 200 :body {:allowed true}})]
+      (is (not (keto/system-read-allowed? "http://mock-keto" "r1" nil false))))))

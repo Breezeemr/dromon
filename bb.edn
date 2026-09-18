@@ -157,9 +157,22 @@
    :task (runner/run-check!)}
 
   smart-grant
-  {:doc "Grants a subject SMART access to a set of patients: creates a Hydra app client (unless --subject) and records Keto tuples via the running server's /auth/grants API. Args: [--subject <id>] --patients p1,p2 [--relations read,write] [--revoke | --list]"
+  {:doc "Grants a subject SMART access to a set of patients: creates a Hydra app client (unless --subject) and records Keto tuples via the running server's /auth/grants API. Args: [--subject <id>] --patients p1,p2 [--realm <realm>] [--relations read,write] [--revoke | --list]"
    :requires ([server.smart-grant :as smart-grant])
    :task (apply smart-grant/-main *command-line-args*)}
+
+  keto-realm-backfill
+  {:doc "Backfills the fhir Keto namespace from realm-blind objects to realm-scoped ones. DRY RUN unless --apply. Args: [--realm <realm>] [--apply] [--prune]. See docs/keto-realm-scoping.md."
+   :requires ([server.keto-realm-backfill :as backfill])
+   :task (apply backfill/-main *command-line-args*)}
+
+  keto-realm-backfill-test
+  {:doc "Unit tests for the realm backfill planner. Needs no running Keto."
+   :requires ([babashka.classpath :as cp] [clojure.test :as test])
+   :task (do (cp/add-classpath "bb/test")
+             (require 'server.keto-realm-backfill-test)
+             (let [{:keys [fail error]} (test/run-tests 'server.keto-realm-backfill-test)]
+               (System/exit (if (pos? (+ fail error)) 1 0))))}
 
   generate-uscore
   {:doc "Generates Malli schema packages (r4b, xver, fhir-extensions, sdc, uscore8) from FHIR StructureDefinitions. Pass --force to regenerate when output already exists."

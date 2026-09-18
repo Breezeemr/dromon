@@ -29,34 +29,102 @@
       (log/error e "Keto authorization check failed for" object relation subject-id)
       false)))
 
+(def default-legacy-realm-blind-fallback?
+  "Whether a realm-scoped check also accepts the pre-realm-scoping object.
+
+   True for the duration of the realm-scoping migration: tuples written before
+   it carry no realm, and a Keto check for \"<realm>/Patient\" is not answered
+   by a \"Patient\" tuple (verified against Keto v0.12.0), so without this
+   every existing grant would stop authorizing the moment the reader changed.
+
+   Turning it off is what proves the backfill complete, which is why it is
+   configuration (`KETO_LEGACY_REALM_BLIND_FALLBACK=0`) and not a code
+   constant: the step that drops the legacy shape has to be reversible without
+   a deploy. See docs/keto-realm-scoping.md."
+  true)
+
+(defn- scoped-object
+  "`object` prefixed with `realm`, or unchanged when there is no realm.
+   A realm can never contain a slash -- it arrives as one URL path segment --
+   so the prefix stays unambiguous however many segments `object` has."
+  [realm object]
+  (if (str/blank? (str realm))
+    object
+    (str realm "/" object)))
+
+(defn- base-objects
+  "The realm-blind objects a request could be authorized by, least specific
+   first. Type-level before instance-level because a type-level grant is the
+   common one, so checking it first usually settles the request in one call."
+  [fhir-type resource-id]
+  (cond
+    (and fhir-type resource-id) [fhir-type (str fhir-type "/" resource-id)]
+    fhir-type                   [fhir-type]
+    :else                       ["system"]))
+
+(defn request-object
+  "The object a request is ABOUT: the most specific one, realm-scoped.
+
+   Distinct from [[request-objects]], which is the list of objects that may
+   authorize the request. This is what the log line and the 403 diagnostics
+   name, because reporting the object that merely happened to be checked first
+   would tell an operator a denied instance request was refused on the type."
+  [realm fhir-type resource-id]
+  (scoped-object realm (peek (base-objects fhir-type resource-id))))
+
+(defn request-objects
+  "The Keto objects that may authorize one request, in the order to check them.
+
+   Realm-scoped objects come first so that once the backfill has run the first
+   check answers and the legacy calls are never made; while legacy tuples are
+   still the common case this costs up to two extra checks per request, which
+   is the accepted price of not locking everyone out on deploy.
+
+   A request carrying no realm -- grant administration under /auth/grants, the
+   Hydra token hook -- keeps the bare object. That surface is global rather
+   than unscoped by oversight, and prefixing it with an empty realm segment
+   would ask Keto about an object nothing ever wrote."
+  [realm fhir-type resource-id legacy-realm-blind?]
+  (let [base (base-objects fhir-type resource-id)]
+    (if (str/blank? (str realm))
+      base
+      (cond-> (mapv #(scoped-object realm %) base)
+        legacy-realm-blind? (into base)))))
+
 (defn- authorized?
-  "Check if subject-id is authorized to perform relation on the given resource.
-   For instance-level access (e.g. Patient/123), checks type-level permission
-   first (e.g. Patient), then falls back to instance-level. This allows
-   type-level grants to cover all instances of that resource type."
-  [keto-url namespace fhir-type resource-id relation subject-id]
-  (let [has-instance? (and fhir-type resource-id)]
-    (if has-instance?
-      ;; Instance-level request: check type-level first (more common grant),
-      ;; then instance-level as fallback
-      (or (check-permission keto-url namespace fhir-type relation subject-id)
-          (check-permission keto-url namespace (str fhir-type "/" resource-id) relation subject-id))
-      ;; Type-level or system request: check directly
-      (let [object (cond
-                     fhir-type fhir-type
-                     :else "system")]
-        (check-permission keto-url namespace object relation subject-id)))))
+  "Whether `subject-id` holds `relation` on any of `objects`.
+
+   `some` short-circuits, so a subject authorized by the realm-scoped object
+   costs exactly one Keto call and the legacy fallback is never reached."
+  [keto-url namespace objects relation subject-id]
+  (boolean (some #(check-permission keto-url namespace % relation subject-id)
+                 objects)))
 
 (defn system-read-allowed?
-  "Whether `subject-id` holds a 'system' read tuple in the 'fhir' namespace.
-   Public entry point mirroring the middleware's check against the 'system'
+  "Whether `subject-id` holds a system read tuple in the 'fhir' namespace for
+   `realm`.
+
+   Public entry point mirroring the middleware's check against the system
    object, for :public? routes (bulk-data $export / $export-file) where
    wrap-keto-authorization is bypassed and the handler must perform the same
-   authorization check itself. `keto-url` falls back to the default when nil."
-  [keto-url subject-id]
-  (boolean
-   (and subject-id
-        (check-permission (or keto-url default-keto-url) "fhir" "system" "read" subject-id))))
+   authorization check itself.
+
+   `realm` is required for these routes rather than optional: they are mounted
+   under /:tenant-id and a full-tenant export is the widest read the server
+   offers, so a realm-blind gate here would let a subject exported from one
+   realm drain every other. A nil realm still answers -- against the bare
+   object -- because the fallback below has to keep pre-migration grants
+   working, but it is not a shape any bulk route produces.
+
+   `keto-url` falls back to the default when nil."
+  ([keto-url realm subject-id]
+   (system-read-allowed? keto-url realm subject-id default-legacy-realm-blind-fallback?))
+  ([keto-url realm subject-id legacy-realm-blind?]
+   (boolean
+    (and subject-id
+         (authorized? (or keto-url default-keto-url) "fhir"
+                      (request-objects realm nil nil legacy-realm-blind?)
+                      "read" subject-id)))))
 
 (defn unauthenticated-response
   "The answer to a request that carries no subject at all.
@@ -86,8 +154,13 @@
    Bypasses authorization if the route specifies `:public? true` in its match-data.
 
    `:login-url` is advertised on the 401 a subject-less request receives; see
-   `unauthenticated-response`."
-  [handler {:keys [keto-url login-url] :or {keto-url default-keto-url}}]
+   `unauthenticated-response`.
+
+   `:legacy-realm-blind-fallback?` keeps the pre-realm-scoping objects as a
+   fallback; see `default-legacy-realm-blind-fallback?`."
+  [handler {:keys [keto-url login-url legacy-realm-blind-fallback?]
+            :or {keto-url default-keto-url
+                 legacy-realm-blind-fallback? default-legacy-realm-blind-fallback?}}]
   (fn [request]
     (let [route-data (get-in request [:reitit.core/match :data])
           public? (:public? route-data)]
@@ -125,10 +198,16 @@
                              :patch "write"
                              "read"))
               resource-id (get-in request [:path-params :id])
-              object (cond
-                       (and fhir-type resource-id) (str fhir-type "/" resource-id)
-                       fhir-type fhir-type
-                       :else "system")]
+              ;; The realm the request addresses, read off the route's
+              ;; :tenant-id path parameter -- the same accessor
+              ;; flotilla/.../fhir.clj `request->realm` uses. Read from the
+              ;; match rather than by splitting :uri because a BFF that mounts
+              ;; dromon under a prefix strips that prefix before the chain
+              ;; runs, leaving the realm at no fixed offset in the URI.
+              realm (get-in request [:path-params :tenant-id])
+              objects (request-objects realm fhir-type resource-id
+                                       legacy-realm-blind-fallback?)
+              object (request-object realm fhir-type resource-id)]
 
           (log/info "Keto authz -> subject:" subject-id "relation:" relation "object:" object "uri:" uri)
           (if (not subject-id)
@@ -139,8 +218,10 @@
                                     :namespace "fhir"
                                     :relation relation
                                     :object object
+                                    :objects objects
+                                    :realm realm
                                     :fhir-type fhir-type}}
-                            (authorized? keto-url "fhir" fhir-type resource-id relation subject-id))]
+                            (authorized? keto-url "fhir" objects relation subject-id))]
               (if allowed?
                 (handler request)
                 {:status 403
