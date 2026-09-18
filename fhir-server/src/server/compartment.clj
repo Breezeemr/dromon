@@ -469,9 +469,18 @@
   (resource-deleted? [_ tenant-id resource-type id]
     (db/resource-deleted? base tenant-id resource-type id))
 
-  (create-resource [_ tenant-id resource-type id resource]
+  (create-resource [this tenant-id resource-type id resource]
+    (db/create-resource this tenant-id resource-type id resource nil))
+
+  ;; Every write arity forwards `opts` UNCHANGED to `base`. A wrapper that
+  ;; implemented an opts arity by calling the delegate's no-opts arity is the
+  ;; silent-drop bug `fhir-store.protocol/ITxMetadataStore` names: the write
+  ;; succeeds and its attribution is gone.
+  (create-resource [_ tenant-id resource-type id resource opts]
     (if (write-in-compartment? all-registries patient-id resource-type id resource)
-      (db/create-resource base tenant-id resource-type id resource)
+      (if opts
+        (db/create-resource base tenant-id resource-type id resource opts)
+        (db/create-resource base tenant-id resource-type id resource))
       (forbidden-write!)))
 
   (update-resource [this tenant-id resource-type id resource]
@@ -500,11 +509,21 @@
   (history-type [_ tenant-id resource-type params]
     (db/history-type base tenant-id resource-type params))
 
-  (transact-transaction [_ tenant-id entries]
-    (db/transact-transaction base tenant-id entries))
+  (transact-transaction [this tenant-id entries]
+    (db/transact-transaction this tenant-id entries nil))
 
-  (transact-bundle [_ tenant-id entries]
-    (db/transact-bundle base tenant-id entries))
+  (transact-transaction [_ tenant-id entries opts]
+    (if opts
+      (db/transact-transaction base tenant-id entries opts)
+      (db/transact-transaction base tenant-id entries)))
+
+  (transact-bundle [this tenant-id entries]
+    (db/transact-bundle this tenant-id entries nil))
+
+  (transact-bundle [_ tenant-id entries opts]
+    (if opts
+      (db/transact-bundle base tenant-id entries opts)
+      (db/transact-bundle base tenant-id entries)))
 
   (create-tenant [_ tenant-id] (db/create-tenant base tenant-id))
   (create-tenant [_ tenant-id opts] (db/create-tenant base tenant-id opts))
@@ -520,7 +539,15 @@
   (scan-type-as-of [_ tenant-id resource-type basis]
     (db/scan-type-as-of base tenant-id resource-type basis))
   (count-as-of [_ tenant-id resource-type basis]
-    (db/count-as-of base tenant-id resource-type basis)))
+    (db/count-as-of base tenant-id resource-type basis))
+
+  ;; A capability a delegate does not have cannot be added from outside the
+  ;; chain, so the question is simply passed down. Declaring it matters: this
+  ;; store REPLACES :fhir/store per request, so were it silent here, every
+  ;; attributed write under a patient token would be refused.
+  db/ITxMetadataStore
+  (tx-metadata-supported? [_ tenant-id]
+    (db/tx-metadata-store? base tenant-id)))
 
 (defn filtering-store
   "Wraps `base` store so every query is confined to `patient-id`'s Patient

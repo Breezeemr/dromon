@@ -307,8 +307,16 @@
 ;; configured. The searches themselves go to the mock store underneath.
 (defrecord TextIndexedStore [base indexed-types]
   db/IFHIRStore
-  (create-resource [_ tenant-id resource-type id resource]
-    (db/create-resource base tenant-id resource-type id resource))
+  (create-resource [this tenant-id resource-type id resource]
+    (db/create-resource this tenant-id resource-type id resource nil))
+  ;; Both arities, and `opts` forwarded UNCHANGED: a wrapper that implements
+  ;; an opts arity by calling its delegate's no-opts arity is the silent-drop
+  ;; bug `db/ITxMetadataStore` rule 3 names. This record stands in for
+  ;; flotilla's IndexedStore, so it has to model the shape that wrapper needs.
+  (create-resource [_ tenant-id resource-type id resource opts]
+    (if opts
+      (db/create-resource base tenant-id resource-type id resource opts)
+      (db/create-resource base tenant-id resource-type id resource)))
   (read-resource [_ tenant-id resource-type id]
     (db/read-resource base tenant-id resource-type id))
   (search [_ tenant-id resource-type params search-registry]
@@ -317,7 +325,12 @@
     (db/count-resources base tenant-id resource-type params search-registry))
   db/ITextSearchStore
   (text-searchable? [_ _tenant-id resource-type]
-    (contains? indexed-types resource-type)))
+    (contains? indexed-types resource-type))
+  ;; A capability a delegate does not have cannot be added from outside the
+  ;; chain, so the question is passed straight down.
+  db/ITxMetadataStore
+  (tx-metadata-supported? [_ tenant-id]
+    (db/tx-metadata-store? base tenant-id)))
 
 (def ^:private directory-types
   "The types the design puts a full-text index on."

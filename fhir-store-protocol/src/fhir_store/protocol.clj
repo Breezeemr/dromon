@@ -86,6 +86,113 @@
   [v]
   (if (= if-match-any v) "*" v))
 
+;; ---------------------------------------------------------------------------
+;; Transaction metadata (:fhir/tx-meta)
+;; ---------------------------------------------------------------------------
+
+(def tx-meta-key
+  "The opts key -- and the ring request key -- carrying host-supplied
+   transaction metadata. Both spellings are deliberately the same word so the
+   whole path is one grep: host middleware, handler, protocol, store.
+
+   Namespaced, unlike its neighbour `:if-match`, and deliberately so. dromon
+   defines and validates `:if-match` (see `normalize-if-match`); the namespace
+   here is the marker that the VALUE is not dromon's to interpret. Do not
+   \"fix\" the inconsistency."
+  :fhir/tx-meta)
+
+(def tx-meta-max-keys
+  "How many keys a transaction metadata map may carry. Attribution is a
+   handful of identifiers -- the motivating case is four -- and the backend
+   this lands in keeps history forever, so the bound is deliberately tight."
+  16)
+
+(def tx-meta-max-value-length
+  "How long a string or keyword value in a transaction metadata map may be.
+   Long enough for a UUID or a subject claim, short enough that free text
+   does not fit."
+  256)
+
+(defn- tx-meta-value-problem
+  "Why `v` may not be a transaction metadata value, or nil when it may."
+  [v]
+  (cond
+    (or (number? v) (boolean? v) (uuid? v) (inst? v)) nil
+    (or (string? v) (keyword? v))
+    (when (> (count (if (keyword? v) (str (symbol v)) v)) tx-meta-max-value-length)
+      (str "value longer than " tx-meta-max-value-length " characters"))
+    :else "value is not a string, keyword, uuid, number, boolean or instant"))
+
+(defn- tx-meta-problem
+  "Why `m` is not a valid transaction metadata map, or nil when it is.
+
+   The shape is bounded on purpose; see `tx-meta`."
+  [m]
+  (cond
+    (not (map? m))          "not a map"
+    (empty? m)              "empty"
+    (> (count m) tx-meta-max-keys) (str "more than " tx-meta-max-keys " keys")
+    (not-every? keyword? (keys m)) "a key is not a keyword"
+    :else (some (fn [[k v]]
+                  (when-let [p (tx-meta-value-problem v)]
+                    (str k ": " p)))
+                m)))
+
+(defn tx-meta
+  "The transaction metadata carried by a store `opts` map, or nil.
+
+   A malformed value is a HOST PROGRAMMING ERROR and throws rather than being
+   coerced or dropped: an attribution that decayed into no attribution is the
+   exact failure this channel exists to prevent. dromon does not read what the
+   map SAYS, but it does bound its SHAPE, because the backend it is destined
+   for keeps transaction history forever and cannot erase it afterwards:
+
+   - a map of at least one and at most `tx-meta-max-keys` entries, or nil;
+   - keyword keys;
+   - scalar values only -- string, keyword, uuid, number, boolean, instant --
+     with strings and keywords under `tx-meta-max-value-length` characters.
+     No nested maps, no collections.
+
+   An EMPTY MAP is rejected, not silently treated as nil. A host that builds
+   its map conditionally and ends up with `{}` has produced an attribution
+   naming nobody, which is a decayed attribution; a host with nothing to say
+   must inject NO KEY AT ALL and get an ordinary unattributed write.
+
+   MUST NOT carry patient-identifying data, clinical free text, or
+   credentials. This is who performed the write, not what the write was
+   about, and it is not erasable once persisted.
+
+   A rejection names the offending KEY and the rule it broke, never the
+   value: the thrown message reaches an OperationOutcome and a log, and the
+   whole point of this channel is that what the map SAYS belongs beside the
+   data rather than in stdout."
+  [opts]
+  (let [m (get opts tx-meta-key)]
+    (if (nil? m)
+      nil
+      (if-let [problem (tx-meta-problem m)]
+        (throw (ex-info (str tx-meta-key " is malformed: " problem)
+                        {:fhir/status 500
+                         :fhir/code   "exception"
+                         :problem     problem
+                         :type        (str (type m))}))
+        m))))
+
+(defn reject-tx-meta!
+  "Throw when `opts` carries transaction metadata this store cannot persist.
+
+   For an implementation that does NOT satisfy `ITxMetadataStore`: call this
+   from every write arity that accepts opts, so the opts key can never be
+   accepted and dropped. Silence here would leave an audit trail that looks
+   complete and is not."
+  [store-name opts]
+  (when (tx-meta opts)
+    (throw (ex-info (str store-name " cannot persist " tx-meta-key
+                         "; the write is refused rather than written unattributed")
+                    {:fhir/status 500
+                     :fhir/code   "exception"
+                     :store       store-name}))))
+
 (defprotocol IFHIRStore
   "Store contract for FHIR resource persistence.
 
@@ -101,7 +208,16 @@
    having no resource to return, return an empty map carrying the
    metadata. Backends that cannot supply a basis omit the metadata;
    callers must treat it as optional."
-  (create-resource [this tenant-id resource-type id resource])
+  (create-resource
+    [this tenant-id resource-type id resource]
+    [this tenant-id resource-type id resource opts]
+    "Create a resource under `id`. `opts` may contain `:fhir/tx-meta`; see
+     `ITxMetadataStore` for what a store owes a caller that supplies it.
+     `:if-match` is meaningless here -- there is no prior version to guard --
+     so callers must not supply it and an implementation that receives one
+     IGNORES it. Unlike the update and delete arities, where an unusable
+     precondition must fail the write, an absent version cannot be guarded
+     wrongly.")
   (read-resource [this tenant-id resource-type id])
   (vread-resource [this tenant-id resource-type id vid])
   (update-resource
@@ -123,28 +239,52 @@
 
        Anything else is a value no resource can hold, and fails the write
        with a 412 rather than being ignored. An :if-match a store cannot
-       make sense of must never degrade into an unconditional write.")
+       make sense of must never degrade into an unconditional write.
+
+     - :fhir/tx-meta — an opaque host-supplied map recorded BESIDE the data
+       (on the transaction entity, or wherever the backend keeps per-
+       transaction facts). See `ITxMetadataStore` for the obligations it
+       puts on an implementation.")
   (delete-resource
     [this tenant-id resource-type id]
     [this tenant-id resource-type id opts]
     "Delete a resource. `opts` may contain :if-match for optimistic
-     concurrency; accepted values and semantics match update-resource.")
+     concurrency; accepted values and semantics match update-resource, and
+     :fhir/tx-meta, per `ITxMetadataStore`.")
   (search [this tenant-id resource-type params search-registry])
   (history [this tenant-id resource-type id])
   (history-type [this tenant-id resource-type params]
     "Returns all versions of all resources of a given type.")
   (count-resources [this tenant-id resource-type params search-registry]
     "Returns the total count of resources matching the search params.")
-  (transact-transaction [this tenant-id entries]
+  (transact-transaction
+    [this tenant-id entries]
+    [this tenant-id entries opts]
     "Atomic FHIR `transaction` Bundle semantics (HL7 FHIR §3.1.0.11.2):
      all entries succeed or all fail as a single database transaction.
      Any failure propagates as an exception that rolls back the whole
-     transaction; there is no per-entry error handling.")
-  (transact-bundle [this tenant-id entries]
+     transaction; there is no per-entry error handling.
+
+     `opts` may contain :fhir/tx-meta, stamped on the one transaction this
+     call opens. The channel is per BUNDLE, not per entry: the bundle IS a
+     single database transaction, so there is no per-entry slot to write
+     into. A Bundle whose entries were authored by different callers cannot
+     be expressed and must be split into separate requests.")
+  (transact-bundle
+    [this tenant-id entries]
+    [this tenant-id entries opts]
     "FHIR `batch` Bundle semantics: each entry is processed
      independently. Per-entry failures do NOT affect other entries.
      Returns a Bundle of type `batch-response` whose :entry vector
-     reports the status of each input entry in the original order.")
+     reports the status of each input entry in the original order.
+
+     `opts` may contain :fhir/tx-meta. Each entry here IS its own
+     transaction, so the SAME map is stamped on every one of them: one HTTP
+     request has one authenticated caller. An implementation that fans the
+     batch out into its own single-resource verbs must thread the metadata
+     into every inner call -- see `ITxMetadataStore` rule 4, which exists
+     because losing it here while keeping it on the transaction path is
+     invisible to every test that does not look for it.")
   (resource-deleted? [this tenant-id resource-type id]
     "Returns true if the resource was previously created and then deleted,
      false if it exists or was never created.")
@@ -397,3 +537,99 @@
      for `tenant-id`. `resource-type` is a keyword, as `search` receives it.
      False means the handler refuses the parameter as not-supported; it must
      not mean the store will quietly ignore it."))
+
+;; ---------------------------------------------------------------------------
+;; Transaction-metadata extension protocol.
+;;
+;; Same split as the two protocols above, and for a sharper reason. A write
+;; that carries attribution and lands in a store that cannot record it is the
+;; worst failure an audit trail has: the trail looks present and is
+;; incomplete. Keeping the capability off IFHIRStore means a caller can ask
+;; BEFORE the write and refuse, instead of discovering afterwards that a
+;; year of records name nobody.
+;;
+;;   fhir-store-mock            ITxMetadataStore (records what it was handed)
+;;   fhir-store-xtdb2           not implemented: refuses the opts key
+;;   CompartmentFilteringStore  delegates the question to its base store
+;; ---------------------------------------------------------------------------
+
+(defprotocol ITxMetadataStore
+  "Host-supplied transaction metadata recorded beside the data.
+
+   The value under `:fhir/tx-meta` is an OPAQUE MAP. dromon never reads
+   inside it, never validates its keys, and never puts it in a span's
+   `:data` or a log event -- it typically names a human, and the whole point
+   of the channel is that it belongs beside the record rather than in
+   stdout. The host decides what it says; the store decides where it goes.
+
+   A method rather than bare `satisfies?`, for the reason `ITextSearchStore`
+   already argues: `satisfies?` says the store CAN front the capability, the
+   method says whether it does HERE. That is concrete, not hypothetical --
+   the attributes a backend writes into may not exist in a given tenant's
+   schema, so per tenant is the only honest answer.
+
+   The obligations, in order of how easily each is violated:
+
+   1. A store that cannot persist tx-metadata does NOT implement this
+      protocol, or implements it returning false. It must NEVER accept the
+      opts key and drop it; `reject-tx-meta!` is the one-line way to comply.
+   2. A store answering true MUST persist or throw. Partial persistence --
+      some verbs stamped, others not -- is forbidden, because a partly
+      populated trail reads exactly like a complete one.
+   3. A DELEGATING WRAPPER must implement this protocol by asking its
+      delegate, and must forward the opts map unchanged. A wrapper that
+      implements the opts arity by calling the delegate's NO-OPTS arity is
+      the silent-drop bug this whole design exists to prevent; it is named
+      here so a reviewer can look for it by name.
+   4. A store that fans a Bundle out into its own single-resource verbs must
+      thread the bundle's tx-metadata into EVERY inner call. Both in-repo
+      stores fan out this way, and both would otherwise stamp the
+      transaction path while silently losing the batch path.
+   5. BOTH ARITIES STAY IMPLEMENTED. When no metadata is supplied the caller
+      invokes the arity that existed before this protocol, not the opts one
+      with nil. That is what keeps out-of-repo stores and partial `reify`s
+      working; an implementation that treats the opts arity as superseding
+      the other breaks every unattributed write.
+   6. `tx-metadata-supported?` IS ON THE REQUEST PATH. It is consulted once
+      per attributed write request, so it must be cheap: cache the answer per
+      tenant and invalidate it when the schema changes, rather than issuing a
+      query per write.
+
+   `fhir-store.tx-meta-contract/check-tx-metadata-contract` is the executable
+   form of rules 2 and 4: run an implementation through it rather than
+   trusting that it satisfies them.
+
+   FAIL CLOSED, and note that this INVERTS the narrative seam
+   (`server.narrative`), which is explicit that the cost of a host bug must
+   be a missing narrative and never a failed write. Prose can be regenerated
+   from the resource at any time; an audit record cannot be reconstructed
+   afterwards from anything on disk. So attribution that cannot be persisted
+   refuses the write rather than writing it bare. The asymmetry is a
+   decision, not an oversight."
+  (tx-metadata-supported? [this tenant-id]
+    "Whether a `:fhir/tx-meta` map supplied for `tenant-id` will actually be
+     persisted. False means the caller must refuse the write; it must not
+     mean the store will quietly ignore the metadata."))
+
+(defn tx-metadata-store?
+  "Whether `store` will persist `:fhir/tx-meta` for `tenant-id`.
+
+   Not satisfying the protocol and answering false are the same answer to a
+   caller, so this collapses them. A check that THROWS is a third thing and
+   is not collapsed into either: it is not an answer, and reporting it as
+   \"cannot persist\" would refuse a clinical write with a message blaming the
+   tenant's schema while the real cause -- a connection blip, a bug in the
+   probe -- exists nowhere. That is this channel's own failure mode one level
+   up. The cause is kept and rethrown; the caller still refuses the write, but
+   an operator can see why."
+  [store tenant-id]
+  (boolean (and (satisfies? ITxMetadataStore store)
+                (try
+                  (tx-metadata-supported? store tenant-id)
+                  (catch Exception e
+                    (throw (ex-info "tx-metadata capability check failed"
+                                    {:fhir/status 500
+                                     :fhir/code   "exception"
+                                     :tenant-id   (str tenant-id)
+                                     :store       (str (type store))}
+                                    e)))))))
