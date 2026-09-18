@@ -117,13 +117,99 @@
           #_(assoc (m/options sch) :malli.core/walk-refs true)
           {:malli.core/walk-refs true}))
 
+(def ^:private data-absent-reason-codes
+  #{"unknown" "asked-unknown" "temp-unknown" "not-asked" "asked-declined"
+    "masked" "not-applicable" "unsupported" "as-text" "error" "not-a-number"
+    "negative-infinity" "positive-infinity" "not-performed" "not-permitted"})
+
+(defn- stated-absence? [element]
+  (boolean
+    (some #(and (= "http://hl7.org/fhir/StructureDefinition/data-absent-reason" (:url %))
+                (contains? data-absent-reason-codes (:valueCode %))
+                (not (seq (:extension %)))
+                (not-any? (fn [k] (and (keyword? k) (not= :valueCode k)
+                                       (.startsWith (name k) "value"))) (keys %)))
+          (:extension element))))
+
+(defn- primitive-map-schema
+  "Keep a map's structural API and required-key metadata while validating
+   generated mandatory strings against either their value or a DAR companion."
+  []
+  (let [base (m/-map-schema)]
+    (reify
+      m/AST
+      (-from-ast [parent ast options] (m/-from-entry-ast parent ast options))
+      m/IntoSchema
+      (-type [_] :map)
+      (-type-properties [_] (m/-type-properties base))
+      (-properties-schema [_ options] (m/-properties-schema base options))
+      (-children-schema [_ options] (m/-children-schema base options))
+      (-into-schema [parent properties children options]
+        (let [structural (m/-into-schema base properties children options)
+              cache (m/-create-cache options)
+              pairs (into {}
+                          (keep (fn [[k props value]]
+                                  (when (and (keyword? k) (:fhir/primitive-absence props)
+                                             (not (:optional props))
+                                             (not (:xml/attr props))
+                                             (= :string (m/type value)))
+                                    (let [companion (keyword (str "_" (name k)))]
+                                      (when (mu/get structural companion)
+                                        [k companion])))))
+                          (m/children structural))
+              relaxed (reduce #(mu/optional-keys %1 [%2]) structural (keys pairs))
+              present? (fn [x] (every? (fn [[k companion]]
+                                        (or (contains? x k) (stated-absence? (get x companion)))) pairs))
+              validate (delay (m/validator relaxed))
+              parse (delay (m/parser relaxed))
+              unparse (delay (m/unparser relaxed))]
+          ^{:type :malli.core/schema}
+          (reify
+            m/AST
+            (-to-ast [_ opts] (m/-to-ast structural opts))
+            m/Schema
+            (-validator [_] (fn [x] (and (@validate x) (present? x))))
+            (-explainer [this path]
+              (let [explain (m/-explainer relaxed path)]
+                (fn [x in acc]
+                  (let [acc (explain x in acc)]
+                    (if-not (map? x) acc
+                      (reduce (fn [acc [k companion]]
+                                (if (or (contains? x k) (stated-absence? (get x companion))) acc
+                                  (conj acc {:path (conj path k) :in (conj in k)
+                                             :schema this :value nil :type :malli.core/missing-key})))
+                              acc pairs))))))
+            (-parser [_] (fn [x] (let [result (@parse x)]
+                                  (if (and (not= result :malli.core/invalid) (present? x)) result :malli.core/invalid))))
+            (-unparser [_] (fn [x] (let [result (@unparse x)]
+                                    (if (and (not= result :malli.core/invalid) (present? result)) result :malli.core/invalid))))
+            (-transformer [_ transformer method opts] (m/-transformer structural transformer method opts))
+            (-walk [this walker path opts] (m/-walk-entries this walker path opts))
+            (-properties [_] (m/properties structural))
+            (-options [_] options)
+            (-children [_] (m/children structural))
+            (-parent [_] parent)
+            (-form [_] (m/form structural))
+            m/EntrySchema
+            (-entries [_] (m/-entries structural))
+            (-entry-parser [_] (m/-entry-parser structural))
+            m/Cached
+            (-cache [_] cache)
+            m/LensSchema
+            (-keep [_] true)
+            (-get [this k default] (m/-get-entries this k default))
+            (-set [this k value] (m/-set-entries this k value))
+            m/ParserInfo
+            (-parser-info [_ opts] (m/-parser-info structural opts))))))))
+
 (def fhir-registry (merge
                     (m/default-schemas)
                     (mu/schemas)
                     (met/schemas)
                     precision-time-schemas
                     md/decimal-schemas
-                    lazy-ref))
+                    lazy-ref
+                    {:map (primitive-map-schema)}))
 
 (def staging-fhir-registry
   "Registry for use during schema generation. Overrides :ref with the lazy-ref

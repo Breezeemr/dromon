@@ -492,7 +492,7 @@
   "Properties that say where a value sits on the wire, and whether it may be
    absent — as opposed to what it is allowed to contain."
   [:xml/attr :xml/text :xml/type-attr :xml/xhtml :xml/choice-group
-   :xml/name :xml/namespace :fhir/representation :optional])
+   :xml/name :xml/namespace :fhir/representation :optional :fhir/primitive-absence])
 
 (defn- fixed-value-props
   "Entry properties to keep once an element's value is pinned to a constant.
@@ -2402,11 +2402,27 @@
         sub-sch (mu/get sch effective-k)
         base-sch (or sub-sch (mu/get sch k) (when base-field-kw (mu/get sch base-field-kw)))
         min-val (when attr-min (parse-long (str attr-min)))
+        primitive-code (or (:code attr-type) (:type field-info))
+        value-required? (or (:mustHaveValue main-attr)
+                            (some #(or (str/starts-with? (name %) "fixed")
+                                       (str/starts-with? (name %) "pattern")) (keys main-attr)))
+        inherited-absence (->> (when (and sch (= :map (m/type sch))) (m/children sch))
+                               (filter #(= effective-k (first %)))
+                               first second :fhir/primitive-absence)
+        absence-allowed? (and (contains? #{"string" "markdown"} primitive-code)
+                              (not (shape/seq-field? field-info))
+                              (not (and (:max main-attr) (not= "1" (:max main-attr))))
+                              (not value-required?)
+                              (not (false? inherited-absence))
+                              (not (some #{"xmlAttr" "xmlText"} (:representation main-attr))))
         ;; Choice type variants (medication[x] → medicationCodeableConcept, medicationReference)
         ;; are individually optional — the min constraint applies to the group, not each variant
         choice-type? (and _id (str/includes? (str _id) "[x]"))
         props (cond-> (merge (select-keys main-attr [:isSummary :short :definition :comment :binding])
                              (representation-props main-attr))
+                (and (= min-val 1) absence-allowed?)
+                (assoc :fhir/primitive-absence true)
+                (and value-required? (contains? #{"string" "markdown"} primitive-code)) (assoc :fhir/primitive-absence false)
                 choice-type? (assoc :optional true)
                 (and (not choice-type?) min-val (or field-info (zero? min-val))) (assoc :optional (zero? min-val)))]
     (if slice-name
