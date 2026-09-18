@@ -3,7 +3,7 @@
             [server.grant :as grant]))
 
 (deftest grant-tuples-shape
-  (let [tuples (grant/grant-tuples "client-1" ["pa" "pb"] ["read"])]
+  (let [tuples (grant/grant-tuples nil "client-1" ["pa" "pb"] ["read"] false)]
     (testing "launch tuple per patient"
       (is (some #(= % {:namespace "fhir" :object "Patient/pa"
                        :relation "launch" :subject_id "client-1"}) tuples))
@@ -22,8 +22,46 @@
     (testing "no write relations unless requested"
       (is (not-any? #(= (:relation %) "write") tuples)))))
 
+(deftest grant-tuples-are-realm-scoped
+  (testing "every object carries the realm as its first segment, so a grant in
+            one realm authorizes nothing in another"
+    (let [tuples (grant/grant-tuples "r1" "client-1" ["pa"] ["read"] false)]
+      (is (some #(= % {:namespace "fhir" :object "r1/Patient/pa"
+                       :relation "launch" :subject_id "client-1"}) tuples))
+      (is (some #(= % {:namespace "fhir" :object "r1/Patient/pa"
+                       :relation "read" :subject_id "client-1"}) tuples))
+      (is (some #(= % {:namespace "fhir" :object "r1/Observation"
+                       :relation "read" :subject_id "client-1"}) tuples))
+      (is (every? #(clojure.string/starts-with? (:object %) "r1/") tuples)
+          "a single unscoped object would be access in every realm")))
+
+  (testing "dual-write emits the legacy realm-blind object beside the scoped
+            one, so rolling the reader back still finds the grant"
+    (let [tuples (grant/grant-tuples "r1" "client-1" ["pa"] ["read"] true)]
+      (is (some #(= % {:namespace "fhir" :object "r1/Patient/pa"
+                       :relation "read" :subject_id "client-1"}) tuples))
+      (is (some #(= % {:namespace "fhir" :object "Patient/pa"
+                       :relation "read" :subject_id "client-1"}) tuples))))
+
+  (testing "dual-write adds nothing when there is no realm: the scoped object
+            IS the legacy object, and duplicating it would double every write"
+    (is (= (grant/grant-tuples nil "client-1" ["pa"] ["read"] false)
+           (grant/grant-tuples nil "client-1" ["pa"] ["read"] true)))))
+
+(deftest launch-object-parses-both-shapes
+  (testing "a realm-scoped launch object yields its realm and patient"
+    (is (= ["r1" "pa"] (grant/launch-object->patient "r1/Patient/pa"))))
+  (testing "a legacy realm-blind object yields a nil realm"
+    (is (= [nil "pa"] (grant/launch-object->patient "Patient/pa"))))
+  (testing "a realm whose name is capitalized is still read as a realm, which
+            a resource-type-shaped test of the first segment would get wrong"
+    (is (= ["Clinic" "pa"] (grant/launch-object->patient "Clinic/Patient/pa"))))
+  (testing "an object naming no patient is not a launch grant"
+    (is (nil? (grant/launch-object->patient "r1/Observation")))
+    (is (nil? (grant/launch-object->patient "system")))))
+
 (deftest task-is-a-granted-member-type
-  (let [tuples (grant/grant-tuples "client-1" ["pa"] ["read"])]
+  (let [tuples (grant/grant-tuples nil "client-1" ["pa"] ["read"] false)]
     (testing "Task joined the Patient compartment, so it gets a type-level tuple"
       (is (some #(= % {:namespace "fhir" :object "Task"
                        :relation "read" :subject_id "client-1"}) tuples)))
@@ -41,14 +79,14 @@
 
 (deftest default-relations-authorize-request-change
   (testing "a minted grant carries read and request-change on the patient instance"
-    (let [tuples (captured-tuples #(grant/grant-patient-set! "client-1" ["pa"]))]
+    (let [tuples (captured-tuples #(grant/grant-patient-set! nil "client-1" ["pa"]))]
       (is (some #(= % {:namespace "fhir" :object "Patient/pa"
                        :relation "read" :subject_id "client-1"}) tuples))
       (is (some #(= % {:namespace "fhir" :object "Patient/pa"
                        :relation "request-change" :subject_id "client-1"}) tuples))))
   (testing "explicit relations override the default"
     (let [tuples (captured-tuples
-                  #(grant/grant-patient-set! "client-1" ["pa"] :relations ["read"]))]
+                  #(grant/grant-patient-set! nil "client-1" ["pa"] :relations ["read"]))]
       (is (some #(= % {:namespace "fhir" :object "Patient/pa"
                        :relation "read" :subject_id "client-1"}) tuples))
       (is (not-any? #(= (:relation %) "request-change") tuples)))))

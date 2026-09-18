@@ -98,21 +98,39 @@
       (System/exit 1))
     (:access_token body)))
 
+(defn url->realm
+  "The tenant segment of a dromon base url:
+   \"https://fhir.local:3001/default/fhir\" -> \"default\".
+
+   Keto objects in the `fhir` namespace carry the realm as their first segment,
+   so a client provisioned against one tenant no longer authorizes every other
+   tenant the server hosts. Derived from the url the suite is actually pointed
+   at rather than hard-coded, so INFERNO_FHIR_URL keeps working."
+  [url]
+  (second (re-find #"://[^/]+/([^/]+)/fhir" (str url))))
+
+(defn- inferno-realm []
+  (or (url->realm (or (not-empty (System/getenv "INFERNO_FHIR_URL"))
+                      "https://fhir.local:3001/default/fhir"))
+      "default"))
+
 (defn grant-keto-permissions [client-id]
   (println "Granting Keto permissions...")
-  (let [objects ["Patient/123" "Patient" "Observation" "AllergyIntolerance" "CarePlan" "CareTeam" "Condition"
+  (let [realm (inferno-realm)
+        objects ["Patient/123" "Patient" "Observation" "AllergyIntolerance" "CarePlan" "CareTeam" "Condition"
                  "Coverage" "Device" "DiagnosticReport" "DocumentReference" "Encounter" "Goal"
                  "Immunization" "MedicationDispense" "MedicationRequest" "Procedure"
                  "QuestionnaireResponse" "RelatedPerson" "ServiceRequest" "Specimen"
                  "Practitioner" "PractitionerRole" "Organization" "Location" "Provenance" "Endpoint"
                  "system"]]
+    (println "  realm:" realm)
     (doseq [obj objects
             relation ["read" "write" "search-type"]]
       (let [resp (try
                    (curl/put "http://127.0.0.1:4467/admin/relation-tuples"
                              {:headers {"Content-Type" "application/json"}
                               :body (json/generate-string {:namespace "fhir"
-                                                           :object obj
+                                                           :object (str realm "/" obj)
                                                            :relation relation
                                                            :subject_id client-id})
                               :timeout 10000

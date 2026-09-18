@@ -10,11 +10,19 @@
      bb smart-grant --subject <id> --patients pa,pb  ; grant to existing subject
      bb smart-grant --subject <id> --list            ; show granted patients
      bb smart-grant --subject <id> --patients pa --revoke
+     bb smart-grant --realm <realm> --patients pa     ; grant within one realm
+
+   `--realm` (or SMART_GRANT_REALM) names the tenant the grant applies to,
+   defaulting to `default`. The grant's Keto objects carry it as their first
+   segment; a grant with no realm at all is access in every tenant the
+   deployment hosts, which is what realm-scoping exists to stop.
 
    Bootstraps a `smart-grant-admin` Keto subject with the system read/write
    tuples the /auth/grants endpoint is gated on, and authenticates to the
    server either with an HS256 dev token (JWT_DEV_SECRET set) or with a
-   dedicated Hydra admin client (JWKS mode)."
+   dedicated Hydra admin client (JWKS mode). Those system tuples stay
+   realm-blind on purpose: /auth/grants carries no tenant segment, so it is a
+   global administration surface and there is no realm to scope them to."
   (:require [babashka.curl :as curl]
             [cheshire.core :as json]
             [clojure.string :as str])
@@ -61,6 +69,7 @@
         "--patients" (recur (nnext args) (assoc opts :patients (str/split (second args) #",")))
         "--subject"  (recur (nnext args) (assoc opts :subject (second args)))
         "--relations" (recur (nnext args) (assoc opts :relations (str/split (second args) #",")))
+        "--realm"    (recur (nnext args) (assoc opts :realm (second args)))
         "--revoke"   (recur (next args) (assoc opts :revoke? true))
         "--list"     (recur (next args) (assoc opts :list? true))
         (fail! "unknown argument" {:arg a}))
@@ -147,7 +156,12 @@
 ;; ── main ───────────────────────────────────────────────────────────────────
 
 (defn -main [& args]
-  (let [{:keys [patients subject relations revoke? list?]} (parse-args args)
+  (let [{:keys [patients subject relations revoke? list? realm]} (parse-args args)
+        ;; Without a realm the grant is realm-blind -- access in every tenant
+        ;; the deployment hosts. The server still accepts that during the
+        ;; realm-scoping migration, so default to the dev tenant rather than
+        ;; minting a cross-realm grant from a dev CLI by omission.
+        realm (or realm (System/getenv "SMART_GRANT_REALM") "default")
         admin (bootstrap-admin!)
         subject (or subject
                     (let [client (create-hydra-client! "smart-app" app-scope)]
@@ -169,7 +183,8 @@
       :else
       (do (when (empty? patients) (fail! "--patients is required" {}))
           (let [g (server-request :post "/auth/grants" admin
-                                  (cond-> {:subject subject :patients patients}
+                                  (cond-> {:subject subject :patients patients
+                                           :realm realm}
                                     relations (assoc :relations relations)))]
             (println "Granted:" (pr-str g))
             (println)

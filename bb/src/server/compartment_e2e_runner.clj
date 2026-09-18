@@ -152,11 +152,18 @@
       (throw (ex-info "token request failed" {:body (:body resp)})))
     (:access_token (json/parse-string (:body resp) true))))
 
+(def ^:private realm
+  "The tenant `base-url` addresses. Keto objects in the `fhir` namespace carry
+   the realm as their first segment, so a grant made here authorizes this
+   tenant and not every other one the server hosts."
+  (or (second (re-find #"://[^/]+/([^/]+)/fhir" base-url)) "default"))
+
 (defn- grant-keto! [client-id objects relations]
   (doseq [obj objects rel relations]
     (let [resp (curl/put (str keto-write "/admin/relation-tuples")
                          {:headers {"Content-Type" "application/json"}
-                          :body (json/generate-string {:namespace "fhir" :object obj
+                          :body (json/generate-string {:namespace "fhir"
+                                                        :object (str realm "/" obj)
                                                         :relation rel :subject_id client-id})
                           :throw false})]
       (when-not (#{200 201} (:status resp))
