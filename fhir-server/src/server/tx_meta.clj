@@ -41,17 +41,15 @@
 (defn of
   "The transaction metadata the host injected on `req`, or nil.
 
-   Validates only that the value is a map or nil. A non-map is a host
-   programming error and throws rather than being coerced or dropped."
+   Delegates to `fhir-store.protocol/tx-meta`, which is the same key in the
+   same shape: one set of rules for what a valid stamp is, applied at the
+   request boundary rather than three layers down. A malformed map is a host
+   programming error and throws rather than being coerced or dropped --
+   including an EMPTY one, which is an attribution naming nobody. Rejecting it
+   HERE also means the answer does not depend on whether the store could have
+   persisted it: a host bug reads as a host bug, not as a store that cannot."
   [req]
-  (let [m (get req db/tx-meta-key)]
-    (cond
-      (nil? m) nil
-      (map? m) m
-      :else    (throw (ex-info (str db/tx-meta-key " must be a map or nil")
-                               {:fhir/status 500
-                                :fhir/code   "exception"
-                                :type        (type m)})))))
+  (db/tx-meta req))
 
 (defn- ensure-supported!
   "Throw unless `store` will actually persist metadata for `tenant-id`.

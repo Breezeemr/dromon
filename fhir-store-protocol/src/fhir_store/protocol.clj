@@ -101,22 +101,82 @@
    \"fix\" the inconsistency."
   :fhir/tx-meta)
 
+(def tx-meta-max-keys
+  "How many keys a transaction metadata map may carry. Attribution is a
+   handful of identifiers -- the motivating case is four -- and the backend
+   this lands in keeps history forever, so the bound is deliberately tight."
+  16)
+
+(def tx-meta-max-value-length
+  "How long a string or keyword value in a transaction metadata map may be.
+   Long enough for a UUID or a subject claim, short enough that free text
+   does not fit."
+  256)
+
+(defn- tx-meta-value-problem
+  "Why `v` may not be a transaction metadata value, or nil when it may."
+  [v]
+  (cond
+    (or (number? v) (boolean? v) (uuid? v) (inst? v)) nil
+    (or (string? v) (keyword? v))
+    (when (> (count (if (keyword? v) (str (symbol v)) v)) tx-meta-max-value-length)
+      (str "value longer than " tx-meta-max-value-length " characters"))
+    :else "value is not a string, keyword, uuid, number, boolean or instant"))
+
+(defn- tx-meta-problem
+  "Why `m` is not a valid transaction metadata map, or nil when it is.
+
+   The shape is bounded on purpose; see `tx-meta`."
+  [m]
+  (cond
+    (not (map? m))          "not a map"
+    (empty? m)              "empty"
+    (> (count m) tx-meta-max-keys) (str "more than " tx-meta-max-keys " keys")
+    (not-every? keyword? (keys m)) "a key is not a keyword"
+    :else (some (fn [[k v]]
+                  (when-let [p (tx-meta-value-problem v)]
+                    (str k ": " p)))
+                m)))
+
 (defn tx-meta
   "The transaction metadata carried by a store `opts` map, or nil.
 
-   Validates only that the value is a map or nil. A non-map is a host
-   programming error and throws rather than being coerced or dropped: an
-   attribution that decayed into no attribution is the exact failure this
-   channel exists to prevent."
+   A malformed value is a HOST PROGRAMMING ERROR and throws rather than being
+   coerced or dropped: an attribution that decayed into no attribution is the
+   exact failure this channel exists to prevent. dromon does not read what the
+   map SAYS, but it does bound its SHAPE, because the backend it is destined
+   for keeps transaction history forever and cannot erase it afterwards:
+
+   - a map of at least one and at most `tx-meta-max-keys` entries, or nil;
+   - keyword keys;
+   - scalar values only -- string, keyword, uuid, number, boolean, instant --
+     with strings and keywords under `tx-meta-max-value-length` characters.
+     No nested maps, no collections.
+
+   An EMPTY MAP is rejected, not silently treated as nil. A host that builds
+   its map conditionally and ends up with `{}` has produced an attribution
+   naming nobody, which is a decayed attribution; a host with nothing to say
+   must inject NO KEY AT ALL and get an ordinary unattributed write.
+
+   MUST NOT carry patient-identifying data, clinical free text, or
+   credentials. This is who performed the write, not what the write was
+   about, and it is not erasable once persisted.
+
+   A rejection names the offending KEY and the rule it broke, never the
+   value: the thrown message reaches an OperationOutcome and a log, and the
+   whole point of this channel is that what the map SAYS belongs beside the
+   data rather than in stdout."
   [opts]
   (let [m (get opts tx-meta-key)]
-    (cond
-      (nil? m) nil
-      (map? m) m
-      :else    (throw (ex-info "tx-meta must be a map or nil"
-                               {:fhir/status 500
-                                :fhir/code   "exception"
-                                :type        (type m)})))))
+    (if (nil? m)
+      nil
+      (if-let [problem (tx-meta-problem m)]
+        (throw (ex-info (str tx-meta-key " is malformed: " problem)
+                        {:fhir/status 500
+                         :fhir/code   "exception"
+                         :problem     problem
+                         :type        (str (type m))}))
+        m))))
 
 (defn reject-tx-meta!
   "Throw when `opts` carries transaction metadata this store cannot persist.
@@ -153,7 +213,11 @@
     [this tenant-id resource-type id resource opts]
     "Create a resource under `id`. `opts` may contain `:fhir/tx-meta`; see
      `ITxMetadataStore` for what a store owes a caller that supplies it.
-     `:if-match` is meaningless on a create and is not accepted here.")
+     `:if-match` is meaningless here -- there is no prior version to guard --
+     so callers must not supply it and an implementation that receives one
+     IGNORES it. Unlike the update and delete arities, where an unusable
+     precondition must fail the write, an absent version cannot be guarded
+     wrongly.")
   (read-resource [this tenant-id resource-type id])
   (vread-resource [this tenant-id resource-type id vid])
   (update-resource
@@ -521,6 +585,19 @@
       thread the bundle's tx-metadata into EVERY inner call. Both in-repo
       stores fan out this way, and both would otherwise stamp the
       transaction path while silently losing the batch path.
+   5. BOTH ARITIES STAY IMPLEMENTED. When no metadata is supplied the caller
+      invokes the arity that existed before this protocol, not the opts one
+      with nil. That is what keeps out-of-repo stores and partial `reify`s
+      working; an implementation that treats the opts arity as superseding
+      the other breaks every unattributed write.
+   6. `tx-metadata-supported?` IS ON THE REQUEST PATH. It is consulted once
+      per attributed write request, so it must be cheap: cache the answer per
+      tenant and invalidate it when the schema changes, rather than issuing a
+      query per write.
+
+   `fhir-store.tx-meta-contract/check-tx-metadata-contract` is the executable
+   form of rules 2 and 4: run an implementation through it rather than
+   trusting that it satisfies them.
 
    FAIL CLOSED, and note that this INVERTS the narrative seam
    (`server.narrative`), which is explicit that the cost of a host bug must
@@ -538,11 +615,21 @@
   "Whether `store` will persist `:fhir/tx-meta` for `tenant-id`.
 
    Not satisfying the protocol and answering false are the same answer to a
-   caller, so this collapses them. A store whose capability check itself
-   throws is treated as not supporting: the caller's job is to refuse the
-   write, and it cannot do that if asking the question kills the request."
+   caller, so this collapses them. A check that THROWS is a third thing and
+   is not collapsed into either: it is not an answer, and reporting it as
+   \"cannot persist\" would refuse a clinical write with a message blaming the
+   tenant's schema while the real cause -- a connection blip, a bug in the
+   probe -- exists nowhere. That is this channel's own failure mode one level
+   up. The cause is kept and rethrown; the caller still refuses the write, but
+   an operator can see why."
   [store tenant-id]
   (boolean (and (satisfies? ITxMetadataStore store)
                 (try
                   (tx-metadata-supported? store tenant-id)
-                  (catch Throwable _ false)))))
+                  (catch Exception e
+                    (throw (ex-info "tx-metadata capability check failed"
+                                    {:fhir/status 500
+                                     :fhir/code   "exception"
+                                     :tenant-id   (str tenant-id)
+                                     :store       (str (type store))}
+                                    e)))))))

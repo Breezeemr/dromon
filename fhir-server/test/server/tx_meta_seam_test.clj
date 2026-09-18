@@ -18,7 +18,8 @@
             [server.compartment :as compartment]
             [server.handlers :as handlers]
             [server.middleware :as middleware]
-            [server.tx-meta :as tx-meta]))
+            [server.tx-meta :as tx-meta]
+            [fhir-store.tx-meta-contract :as tx-contract]))
 
 (def ^:private tenant "default")
 
@@ -31,8 +32,9 @@
 
 (def ^:private stamp
   "An opaque host map. dromon must not read inside it, so its keys are
-   deliberately not the ones a real host would use."
-  {:who "alice" :on-behalf-of "bob" :nested {:a 1}})
+   deliberately not the ones a real host would use. Flat scalars, because
+   `db/tx-meta` bounds the SHAPE even though it never reads the content."
+  {:who "alice" :on-behalf-of "bob" :via :test})
 
 (def ^:private search-registry
   {"identifier" {:type "token" :columns [{:col "identifier" :array? true
@@ -152,9 +154,12 @@
                   (req st :id "u1" :body (patient) :meta? true))]
         (is (= 201 (:status resp)))
         (is (= stamp (recorded st "u1")))))
-    (testing "and the plain update branch"
+    (testing "and the plain update branch, over a version that is NOT stamped,
+              so the assertion cannot pass on the create's stamp"
+      (handlers/update-resource (req st :id "u1" :body (assoc (patient) :active true)))
+      (is (nil? (recorded st "u1")) "the unattributed write reads back unattributed")
       (let [resp (handlers/update-resource
-                  (req st :id "u1" :body (assoc (patient) :active true) :meta? true))]
+                  (req st :id "u1" :body (assoc (patient) :gender "other") :meta? true))]
         (is (= 200 (:status resp)))
         (is (= stamp (recorded st "u1")))))))
 
@@ -179,12 +184,15 @@
             (req st :id "p1" :body [{:op "add" :path "/active" :value true}] :meta? true))
         _  (is (= 200 (:status r1)))
         _  (is (= stamp (recorded st "p1")))
+        ;; A resource whose current version carries NO stamp, so the guarded
+        ;; branch proves itself rather than reading the plain branch's stamp.
+        _  (handlers/update-resource (req st :id "p2" :body (patient)))
         r2 (handlers/patch-resource
-            (assoc (req st :id "p1" :body [{:op "replace" :path "/active" :value false}]
+            (assoc (req st :id "p2" :body [{:op "add" :path "/active" :value true}]
                         :meta? true)
-                   :headers {"if-match" "W/\"2\""}))]
+                   :headers {"if-match" "W/\"1\""}))]
     (is (= 200 (:status r2)) "guarded patch")
-    (is (= stamp (recorded st "p1")))))
+    (is (= stamp (recorded st "p2")))))
 
 (deftest the-map-reaches-the-store-on-delete-both-branches
   (let [st (store)]
@@ -204,18 +212,26 @@
         (is (= 201 (:status resp)))
         (is (= stamp (recorded st (get-in resp [:body :id]))))))
     (testing "conditional update, one-match branch: updates"
+      ;; An unattributed write first, so each branch below is asserted against
+      ;; a version that was NOT stamped by the branch before it.
+      (handlers/conditional-update
+       (req st :body (assoc (patient "cu") :gender "other") :params {"identifier" "cu"}))
       (let [resp (handlers/conditional-update
                   (req st :body (assoc (patient "cu") :active true)
                        :params {"identifier" "cu"} :meta? true))]
         (is (= 200 (:status resp)))
         (is (= stamp (recorded st (get-in resp [:body :id]))))))
     (testing "conditional patch"
+      (handlers/conditional-update
+       (req st :body (patient "cu") :params {"identifier" "cu"}))
       (let [resp (handlers/conditional-patch
                   (req st :body [{:op "add" :path "/gender" :value "other"}]
                        :params {"identifier" "cu"} :meta? true))]
         (is (= 200 (:status resp)))
         (is (= stamp (recorded st (get-in resp [:body :id]))))))
     (testing "conditional delete"
+      ;; The patch that finds the id is itself unattributed, so the delete is
+      ;; the only write that could have written the stamp read back below.
       (let [before (get-in (handlers/conditional-patch
                             (req st :body [] :params {"identifier" "cu"}))
                            [:body :id])
@@ -290,6 +306,48 @@
     (is (= 500 (:status resp)))
     (is (empty? @calls) "refused before the store was touched")))
 
+(deftest an-empty-injected-map-is-a-host-bug-and-throws
+  (testing "an attribution that collapsed to {} names nobody. A host with
+            nothing to say must inject no key at all and get an ordinary
+            unattributed write, rather than persist an empty attribution or
+            refuse the write against a store that cannot take one"
+    (let [st   (store)
+          resp (run handlers/create-resource
+                    (assoc (req st :body (patient)) :fhir/tx-meta {}))]
+      (is (= 500 (:status resp)))
+      (is (empty? (get-in @(:state st) [tenant :Patient]))))
+    (testing "and it reads as the host bug it is, whether or not the store
+              could have persisted a real map"
+      (let [resp (run handlers/create-resource
+                      (assoc (req (unsupported-store) :body (patient)) :fhir/tx-meta {}))]
+        (is (re-find #"malformed"
+                     (str (get-in resp [:body :issue 0 :diagnostics]))))))))
+
+(deftest a-request-that-writes-nothing-is-not-refused-by-the-capability-check
+  (testing "the check exists to stop an attributed WRITE landing unattributed.
+            A request that performs no write could not have lost an audit
+            record, so it must answer for itself rather than 500 -- which is
+            why every handler binds the check lazily"
+    (let [st (unsupported-store)]
+      (testing "conditional delete matching nothing"
+        (is (= 204 (:status (run handlers/conditional-delete
+                                 (req st :params {"identifier" "nope"} :meta? true))))))
+      (testing "conditional patch matching nothing"
+        (is (= 404 (:status (run handlers/conditional-patch
+                                 (req st :body [{:op "add" :path "/active" :value true}]
+                                      :params {"identifier" "nope"} :meta? true))))))
+      (testing "PATCH of a resource that does not exist"
+        (is (= 404 (:status (run handlers/patch-resource
+                                 (req st :id "absent"
+                                      :body [{:op "add" :path "/active" :value true}]
+                                      :meta? true))))))
+      (testing "a body that is not a Bundle at all"
+        (is (= 400 (:status (run (handlers/transaction {})
+                                 {:fhir/store st
+                                  :path-params {:tenant-id tenant}
+                                  :fhir/tx-meta stamp
+                                  :body-params {:resourceType "Patient"}}))))))))
+
 (deftest a-non-map-injected-value-is-a-host-bug-and-throws
   (testing "never coerced, never dropped: a stamp that decayed into no stamp
             is the failure the channel exists to prevent"
@@ -330,3 +388,17 @@
   (let [wrapped (compartment/filtering-store (unsupported-store)
                                              {:patient-id "pat-1" :all-registries {}})]
     (is (not (db/tx-metadata-store? wrapped tenant)))))
+
+(deftest the-compartment-wrapper-satisfies-the-contract-on-every-write-verb
+  (testing "the one delegating wrapper dromon ships, run through the same
+            conformance suite the parent repo's two wrappers must answer.
+            Rule 3 -- an opts arity that calls the delegate's no-opts arity --
+            is invisible from outside unless every verb is driven"
+    (let [base    (store)
+          wrapped (compartment/filtering-store base {:patient-id "pat-1"
+                                                     :all-registries {}})]
+      (tx-contract/check-tx-metadata-contract
+       {:store     wrapped
+        :tenant-id tenant
+        :id        "pat-1"
+        :recorded  (fn [_ tid rt rid] (mock/tx-meta-of base tid rt rid))}))))

@@ -380,8 +380,12 @@
                                                   (get-in req [:parameters :body]))
         ;; Same reasoning as the narrative binding above, and nil when the
         ;; host injected nothing -- which is what keeps every branch below on
-        ;; the arity it has always called.
-        tx-opts (tx-meta/write-opts req)
+        ;; the arity it has always called. A DELAY, not a value: computing it
+        ;; runs the store capability check, and a request that turns out to
+        ;; write nothing (a body/path id mismatch, an unusable If-Match) must
+        ;; answer with its own 400 rather than a 500 refusal for a write that
+        ;; was never going to happen.
+        tx-opts (delay (tx-meta/write-opts req))
         body-id (:id resource-body)
         expected-version (parse-if-match req)]
     (cond
@@ -403,7 +407,7 @@
       expected-version
       (let [res (db/update-resource store tenant-id (keyword resource-type) id
                                     resource-body
-                                    (merge {:if-match expected-version} tx-opts))]
+                                    (merge {:if-match expected-version} @tx-opts))]
         {:status 200 :body res})
 
       ;; Without If-Match: preserve the create-with-client-id upsert path
@@ -412,14 +416,14 @@
       :else
       (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
         (if existing
-          (let [res (if tx-opts
-                      (db/update-resource store tenant-id (keyword resource-type) id resource-body tx-opts)
+          (let [res (if-let [opts @tx-opts]
+                      (db/update-resource store tenant-id (keyword resource-type) id resource-body opts)
                       (db/update-resource store tenant-id (keyword resource-type) id resource-body))]
             {:status 200 :body res})
           ;; Upsert: a PUT to a nonexistent id CREATES, so this create reached
           ;; from the update handler needs the same stamp.
-          (let [res (if tx-opts
-                      (db/create-resource store tenant-id (keyword resource-type) id resource-body tx-opts)
+          (let [res (if-let [opts @tx-opts]
+                      (db/create-resource store tenant-id (keyword resource-type) id resource-body opts)
                       (db/create-resource store tenant-id (keyword resource-type) id resource-body))
                 base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
                 vid (get-in res [:meta :versionId])]
@@ -466,6 +470,10 @@
                      (:fhir/narrative req)
                      resource-type
                      (json-patch/apply-patch existing patch-ops))
+            ;; Computed HERE rather than at the handler's `let`, so a PATCH
+            ;; against a nonexistent resource still answers 404 instead of a
+            ;; 500 refusal for a write that was never going to happen. Every
+            ;; other handler gets the same property from a delay.
             opts (merge (when expected-version {:if-match expected-version})
                         (tx-meta/write-opts req))
             result (if opts
@@ -480,7 +488,7 @@
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
         id (-> req :path-params :id)
-        tx-opts (tx-meta/write-opts req)
+        tx-opts (delay (tx-meta/write-opts req))
         expected-version (parse-if-match req)]
     (cond
       ;; Refuse an If-Match we cannot act on: an unusable guard must not
@@ -489,12 +497,12 @@
 
       expected-version
       (do (db/delete-resource store tenant-id (keyword resource-type) id
-                              (merge {:if-match expected-version} tx-opts))
+                              (merge {:if-match expected-version} @tx-opts))
           {:status 204 :body nil})
 
       :else
-      (do (if tx-opts
-            (db/delete-resource store tenant-id (keyword resource-type) id tx-opts)
+      (do (if-let [opts @tx-opts]
+            (db/delete-resource store tenant-id (keyword resource-type) id opts)
             (db/delete-resource store tenant-id (keyword resource-type) id))
           {:status 204 :body nil}))))
 
@@ -627,7 +635,10 @@
         resource-type (:fhir/resource-type req)
         resource-body (get-in req [:parameters :body])
         if-none-exist (get-in req [:headers "if-none-exist"])
-        tx-opts (tx-meta/write-opts req)
+        ;; A delay: the If-None-Exist one-match and multiple-match branches
+        ;; write nothing, and must not be turned into 500s by a capability
+        ;; check they never needed.
+        tx-opts (delay (tx-meta/write-opts req))
         search-registry (:fhir/search-registry req)]
     (if if-none-exist
       ;; Conditional create: serialize search+create on a per-tenant,
@@ -646,7 +657,7 @@
              (cond
                (zero? match-count)
                (do-create store tenant-id resource-type resource-body
-                          (:fhir/narrative req) tx-opts)
+                          (:fhir/narrative req) @tx-opts)
 
                (= 1 match-count)
                {:status 200 :body (first results)}
@@ -659,7 +670,7 @@
                                 :diagnostics "Conditional create found multiple matches"}]}})))))
       ;; No If-None-Exist: create normally
       (do-create store tenant-id resource-type resource-body
-                 (:fhir/narrative req) tx-opts))))
+                 (:fhir/narrative req) @tx-opts))))
 
 (defn- ensure-coll
   "Coerce a value to a collection. If already sequential, return as-is; otherwise wrap in a vector."
@@ -1035,7 +1046,7 @@
                                                   resource-type
                                                   (get-in req [:parameters :body]))
         search-registry (:fhir/search-registry req)
-        tx-opts (tx-meta/write-opts req)
+        tx-opts (delay (tx-meta/write-opts req))
         params (merge (or (:query-params req) {}) (or (:form-params req) {}))]
     (or
      (conditional-criteria-error resource-type search-registry params)
@@ -1046,8 +1057,8 @@
          (zero? match-count)
          ;; No matches: create
          (let [id (or (:id resource-body) (str (java.util.UUID/randomUUID)))
-               res (if tx-opts
-                     (db/create-resource store tenant-id (keyword resource-type) id resource-body tx-opts)
+               res (if-let [opts @tx-opts]
+                     (db/create-resource store tenant-id (keyword resource-type) id resource-body opts)
                      (db/create-resource store tenant-id (keyword resource-type) id resource-body))
                base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
                vid (get-in res [:meta :versionId])]
@@ -1065,8 +1076,8 @@
               :body {:resourceType "OperationOutcome"
                      :issue [{:severity "error" :code "invalid"
                               :diagnostics (str "Resource id in body (" body-id ") does not match resolved id (" id ")")}]}}
-             (let [res (if tx-opts
-                         (db/update-resource store tenant-id (keyword resource-type) id resource-body tx-opts)
+             (let [res (if-let [opts @tx-opts]
+                         (db/update-resource store tenant-id (keyword resource-type) id resource-body opts)
                          (db/update-resource store tenant-id (keyword resource-type) id resource-body))]
                {:status 200 :body res})))
 
@@ -1083,7 +1094,7 @@
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
         search-registry (:fhir/search-registry req)
-        tx-opts (tx-meta/write-opts req)
+        tx-opts (delay (tx-meta/write-opts req))
         params (merge (or (:query-params req) {}) (or (:form-params req) {}))]
     (or
      (conditional-criteria-error resource-type search-registry params)
@@ -1096,8 +1107,8 @@
 
          (= 1 match-count)
          (let [id (:id (first results))]
-           (if tx-opts
-             (db/delete-resource store tenant-id (keyword resource-type) id tx-opts)
+           (if-let [opts @tx-opts]
+             (db/delete-resource store tenant-id (keyword resource-type) id opts)
              (db/delete-resource store tenant-id (keyword resource-type) id))
            {:status 204 :body nil})
 
@@ -1115,7 +1126,7 @@
         resource-type (:fhir/resource-type req)
         patch-ops (get-in req [:parameters :body])
         search-registry (:fhir/search-registry req)
-        tx-opts (tx-meta/write-opts req)
+        tx-opts (delay (tx-meta/write-opts req))
         params (merge (or (:query-params req) {}) (or (:form-params req) {}))]
     (or
      (conditional-criteria-error resource-type search-registry params)
@@ -1136,8 +1147,8 @@
                         (:fhir/narrative req)
                         resource-type
                         (json-patch/apply-patch existing patch-ops))
-               result (if tx-opts
-                        (db/update-resource store tenant-id (keyword resource-type) id patched tx-opts)
+               result (if-let [opts @tx-opts]
+                        (db/update-resource store tenant-id (keyword resource-type) id patched opts)
                         (db/update-resource store tenant-id (keyword resource-type) id patched))]
            {:status 200 :body result})
 
@@ -1930,8 +1941,9 @@
           bundle-type (:type body)
           raw-entries (:entry body)
           ;; Per BUNDLE, not per entry: one HTTP request has one
-          ;; authenticated caller, so both branches stamp the same map.
-          tx-opts (tx-meta/write-opts req)]
+          ;; authenticated caller, so both branches stamp the same map. A
+          ;; delay, so a body that is not a Bundle at all still answers 400.
+          tx-opts (delay (tx-meta/write-opts req))]
       (if (and (= resource-type "Bundle") (#{"transaction" "batch"} bundle-type))
         (if (= bundle-type "transaction")
           ;; Transaction: atomic — all succeed or all fail. Store failures
@@ -1952,8 +1964,8 @@
                 entries (narrative/ensure-bundle-narrative
                          (:fhir/narrative req)
                          (resolve-patch-entries store tenant-id entries))]
-            (bundle-response (if tx-opts
-                               (db/transact-transaction store tenant-id entries tx-opts)
+            (bundle-response (if-let [opts @tx-opts]
+                               (db/transact-transaction store tenant-id entries opts)
                                (db/transact-transaction store tenant-id entries))
                              entries))
           ;; Batch: each entry independent. Decode entries (with per-entry
@@ -1973,8 +1985,8 @@
                 narrated (narrative/ensure-bundle-narrative
                           (:fhir/narrative req)
                           (into [] (keep :entry) resolved))
-                res (if tx-opts
-                      (db/transact-bundle store tenant-id narrated tx-opts)
+                res (if-let [opts @tx-opts]
+                      (db/transact-bundle store tenant-id narrated opts)
                       (db/transact-bundle store tenant-id narrated))
                 ;; Weave the store's responses back into input order around
                 ;; the entries it never saw.

@@ -1,7 +1,8 @@
 (ns fhir-store.mock.core-test
   (:require [clojure.test :refer [deftest is testing]]
             [fhir-store.mock.core :as mock]
-            [fhir-store.protocol :as protocol]))
+            [fhir-store.protocol :as protocol]
+            [fhir-store.tx-meta-contract :as tx-contract]))
 
 (deftest create-read-test
   (let [store (mock/create-mock-store {})
@@ -367,3 +368,29 @@
       (protocol/create-resource store tenant "Patient" "p3"
                                 {:resourceType "Patient" :name [{:family "C"}]})
       (is (= #{"p1" "p3"} (set (map :id (protocol/scan-type-as-of store tenant "Patient" basis))))))))
+
+;; ---------------------------------------------------------------------------
+;; Transaction metadata
+;; ---------------------------------------------------------------------------
+
+(deftest tx-metadata-contract-test
+  (testing "the mock is a real ITxMetadataStore, so it answers the same
+            conformance suite fhir-store-datomic and the delegating wrappers
+            have to answer"
+    (tx-contract/check-tx-metadata-contract
+     {:store     (mock/create-mock-store {})
+      :tenant-id "contract-tenant"
+      :recorded  mock/tx-meta-of})))
+
+(deftest tx-metadata-is-kept-per-version-test
+  (let [store  (mock/create-mock-store {})
+        tenant "tx-meta-tenant"
+        stamp  {:who "alice"}
+        res    {:resourceType "Patient" :name [{:family "Smith"}]}]
+    (protocol/create-resource store tenant :Patient "p1" res
+                              {protocol/tx-meta-key stamp})
+    (protocol/update-resource store tenant :Patient "p1" (assoc res :active true))
+    (testing "the current version reads back as what IT was written with"
+      (is (nil? (mock/tx-meta-of store tenant :Patient "p1"))))
+    (testing "and the earlier version keeps its own stamp"
+      (is (= {"1" stamp} (mock/tx-meta-history store tenant :Patient "p1"))))))

@@ -94,17 +94,27 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- stamp
-  "Record `m` as the metadata of version `vid` on a store record."
+  "Record `m` as the metadata of version `vid` on a store record.
+
+   PER VERSION AND NOWHERE ELSE. An earlier draft also kept a current-version
+   key, and because update and delete rebuild the record from the existing
+   one, that key survived a later write that carried no metadata -- so the
+   mock reported attribution for versions that had none. That is the \"trail
+   looks present and is incomplete\" state `ITxMetadataStore` forbids, and it
+   also made every seam assertion that wrote twice hold vacuously."
   [record vid m]
   (cond-> record
-    m (-> (assoc :tx-meta m)
-          (assoc-in [:tx-meta-history vid] m))))
+    m (assoc-in [:tx-meta-history vid] m)))
 
 (defn tx-meta-of
   "The transaction metadata recorded for the CURRENT version of a resource, or
-   nil. Test accessor; the mock is the only store in this repo that keeps it."
+   nil. Test accessor; the mock is the only store in this repo that keeps it.
+
+   Read from the current version's own entry, so an unattributed write reads
+   back as unattributed however the versions before it were written."
   [store tenant-id resource-type id]
-  (:tx-meta (get-in @(:state store) [tenant-id resource-type id])))
+  (let [record (get-in @(:state store) [tenant-id resource-type id])]
+    (get-in record [:tx-meta-history (:current record)])))
 
 (defn tx-meta-history
   "Every version's transaction metadata for one resource, as {vid m}."
@@ -305,8 +315,11 @@
      (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
            ;; Threaded into EVERY inner verb below. The fan-out is where a
            ;; bundle's attribution evaporates if it is threaded nowhere, and
-           ;; the loss is invisible from outside.
-           tx-opts (select-keys opts [protocol/tx-meta-key])
+           ;; the loss is invisible from outside. Removing only the key that is
+           ;; genuinely per entry, rather than allowlisting the one key we know
+           ;; about, means a future opts key reaches the inner verbs instead of
+           ;; being dropped here silently.
+           tx-opts (dissoc opts :if-match)
            snapshot @state]
        (try
          (let [results (mapv (fn [entry]
@@ -387,7 +400,9 @@
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
      (let [;; Each entry here IS its own transaction, so the same map is
            ;; stamped on every one of them -- N entries, N stamped writes.
-           tx-opts (select-keys opts [protocol/tx-meta-key])
+           ;; `dissoc` rather than an allowlist, for the reason given in
+           ;; transact-transaction.
+           tx-opts (dissoc opts :if-match)
            results
            (mapv
             (fn [entry]
