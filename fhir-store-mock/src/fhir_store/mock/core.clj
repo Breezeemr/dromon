@@ -83,20 +83,53 @@
                                  (= (:value field-val) v-str))
             :else (= (str field-val) v-str)))))))
 
+;; ---------------------------------------------------------------------------
+;; Transaction metadata
+;;
+;; The mock is a real `ITxMetadataStore`, not a store that merely tolerates
+;; the opts key: it records what it was handed, per version, beside the record
+;; itself. That is what makes the channel testable end to end inside dromon --
+;; a store that accepted the map and forgot it would pass every test the seam
+;; could write, which is precisely the failure the protocol warns about.
+;; ---------------------------------------------------------------------------
+
+(defn- stamp
+  "Record `m` as the metadata of version `vid` on a store record."
+  [record vid m]
+  (cond-> record
+    m (-> (assoc :tx-meta m)
+          (assoc-in [:tx-meta-history vid] m))))
+
+(defn tx-meta-of
+  "The transaction metadata recorded for the CURRENT version of a resource, or
+   nil. Test accessor; the mock is the only store in this repo that keeps it."
+  [store tenant-id resource-type id]
+  (:tx-meta (get-in @(:state store) [tenant-id resource-type id])))
+
+(defn tx-meta-history
+  "Every version's transaction metadata for one resource, as {vid m}."
+  [store tenant-id resource-type id]
+  (or (:tx-meta-history (get-in @(:state store) [tenant-id resource-type id])) {}))
+
 (defrecord MockStore [state options]
   protocol/IFHIRStore
-  (create-resource [_ tenant-id resource-type id resource]
+  (create-resource [this tenant-id resource-type id resource]
+    (protocol/create-resource this tenant-id resource-type id resource nil))
+
+  (create-resource [_ tenant-id resource-type id resource opts]
     (let [id (or id (new-id))
           vid "1"
+          tx-m (protocol/tx-meta opts)
           meta-info {:versionId vid
                      :lastUpdated (java.time.Instant/now)}
           resource-with-meta (-> resource
                                  (update :meta merge meta-info)
                                  (assoc :id id))
-          record {:history {vid resource-with-meta}
-                  :current vid
-                  :resource resource-with-meta
-                  :deleted? false}]
+          record (stamp {:history {vid resource-with-meta}
+                         :current vid
+                         :resource resource-with-meta
+                         :deleted? false}
+                        vid tx-m)]
       (swap! state update-in [tenant-id resource-type id]
              (fn [existing]
                (if existing
@@ -123,6 +156,7 @@
 
   (update-resource [_ tenant-id resource-type id resource opts]
     (let [expected (protocol/normalize-if-match (:if-match opts))
+          tx-m (protocol/tx-meta opts)
           result (atom nil)
           swap-fn (fn [existing]
                     (let [active? (and existing (not (:deleted? existing)))
@@ -151,10 +185,12 @@
                             resource-with-meta (-> resource
                                                    (update :meta merge meta-info)
                                                    (assoc :id id))
-                            record {:history (assoc (or (:history existing) {}) vid resource-with-meta)
-                                    :current vid
-                                    :resource resource-with-meta
-                                    :deleted? false}]
+                            record (stamp (assoc existing
+                                                 :history (assoc (or (:history existing) {}) vid resource-with-meta)
+                                                 :current vid
+                                                 :resource resource-with-meta
+                                                 :deleted? false)
+                                          vid tx-m)]
                         (reset! result resource-with-meta)
                         record)))]
       (swap! state update-in [tenant-id resource-type id] swap-fn)
@@ -165,6 +201,7 @@
 
   (delete-resource [_ tenant-id resource-type id opts]
     (let [expected (protocol/normalize-if-match (:if-match opts))
+          tx-m (protocol/tx-meta opts)
           result (atom false)
           swap-fn (fn [existing]
                     (let [active? (and existing (not (:deleted? existing)))
@@ -185,10 +222,11 @@
                       (if active?
                         (let [vid (str (inc (Long/parseLong current-vid)))]
                           (reset! result true)
-                          (assoc existing
-                                 :current vid
-                                 :deleted? true
-                                 :resource nil))
+                          (stamp (assoc existing
+                                        :current vid
+                                        :deleted? true
+                                        :resource nil)
+                                 vid tx-m))
                         existing)))]
       (swap! state update-in [tenant-id resource-type id] swap-fn)
       @result))
@@ -256,12 +294,19 @@
       (mapcat (fn [record] (vals (:history record))) records)))
 
   (transact-transaction [this tenant-id entries]
+    (protocol/transact-transaction this tenant-id entries nil))
+
+  (transact-transaction [this tenant-id entries opts]
     ;; Atomic transaction: snapshot state for rollback on failure.
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
     (ftrace/trace!
      {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
      (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
+           ;; Threaded into EVERY inner verb below. The fan-out is where a
+           ;; bundle's attribution evaporates if it is threaded nowhere, and
+           ;; the loss is invisible from outside.
+           tx-opts (select-keys opts [protocol/tx-meta-key])
            snapshot @state]
        (try
          (let [results (mapv (fn [entry]
@@ -285,7 +330,7 @@
                                      ;; unconditional one.
                                      entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                                  (case method
-                                   "POST" (let [res (protocol/create-resource this tenant-id rt nil resource)
+                                   "POST" (let [res (protocol/create-resource this tenant-id rt nil resource tx-opts)
                                                 vid (get-in res [:meta :versionId])
                                                 last-mod (str (get-in res [:meta :lastUpdated]))]
                                             {:resource res
@@ -293,20 +338,20 @@
                                                         :location (str type "/" (:id res) "/_history/" vid)
                                                         :etag (str "W/\"" vid "\"")
                                                         :lastModified last-mod}})
-                                   "PUT" (let [res (if entry-if-match
-                                                     (protocol/update-resource this tenant-id rt id resource
-                                                                               {:if-match entry-if-match})
-                                                     (protocol/update-resource this tenant-id rt id resource))
+                                   "PUT" (let [res (protocol/update-resource
+                                                    this tenant-id rt id resource
+                                                    (cond-> tx-opts
+                                                      entry-if-match (assoc :if-match entry-if-match)))
                                                vid (get-in res [:meta :versionId])
                                                last-mod (str (get-in res [:meta :lastUpdated]))]
                                            {:resource res
                                             :response {:status "200 OK"
                                                        :etag (str "W/\"" vid "\"")
                                                        :lastModified last-mod}})
-                                   "DELETE" (do (if entry-if-match
-                                                  (protocol/delete-resource this tenant-id rt id
-                                                                            {:if-match entry-if-match})
-                                                  (protocol/delete-resource this tenant-id rt id))
+                                   "DELETE" (do (protocol/delete-resource
+                                                 this tenant-id rt id
+                                                 (cond-> tx-opts
+                                                   entry-if-match (assoc :if-match entry-if-match)))
                                                 {:response {:status "204 No Content"}})
                                    "GET" (let [res (protocol/read-resource this tenant-id rt id)]
                                            (if res
@@ -331,13 +376,19 @@
            (throw e))))))
 
   (transact-bundle [this tenant-id entries]
+    (protocol/transact-bundle this tenant-id entries nil))
+
+  (transact-bundle [this tenant-id entries opts]
     ;; Batch semantics: each entry is processed independently; per-entry
     ;; failures do NOT roll back other entries. Returns a batch-response
     ;; Bundle reporting per-entry status in input order.
     (ftrace/trace!
      {:id :store/transact-bundle
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
-     (let [results
+     (let [;; Each entry here IS its own transaction, so the same map is
+           ;; stamped on every one of them -- N entries, N stamped writes.
+           tx-opts (select-keys opts [protocol/tx-meta-key])
+           results
            (mapv
             (fn [entry]
               (try
@@ -356,7 +407,7 @@
                       entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                   (case method
                     "POST"
-                    (let [res (protocol/create-resource this tenant-id rt nil resource)
+                    (let [res (protocol/create-resource this tenant-id rt nil resource tx-opts)
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -366,10 +417,10 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "PUT"
-                    (let [res (if entry-if-match
-                                (protocol/update-resource this tenant-id rt id resource
-                                                          {:if-match entry-if-match})
-                                (protocol/update-resource this tenant-id rt id resource))
+                    (let [res (protocol/update-resource
+                               this tenant-id rt id resource
+                               (cond-> tx-opts
+                                 entry-if-match (assoc :if-match entry-if-match)))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -378,10 +429,10 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "DELETE"
-                    (do (if entry-if-match
-                          (protocol/delete-resource this tenant-id rt id
-                                                    {:if-match entry-if-match})
-                          (protocol/delete-resource this tenant-id rt id))
+                    (do (protocol/delete-resource
+                         this tenant-id rt id
+                         (cond-> tx-opts
+                           entry-if-match (assoc :if-match entry-if-match)))
                         {:response {:status "204 No Content"}})
 
                     "GET"
@@ -488,7 +539,16 @@
     (->> (get-in @state [tenant-id resource-type])
          vals
          (remove :deleted?)
-         count)))
+         count))
+
+  protocol/ITxMetadataStore
+  (tx-metadata-supported? [_ tenant-id]
+    ;; True by default, because the mock really does record what it is handed.
+    ;; `:tx-metadata-supported?` in options -- a boolean, or a predicate of
+    ;; tenant-id -- lets a test stand in for a store that cannot, which is the
+    ;; only way to exercise the refusal path.
+    (let [v (get options :tx-metadata-supported? true)]
+      (boolean (if (fn? v) (v tenant-id) v)))))
 
 (defn- mock-valueset-expand [store tenant-id _params id]
   ;; Mock an expansion logic

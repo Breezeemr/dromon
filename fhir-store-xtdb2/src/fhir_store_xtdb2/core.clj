@@ -1502,7 +1502,16 @@
 (defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode pool-opts]
   IFHIRStore
 
+  ;; No ITxMetadataStore. This backend has nowhere to put a host's transaction
+  ;; metadata, so every opts arity REFUSES the key rather than accepting and
+  ;; dropping it: an audit trail that looks complete and is not is the failure
+  ;; the channel exists to prevent. Giving XTDB v2 a real home for it is a
+  ;; separate change; until then the refusal is the honest answer.
   (create-resource [this tenant-id resource-type id resource]
+    (fp/create-resource this tenant-id resource-type id resource nil))
+
+  (create-resource [this tenant-id resource-type id resource opts]
+    (fp/reject-tx-meta! "fhir-store-xtdb2" opts)
     (ftrace/trace!
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1536,6 +1545,7 @@
     (fp/update-resource this tenant-id resource-type id resource nil))
 
   (update-resource [this tenant-id resource-type id resource opts]
+    (fp/reject-tx-meta! "fhir-store-xtdb2" opts)
     (ftrace/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1549,6 +1559,7 @@
     (fp/delete-resource this tenant-id resource-type id nil))
 
   (delete-resource [this tenant-id resource-type id opts]
+    (fp/reject-tx-meta! "fhir-store-xtdb2" opts)
     (ftrace/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1635,6 +1646,10 @@
          :xtql (history-type-xtql node resource-type params read-decoders)
          (with-open [conn (jdbc/get-connection pool)]
            (history-type-sql conn resource-type params read-decoders))))))
+
+  (transact-transaction [this tenant-id entries opts]
+    (fp/reject-tx-meta! "fhir-store-xtdb2" opts)
+    (fp/transact-transaction this tenant-id entries))
 
   (transact-transaction [this tenant-id entries]
     ;; Pre-compute entry metadata (method, resource-type, id) for use in both
@@ -1798,6 +1813,10 @@
                              resource (assoc :resource resource))))
                        entry-results)}
           tx-key)))))))))
+
+  (transact-bundle [this tenant-id entries opts]
+    (fp/reject-tx-meta! "fhir-store-xtdb2" opts)
+    (fp/transact-bundle this tenant-id entries))
 
   (transact-bundle [this tenant-id entries]
     ;; Batch semantics: each entry is processed independently via the
