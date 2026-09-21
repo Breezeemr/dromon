@@ -126,10 +126,18 @@
 (defn wrap-keto-url
   "Inject the configured Keto read API URL so the :public? bulk-data handlers,
    where wrap-keto-authorization is bypassed, can perform the same 'system'
-   authorization check the middleware would (server.keto/system-read-allowed?)."
-  [handler keto-url]
+   authorization check the middleware would (server.keto/system-read-allowed?).
+
+   `legacy-realm-blind-fallback?` rides along so those handlers resolve the
+   realm-scoping migration window the same way the middleware does. Injecting
+   it rather than letting them read the env keeps one source of truth for a
+   flag whose whole purpose is to be flipped once, everywhere, at the same
+   time."
+  [handler keto-url legacy-realm-blind-fallback?]
   (fn [req]
-    (handler (assoc req :fhir/keto-url keto-url))))
+    (handler (assoc req
+                    :fhir/keto-url keto-url
+                    :fhir/keto-legacy-realm-blind-fallback? legacy-realm-blind-fallback?))))
 
 ;; ---------------------------------------------------------------------------
 ;; Options
@@ -152,8 +160,8 @@
    consumed by [[default-middleware]].
 
    Accepts `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
-   `:enforce-smart-scopes?`, `:bulk-job-store` and `:login-url`; unknown keys
-   are ignored.
+   `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url` and
+   `:legacy-realm-blind-fallback?`; unknown keys are ignored.
 
    This is the ONLY place the environment is consulted, so tests and hosts can
    bypass it entirely by hand-building the resolved map (for example passing a
@@ -164,6 +172,9 @@
                                unless `JWT_DEV_SECRET` is set (dev HS256 mode).
    - :keto-url              -- argument, else `KETO_URL`, else
                                `http://localhost:4466`.
+   - :legacy-realm-blind-fallback? -- argument when non-nil, else
+                               `KETO_LEGACY_REALM_BLIND_FALLBACK=0` to disable,
+                               else `server.keto/default-legacy-realm-blind-fallback?`.
    - :enforce-smart-scopes? -- argument when non-nil, else `ENFORCE_SMART_SCOPES=1`.
    - :cors-origins          -- [[parse-cors-origins]] of the argument, else of
                                `CORS_ALLOWED_ORIGINS`.
@@ -171,12 +182,21 @@
                                only when `DROMON_DEV_TRACE_TAP=1`, so the OTel
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url terminology cors-allowed-origins
-           enforce-smart-scopes? bulk-job-store login-url]}]
+           enforce-smart-scopes? bulk-job-store login-url
+           legacy-realm-blind-fallback?]}]
   {:jwks-url              (or jwks-url
                               (System/getenv "JWKS_URL")
                               (when-not (System/getenv "JWT_DEV_SECRET")
                                 "http://localhost:4444/.well-known/jwks.json"))
    :keto-url              (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
+   :legacy-realm-blind-fallback? (cond
+                                   (some? legacy-realm-blind-fallback?)
+                                   legacy-realm-blind-fallback?
+
+                                   (some? (System/getenv "KETO_LEGACY_REALM_BLIND_FALLBACK"))
+                                   (not= "0" (System/getenv "KETO_LEGACY_REALM_BLIND_FALLBACK"))
+
+                                   :else keto/default-legacy-realm-blind-fallback?)
    :login-url             login-url
    :enforce-smart-scopes? (if (some? enforce-smart-scopes?)
                             enforce-smart-scopes?
@@ -281,7 +301,9 @@
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
-                 jwks-url enforce-smart-scopes? login-url narrative]}]
+                 jwks-url enforce-smart-scopes? login-url narrative
+                 legacy-realm-blind-fallback?]
+          :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}}]
   (cond-> []
     trace-tap
     (conj {:name ::trace-tap :wrap trace-tap})
@@ -314,7 +336,9 @@
            {:name ::narrative :wrap (fn [handler] (wrap-narrative handler narrative))}
            {:name ::bulk-job-store
             :wrap (fn [handler] (wrap-bulk-job-store handler bulk-job-store))}
-           {:name ::keto-url :wrap (fn [handler] (wrap-keto-url handler keto-url))}
+           {:name ::keto-url
+            :wrap (fn [handler]
+                    (wrap-keto-url handler keto-url legacy-realm-blind-fallback?))}
            {:name ::jwt-auth
             :wrap (fn [handler] (auth/wrap-jwt-auth handler {:jwks-url jwks-url}))}])
 
@@ -325,7 +349,12 @@
 
     :always
     (conj {:name ::keto-authorization
-           :wrap (fn [handler] (keto/wrap-keto-authorization handler {:keto-url keto-url :login-url login-url}))})))
+           :wrap (fn [handler]
+                   (keto/wrap-keto-authorization
+                     handler
+                     {:keto-url keto-url
+                      :login-url login-url
+                      :legacy-realm-blind-fallback? legacy-realm-blind-fallback?}))})))
 
 ;; ---------------------------------------------------------------------------
 ;; Recomposition helpers

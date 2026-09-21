@@ -150,11 +150,16 @@
                  {})
         min-level (get config :min-level :info)]
 
-    ;; Set minimum log levels for chatty libraries
+    ;; Set minimum log levels for chatty libraries.
+    ;; The `nil` first argument is the signal KIND: Telemere's `set-min-level!`
+    ;; has sf-arity 4, so the two-argument form is [kind min-level], not
+    ;; [ns-filter min-level]. Passing a pattern as the sole leading argument
+    ;; registers a floor for a kind nothing emits, silently leaving these
+    ;; namespaces at the default level.
     (t/set-min-level! min-level)
-    (t/set-min-level! "org.eclipse.jetty.*" :warn)
-    (t/set-min-level! "xtdb.*" :warn)
-    (t/set-min-level! "malli.*" :warn)
+    (t/set-min-level! nil "org.eclipse.jetty.*" :warn)
+    (t/set-min-level! nil "xtdb.*" :warn)
+    (t/set-min-level! nil "malli.*" :warn)
 
     ;; Configure default console handler securely, replacing any default ones
     (t/remove-handler! :default/console)

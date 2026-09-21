@@ -92,16 +92,27 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- system-authorized?
-  "Whether the request's authenticated subject holds the 'system' read tuple.
+  "Whether the request's authenticated subject holds the system read tuple for
+   the realm in the path.
    Overridable per-request via :fhir/system-authorized? (a
    (fn [subject-id] -> boolean), used by tests); otherwise performs a live
-   server.keto check against the 'system' object using the injected
-   :fhir/keto-url (server.core/wrap-keto-url)."
+   server.keto check against the realm's system object using the injected
+   :fhir/keto-url (server.core/wrap-keto-url).
+
+   The realm must be part of the check here. A bulk export is the widest read
+   the server offers -- a whole tenant, asynchronously, to a file the caller
+   then fetches -- and these routes are :public?, so the Keto middleware and
+   flotilla's realm-membership middleware are both bypassed. A realm-blind
+   gate would let a subject entitled to export one realm drain every other."
   [req]
   (let [subject-id (get-in req [:identity :sub])]
     (if-let [pred (:fhir/system-authorized? req)]
       (boolean (pred subject-id))
-      (keto/system-read-allowed? (:fhir/keto-url req) subject-id))))
+      (keto/system-read-allowed? (:fhir/keto-url req)
+                                 (get-in req [:path-params :tenant-id])
+                                 subject-id
+                                 (:fhir/keto-legacy-realm-blind-fallback? req
+                                   keto/default-legacy-realm-blind-fallback?)))))
 
 (defn- authorize-system
   "Gate a :public? bulk route on the 'system' Keto read tuple. Returns nil to

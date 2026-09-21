@@ -44,6 +44,25 @@ XTDB node / connection pool, selected by the `/:tenant-id/fhir/` route prefix. T
 provisioning is explicit via the `IFHIRStore` `create-tenant` / `warmup-tenant` /
 `delete-tenant` lifecycle. See `multitenancy.md`.
 
+## Transaction Metadata
+Every write verb takes an `opts` map carrying `:tx-metadata`, an open map of provenance the
+host builds and the store persists **in the same transaction as the data** — see
+[`../tasks/fhir-store-tx-metadata-channel.md`](../tasks/fhir-store-tx-metadata-channel.md).
+Where each backend keeps it:
+
+| backend | storage home | status |
+|---|---|---|
+| `fhir-store-datomic` | the transaction entity every write already names, which is also the value of `:fhir/version-id` | planned |
+| `fhir-store-xtdb2` | a per-tenant `fhir_tx_metadata` row written as an extra op inside the *same* `xt/execute-tx`, keyed by the transaction's system time | planned |
+| `fhir-store-mock` | the per-version history record | planned |
+| `CompartmentFilteringStore` | delegates to its base | planned |
+
+A backend with no home for the stamp **must not implement `ITxMetadataStore`**. Accepting the
+key and discarding it is permitted — the opts arity still has `:if-match` to honour — but only
+because a caller can ask `supports-tx-metadata?` *before* the call and decide its own policy.
+A store that claimed the capability and dropped the stamp would make an unattributed write
+indistinguishable from an attributed one, which is exactly what the split prevents.
+
 ## Test Environments
 ### XTDB v2 Testing
 - **Java NIO access** — XTDB v2 uses Apache Arrow, which needs reflective NIO access on

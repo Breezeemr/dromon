@@ -2,20 +2,27 @@
   "SMART on FHIR patient-set grants backed by Ory Hydra and Ory Keto.
 
    A grant gives an OAuth2 subject (a Hydra client id or end-user sub) access
-   to a set of patients. It is recorded as Keto relation tuples in the `fhir`
-   namespace:
+   to a set of patients within one realm. It is recorded as Keto relation
+   tuples in the `fhir` namespace, every object carrying the realm as its
+   first segment (see docs/keto-realm-scoping.md):
 
-   - {:object \"Patient/<id>\" :relation \"launch\"} -- the subject may obtain
-     a token whose SMART launch context is that patient. Never consulted by
-     the data-access middleware, so it grants no data access by itself.
-   - {:object \"Patient/<id>\" :relation \"read\"|...} -- instance-level access
-     to the Patient resource itself (checked by server.keto).
-   - {:object \"Patient/<id>\" :relation \"request-change\"} -- instance-level
-     authorization for the Patient/$request-demographic-change operation.
-   - {:object <MemberType> :relation \"read\"|...} -- type-level access to the
-     Patient-compartment member types. Safe in combination with a patient/
-     scoped token because server.compartment confines every query to the
-     launch patient's compartment.
+   - {:object \"<realm>/Patient/<id>\" :relation \"launch\"} -- the subject may
+     obtain a token whose SMART launch context is that patient. Never
+     consulted by the data-access middleware, so it grants no data access by
+     itself.
+   - {:object \"<realm>/Patient/<id>\" :relation \"read\"|...} -- instance-level
+     access to the Patient resource itself (checked by server.keto).
+   - {:object \"<realm>/Patient/<id>\" :relation \"request-change\"} --
+     instance-level authorization for the
+     Patient/$request-demographic-change operation.
+   - {:object \"<realm>/<MemberType>\" :relation \"read\"|...} -- type-level
+     access to the Patient-compartment member types. Safe in combination with
+     a patient/ scoped token because server.compartment confines every query
+     to the launch patient's compartment.
+
+   During the realm-scoping migration each of these is written twice, once
+   scoped and once in the legacy realm-blind shape, so a rollback to the
+   previous reader still finds grants it understands.
 
    Hydra integration: `token-hook` is an endpoint for Hydra's
    OAUTH2_TOKEN_HOOK_URL webhook. During token issuance it resolves the launch
@@ -50,6 +57,64 @@
 ;; mints on member types are inert.
 (def ^:private default-relations ["read" "request-change"])
 
+;; ---------------------------------------------------------------------------
+;; Realm scoping
+;;
+;; Objects in the `fhir` namespace carry the realm as their first segment --
+;; "<realm>/Patient", "<realm>/Patient/<id>" -- matching the convention the
+;; breezeehr-role and practitioner-id namespaces already use. See
+;; docs/keto-realm-scoping.md for why the object is the only slot available.
+;;
+;; Writers DUAL-WRITE the realm-scoped and the legacy realm-blind shape for the
+;; duration of the migration, so a rollback to the previous reader still finds
+;; grants it understands. `dual-write-legacy?` is what step 4 turns off.
+;; ---------------------------------------------------------------------------
+
+(def default-dual-write-legacy?
+  "Whether a grant also writes the pre-realm-scoping realm-blind tuple.
+   True until the backfill is confirmed complete; see
+   docs/keto-realm-scoping.md. `KETO_DUAL_WRITE_LEGACY=0` disables it."
+  true)
+
+(defn- dual-write-legacy? []
+  (if-some [v (System/getenv "KETO_DUAL_WRITE_LEGACY")]
+    (not= "0" v)
+    default-dual-write-legacy?))
+
+(defn scoped-object
+  "`object` prefixed with `realm`, or `object` unchanged when there is no realm.
+
+   A realm can never contain a slash -- it arrives as a single URL path
+   segment -- so the prefix stays unambiguous however many segments `object`
+   already has."
+  [realm object]
+  (if (str/blank? (str realm))
+    object
+    (str realm "/" object)))
+
+(def ^:private launch-object-re
+  "Matches both shapes of a launch tuple's object, capturing [realm patient-id]:
+   the realm-scoped `<realm>/Patient/<id>` and the legacy realm-blind
+   `Patient/<id>`, whose realm group is then nil.
+
+   Matched with an optional leading segment rather than by counting segments,
+   because `Patient/123` and `<realm>/Patient` have the same segment count, and
+   rather than by testing the first segment for a resource-type shape, because
+   that would misread a realm whose name happens to be capitalized."
+  #"(?:([^/]+)/)?Patient/(.+)")
+
+(defn launch-object->patient
+  "[realm patient-id] for a launch tuple's object, realm nil for the legacy
+   realm-blind shape, or nil when the object names no patient.
+
+   Both shapes have to be readable at once: during the migration a subject's
+   launch tuples are a mix of the two, and a reader that understands only one
+   of them reports a patient set missing half the grants -- which the token
+   hook turns into a refusal to issue any patient-scoped token."
+  [object]
+  (when-let [[_ realm pid] (re-matches launch-object-re (str object))]
+    [realm pid]))
+
 (defn- put-tuple! [tuple]
   (let [resp (hc/put (str (keto-admin-url) "/admin/relation-tuples")
                      {:headers {"content-type" "application/json"}
@@ -74,16 +139,6 @@
     (when (= 200 (:status resp))
       (get-in resp [:body :relation_tuples]))))
 
-(defn- launch-authorized? [subject patient-id]
-  (let [resp (hc/get (str (keto-read-url) "/relation-tuples/check")
-                     {:query-params {"namespace" "fhir"
-                                     "object" (str "Patient/" patient-id)
-                                     "relation" launch-relation
-                                     "subject_id" subject}
-                      :as :json
-                      :throw-exceptions false})]
-    (boolean (and (= 200 (:status resp)) (get-in resp [:body :allowed])))))
-
 ;; ---------------------------------------------------------------------------
 ;; Grant model
 ;; ---------------------------------------------------------------------------
@@ -96,55 +151,154 @@
        sort
        vec))
 
-(defn grant-tuples
-  "The full set of Keto tuples that a patient-set grant comprises."
-  [subject patient-ids relations]
+(defn- grant-object+relations
+  "The [object relation] pairs a patient-set grant comprises, realm-blind.
+   `grant-tuples` scopes each object to the realm."
+  [patient-ids relations]
   (-> []
       (into (for [pid patient-ids]
-              {:namespace "fhir" :object (str "Patient/" pid)
-               :relation launch-relation :subject_id subject}))
+              [(str "Patient/" pid) launch-relation]))
       (into (for [pid patient-ids, rel relations]
-              {:namespace "fhir" :object (str "Patient/" pid)
-               :relation rel :subject_id subject}))
+              [(str "Patient/" pid) rel]))
       (into (for [t (patient-member-types), rel relations]
-              {:namespace "fhir" :object t :relation rel :subject_id subject}))))
+              [t rel]))))
+
+(defn grant-tuples
+  "The full set of Keto tuples that a patient-set grant comprises, with every
+   object scoped to `realm`.
+
+   `legacy?` additionally emits the pre-realm-scoping realm-blind tuple for
+   each object. Both are written during the migration so that rolling the
+   reader back to the previous release still finds grants it understands; a
+   grant written scoped-only would be invisible to it. It is a no-op when
+   `realm` is blank, where the scoped object already IS the legacy object.
+   See docs/keto-realm-scoping.md."
+  [realm subject patient-ids relations legacy?]
+  (vec
+   (for [[object relation] (grant-object+relations patient-ids relations)
+         obj (cond-> [(scoped-object realm object)]
+               (and legacy? (not (str/blank? (str realm)))) (conj object))]
+     {:namespace "fhir" :object obj :relation relation :subject_id subject})))
 
 (defn grant-patient-set!
-  "Grants `subject` access to the given patient ids with the given relations
-   (default read-only). Idempotent: Keto tuple writes are upserts."
-  [subject patient-ids & {:keys [relations] :or {relations default-relations}}]
-  (run! put-tuple! (grant-tuples subject patient-ids relations))
-  (t/event! :grant/patient-set-granted
-            {:data {:subject subject :patients (vec patient-ids)
-                    :relations (vec relations)}})
-  {:subject subject :patients (vec patient-ids) :relations (vec relations)})
+  "Grants `subject` access to the given patient ids within `realm`, with the
+   given relations (default read-only).
 
-(defn granted-patients
-  "Patient ids the subject holds a launch tuple for."
+   NOT idempotent, contrary to what this docstring said before: Keto's tuple
+   write is not an upsert. Three identical PUTs produce three rows (verified
+   against Keto v0.12.0; `PATCH ... insert` behaves the same), because a
+   relationship's primary key is a generated id rather than the tuple itself.
+   Re-granting therefore duplicates rows. Checks still answer true, so nothing
+   breaks visibly -- but `list-tuples` takes one page of 500 and stops, so a
+   subject re-granted often enough eventually has real grants pushed off the
+   end of the page `granted-patients` reads. Deduplicating the writes is a
+   separate change; `granted-patients` de-duplicates on the read side.
+
+   A nil `realm` grants the legacy realm-blind shape, which is access in EVERY
+   realm the deployment hosts. It stays callable so pre-existing callers keep
+   working during the migration, and it is recorded on the event so such a
+   grant is findable afterwards."
+  [realm subject patient-ids & {:keys [relations] :or {relations default-relations}}]
+  (run! put-tuple! (grant-tuples realm subject patient-ids relations
+                                 (dual-write-legacy?)))
+  (t/event! :grant/patient-set-granted
+            {:data {:realm realm :realm-blind? (str/blank? (str realm))
+                    :subject subject :patients (vec patient-ids)
+                    :relations (vec relations)}})
+  {:realm realm :subject subject :patients (vec patient-ids)
+   :relations (vec relations)})
+
+(defn granted-patient-grants
+  "[{:realm <realm-or-nil> :patient-id <id>}] for every launch tuple the
+   subject holds, in either object shape.
+
+   The listing is the one Keto call that sees both shapes at once: there is no
+   prefix filter on `getRelationships`, so a realm cannot be queried for
+   directly and the narrowing is client-side anyway."
   [subject]
   (->> (list-tuples {"namespace" "fhir"
                      "relation" launch-relation
                      "subject_id" subject})
        (keep (fn [{:keys [object]}]
-               (second (re-matches #"Patient/(.+)" (str object)))))
+               (when-let [[realm pid] (launch-object->patient object)]
+                 {:realm realm :patient-id pid})))
+       (sort-by (juxt :patient-id :realm))
+       vec))
+
+(defn granted-patients
+  "Patient ids the subject holds a launch tuple for, in ANY realm.
+
+   Deliberately realm-blind, and it has to be: the only caller that matters is
+   the Hydra token hook, and a token request carries no realm -- Hydra knows
+   about clients and scopes, not about this server's tenants. Unioning the
+   realms is what keeps behaviour identical to before realm-scoping. Nothing
+   downstream needs the realm either, because the SMART `patient` claim is a
+   bare id.
+
+   Pre-existing limitation, unchanged here: `list-tuples` fetches one page of
+   500 and does not follow `next_page_token`, so a subject granted more than
+   500 launch tuples has the excess silently invisible."
+  [subject]
+  (->> (granted-patient-grants subject)
+       (map :patient-id)
+       distinct
        sort
        vec))
 
+(defn- launch-authorized?
+  "Whether the subject holds a launch tuple for `patient-id` in any realm.
+
+   Reads the listing rather than Keto's check endpoint, because a check needs
+   an exact object and during the migration the tuple may carry either shape,
+   in any realm -- there is nothing to build an exact object from. This is also
+   the source `resolve-launch-patient`'s other branch already trusts, so both
+   branches now agree by construction instead of by coincidence.
+
+   What this gives up is Keto's subject-SET expansion: a launch grant made to a
+   userset rather than to a subject id would not be seen. No writer in the
+   estate makes one -- `grant-tuples` and `linkage/launch-tuple` both write
+   `subject_id` -- and the userset refactor is blocked on the subject-spelling
+   split (docs/keto-realm-scoping.md), so nothing is lost today. It has to be
+   revisited the day launch grants move to usersets."
+  [subject patient-id]
+  (contains? (set (granted-patients subject)) (str patient-id)))
+
 (defn revoke-patient-set!
-  "Removes the subject's tuples for the given patient ids (all relations).
-   Type-level compartment tuples are removed once the subject's last patient
-   grant is gone."
+  "Removes the subject's tuples for the given patient ids (all relations, all
+   realms). Type-level compartment tuples are removed once the subject's last
+   patient grant is gone.
+
+   Revocation deletes EVERY shape it can find, not the ones a caller names:
+   the legacy realm-blind object, and the realm-scoped object for every realm
+   the subject holds a launch tuple for. Over-deleting is the only acceptable
+   direction here -- a revoke that leaves one shape behind leaves the access it
+   was called to remove, and reports success."
   [subject patient-ids]
-  (doseq [pid patient-ids]
-    (delete-tuples! {"namespace" "fhir"
-                     "object" (str "Patient/" pid)
-                     "subject_id" subject}))
-  (when (empty? (granted-patients subject))
-    (doseq [t (patient-member-types)]
-      (delete-tuples! {"namespace" "fhir" "object" t "subject_id" subject})))
-  (t/event! :grant/patient-set-revoked
-            {:data {:subject subject :patients (vec patient-ids)}})
-  {:subject subject :revoked (vec patient-ids)})
+  (let [;; Read before deleting: this is what tells us which realms the
+        ;; subject's tuples live in, and they are deleted below.
+        ;;
+        ;; Every instance tuple is scanned, not just the launch ones, because
+        ;; a realm whose launch tuple has already been revoked can still hold
+        ;; read and request-change tuples. Missing such a realm would leave
+        ;; exactly the access this call exists to remove.
+        realms (into #{}
+                     (comp (map :object)
+                           (keep #(first (launch-object->patient %))))
+                     (list-tuples {"namespace" "fhir" "subject_id" subject}))]
+    (doseq [pid patient-ids
+            object (cons (str "Patient/" pid)
+                         (map #(scoped-object % (str "Patient/" pid)) realms))]
+      (delete-tuples! {"namespace" "fhir"
+                       "object" object
+                       "subject_id" subject}))
+    (when (empty? (granted-patients subject))
+      (doseq [t (patient-member-types)
+              object (cons t (map #(scoped-object % t) realms))]
+        (delete-tuples! {"namespace" "fhir" "object" object "subject_id" subject})))
+    (t/event! :grant/patient-set-revoked
+              {:data {:subject subject :patients (vec patient-ids)
+                      :realms (vec (sort realms))}})
+    {:subject subject :revoked (vec patient-ids)}))
 
 ;; ---------------------------------------------------------------------------
 ;; HTTP handlers -- grant administration
@@ -161,16 +315,22 @@
           :issue [{:severity "error" :code "invalid" :diagnostics diagnostics}]}})
 
 (defn create-grant
-  "POST /auth/grants {subject, patients [...], relations? [...]}"
+  "POST /auth/grants {subject, patients [...], realm?, relations? [...]}
+
+   `realm` confines the grant to one tenant. It is optional so that callers
+   predating realm-scoping keep working, but omitting it grants access in
+   EVERY realm the deployment hosts, and the response says so in
+   `:realm-blind?` rather than leaving the caller to infer it."
   [req]
-  (let [{:keys [subject patients relations]} (:body-params req)]
+  (let [{:keys [subject patients relations realm]} (:body-params req)]
     (cond
       (str/blank? (str subject)) (bad-request "subject is required")
       (empty? patients) (bad-request "patients must be a non-empty list")
       :else {:status 201
-             :body (grant-patient-set! subject patients
-                                       :relations (or (not-empty relations)
-                                                      default-relations))})))
+             :body (assoc (grant-patient-set! realm subject patients
+                                              :relations (or (not-empty relations)
+                                                             default-relations))
+                          :realm-blind? (str/blank? (str realm)))})))
 
 (defn read-grant
   "GET /auth/grants?subject=<id>"
@@ -179,7 +339,9 @@
     (if (str/blank? (str subject))
       (bad-request "subject query parameter is required")
       {:status 200
-       :body {:subject subject :patients (granted-patients subject)}})))
+       :body {:subject subject
+              :patients (granted-patients subject)
+              :grants (granted-patient-grants subject)}})))
 
 (defn delete-grant
   "DELETE /auth/grants {subject, patients [...]}"

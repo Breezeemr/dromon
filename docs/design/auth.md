@@ -27,11 +27,16 @@ enforcement is delegated to Keto.
 
 ## Authorization (`server.keto/wrap-keto-authorization`)
 Checks Ory Keto `/relation-tuples/check` (namespace `"fhir"`). HTTP method maps to a relation
-(GET→`read`, POST/PUT/PATCH→`write`, DELETE→`delete`). Granularity is **two-tier**: the
-**type-level** object (`Patient`) is checked first, then the **instance-level** object
-(`Patient/123`) as a fallback — so a type-level grant covers all instances of that type. Routes
-marked `:public? true` (SMART discovery, `metadata`) bypass authz. A missing subject or a Keto
-error is **fail-closed** to `403`.
+(GET→`read`, POST/PUT/PATCH→`write`, DELETE→`delete`). Objects are **realm-scoped**: the
+request's `:tenant-id` is the object's first segment, so granularity is **two-tier within a
+realm** — the **type-level** object (`<realm>/Patient`) is checked first, then the
+**instance-level** object (`<realm>/Patient/123`) — and a grant in one realm authorizes nothing
+in another. A request with no realm in its path keeps the bare object. While the realm-scoping
+migration is in flight the legacy realm-blind objects are accepted as a further fallback; see
+[keto-realm-scoping.md](../keto-realm-scoping.md). Routes marked `:public? true` (SMART
+discovery, `metadata`) bypass authz — except the bulk-data routes, which are `:public?` and
+therefore run the same `<realm>/system` check inline (`server.keto/system-read-allowed?`). A
+missing subject is a `401`; a denial or a Keto error is **fail-closed** to `403`.
 
 ## OAuth2 / SMART (Ory Hydra)
 - **Hydra** issues OAuth2 tokens. The dev/Inferno path provisions a Hydra client and obtains a

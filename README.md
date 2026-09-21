@@ -4,33 +4,141 @@
   <img src="docs/dromon_ship.png" alt="A majestic Byzantine dromon warship" width="600" />
 </div>
 
-A Clojure-based multitenant FHIR server with pluggable immutable storage backends, built on Reitit, Malli, and XTDB v2.
+A Clojure-based multitenant FHIR R4B server built on storage that never
+overwrites, with Malli validators generated from FHIR StructureDefinitions and
+XTDB v2 underneath.
 
-## The Name
+**[Getting Started](docs/getting-started.md)** covers prerequisites, running the
+server, architecture, schema generation, and the test and compliance tasks.
 
-The **Dromon** (from the Greek *dromōn*, "runner") was the primary warship of the Byzantine navy, known for its speed and maneuverability. Equipped with a bronze-tipped siphon at the prow, it discharged **Greek Fire** -- an incendiary weapon that burned even on water.
+## A FHIR Server Well Adapted to AI
 
-## Architecture
+A growing share of decisions against a clinical record are made by something
+that reads the record, acts on it, and cannot be asked afterward what it was
+thinking. Dromon is built for that setting on three properties: it never
+forgets, it keeps provenance, and it is malleable.
+
+### It never forgets
+
+The store never overwrites. XTDB v2 is the primary backend and Datomic a
+benchmarked alternative; a write adds a version and nothing is destroyed. Every
+version carries two timestamps.
+
+- **Valid time** is when the fact was true in the world.
+- **System time** is when the system learned it.
+
+A lab specimen drawn on Friday and corrected on Tuesday is valid from Friday
+and known from Tuesday. A coverage termination backdated to the first of the
+month was true from the first and recorded on the twentieth. Keep one axis and
+you can reconstruct one of those. You will not find out which one you needed
+until somebody asks why a claim was denied.
+
+FHIR versions records, not facts: `_history` gives you system time, and the
+specification has no valid-time axis at all. Dromon adds one as a selector a
+store must advertise, so a plain `GET` still means current state.
+
+| Surface | Question it answers |
+|---|---|
+| `_asOf` | As the server knew it then |
+| `_validAt` | As it was true in the world |
+| `$as-of`, `$timeline` | One resource at an instant, or every version with its bounds |
+
+This is what makes a model's decision debuggable. When its input was database
+reads and the database has since moved on, you have the prompt template but not
+the data it was filled with, and a model that reasoned badly over correct data
+looks identical to one that reasoned correctly over data since quietly fixed.
+Re-read at the transaction the request ran against and the disagreement becomes
+something a person can check.
+
+The same read keeps the future out of training data. A "diagnosis at
+admission" extracted from current state includes the diagnosis added three
+weeks after discharge. Nothing errors; the numbers are just better than they
+should be.
+
+And a correction stops rewriting the past. On the twentieth the payer reports
+that the coverage above ended on the first. On a forgetting database you set an
+end date and the system looks as though it had always known. Here the fix is a
+retroactive close, a store verb that names the portion of valid time it covers:
+
+```clojure
+(db/close-valid-time store "default" :Coverage "cov-1"
+                     (Instant/parse "2026-03-01T00:00:00Z"))
+```
+
+The same instant now answers differently depending on which question you ask.
 
 ```
-                       test-server
-                   (Integrant system)
-                    /       |        \
-            fhir-server    store    malli schemas
-         (routing, auth,  (xtdb2 /   (r4b, uscore8,
-          handlers, MW)    mock)      ...)
-                \           |          /
-                 fhir-store-protocol
-                    (IFHIRStore)
+GET /default/fhir/Coverage/cov-1/$as-of?_asOf=2026-03-10T00:00:00Z&_validAt=2026-03-10T00:00:00Z
+  -> 200, active: what was true on the tenth, as we knew it on the tenth
+
+GET /default/fhir/Coverage/cov-1/$as-of?_validAt=2026-03-10T00:00:00Z
+  -> 404: what was true on the tenth, as we know it now
 ```
 
-The server is built around the `IFHIRStore` protocol, which defines FHIR operations (create, read, update, delete, search, history, vread, transact-bundle). Storage backends implement this protocol, making the server database-agnostic.
+The claim adjudicated on the tenth stays explicable, and the correction stays
+dated to the twentieth. Valid-time writes are store verbs today, not HTTP; the
+reads are. Mechanics are in
+[Getting Started](docs/getting-started.md#point-in-time-reads).
 
-`fhir-server` has no static dependency on any storage backend or Malli schema package. `test-server` selects both at startup -- the store via the `:store/*` aliases (or `TEST_SERVER_STORE`) and the schema package via the `:malli/*` aliases (or `TEST_SERVER_SCHEMAS`). Schemas are resolved from config by `server.core/resolve-schemas` using `requiring-resolve`.
+### It keeps provenance
 
-Routes are generated dynamically from Malli schemas. Each schema carries metadata describing its FHIR type, supported interactions, handler functions, and custom operations. Reitit builds the route tree at startup.
+Immutability records that a row changed and when. It does not record who or
+why. FHIR's answer is the `Provenance` resource, and Dromon treats it as a
+first-class type: routed, validated, and compartment-indexed by `agent`.
+Everything a given run touched is one search away.
 
-All routes are tenant-scoped: `/:tenant-id/fhir/{ResourceType}/{id}`.
+Write it in the same transaction as the change. A `transaction` Bundle carrying
+the resource and its `Provenance` commits atomically, so either both land or
+neither does. Attribution written afterward can fail on its own and leave a
+change with nothing to account for it. Underneath, XTDB stamps system time on
+every commit and accepts a `:metadata` map per transaction for request or
+agent-run ids, a seam `fhir-store-xtdb2` does not use yet. See
+[Provenance and Attribution](docs/getting-started.md#provenance-and-attribution).
+
+An agent that updates records or closes coverage is acting on the system of
+record, where a mistake is a wrong row with payments downstream of it. On a
+forgetting database the remedy is another `UPDATE`, which destroys the
+evidence. Here the run is fully present: what it read, what it wrote, and what
+the record looked like before it touched anything. An automated system that
+quietly improves its own history cannot be audited, and an unauditable system
+has no business making decisions that carry a cost.
+
+### It is malleable
+
+Nothing about the server's FHIR surface is compiled in. It comes from the
+conformance resources of whichever implementation guide is on the classpath.
+
+| Artifact | Determines |
+|---|---|
+| CapabilityStatement | Which types exist and which interactions each supports. A type that does not declare `read` has no read route. |
+| StructureDefinition | The Malli validator for each profiled resource. |
+| SearchParameter | The search registry, combined with schema introspection so no field name is hardcoded in the store. |
+| OperationDefinition | The operations mounted per type, and what `/metadata` advertises. |
+
+The served CapabilityStatement is generated from the same source as the routes,
+so the server's description of itself cannot drift from its behaviour. The
+schema package (`:malli/uscore8`, `:malli/r4b`, a private Breeze IG outside
+this repository) and the store backend (`:store/xtdb2`, `:store/datomic`,
+`:store/mock`) are both aliases chosen at startup, and `fhir-server` depends
+statically on neither. A private guide can even ship a storage registry that
+`server.core/resolve-schema` recompiles schemas under, adapting a profile to a
+backend's storage model without forking the server.
+
+A server whose behaviour is spread by hand across route tables and validators
+has no single place where a requirement lives, so a model editing it is editing
+a dozen loosely coupled guesses. Here a schema upgrade is mechanical.
+The generator pins the guide (`download-and-extract-uscore! "STU8.0.1"`) and
+emits namespaces that carry the version (`us-core.capability.v8-0-1.Patient`),
+which the server's spec vector names. To take the next US Core release you
+change the pin, regenerate, repoint the spec vector, and run the suite.
+`validator-compile-test` requires those namespaces by name and fails to load
+until it is repointed; a search parameter the new guide dropped fails
+`search-param-contract-test`, which insists every declared parameter is
+honoured or reported; a newly declared type shows up as a route with no
+handler. That loop runs in CI, where an AI-assisted change should be judged,
+and `bb inferno-test` gates US Core compliance the same way. TypeScript types
+for profiled resources and operations are planned, not shipped. Details in
+[Conformance-Driven Configuration](docs/getting-started.md#conformance-driven-configuration).
 
 ## Project Structure
 
@@ -48,103 +156,26 @@ dromon/
   test-server/                  Runnable server, configurable store + schema package
 ```
 
-### Dependency Graph
+The module name `fhir-defintions-to-malli` carries a typo in "defintions". It is
+spelled that way on disk, so use that spelling in paths and references. How the
+modules depend on each other is in
+[Getting Started](docs/getting-started.md#dependency-graph).
 
-```
-test-server --> fhir-server --> fhir-store-protocol
-            \-> fhir-store-xtdb2 (or fhir-store-mock) --/
-            \-> fhir/malli/uscore8 (or other malli pkgs, alias-controlled)
+## Documentation
 
-fhir-defintions-to-malli --> fhir-primitives --> com.breezeehr/malli-decimal (external)
-```
+- [Getting Started](docs/getting-started.md): setup, running, architecture, tasks
+- [API, routing, and validation](docs/design/api.md)
+- [Server architecture](docs/design/server.md)
+- [Storage backends](docs/design/backends.md)
+- [Authentication](docs/design/auth.md)
+- [Multitenancy](docs/design/multitenancy.md)
 
-## Prerequisites
+## The Name
 
-- **Java 21** (required by XTDB v2)
-- **Clojure CLI** (`clj` / `clojure`)
-- **Babashka** (`bb`) for task automation
-- **Podman** or **Docker** for integration tests and Ory services
-- **mkcert** for local TLS certificates (optional, for Inferno tests)
-
-## Quick Start
-
-Start `test-server` with an in-memory XTDB v2 node and the US Core STU8 schema package:
-
-```bash
-cd test-server
-clj -A:store/xtdb2:malli/uscore8 -X test-server.core/-main
-```
-
-The server starts on port `8080` (HTTP) and `8443` (HTTPS).
-
-Test it:
-
-```bash
-curl http://localhost:8080/default/fhir/metadata
-```
-
-Switch backends or schema packages by changing the aliases (e.g. `-A:store/mock:malli/r4b`) or via env vars `TEST_SERVER_STORE` and `TEST_SERVER_SCHEMAS`.
-
-## Babashka Tasks
-
-All tasks run from the repo root via `bb <task>`:
-
-| Task | Description |
-|------|-------------|
-| `setup` | Start local integration env (Postgres, Ory Kratos/Keto/Hydra) |
-| `teardown` | Stop and remove integration env containers |
-| `tls-setup` | Add `fhir.local` to `/etc/hosts` and generate dev TLS cert |
-| `inferno-setup` | Clone US Core Test Kit, build images, patch compose files |
-| `inferno-test` | Run Inferno US Core compliance tests headlessly |
-| `inferno-check` | Smoke test: verify containers and server health |
-| `inferno-run` | Start Inferno web UI for interactive testing |
-| `inferno-down` | Stop Inferno containers |
-
-### Running Inferno Tests
-
-```bash
-bb tls-setup        # one-time: hosts entry + dev cert
-bb setup            # start Ory auth services
-bb inferno-setup    # clone and build Inferno test kit
-bb inferno-test     # run compliance tests
-```
-
-Results are written to `target/inferno-report.json`.
-
-## Key Technologies
-
-| Component | Version | Role |
-|-----------|---------|------|
-| Clojure | 1.12.0 | Language |
-| XTDB | 2.1.0 | Temporal database backend |
-| Malli | 0.14.0+ | Schema validation and route generation |
-| Reitit | 0.7.0-alpha7 | HTTP routing |
-| Jetty | (ring-jetty9) | HTTP server with virtual threads |
-| Integrant | 0.13.1 | Component lifecycle |
-| Buddy | 3.x | JWT authentication |
-| Ory Hydra/Kratos/Keto | v2.2/v1.3/v0.12 | OAuth2, identity, authorization |
-
-## Storage Backends
-
-### XTDB v2 (`fhir-store-xtdb2`)
-
-The primary backend. Maps FHIR resources to dynamic SQL tables, stores original JSON alongside exploded columns, and uses XTDB's native temporal features for version history. Supports 20+ FHIR search parameter types including date ranges, token searches, reference resolution, and composite parameters.
-
-### Mock (`fhir-store-mock`)
-
-Atom-backed in-memory store for testing. Tracks version history and supports all protocol operations. No external dependencies.
-
-## FHIR Schema Generation
-
-The `fhir-defintions-to-malli` project downloads official FHIR StructureDefinitions and generates Malli schemas. The `fhir-primitives` and `malli-decimal` libraries provide the type foundations, including support for FHIR's recursive type references and arbitrary-precision decimals.
-
-The generator runs a 6-step pipeline that produces independent schema packages under `fhir/malli/`: `r4b`, `xver` (cross-version extensions), `fhir-extensions`, `sdc`, and `uscore8` (which also writes CapabilityStatement `:multi` schemas). Each package is consumable as its own deps.edn dependency.
-
-```bash
-cd fhir-defintions-to-malli
-mkdir -p target/staging/src
-clj -X com.breezeehr.main/generate-uscore!
-```
+The **Dromon** (from the Greek *dromōn*, "runner") was the primary warship of
+the Byzantine navy, known for its speed and maneuverability. Equipped with a
+bronze-tipped siphon at the prow, it discharged **Greek Fire**, an incendiary
+weapon that burned even on water.
 
 ## License
 
