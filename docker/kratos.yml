@@ -10,14 +10,22 @@
 # server.docker-env/start-auth-stack!. The same pattern is used in
 # production (breeze-deploy kratos manifests).
 
+# TLS is served natively from the mkcert pair `start-auth-stack!` mounts at
+# /etc/ory/tls (docker/tls on the host, minted by `ensure-ory-tls-cert!` or the
+# repo-root `bb cert:setup ory`). The names resolve to loopback through
+# /etc/hosts; there is no plain-HTTP listener.
 serve:
   public:
-    base_url: http://127.0.0.1:4433/
+    base_url: https://localkratos.breezeehr.com:4433/
+    tls:
+      cert:
+        path: /etc/ory/tls/ory.pem
+      key:
+        path: /etc/ory/tls/ory-key.pem
     cors:
       enabled: true
       allowed_origins:
-        - http://127.0.0.1:3001
-        - http://localhost:3001
+        - https://localauth.breezeehr.com:3001
       allowed_methods:
         - POST
         - GET
@@ -32,23 +40,27 @@ serve:
         - Content-Type
         - Set-Cookie
   admin:
-    base_url: http://127.0.0.1:4434/
+    base_url: https://localkratos.breezeehr.com:4434/
+    tls:
+      cert:
+        path: /etc/ory/tls/ory.pem
+      key:
+        path: /etc/ory/tls/ory-key.pem
 
 selfservice:
   # The login-consent app (Hydra login/consent challenge UI) serves the
   # credential screens; 3001 avoids the FHIR test-server on 3000.
-  default_browser_return_url: http://127.0.0.1:3001/
+  default_browser_return_url: https://localauth.breezeehr.com:3001/
   allowed_return_urls:
-    - http://127.0.0.1:3001
-    - http://localhost:3001
+    - https://localauth.breezeehr.com:3001
   methods:
     password:
       enabled: true
   flows:
     login:
-      ui_url: http://127.0.0.1:3001/kratos/login
+      ui_url: https://localauth.breezeehr.com:3001/kratos/login
     registration:
-      ui_url: http://127.0.0.1:3001/kratos/register
+      ui_url: https://localauth.breezeehr.com:3001/kratos/register
     recovery:
       enabled: false
     verification:

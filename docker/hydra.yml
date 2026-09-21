@@ -43,9 +43,12 @@ urls:
     # via JWKS (not `iss`), so the issuer change is transparent to authorization.
     issuer: https://fhir.local:4443/
 
-  consent: http://127.0.0.1:3000/consent
-  login: http://127.0.0.1:3000/login
-  logout: http://127.0.0.1:3000/logout
+  # The login-consent app (login-consent/ in master-at-arms2), as the browser
+  # reaches it. `start-auth-stack!` sets the same three through URLS_LOGIN,
+  # URLS_CONSENT and URLS_LOGOUT; the main pool never redirects a browser.
+  consent: https://localauth.breezeehr.com:3001/consent
+  login: https://localauth.breezeehr.com:3001/login
+  logout: https://localauth.breezeehr.com:3001/logout
 
 secrets:
   system:
