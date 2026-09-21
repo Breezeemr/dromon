@@ -139,7 +139,7 @@ and `:malli/*` aliases from `test-server/deps.edn` to put alternate
 backends or schema packages on the classpath.
 
 ### Key modules
-- **fhir-store-protocol** -- `IFHIRStore` protocol: create, read, update, delete, search, history, vread, transact-bundle
+- **fhir-store-protocol** -- `IFHIRStore` protocol: create, read, update, delete, search, history, vread, transact-bundle. Every write verb also takes a trailing `opts` map carrying `:if-match` and `:tx-metadata`; `ITxMetadataStore` says whether a store actually keeps the latter
 - **fhir-store-xtdb2** -- Primary backend; maps FHIR resources to dynamic SQL tables, stores original JSON in `fhir_source` column
 - **fhir-store-mock** -- Atom-backed in-memory store for tests
 - **fhir-server** -- Reitit routing, Ring handlers, JWT auth, Keto authorization, Muuntaja content negotiation, FHIR exception middleware. No static dep on any malli schema package or store impl.
@@ -225,6 +225,62 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   rather than for the call. Where the engine does raise, it is
   `xtdb.error.Incorrect` and a store span rethrows it wrapped, so that code
   sits on the cause.
+
+### Transaction metadata (`:tx-metadata`)
+
+Provenance recorded BESIDE the data rather than only in a log, for the
+writes no request-level middleware can see: a host's own routes calling the
+raw store, back-office code holding a store handle, and machine traffic
+running under a service credential with no human in it at all.
+
+Every `IFHIRStore` write verb takes an `opts` map, and `:tx-metadata` is a
+key on it. The map is OPEN and dromon never reads it -- the host builds it,
+the store persists it, the same WHAT/WHEN division the narrative seam draws.
+Two documented axes, both optional:
+
+- `:principal` -- who authorized the write (`:credential`, `:altId`,
+  `:userId`, the act-as pair while impersonating, Kratos subjects). The
+  camelCase keys are the host's audit-trail keys deliberately, so a stamp and
+  a log line join with no translation.
+- `:device` -- what code performed it: a required `:name` and a `:versions`
+  map of component -> version string. Plural by design: which dependency read
+  the input changes how the input was interpreted. It is DATA, not a FHIR
+  Reference, because nothing mints `Device` resources yet.
+
+`check-tx-metadata` is the shared rule every adopting store runs, the
+analogue of `normalize-if-match`: nil / empty / all-nil-values -> nil, a
+well-formed map returned unchanged, anything else a 500 (the host assembles
+the stamp, so a malformed one is a programming error on this side).
+
+Rules that are easy to get wrong:
+
+- **A store that cannot persist the stamp MUST NOT implement
+  `ITxMetadataStore`.** Every store accepts the key once the arity exists,
+  including one that drops it, so `satisfies? IFHIRStore` says nothing. Same
+  capability split, for the same reason, as the bitemporal and `_text`
+  protocols above. Ask `supports-tx-metadata?`, which checks `satisfies?` and
+  `tx-metadata-supported?` in that order -- the second alone throws on a
+  store that does not implement the protocol at all.
+- **A supporting store persists the stamp in the SAME transaction as the
+  data.** A stamp written separately can name a write that never committed,
+  which is worse than no stamp.
+- **A decorator forwards the opts arity iff opts is non-nil** --
+  `(if opts (verb base ... opts) (verb base ...))`. A base predating the
+  arity has no such method, so unconditional forwarding turns every plain
+  write into an `AbstractMethodError`.
+- **One stamp per TRANSACTION.** A transaction Bundle carries one for the
+  whole Bundle; a batch Bundle applies the same map to each entry's own
+  transaction. Entries that fail commit nothing and are stamped nowhere.
+- **A stamp never goes into a span's `:data`** -- it carries usernames and
+  practitioner ids. Log key presence only, same rule as `fhir-store.trace`.
+- **The log is not retired by this.** A stamp exists only for a write that
+  landed, so refusals and thrown writes remain the audit log's business.
+
+The protocol lives here and its implementations live in the consuming
+repository, which advances its submodule pointer only later, so every change
+to this surface must be additive. See
+`docs/tasks/fhir-store-tx-metadata-channel.md` for the payload reasoning,
+each backend's storage home, and the adoption order.
 
 ### Auth stack
 - **JWT**: `server.auth/wrap-jwt-auth` -- HS256 with `JWT_DEV_SECRET` env var (dev) or RS256 with JWKS from `JWKS_URL` (prod)

@@ -1,4 +1,5 @@
-(ns fhir-store.protocol)
+(ns fhir-store.protocol
+  (:require [clojure.string :as str]))
 
 ;; Reflective lookup for the OpenTelemetry Context class. We avoid a hard
 ;; compile-time dependency on the OTel SDK so this module stays free of
@@ -86,6 +87,89 @@
   [v]
   (if (= if-match-any v) "*" v))
 
+;; ---------------------------------------------------------------------------
+;; Transaction metadata (:tx-metadata)
+;; ---------------------------------------------------------------------------
+
+(defn check-tx-metadata
+  "Validate a `:tx-metadata` opt and normalize \"carries nothing\" to nil.
+
+   The analogue of `normalize-if-match`: one shared rule every adopting
+   store runs, so the stores agree on what a caller may pass instead of each
+   inventing its own tolerance.
+
+   THE MAP IS OPEN and dromon never reads it. Two top-level keys are
+   documented, both optional, both maps, and they are orthogonal axes --
+   who authorized the write, and what code performed it:
+
+     {:principal {:credential   \"session\" | \"token\" | \"anonymous\"
+                  :altId        <the real human, or a service's client_id>
+                  :userId       <acting practitioner uuid, bare string>
+                  :actAsAltId   <impersonated username>          ; session only
+                  :actAsUserId  <impersonated practitioner uuid> ; session only
+                  :subject      <Kratos id>
+                  :actAsSubject <Kratos id of the impersonated>}
+      :device    {:name      \"purser\"                  ; required inside :device
+                  :versions  {\"purser\" \"<git sha>\" \"rcm-x12\" \"<git sha>\"}
+                  :reference \"Device/<id>\"}}           ; optional
+
+   `:principal`'s keys are camelCase on purpose: they are the tails of the
+   four `SecurityEvent.participant` attributes the host already stamps on a
+   Datomic transaction entity, so an in-store stamp and the host's audit
+   trail join with no translation.
+
+   `:device` is DATA, not a FHIR Reference, because nothing mints Device
+   resources yet; committing the channel to `Device/<id>` would oblige every
+   producer to register one before it could stamp anything. `:versions` is a
+   map rather than one sha because which dependency read the input changes
+   how the input was interpreted. A `:reference` may be added later without
+   changing this contract.
+
+   Returns nil for nil, for an empty map, and for a map whose values are all
+   nil -- a stamp that names nobody and nothing is no stamp, and a store
+   should not write an empty row for it. Otherwise returns the map ITSELF,
+   unchanged and including keys not documented here.
+
+   Throws ex-info `{:fhir/status 500 :fhir/code \"exception\"
+   :tx-metadata/problem <keyword>}` for a shape no producer should ever
+   build. 500 and not 400: the stamp is assembled by the host from its own
+   request context, so a malformed one is a programming error on this side,
+   not something a client sent. The exception names the RULE and never
+   echoes the value, because the map can carry usernames and practitioner
+   ids -- the same reason a stamp must not go into a span's `:data`."
+  [m]
+  (letfn [(bad! [problem message]
+            (throw (ex-info message
+                            {:fhir/status 500
+                             :fhir/code "exception"
+                             :tx-metadata/problem problem})))]
+    (cond
+      (nil? m) nil
+
+      (not (map? m))
+      (bad! :not-a-map ":tx-metadata must be a map")
+
+      (every? nil? (vals m)) nil
+
+      :else
+      (let [{:keys [principal device]} m]
+        (when (and (some? principal) (not (map? principal)))
+          (bad! :principal-not-a-map ":tx-metadata :principal must be a map"))
+        (when (some? device)
+          (when-not (map? device)
+            (bad! :device-not-a-map ":tx-metadata :device must be a map"))
+          (when-not (and (string? (:name device))
+                         (not (str/blank? (:name device))))
+            (bad! :device-name-missing
+                  ":tx-metadata :device must carry a non-blank string :name"))
+          (when-some [versions (:versions device)]
+            (when-not (and (map? versions)
+                           (every? string? (keys versions))
+                           (every? string? (vals versions)))
+              (bad! :device-versions-malformed
+                    ":tx-metadata :device :versions must map strings to strings"))))
+        m))))
+
 (defprotocol IFHIRStore
   "Store contract for FHIR resource persistence.
 
@@ -100,8 +184,55 @@
    stamp and order frames by it without minting its own counter. Deletes,
    having no resource to return, return an empty map carrying the
    metadata. Backends that cannot supply a basis omit the metadata;
-   callers must treat it as optional."
-  (create-resource [this tenant-id resource-type id resource])
+   callers must treat it as optional.
+
+   Opts convention. Every write verb has a plain arity and an arity taking
+   a trailing `opts` map, and four rules hold across all of them:
+
+   1. THE PLAIN ARITY IS THE OPTS ARITY WITH nil. An implementation should
+      define it by delegating, the way CompartmentFilteringStore already
+      does for the tenant verbs, so there is one body per verb.
+   2. A DECORATOR FORWARDS THE OPTS ARITY IFF opts IS NON-nil --
+      `(if opts (verb base ... opts) (verb base ...))`. A base that predates
+      an arity has no such method, so forwarding unconditionally turns every
+      plain write through the decorator into an AbstractMethodError. This
+      was CompartmentFilteringStore's private habit; it is now the rule.
+   3. `:tx-metadata` is THREADED, NEVER READ. dromon does not interpret
+      `:principal` or `:device` and has no vocabulary for them: the host
+      builds the map, the store persists it, the same division
+      `server.narrative` draws between WHAT and WHEN. See
+      `check-tx-metadata` for the shape and `ITxMetadataStore` for who
+      promises to keep it.
+   4. A STAMP MUST NOT REACH A SPAN'S `:data`. The map can carry usernames
+      and practitioner ids; log key presence, never values. Same rule as
+      `fhir-store.trace`.
+
+   PASSING A STAMP TO AN UNADOPTED IMPLEMENTATION FAILS TWO DIFFERENT WAYS,
+   and the difference is the whole reason `ITxMetadataStore` exists.
+
+   `update-resource` and `delete-resource` already had an opts arity before
+   this seam, so an implementation that predates it ACCEPTS `:tx-metadata`
+   and silently ignores it -- no error, no stamp.
+
+   `create-resource`, `transact-transaction` and `transact-bundle` gained
+   their opts arity here, so an implementation that predates it does NOT have
+   that arity to call: the invocation throws `AbstractMethodError` at runtime.
+   It compiles, it loads, `satisfies?` is true, and it dies on the call. That
+   is Clojure's behaviour for an added arity on an inline implementation, and
+   it is measured rather than assumed.
+
+   So a caller must not decide by trying. It finds out BEFORE the call, with
+   `supports-tx-metadata?` -- see `ITxMetadataStore`."
+  (create-resource
+    [this tenant-id resource-type id resource]
+    [this tenant-id resource-type id resource opts]
+    "Create a resource under a caller-assigned logical id.
+
+     `opts` may contain:
+     - :tx-metadata — provenance recorded BESIDE the data, in the same
+       transaction. See `check-tx-metadata` for the shape, and
+       `ITxMetadataStore` for which stores promise to keep it. A store that
+       does not implement `ITxMetadataStore` ignores this key.")
   (read-resource [this tenant-id resource-type id])
   (vread-resource [this tenant-id resource-type id vid])
   (update-resource
@@ -123,28 +254,50 @@
 
        Anything else is a value no resource can hold, and fails the write
        with a 412 rather than being ignored. An :if-match a store cannot
-       make sense of must never degrade into an unconditional write.")
+       make sense of must never degrade into an unconditional write.
+
+     - :tx-metadata — provenance recorded beside the data, in the same
+       transaction. See `check-tx-metadata` and `ITxMetadataStore`.")
   (delete-resource
     [this tenant-id resource-type id]
     [this tenant-id resource-type id opts]
     "Delete a resource. `opts` may contain :if-match for optimistic
-     concurrency; accepted values and semantics match update-resource.")
+     concurrency; accepted values and semantics match update-resource.
+     It may also contain :tx-metadata, as every write verb does — a delete
+     is the write whose provenance is least recoverable from the data, since
+     it leaves none.")
   (search [this tenant-id resource-type params search-registry])
   (history [this tenant-id resource-type id])
   (history-type [this tenant-id resource-type params]
     "Returns all versions of all resources of a given type.")
   (count-resources [this tenant-id resource-type params search-registry]
     "Returns the total count of resources matching the search params.")
-  (transact-transaction [this tenant-id entries]
+  (transact-transaction
+    [this tenant-id entries]
+    [this tenant-id entries opts]
     "Atomic FHIR `transaction` Bundle semantics (HL7 FHIR §3.1.0.11.2):
      all entries succeed or all fail as a single database transaction.
      Any failure propagates as an exception that rolls back the whole
-     transaction; there is no per-entry error handling.")
-  (transact-bundle [this tenant-id entries]
+     transaction; there is no per-entry error handling.
+
+     `opts` may contain:
+     - :tx-metadata — ONE stamp for the WHOLE Bundle, because the whole
+       Bundle is one transaction. There is no per-entry stamp here: a stamp
+       names a transaction, and every entry shares this one.")
+  (transact-bundle
+    [this tenant-id entries]
+    [this tenant-id entries opts]
     "FHIR `batch` Bundle semantics: each entry is processed
      independently. Per-entry failures do NOT affect other entries.
      Returns a Bundle of type `batch-response` whose :entry vector
-     reports the status of each input entry in the original order.")
+     reports the status of each input entry in the original order.
+
+     `opts` may contain:
+     - :tx-metadata — the SAME stamp applied to each entry's own
+       transaction. A batch is many transactions, so the map is written
+       many times; entries that fail commit nothing and are stamped
+       nowhere, which is the correct reading of a stamp: it exists only
+       for a write that landed.")
   (resource-deleted? [this tenant-id resource-type id]
     "Returns true if the resource was previously created and then deleted,
      false if it exists or was never created.")
@@ -397,3 +550,70 @@
      for `tenant-id`. `resource-type` is a keyword, as `search` receives it.
      False means the handler refuses the parameter as not-supported; it must
      not mean the store will quietly ignore it."))
+
+;; ---------------------------------------------------------------------------
+;; Transaction-metadata extension protocol.
+;;
+;; Same reasoning as the two splits above, and the same failure it prevents.
+;; Every write verb ACCEPTS `:tx-metadata` in its opts map, so `satisfies?
+;; IFHIRStore` is true of a store that takes the stamp and drops it on the
+;; floor. Without a separate capability, provenance would go missing exactly
+;; where it is load-bearing -- an unattributed clinical write looks identical
+;; to an attributed one -- and nothing would say so. Implementing this
+;; protocol is the promise to keep the stamp; a store that cannot keep it
+;; MUST NOT implement it, and may still take the opts arity to honour
+;; `:if-match`.
+;;
+;;   fhir-store-xtdb2   planned: a per-tenant fhir_tx_metadata row written
+;;                      inside the same xt/execute-tx as the data
+;;   fhir-store-datomic planned: the transaction entity every write already
+;;                      names, which is also the value of :fhir/version-id
+;;   fhir-store-mock    planned: the per-version history record
+;;   decorators         CompartmentFilteringStore (dromon) and IndexedStore
+;;                      (flotilla) by delegation to their base
+;;   as-of-store, test stubs  not implemented -- they persist nothing
+;; ---------------------------------------------------------------------------
+
+(defprotocol ITxMetadataStore
+  "Provenance persisted BESIDE the data: the `:tx-metadata` map handed to a
+   write verb is committed in the SAME transaction as the resource it
+   describes.
+
+   Same-transaction is the whole promise. A stamp written afterwards can
+   name a write that never committed, and a stamp written before can be
+   orphaned by a rollback; either way the record is evidence of something
+   that did not happen, which is worse than no record. An implementation
+   that cannot write the stamp atomically with the data must not implement
+   this protocol.
+
+   The log is not retired by this. A stamp exists only for a write that
+   landed, so refusals, precondition failures and thrown writes remain the
+   audit log's business; the two are complementary, not redundant."
+  (tx-metadata-supported? [this]
+    "Whether a stamp handed to this store's write verbs is actually kept.
+
+     Separate from `satisfies?` because a DECORATOR cannot answer
+     statically: it implements this protocol in its own source, but whether
+     the stamp survives depends on the base it was handed at runtime. A
+     decorator answers by delegating to its base. Prefer
+     `supports-tx-metadata?`, which asks both questions in the right order.")
+  (tx-metadata-of [this tenant-id resource-type id vid]
+    "The stamp the named committed version was written under, or nil when
+     that version carried none or does not exist.
+
+     A read verb, so that \"beside the data\" is observable rather than a
+     write-only claim: without it no test and no operator can tell a store
+     that keeps stamps from one that accepts and discards them."))
+
+(defn supports-tx-metadata?
+  "Whether `store` will keep a `:tx-metadata` stamp -- the check a caller
+   makes BEFORE deciding to pass one.
+
+   Both halves are needed and the order matters: `satisfies?` alone is not
+   enough for a decorator, whose base may keep nothing, and
+   `tx-metadata-supported?` alone throws IllegalArgumentException on a store
+   that does not implement the protocol at all. Writing that pair out at
+   every call site is how one of the halves eventually goes missing."
+  [store]
+  (boolean (and (satisfies? ITxMetadataStore store)
+                (tx-metadata-supported? store))))

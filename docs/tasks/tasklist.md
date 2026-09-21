@@ -12,6 +12,10 @@ Inferno current:  505 passed,  0 failed,   0 skipped, 0 errors
 - [conditional-search-criteria-races.md](conditional-search-criteria-races.md) — Conditional update/delete/patch via URL search criteria (`PUT/DELETE/PATCH /{type}?...`) are all TOCTOU-racy: the search and the subsequent write are not atomic. Fix by auto-propagating the matched row's `versionId` as an implicit `If-Match` into the store call, plus a lock for the phantom-create branch of conditional-update.
 - [kratos-reintroduce-secondary-auth-path.md](kratos-reintroduce-secondary-auth-path.md) — Reintroduce Ory Kratos (the `authorization_code` login/consent provider, dropped only as a temporary workaround) in a **secondary, opt-in auth path** — a new runner + `bb auth-code-e2e` task mirroring `compartment-e2e` — without touching the main `bb setup` / `bb inferno-test` path (which stays `ory-pg`/`keto`/`hydra`, 505/505). Prerequisite for the interactive login flow and human-initiated delegation.
 
+### Transaction metadata (new protocol surface)
+
+- [fhir-store-tx-metadata-channel.md](fhir-store-tx-metadata-channel.md) — Provenance recorded beside the data instead of only in a log, for the writes no request middleware can see (a host's own routes on the raw store, in-process callers, machine traffic under a service credential). **Step 1 is done**: `:tx-metadata` on every write verb's opts map, an opts arity added to `create-resource` / `transact-transaction` / `transact-bundle`, `ITxMetadataStore` + `supports-tx-metadata?` as the capability check, and `check-tx-metadata` as the shared validation rule. Nothing adopts it yet and no behaviour changed. Remaining: mock + `CompartmentFilteringStore` + a `wrap-tx-metadata` host hook in the write handlers (step 2), XTDB v2 persistence and the `IValidTimeStore` opts arities (step 3), then the consuming repo's pointer advance and backend adoption.
+
 ### Tenant lifecycle (new protocol surface)
 
 Dromon-side work is complete; the datomic implementation lives in a separate repo and is tracked here only for cross-reference.
