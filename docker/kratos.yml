@@ -10,13 +10,14 @@
 # server.docker-env/start-auth-stack!. The same pattern is used in
 # production (breeze-deploy kratos manifests).
 
-# TLS is served natively from the mkcert pair `start-auth-stack!` mounts at
-# /etc/ory/tls (docker/tls on the host, minted by `ensure-ory-tls-cert!` or the
-# repo-root `bb cert:setup ory`). The names resolve to loopback through
-# /etc/hosts; there is no plain-HTTP listener.
+# TEMPLATE: `server.docker-env/render-kratos-config!` fills the {{...}}
+# placeholders with the configured hostnames and writes docker/generated/
+# kratos.yml, which is what the containers mount -- Kratos does no
+# substitution of its own. TLS is served natively from the mkcert pair
+# `start-auth-stack!` mounts at /etc/ory/tls; there is no plain-HTTP listener.
 serve:
   public:
-    base_url: https://localkratos.breezeehr.com:4433/
+    base_url: {{KRATOS_PUBLIC_URL}}/
     tls:
       cert:
         path: /etc/ory/tls/ory.pem
@@ -25,7 +26,7 @@ serve:
     cors:
       enabled: true
       allowed_origins:
-        - https://localauth.breezeehr.com:3001
+        - {{LOGIN_APP_BASE_URL}}
       allowed_methods:
         - POST
         - GET
@@ -40,7 +41,7 @@ serve:
         - Content-Type
         - Set-Cookie
   admin:
-    base_url: https://localkratos.breezeehr.com:4434/
+    base_url: {{KRATOS_ADMIN_URL}}/
     tls:
       cert:
         path: /etc/ory/tls/ory.pem
@@ -50,17 +51,17 @@ serve:
 selfservice:
   # The login-consent app (Hydra login/consent challenge UI) serves the
   # credential screens; 3001 avoids the FHIR test-server on 3000.
-  default_browser_return_url: https://localauth.breezeehr.com:3001/
+  default_browser_return_url: {{LOGIN_APP_BASE_URL}}/
   allowed_return_urls:
-    - https://localauth.breezeehr.com:3001
+    - {{LOGIN_APP_BASE_URL}}
   methods:
     password:
       enabled: true
   flows:
     login:
-      ui_url: https://localauth.breezeehr.com:3001/kratos/login
+      ui_url: {{LOGIN_APP_BASE_URL}}/kratos/login
     registration:
-      ui_url: https://localauth.breezeehr.com:3001/kratos/register
+      ui_url: {{LOGIN_APP_BASE_URL}}/kratos/register
     recovery:
       enabled: false
     verification:

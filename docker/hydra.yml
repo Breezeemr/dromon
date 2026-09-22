@@ -44,11 +44,12 @@ urls:
     issuer: https://fhir.local:4443/
 
   # The login-consent app (login-consent/ in master-at-arms2), as the browser
-  # reaches it. `start-auth-stack!` sets the same three through URLS_LOGIN,
-  # URLS_CONSENT and URLS_LOGOUT; the main pool never redirects a browser.
-  consent: https://localauth.breezeehr.com:3001/consent
-  login: https://localauth.breezeehr.com:3001/login
-  logout: https://localauth.breezeehr.com:3001/logout
+  # reaches it, at this repo's default of TLS on localhost. `start-auth-stack!`
+  # sets the same three through URLS_LOGIN, URLS_CONSENT and URLS_LOGOUT from
+  # its :login-app-base-url; the main pool never redirects a browser.
+  consent: https://localhost:3001/consent
+  login: https://localhost:3001/login
+  logout: https://localhost:3001/logout
 
 secrets:
   system:

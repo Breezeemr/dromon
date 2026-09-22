@@ -204,10 +204,10 @@
    :task (apply e2e/run! *command-line-args*)}
 
   auth-stack-up
-  {:doc "Starts the secondary auth stack for the interactive authorization_code flow: the main pool (ory-pg/keto/hydra) plus Kratos, all three Ory services serving TLS under their own names (https://localhydra.breezeehr.com:4444, https://localkratos.breezeehr.com:4433, https://localketo.breezeehr.com:4466; the pair is minted with mkcert into docker/tls, the /etc/hosts entries come from the repo-root `bb cert:setup ory`), with Hydra's login/consent URLs pointed at the login-consent app on the host (default https://localauth.breezeehr.com:3001; override with LOGIN_APP_BASE_URL, enable the token hook with TOKEN_HOOK_URL). Never part of setup/inferno-test."
+  {:doc "Starts the secondary auth stack for the interactive authorization_code flow: the main pool (ory-pg/keto/hydra) plus Kratos, all three Ory services over TLS. Hostnames default to localhost (https://localhost:4444, :4433, :4466; the pair is minted with mkcert into docker/tls) and are set with ORY_HOST, or HYDRA_HOST / KRATOS_HOST / KETO_HOST -- master-at-arms2's root `bb auth-stack-up` passes its local*.breezeehr.com names. Hydra's login/consent URLs point at the login-consent app on the host (default https://localhost:3001; LOGIN_APP_BASE_URL overrides, and it must be same-site with the Kratos host). TOKEN_HOOK_URL enables the token hook. Never part of setup/inferno-test."
    :requires ([server.docker-env :as env])
    :task (env/start-auth-stack!
-           (cond-> {}
+           (cond-> {:hosts (env/ory-hosts-from-env)}
              (System/getenv "LOGIN_APP_BASE_URL")
              (assoc :login-app-base-url (System/getenv "LOGIN_APP_BASE_URL"))
              (System/getenv "TOKEN_HOOK_URL")
