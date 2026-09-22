@@ -30,3 +30,5 @@ e2e-server.log
 
 # Dev TLS cert/key for the Hydra TLS terminator, minted at runtime via mkcert.
 docker/tls/
+# Kratos config rendered from docker/kratos.yml by start-auth-stack!.
+docker/generated/

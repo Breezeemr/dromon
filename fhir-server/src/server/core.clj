@@ -313,16 +313,23 @@
 
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
                                                 jwks-url keto-url terminology cors-allowed-origins bulk-job-store]}]
-  (println "Starting Jetty Server on port" port "and SSL port" ssl-port "with virtual threads")
-  (let [jetty-opts (merge {:port port
-                           :join? false
-                           :virtual-threads? true}
-                          (when ssl-port
-                            {:ssl? true
-                             :ssl-port ssl-port
-                             :keystore keystore
-                             :keystore-type keystore-type
-                             :key-password key-password}))]
+  ;; A nil :port means TLS only. The adapter's default is a cleartext
+  ;; connector beside the TLS one, so it has to be told (:http? false) rather
+  ;; than merely not given a port.
+  (when-not (or port ssl-port)
+    (throw (ex-info "server/jetty needs a :port, an :ssl-port, or both" {})))
+  (println "Starting Jetty Server"
+           (if port (str "on port " port) "with no plain-HTTP port")
+           "and SSL port" ssl-port "with virtual threads")
+  (let [jetty-opts (cond-> {:join? false
+                            :virtual-threads? true}
+                     port        (assoc :port port)
+                     (nil? port) (assoc :http? false)
+                     ssl-port    (assoc :ssl? true
+                                        :ssl-port ssl-port
+                                        :keystore keystore
+                                        :keystore-type keystore-type
+                                        :key-password key-password))]
     (jetty/run-jetty (fhir-app store schemas :jwks-url jwks-url :keto-url keto-url :terminology terminology
                                :cors-allowed-origins cors-allowed-origins :bulk-job-store bulk-job-store) jetty-opts)))
 

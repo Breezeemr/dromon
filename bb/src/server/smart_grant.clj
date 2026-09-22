@@ -10,6 +10,18 @@
      bb smart-grant --subject <id> --patients pa,pb  ; grant to existing subject
      bb smart-grant --subject <id> --list            ; show granted patients
      bb smart-grant --subject <id> --patients pa --revoke
+
+   The Ory URLs default to the main pool's plain-HTTP listeners. Against
+   `bb auth-stack-up`, which serves TLS under its own names, override them:
+
+     HYDRA_ADMIN_URL=https://localhydra.breezeehr.com:4445
+     HYDRA_PUBLIC_URL=https://localhydra.breezeehr.com:4444
+     KETO_ADMIN_URL=https://localketo.breezeehr.com:4467
+     FHIR_SERVER_URL=https://localdromon.breezeehr.com:8443
+     bb smart-grant ...            ; with the four exported
+
+   Requests go through curl, which trusts mkcert's CA once `mkcert -install`
+   has run.
      bb smart-grant --realm <realm> --patients pa     ; grant within one realm
 
    `--realm` (or SMART_GRANT_REALM) names the tenant the grant applies to,
@@ -30,9 +42,9 @@
            [javax.crypto.spec SecretKeySpec]
            [java.util Base64]))
 
-(def ^:private hydra-admin  "http://127.0.0.1:4445")
-(def ^:private hydra-public "http://127.0.0.1:4444")
-(def ^:private keto-admin   "http://127.0.0.1:4467")
+(def ^:private hydra-admin  (or (System/getenv "HYDRA_ADMIN_URL") "http://127.0.0.1:4445"))
+(def ^:private hydra-public (or (System/getenv "HYDRA_PUBLIC_URL") "http://127.0.0.1:4444"))
+(def ^:private keto-admin   (or (System/getenv "KETO_ADMIN_URL") "http://127.0.0.1:4467"))
 (def ^:private server-base  (or (System/getenv "FHIR_SERVER_URL") "http://localhost:8080"))
 (def ^:private admin-subject "smart-grant-admin")
 

@@ -10,14 +10,23 @@
 # server.docker-env/start-auth-stack!. The same pattern is used in
 # production (breeze-deploy kratos manifests).
 
+# TEMPLATE: `server.docker-env/render-kratos-config!` fills the {{...}}
+# placeholders with the configured hostnames and writes docker/generated/
+# kratos.yml, which is what the containers mount -- Kratos does no
+# substitution of its own. TLS is served natively from the mkcert pair
+# `start-auth-stack!` mounts at /etc/ory/tls; there is no plain-HTTP listener.
 serve:
   public:
-    base_url: http://127.0.0.1:4433/
+    base_url: {{KRATOS_PUBLIC_URL}}/
+    tls:
+      cert:
+        path: /etc/ory/tls/ory.pem
+      key:
+        path: /etc/ory/tls/ory-key.pem
     cors:
       enabled: true
       allowed_origins:
-        - http://127.0.0.1:3001
-        - http://localhost:3001
+        - {{LOGIN_APP_BASE_URL}}
       allowed_methods:
         - POST
         - GET
@@ -32,23 +41,27 @@ serve:
         - Content-Type
         - Set-Cookie
   admin:
-    base_url: http://127.0.0.1:4434/
+    base_url: {{KRATOS_ADMIN_URL}}/
+    tls:
+      cert:
+        path: /etc/ory/tls/ory.pem
+      key:
+        path: /etc/ory/tls/ory-key.pem
 
 selfservice:
   # The login-consent app (Hydra login/consent challenge UI) serves the
   # credential screens; 3001 avoids the FHIR test-server on 3000.
-  default_browser_return_url: http://127.0.0.1:3001/
+  default_browser_return_url: {{LOGIN_APP_BASE_URL}}/
   allowed_return_urls:
-    - http://127.0.0.1:3001
-    - http://localhost:3001
+    - {{LOGIN_APP_BASE_URL}}
   methods:
     password:
       enabled: true
   flows:
     login:
-      ui_url: http://127.0.0.1:3001/kratos/login
+      ui_url: {{LOGIN_APP_BASE_URL}}/kratos/login
     registration:
-      ui_url: http://127.0.0.1:3001/kratos/register
+      ui_url: {{LOGIN_APP_BASE_URL}}/kratos/register
     recovery:
       enabled: false
     verification:
