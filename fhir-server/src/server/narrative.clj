@@ -61,6 +61,56 @@
               first
               not-empty)))
 
+(def ^:private present-fn (atom nil))
+
+(defn install-present!
+  "Install `f`, a function of `[tenant-id resource]` that returns the
+   Composition to put on a response. The stored resource is not this map."
+  [f]
+  (reset! present-fn f)
+  nil)
+
+(defn- composition-response?
+  [resource-type resource]
+  (or (= "Composition" (some-> resource-type name))
+      (and (map? resource) (= "Composition" (:resourceType resource)))))
+
+(defn present-response
+  "Fill a Composition for a response. Any other resource, and a host that
+   installed nothing, is returned unchanged. A throwing host function leaves
+   the resource unchanged: a read must not 500 because narrative derivation
+   failed."
+  [tenant-id resource-type resource]
+  (if-let [f @present-fn]
+    (if (composition-response? resource-type resource)
+      (try
+        (or (f tenant-id resource) resource)
+        (catch Throwable t
+          (tel/error! {:id   :fhir/narrative-present-failed
+                       :data {:error (ex-message t)}}
+                      t)
+          resource))
+      resource)
+    resource))
+
+(defn present-bundle-response
+  "Fill Composition resources inside a transaction or batch response. Other
+   bundle types pass through, search included: those return the stored
+   resource."
+  [tenant-id bundle]
+  (if (and @present-fn
+           (map? bundle)
+           (#{"transaction-response" "batch-response"} (:type bundle)))
+    (update bundle :entry
+            (fn [entries]
+              (mapv (fn [entry]
+                      (if (map? (:resource entry))
+                        (update entry :resource
+                                #(present-response tenant-id (:resourceType %) %))
+                        entry))
+                    entries)))
+    bundle))
+
 (defn ensure-bundle-narrative
   "Apply `narrative-fn` to every POST/PUT entry carrying a `:resource`.
 
