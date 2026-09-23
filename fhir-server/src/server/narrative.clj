@@ -25,8 +25,18 @@
 
    ONE CONSTRAINT A HOST MUST KNOW: on a create the narrative is derived from
    the posted body, BEFORE the server mints the id, so a renderer cannot
-   reference the resource's own id. `server.narrative-seam-test` pins this."
+   reference the resource's own id. `server.narrative-seam-test` pins this.
+
+   PRESENTATION is the other half and does not touch storage. A host that
+   shows a resource differently on a response than it stores it injects a
+   `fhir-store.lifecycle/IReadLifecycle` as `:fhir/lifecycle` on the request
+   (`server.router/wrap-lifecycle`). `present-response` and
+   `present-bundle-response` hand it every resource a read, create, update,
+   patch, or transaction/batch response returns; search, history and vread
+   return the stored resource. No injected lifecycle means responses carry
+   exactly what the store returned."
   (:require [clojure.string :as str]
+            [fhir-store.lifecycle :as lifecycle]
             [taoensso.telemere :as tel]))
 
 (defn ensure-narrative
@@ -61,44 +71,32 @@
               first
               not-empty)))
 
-(def ^:private present-fn (atom nil))
-
-(defn install-present!
-  "Install `f`, a function of `[tenant-id resource]` that returns the
-   Composition to put on a response. The stored resource is not this map."
-  [f]
-  (reset! present-fn f)
-  nil)
-
-(defn- composition-response?
-  [resource-type resource]
-  (or (= "Composition" (some-> resource-type name))
-      (and (map? resource) (= "Composition" (:resourceType resource)))))
+(defn- read-context
+  "The read map `fhir-store.lifecycle/present` receives for a response to
+   `req`."
+  [req resource-type]
+  {:tenant-id     (get-in req [:path-params :tenant-id])
+   :resource-type (some-> resource-type name)
+   :store         (:fhir/store req)
+   :request       req})
 
 (defn present-response
-  "Fill a Composition for a response. Any other resource, and a host that
-   installed nothing, is returned unchanged. A throwing host function leaves
-   the resource unchanged: a read must not 500 because narrative derivation
-   failed."
-  [tenant-id resource-type resource]
-  (if-let [f @present-fn]
-    (if (composition-response? resource-type resource)
-      (try
-        (or (f tenant-id resource) resource)
-        (catch Throwable t
-          (tel/error! {:id   :fhir/narrative-present-failed
-                       :data {:error (ex-message t)}}
-                      t)
-          resource))
-      resource)
+  "The resource to put on the response to `req`: the injected lifecycle's
+   `present`, or `resource` unchanged when `req` carries no `:fhir/lifecycle`.
+   The lifecycle filters its own resource types. A throwing lifecycle leaves
+   the resource unchanged (see `fhir-store.lifecycle/present-resource`): a
+   read must not 500 because presentation failed."
+  [req resource-type resource]
+  (if-let [lc (:fhir/lifecycle req)]
+    (lifecycle/present-resource lc (read-context req resource-type) resource)
     resource))
 
 (defn present-bundle-response
-  "Fill Composition resources inside a transaction or batch response. Other
-   bundle types pass through, search included: those return the stored
+  "Present every entry resource of a transaction or batch response to `req`.
+   Other bundle types pass through, search included: those return the stored
    resource."
-  [tenant-id bundle]
-  (if (and @present-fn
+  [req bundle]
+  (if (and (:fhir/lifecycle req)
            (map? bundle)
            (#{"transaction-response" "batch-response"} (:type bundle)))
     (update bundle :entry
@@ -106,7 +104,7 @@
               (mapv (fn [entry]
                       (if (map? (:resource entry))
                         (update entry :resource
-                                #(present-response tenant-id (:resourceType %) %))
+                                #(present-response req (:resourceType %) %))
                         entry))
                     entries)))
     bundle))

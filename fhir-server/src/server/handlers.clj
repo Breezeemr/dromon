@@ -260,7 +260,7 @@
     (if res
       (if (not-modified? res req)
         {:status 304 :body nil}
-        {:status 200 :body (narrative/present-response tenant-id resource-type res)})
+        {:status 200 :body (narrative/present-response req resource-type res)})
       (if (db/resource-deleted? store tenant-id (keyword resource-type) id)
         (gone-response resource-type id)
         (not-found-response resource-type id)))))
@@ -398,7 +398,7 @@
       expected-version
       (let [res (db/update-resource store tenant-id (keyword resource-type) id
                                     resource-body {:if-match expected-version})]
-        {:status 200 :body (narrative/present-response tenant-id resource-type res)})
+        {:status 200 :body (narrative/present-response req resource-type res)})
 
       ;; Without If-Match: preserve the create-with-client-id upsert path
       ;; for nonexistent resources. Existing resources take the normal
@@ -407,13 +407,13 @@
       (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
         (if existing
           (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
-            {:status 200 :body (narrative/present-response tenant-id resource-type res)})
+            {:status 200 :body (narrative/present-response req resource-type res)})
           (let [res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
                 base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
                 vid (get-in res [:meta :versionId])]
             {:status 201
              :headers {"Location" (str base-url "/_history/" vid)}
-             :body (narrative/present-response tenant-id resource-type res)}))))))
+             :body (narrative/present-response req resource-type res)}))))))
 
 (defn patch-resource
   "Handler for PATCH /[type]/:id RESTful interaction.
@@ -458,7 +458,7 @@
             result (if opts
                      (db/update-resource store tenant-id (keyword resource-type) id patched opts)
                      (db/update-resource store tenant-id (keyword resource-type) id patched))]
-        {:status 200 :body (narrative/present-response tenant-id resource-type result)}))))
+        {:status 200 :body (narrative/present-response req resource-type result)}))))
 
 (defn delete-resource
   "Handler for DELETE /[type]/:id RESTful interaction."
@@ -587,18 +587,18 @@
 
 (defn- do-create
   "Perform the actual resource creation, returning a 201 response."
-  [store tenant-id resource-type resource-body narrative-fn]
+  [req store tenant-id resource-type resource-body]
   ;; One edit covers both callers: create-resource's plain path and its
   ;; If-None-Exist zero-match branch. The one-match branch returns an existing
   ;; resource without writing and must NOT be touched.
-  (let [resource-body (narrative/ensure-narrative narrative-fn resource-type resource-body)
+  (let [resource-body (narrative/ensure-narrative (:fhir/narrative req) resource-type resource-body)
         id (str (java.util.UUID/randomUUID))
         res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
         base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
         vid (get-in res [:meta :versionId])]
     {:status 201
      :headers {"Location" (str base-url "/_history/" vid)}
-     :body (narrative/present-response tenant-id resource-type res)}))
+     :body (narrative/present-response req resource-type res)}))
 
 (defn create-resource
   "Handler for POST /[type] RESTful interaction.
@@ -626,12 +626,11 @@
                  match-count (count results)]
              (cond
                (zero? match-count)
-               (do-create store tenant-id resource-type resource-body
-                          (:fhir/narrative req))
+               (do-create req store tenant-id resource-type resource-body)
 
                (= 1 match-count)
                {:status 200
-                :body (narrative/present-response tenant-id resource-type (first results))}
+                :body (narrative/present-response req resource-type (first results))}
 
                :else
                {:status 412
@@ -640,8 +639,7 @@
                                 :code "duplicate"
                                 :diagnostics "Conditional create found multiple matches"}]}})))))
       ;; No If-None-Exist: create normally
-      (do-create store tenant-id resource-type resource-body
-                 (:fhir/narrative req)))))
+      (do-create req store tenant-id resource-type resource-body))))
 
 (defn- ensure-coll
   "Coerce a value to a collection. If already sequential, return as-is; otherwise wrap in a vector."
@@ -1032,7 +1030,7 @@
                vid (get-in res [:meta :versionId])]
            {:status 201
             :headers {"Location" (str base-url "/_history/" vid)}
-            :body (narrative/present-response tenant-id resource-type res)})
+            :body (narrative/present-response req resource-type res)})
 
          (= 1 match-count)
          ;; One match: update it
@@ -1046,7 +1044,7 @@
                               :diagnostics (str "Resource id in body (" body-id ") does not match resolved id (" id ")")}]}}
              (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
                {:status 200
-                :body (narrative/present-response tenant-id resource-type res)})))
+                :body (narrative/present-response req resource-type res)})))
 
          :else
          {:status 412
@@ -1111,7 +1109,7 @@
                         (json-patch/apply-patch existing patch-ops))
                result (db/update-resource store tenant-id (keyword resource-type) id patched)]
            {:status 200
-            :body (narrative/present-response tenant-id resource-type result)})
+            :body (narrative/present-response req resource-type result)})
 
          :else
          {:status 412
@@ -1923,7 +1921,7 @@
                          (resolve-patch-entries store tenant-id entries))]
             (bundle-response
              (narrative/present-bundle-response
-              tenant-id
+              req
               (db/transact-transaction store tenant-id entries))
              entries))
           ;; Batch: each entry independent. Decode entries (with per-entry
@@ -1954,7 +1952,7 @@
                                     head)))
                             resolved)]
             (bundle-response
-             (narrative/present-bundle-response tenant-id (assoc res :entry woven))
+             (narrative/present-bundle-response req (assoc res :entry woven))
              decoded)))
         {:status 400
          :body {:resourceType "OperationOutcome"

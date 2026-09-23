@@ -42,6 +42,7 @@
    See [[default-middleware]] for the ordering invariants that constrain
    where new entries may go."
   (:require [clojure.string :as str]
+            [fhir-store.lifecycle :as lifecycle]
             [jsonista.core :as json]
             [muuntaja.core :as m-core]
             [muuntaja.format.json :as muuntaja-json]
@@ -111,6 +112,14 @@
   (fn [req]
     (handler (assoc req :fhir/narrative narrative-fn))))
 
+(defn wrap-lifecycle
+  "Inject the host's `fhir-store.lifecycle` object, mirroring wrap-narrative.
+   The handlers read it from :fhir/lifecycle via `server.narrative` to present
+   responses. A host that injects nothing gets the stored resource back."
+  [handler lifecycle]
+  (fn [req]
+    (handler (assoc req :fhir/lifecycle lifecycle))))
+
 (defn wrap-terminology [handler terminology]
   (fn [req]
     (handler (assoc req :fhir/terminology terminology))))
@@ -160,8 +169,9 @@
    consumed by [[default-middleware]].
 
    Accepts `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
-   `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url` and
-   `:legacy-realm-blind-fallback?`; unknown keys are ignored.
+   `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle` and
+   `:legacy-realm-blind-fallback?`; unknown keys are ignored. `:lifecycle` is
+   carried through as given; [[default-middleware]] resolves it.
 
    This is the ONLY place the environment is consulted, so tests and hosts can
    bypass it entirely by hand-building the resolved map (for example passing a
@@ -182,7 +192,7 @@
                                only when `DROMON_DEV_TRACE_TAP=1`, so the OTel
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url terminology cors-allowed-origins
-           enforce-smart-scopes? bulk-job-store login-url
+           enforce-smart-scopes? bulk-job-store login-url lifecycle
            legacy-realm-blind-fallback?]}]
   {:jwks-url              (or jwks-url
                               (System/getenv "JWKS_URL")
@@ -208,6 +218,7 @@
                             (some-> (requiring-resolve 'server.dev.trace-tap/wrap-trace-tap)
                                     deref))
    :terminology           terminology
+   :lifecycle             lifecycle
    :bulk-job-store        bulk-job-store})
 
 ;; ---------------------------------------------------------------------------
@@ -223,9 +234,16 @@
    splice relative to names rather than indices (see [[insert-before]],
    [[insert-after]], [[replace-middleware]]).
 
-   Two entry groups are conditional: `::trace-tap` appears only when `opts`
-   carries a `:trace-tap` function, and `::smart-scope` / `::patient-compartment`
+   Three entry groups are conditional: `::trace-tap` appears only when `opts`
+   carries a `:trace-tap` function, `::lifecycle` only when it carries a
+   `:lifecycle` (a lifecycle value, a qualified symbol naming one, or a
+   constructor fn, resolved here by `fhir-store.lifecycle/resolve-lifecycle`
+   with `opts` as its argument), and `::smart-scope` / `::patient-compartment`
    only when `:enforce-smart-scopes?` is truthy.
+
+   A host that also hands the lifecycle to its store should pass the same
+   value, or a symbol naming it, to both: a constructor fn is called once by
+   each, and yields two objects.
 
    ORDERING INVARIANTS. Entries listed EARLIER are OUTER: they see the request
    first and the response last. Recomposition must respect the following, which
@@ -257,9 +275,10 @@
       Coercion errors are in practice caught by `::fhir-exceptions` (422/500
       OperationOutcomes); `::coerce-exceptions` is retained for compatibility.
    7. The injection middleware (`::fhir-store`, `::terminology`,
-      `::bulk-job-store`, `::keto-url`) must sit outside `::patient-compartment`,
-      which reads and REPLACES `:fhir/store` with a compartment-filtering store,
-      and outside the handlers that consume the injected values.
+      `::narrative`, `::lifecycle`, `::bulk-job-store`, `::keto-url`) must sit
+      outside `::patient-compartment`, which reads and REPLACES `:fhir/store`
+      with a compartment-filtering store, and outside the handlers that
+      consume the injected values.
    8. `::jwt-auth` must sit outside `::smart-scope`, `::patient-compartment` and
       `::keto-authorization`, all of which read the `:identity` it attaches.
       `::smart-scope` must sit outside `::patient-compartment` (compartment
@@ -301,9 +320,10 @@
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
-                 jwks-url enforce-smart-scopes? login-url narrative
+                 jwks-url enforce-smart-scopes? login-url narrative lifecycle
                  legacy-realm-blind-fallback?]
-          :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}}]
+          :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}
+          :as opts}]
   (cond-> []
     trace-tap
     (conj {:name ::trace-tap :wrap trace-tap})
@@ -333,8 +353,14 @@
            (assoc rrc/coerce-exceptions-middleware :name ::coerce-exceptions)
            {:name ::fhir-store :wrap (fn [handler] (wrap-fhir-store handler store))}
            {:name ::terminology :wrap (fn [handler] (wrap-terminology handler terminology))}
-           {:name ::narrative :wrap (fn [handler] (wrap-narrative handler narrative))}
-           {:name ::bulk-job-store
+           {:name ::narrative :wrap (fn [handler] (wrap-narrative handler narrative))}])
+
+    lifecycle
+    (conj (let [lc (lifecycle/resolve-lifecycle lifecycle opts)]
+            {:name ::lifecycle :wrap (fn [handler] (wrap-lifecycle handler lc))}))
+
+    :always
+    (into [{:name ::bulk-job-store
             :wrap (fn [handler] (wrap-bulk-job-store handler bulk-job-store))}
            {:name ::keto-url
             :wrap (fn [handler]

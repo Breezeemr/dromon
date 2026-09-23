@@ -34,6 +34,10 @@
   "See `server.router/wrap-narrative`."
   router/wrap-narrative)
 
+(def wrap-lifecycle
+  "See `server.router/wrap-lifecycle`."
+  router/wrap-lifecycle)
+
 (def wrap-terminology
   "Moved to server.router; alias kept for external consumers."
   router/wrap-terminology)
@@ -301,6 +305,7 @@
    Options: `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
    `:enforce-smart-scopes?`, `:bulk-job-store`; each falls back to an
    environment variable as documented on `server.router/resolve-options`.
+   `:lifecycle` (see `server.router/default-middleware`) has no fallback.
 
    This is a thin composition of `server.router/resolve-options`,
    `default-middleware`, `router` and `default-handler`. Hosts that need to
@@ -312,7 +317,8 @@
 
 
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
-                                                jwks-url keto-url terminology cors-allowed-origins bulk-job-store]}]
+                                                jwks-url keto-url terminology cors-allowed-origins bulk-job-store
+                                                lifecycle]}]
   ;; A nil :port means TLS only. The adapter's default is a cleartext
   ;; connector beside the TLS one, so it has to be told (:http? false) rather
   ;; than merely not given a port.
@@ -331,7 +337,8 @@
                                         :keystore-type keystore-type
                                         :key-password key-password))]
     (jetty/run-jetty (fhir-app store schemas :jwks-url jwks-url :keto-url keto-url :terminology terminology
-                               :cors-allowed-origins cors-allowed-origins :bulk-job-store bulk-job-store) jetty-opts)))
+                               :cors-allowed-origins cors-allowed-origins :bulk-job-store bulk-job-store
+                               :lifecycle lifecycle) jetty-opts)))
 
 (defmethod ig/halt-key! :server/jetty [_ server]
   (println "Stopping Jetty Server")

@@ -199,10 +199,10 @@
     (let [store (mock/create-mock-store {})
           tenant "test-tenant"
           ;; Create a resource we expect to survive rollback
-          _ (protocol/create-resource store tenant "Patient" "survivor" {:resourceType "Patient" :name [{:family "Survivor"}]})
+          _ (protocol/create-resource store tenant :Patient "survivor" {:resourceType "Patient" :name [{:family "Survivor"}]})
           ;; Create a transaction where the second entry will fail
           ;; (POST with an id that already exists triggers duplicate error)
-          _ (protocol/create-resource store tenant "Patient" "dup" {:resourceType "Patient" :name [{:family "Existing"}]})
+          _ (protocol/create-resource store tenant :Patient "dup" {:resourceType "Patient" :name [{:family "Existing"}]})
           entries [{:request {:method "PUT" :url "Patient/survivor"}
                     :resource {:resourceType "Patient" :name [{:family "Updated"}]}}
                    {:request {:method "POST" :url "Patient"}
@@ -212,13 +212,13 @@
       (let [result (protocol/transact-transaction store tenant entries)]
         (is (= "transaction-response" (:type result))))
       ;; Verify the original "survivor" was updated (PUT processed after POST in ordering)
-      (let [res (protocol/read-resource store tenant "Patient" "survivor")]
+      (let [res (protocol/read-resource store tenant :Patient "survivor")]
         (is (= [{:family "Updated"}] (:name res))))))
 
   (testing "failed transaction restores previous state"
     (let [store (mock/create-mock-store {})
           tenant "test-tenant"
-          _ (protocol/create-resource store tenant "Patient" "keep-me" {:resourceType "Patient" :name [{:family "Original"}]})
+          _ (protocol/create-resource store tenant :Patient "keep-me" {:resourceType "Patient" :name [{:family "Original"}]})
           ;; First entry (DELETE, order=0) will succeed and remove "keep-me"
           ;; Second entry uses an unsupported method to trigger an error
           entries [{:request {:method "DELETE" :url "Patient/keep-me"}}
@@ -227,7 +227,7 @@
       ;; The transaction should throw because INVALID method hits default case in (case ...)
       (is (thrown? Exception (protocol/transact-transaction store tenant entries)))
       ;; After rollback, the original resource should still exist
-      (let [res (protocol/read-resource store tenant "Patient" "keep-me")]
+      (let [res (protocol/read-resource store tenant :Patient "keep-me")]
         (is (some? res) "Resource should be restored after rollback")
         (is (= [{:family "Original"}] (:name res)))))))
 
@@ -235,7 +235,7 @@
   (testing "batch processes entries independently; per-entry failures do not affect others"
     (let [store (mock/create-mock-store {})
           tenant "batch-tenant"
-          _ (protocol/create-resource store tenant "Patient" "alive" {:resourceType "Patient" :name [{:family "Alive"}]})
+          _ (protocol/create-resource store tenant :Patient "alive" {:resourceType "Patient" :name [{:family "Alive"}]})
           entries [{:request {:method "POST" :url "Patient"}
                     :resource {:resourceType "Patient" :name [{:family "Fresh"}]}}
                    {:request {:method "GET" :url "Patient/alive"}}
@@ -253,7 +253,7 @@
         (is (= "404 Not Found" (get-in get-missing [:response :status])))
         (is (= "400 Bad Request" (get-in bogus [:response :status]))))
       (testing "successful entries actually landed; failed ones did not roll back others"
-        (let [all (protocol/search store tenant "Patient" {} nil)]
+        (let [all (protocol/search store tenant :Patient {} nil)]
           (is (>= (count all) 2) "alive + newly posted patient exist"))))))
 
 (deftest create-tenant-test

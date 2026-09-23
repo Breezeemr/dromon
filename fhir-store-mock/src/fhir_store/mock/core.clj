@@ -1,6 +1,7 @@
 (ns fhir-store.mock.core
   (:require [clojure.string :as str]
             [fhir-store.protocol :as protocol]
+            [fhir-store.lifecycle :as lc]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]))
 
@@ -83,26 +84,77 @@
                                  (= (:value field-val) v-str))
             :else (= (str field-val) v-str)))))))
 
+;; ---------------------------------------------------------------------------
+;; Write lifecycle (see fhir-store.lifecycle for the ordering contract).
+;;
+;; The mock has no transactions. `prepare` runs INSIDE the swap! fn, after the
+;; precondition checks, so it may run more than once under contention; the
+;; contract already requires it to be free of lasting side effects. `tx-ops`
+;; is computed (so a lifecycle can still refuse a write from it) but never
+;; applied: the ops are only handed back on the commit's write map. The
+;; commit's :result is the state value the write produced.
+;; ---------------------------------------------------------------------------
+
+(def ^:private ^:dynamic *transaction-writes*
+  "Bound to an atom while transact-transaction runs its entries through the
+   single-write verbs. Each committed write is collected here instead of
+   firing after-commit, and the Bundle fires once after every entry landed."
+  nil)
+
+(defn- lifecycle-write
+  "Run prepare then tx-ops for one create or update; returns the write map
+   with :resource the prepared body and :tx-ops the (unapplied) ops."
+  [store tenant-id method resource-type id resource db]
+  (let [lifecycle (:resource/lifecycle store)
+        write     {:tenant-id     (str tenant-id)
+                   :resource-type (name resource-type)
+                   :id            id
+                   :method        method
+                   :resource      resource
+                   :db            db
+                   :entity        nil
+                   :store         store}
+        prepared  (lc/prepare-write lifecycle write)
+        ops-write (assoc write :resource prepared :submitted resource)]
+    (assoc ops-write :tx-ops (lc/write-tx-ops lifecycle ops-write))))
+
+(defn- committed!
+  [store tenant-id write result]
+  (if-let [pending *transaction-writes*]
+    (swap! pending conj write)
+    (lc/fire-after-commit! (:resource/lifecycle store)
+                           {:tenant-id (str tenant-id)
+                            :writes    [write]
+                            :result    result
+                            :store     store})))
+
 (defrecord MockStore [state options]
   protocol/IFHIRStore
-  (create-resource [_ tenant-id resource-type id resource]
+  (create-resource [this tenant-id resource-type id resource]
     (let [id (or id (new-id))
           vid "1"
-          meta-info {:versionId vid
-                     :lastUpdated (java.time.Instant/now)}
-          resource-with-meta (-> resource
-                                 (update :meta merge meta-info)
-                                 (assoc :id id))
-          record {:history {vid resource-with-meta}
-                  :current vid
-                  :resource resource-with-meta
-                  :deleted? false}]
-      (swap! state update-in [tenant-id resource-type id]
-             (fn [existing]
-               (if existing
-                 (throw (ex-info "Resource already exists" {:id id :type resource-type}))
-                 record)))
-      resource-with-meta))
+          write (atom nil)
+          result (atom nil)
+          new-state
+          (swap! state
+                 (fn [s]
+                   (when (get-in s [tenant-id resource-type id])
+                     (throw (ex-info "Resource already exists" {:id id :type resource-type})))
+                   (let [w (lifecycle-write this tenant-id :create resource-type id resource s)
+                         meta-info {:versionId vid
+                                    :lastUpdated (java.time.Instant/now)}
+                         resource-with-meta (-> (:resource w)
+                                                (update :meta merge meta-info)
+                                                (assoc :id id))]
+                     (reset! write w)
+                     (reset! result resource-with-meta)
+                     (assoc-in s [tenant-id resource-type id]
+                               {:history {vid resource-with-meta}
+                                :current vid
+                                :resource resource-with-meta
+                                :deleted? false}))))]
+      (committed! this tenant-id @write new-state)
+      @result))
 
   (read-resource [_ tenant-id resource-type id]
     (let [s @state
@@ -121,10 +173,11 @@
   (update-resource [this tenant-id resource-type id resource]
     (protocol/update-resource this tenant-id resource-type id resource nil))
 
-  (update-resource [_ tenant-id resource-type id resource opts]
+  (update-resource [this tenant-id resource-type id resource opts]
     (let [expected (protocol/normalize-if-match (:if-match opts))
           result (atom nil)
-          swap-fn (fn [existing]
+          write (atom nil)
+          swap-fn (fn [s existing]
                     (let [active? (and existing (not (:deleted? existing)))
                           current-vid (when existing (:current existing))
                           ;; `If-Match: *` guards on existence alone: any live
@@ -146,18 +199,23 @@
                       (let [vid (if current-vid
                                   (str (inc (Long/parseLong current-vid)))
                                   "1")
+                            w (lifecycle-write this tenant-id :update resource-type id resource s)
                             meta-info {:versionId vid
                                        :lastUpdated (java.time.Instant/now)}
-                            resource-with-meta (-> resource
+                            resource-with-meta (-> (:resource w)
                                                    (update :meta merge meta-info)
                                                    (assoc :id id))
                             record {:history (assoc (or (:history existing) {}) vid resource-with-meta)
                                     :current vid
                                     :resource resource-with-meta
                                     :deleted? false}]
+                        (reset! write w)
                         (reset! result resource-with-meta)
-                        record)))]
-      (swap! state update-in [tenant-id resource-type id] swap-fn)
+                        record)))
+          new-state (swap! state
+                           (fn [s]
+                             (update-in s [tenant-id resource-type id] #(swap-fn s %))))]
+      (committed! this tenant-id @write new-state)
       @result))
 
   (delete-resource [this tenant-id resource-type id]
@@ -262,67 +320,76 @@
      {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
      (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
-           snapshot @state]
+           snapshot @state
+           writes (atom [])]
        (try
-         (let [results (mapv (fn [entry]
-                               (let [req (:request entry)
-                                     method (:method req)
-                                     url (:url req)
-                                     resource (:resource entry)
-                                     [type id] (str/split url #"/")
-                                     ;; State is keyed by whatever the caller
-                                     ;; passed, and every other verb is called
-                                     ;; with the keyword form. Splitting the
-                                     ;; url yields a string, so without this
-                                     ;; the whole Bundle wrote into a parallel
-                                     ;; bucket no read would ever look in.
-                                     rt (keyword type)
-                                     ;; update/delete-resource normalize the
-                                     ;; ETag spellings themselves; this only
-                                     ;; decides whether the entry carries a
-                                     ;; precondition at all. Dropping it would
-                                     ;; turn a guarded write into an
-                                     ;; unconditional one.
-                                     entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
-                                 (case method
-                                   "POST" (let [res (protocol/create-resource this tenant-id rt nil resource)
-                                                vid (get-in res [:meta :versionId])
-                                                last-mod (str (get-in res [:meta :lastUpdated]))]
-                                            {:resource res
-                                             :response {:status "201 Created"
-                                                        :location (str type "/" (:id res) "/_history/" vid)
-                                                        :etag (str "W/\"" vid "\"")
-                                                        :lastModified last-mod}})
-                                   "PUT" (let [res (if entry-if-match
-                                                     (protocol/update-resource this tenant-id rt id resource
-                                                                               {:if-match entry-if-match})
-                                                     (protocol/update-resource this tenant-id rt id resource))
-                                               vid (get-in res [:meta :versionId])
-                                               last-mod (str (get-in res [:meta :lastUpdated]))]
-                                           {:resource res
-                                            :response {:status "200 OK"
-                                                       :etag (str "W/\"" vid "\"")
-                                                       :lastModified last-mod}})
-                                   "DELETE" (do (if entry-if-match
-                                                  (protocol/delete-resource this tenant-id rt id
-                                                                            {:if-match entry-if-match})
-                                                  (protocol/delete-resource this tenant-id rt id))
-                                                {:response {:status "204 No Content"}})
-                                   "GET" (let [res (protocol/read-resource this tenant-id rt id)]
-                                           (if res
-                                             (let [vid (get-in res [:meta :versionId])
-                                                   last-mod (str (get-in res [:meta :lastUpdated]))]
-                                               {:resource res
-                                                :response {:status "200 OK"
-                                                           :etag (when vid (str "W/\"" vid "\""))
-                                                           :lastModified last-mod}})
-                                             {:response {:status "404 Not Found"}}))
-                                   (throw (ex-info (str "Bundle entry method not supported: " method)
-                                                   {:fhir/status 405
-                                                    :fhir/code "not-supported"
-                                                    :method method
-                                                    :url url})))))
-                             ordered)]
+         (let [results (binding [*transaction-writes* writes]
+                         (mapv (fn [entry]
+                                 (let [req (:request entry)
+                                       method (:method req)
+                                       url (:url req)
+                                       resource (:resource entry)
+                                       [type id] (str/split url #"/")
+                                       ;; State is keyed by whatever the caller
+                                       ;; passed, and every other verb is called
+                                       ;; with the keyword form. Splitting the
+                                       ;; url yields a string, so without this
+                                       ;; the whole Bundle wrote into a parallel
+                                       ;; bucket no read would ever look in.
+                                       rt (keyword type)
+                                       ;; update/delete-resource normalize the
+                                       ;; ETag spellings themselves; this only
+                                       ;; decides whether the entry carries a
+                                       ;; precondition at all. Dropping it would
+                                       ;; turn a guarded write into an
+                                       ;; unconditional one.
+                                       entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
+                                   (case method
+                                     "POST" (let [res (protocol/create-resource this tenant-id rt nil resource)
+                                                  vid (get-in res [:meta :versionId])
+                                                  last-mod (str (get-in res [:meta :lastUpdated]))]
+                                              {:resource res
+                                               :response {:status "201 Created"
+                                                          :location (str type "/" (:id res) "/_history/" vid)
+                                                          :etag (str "W/\"" vid "\"")
+                                                          :lastModified last-mod}})
+                                     "PUT" (let [res (if entry-if-match
+                                                       (protocol/update-resource this tenant-id rt id resource
+                                                                                 {:if-match entry-if-match})
+                                                       (protocol/update-resource this tenant-id rt id resource))
+                                                 vid (get-in res [:meta :versionId])
+                                                 last-mod (str (get-in res [:meta :lastUpdated]))]
+                                             {:resource res
+                                              :response {:status "200 OK"
+                                                         :etag (str "W/\"" vid "\"")
+                                                         :lastModified last-mod}})
+                                     "DELETE" (do (if entry-if-match
+                                                    (protocol/delete-resource this tenant-id rt id
+                                                                              {:if-match entry-if-match})
+                                                    (protocol/delete-resource this tenant-id rt id))
+                                                  {:response {:status "204 No Content"}})
+                                     "GET" (let [res (protocol/read-resource this tenant-id rt id)]
+                                             (if res
+                                               (let [vid (get-in res [:meta :versionId])
+                                                     last-mod (str (get-in res [:meta :lastUpdated]))]
+                                                 {:resource res
+                                                  :response {:status "200 OK"
+                                                             :etag (when vid (str "W/\"" vid "\""))
+                                                             :lastModified last-mod}})
+                                               {:response {:status "404 Not Found"}}))
+                                     (throw (ex-info (str "Bundle entry method not supported: " method)
+                                                     {:fhir/status 405
+                                                      :fhir/code "not-supported"
+                                                      :method method
+                                                      :url url})))))
+                               ordered))]
+           ;; Once for the whole Bundle, and only once every entry landed.
+           (when (seq @writes)
+             (lc/fire-after-commit! (:resource/lifecycle this)
+                                    {:tenant-id (str tenant-id)
+                                     :writes    @writes
+                                     :result    @state
+                                     :store     this}))
            {:resourceType "Bundle"
             :type "transaction-response"
             :entry results})
@@ -517,9 +584,15 @@
                {:name "display"
                 :valueString "Mocked"}]})
 
-(defn create-mock-store [options]
+(defn create-mock-store
+  "Options may carry :resource/lifecycle (qualified symbol, value, or
+   constructor fn of `options`), resolved once here; see fhir-store.lifecycle
+   and the notes above MockStore for what a store without transactions does
+   with it."
+  [options]
   (let [store (->MockStore (atom {}) options)]
     (assoc store
+           :resource/lifecycle (lc/resolve-lifecycle (:resource/lifecycle options) options)
            :basis-counter (atom 0)
            :operations {:valueset-expand mock-valueset-expand
                         :valueset-lookup mock-valueset-lookup})))
