@@ -7,6 +7,7 @@
             [clojure.walk :as walk]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]
+            [fhir-store.lifecycle :as lc]
             [cheshire.core :as json]
             [cheshire.generate :as json-gen]
             [integrant.core :as ig]
@@ -197,6 +198,83 @@
    on a write return value (see the IFHIRStore protocol docstring)."
   [ret tx-key]
   (vary-meta ret assoc :fhir-store/basis (tx-key->basis tx-key)))
+
+;; ---------------------------------------------------------------------------
+;; Write lifecycle (see fhir-store.lifecycle for the ordering contract).
+;;
+;; A write path receives an lc-ctx, {:lifecycle :tenant-id :store}, built once
+;; per store call. With no lifecycle configured every helper below is a
+;; pass-through, so the write behaves exactly as it did before the seam.
+;; ---------------------------------------------------------------------------
+
+(defn- lifecycle-ctx [store tenant-id]
+  {:lifecycle (:resource/lifecycle store)
+   :tenant-id (str tenant-id)
+   :store     store})
+
+(defn ^:no-doc lifecycle-write
+  "Run the lifecycle's prepare, then its tx-ops, for one create or update
+   whose preconditions have passed and whose id is final. `db` is the node or
+   jdbc connection the write executes through. Returns the write map with
+   :resource the PREPARED body (the one to encode), :submitted the body as
+   sent, and :tx-ops the ops to append to the same execute-tx (nil for none).
+   Exceptions propagate: they refuse the write before anything is sent."
+  [{:keys [lifecycle tenant-id store]} db method resource-type id resource]
+  (let [write     {:tenant-id     tenant-id
+                   :resource-type (name resource-type)
+                   :id            id
+                   :method        method
+                   :resource      resource
+                   :db            db
+                   :entity        nil
+                   :store         store}
+        prepared  (lc/prepare-write lifecycle write)
+        ops-write (assoc write :resource prepared :submitted resource)]
+    (assoc ops-write :tx-ops (lc/write-tx-ops lifecycle ops-write))))
+
+(defn ^:no-doc fire-after-commit!
+  "Hand one committed transaction's writes to the lifecycle. Contained: a
+   failing after-commit is logged, never rethrown."
+  [{:keys [lifecycle tenant-id store]} writes tx-key]
+  (lc/fire-after-commit! lifecycle {:tenant-id tenant-id
+                                    :writes    (vec writes)
+                                    :result    tx-key
+                                    :store     store}))
+
+(defn ^:no-doc lifecycle-op-failure?
+  "True when execute-tx failed on an op at or past `own-op-count`, i.e. one a
+   lifecycle appended. That failure is rethrown as is: reporting it as the
+   resource's own conflict (409 already exists, 412 version) would be false."
+  [e own-op-count]
+  (when-let [idx (:tx-op-idx (ex-data e))]
+    (>= idx own-op-count)))
+
+(defn- version-assert-op
+  "The ASSERT that fails a transaction unless `id` still holds `vid`."
+  [resource-type id vid]
+  [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
+                (table-name resource-type))
+   [id vid]])
+
+(defn- entry-if-match
+  "The version a transaction PUT entry's `request.ifMatch` guards on, checked
+   against the `current` version before the lifecycle sees the write: nil when
+   the entry is unguarded, else the version it must still hold at commit.
+   Throws 412 when the guard already fails."
+  [{:keys [if-match resource-type id]} current]
+  (when if-match
+    (when (nil? current)
+      (throw (ex-info "Version conflict: resource does not exist"
+                      {:fhir/status 412 :fhir/code "conflict"
+                       :resource-type resource-type :id id
+                       :expected (fp/if-match-label if-match) :actual nil})))
+    (let [expected (if (= fp/if-match-any if-match) current if-match)]
+      (when (not= expected current)
+        (throw (ex-info "Version conflict"
+                        {:fhir/status 412 :fhir/code "conflict"
+                         :resource-type resource-type :id id
+                         :expected expected :actual current})))
+      expected)))
 
 (defn- inject-meta
   "Injects :meta :versionId and :meta :lastUpdated onto a decoded FHIR resource.
@@ -1203,28 +1281,34 @@
 ;; Write-side SQL impls.
 ;; ---------------------------------------------------------------------------
 
-(defn- create-sql [node resource-type id resource storage-encoders]
+(defn- create-sql [node resource-type id resource storage-encoders lc-ctx]
   (let [version "1"
         rt-name (name resource-type)
+        write (lifecycle-write lc-ctx node :create resource-type id resource)
+        resource (:resource write)
         [sql args] (extract-and-build-sql resource-type id resource storage-encoders
                                           :version version)
         assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
                                 (table-name resource-type))
                    [id]]
+        own-ops [assert-op [:sql sql args]]
         tx-key (try
-                 (xt/execute-tx node [assert-op [:sql sql args]])
+                 (xt/execute-tx node (into own-ops (:tx-ops write)))
                  (catch Exception e
+                   (when (lifecycle-op-failure? e (count own-ops))
+                     (throw e))
                    (throw (ex-info (str "Resource already exists: " rt-name "/" id)
                                    {:fhir/status 409 :fhir/code "conflict"
                                     :resource-type rt-name :id id}
                                    e))))]
+    (fire-after-commit! lc-ctx [write] tx-key)
     (with-basis
       (-> resource
           (assoc :id id)
           (assoc-in [:meta :versionId] version))
       tx-key)))
 
-(defn- update-sql [node resource-type id resource opts storage-encoders]
+(defn- update-sql [node resource-type id resource opts storage-encoders lc-ctx]
   (let [rt-name (table-name resource-type)
         supplied (fp/normalize-if-match (:if-match opts))
         current (current-version node resource-type id)
@@ -1242,6 +1326,8 @@
                              :expected if-match :actual current})))
         expected-vid (or if-match current)
         new-version (next-version expected-vid)
+        write (lifecycle-write lc-ctx node :update resource-type id resource)
+        resource (:resource write)
         [sql args] (extract-and-build-sql resource-type id resource storage-encoders
                                           :version new-version)
         assert-op (if expected-vid
@@ -1251,9 +1337,12 @@
                     [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
                                   rt-name)
                      [id]])
+        own-ops [assert-op [:sql sql args]]
         tx-key (try
-                 (xt/execute-tx node [assert-op [:sql sql args]])
+                 (xt/execute-tx node (into own-ops (:tx-ops write)))
                  (catch Exception e
+                   (when (lifecycle-op-failure? e (count own-ops))
+                     (throw e))
                    (if if-match
                      (throw (ex-info (str "Version conflict: " (ex-message e))
                                      {:fhir/status 412 :fhir/code "conflict"
@@ -1262,6 +1351,7 @@
                      (throw (ex-info (str "Conflict: " (ex-message e))
                                      {:fhir/status 409 :fhir/code "conflict"}
                                      e)))))]
+    (fire-after-commit! lc-ctx [write] tx-key)
     (with-basis
       (-> resource
           (assoc :id id)
@@ -1508,9 +1598,11 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
-         :xtql (create-xtql node resource-type id resource storage-encoders)
+         :xtql (create-xtql node resource-type id resource storage-encoders
+                            (lifecycle-ctx this tenant-id))
          (with-open [conn (jdbc/get-connection pool)]
-           (create-sql conn resource-type id resource storage-encoders))))))
+           (create-sql conn resource-type id resource storage-encoders
+                       (lifecycle-ctx this tenant-id)))))))
 
   (read-resource [this tenant-id resource-type id]
     (ftrace/trace!
@@ -1541,9 +1633,11 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
        (case query-mode
-         :xtql (update-xtql node resource-type id resource opts storage-encoders)
+         :xtql (update-xtql node resource-type id resource opts storage-encoders
+                            (lifecycle-ctx this tenant-id))
          (with-open [conn (jdbc/get-connection pool)]
-           (update-sql conn resource-type id resource opts storage-encoders))))))
+           (update-sql conn resource-type id resource opts storage-encoders
+                       (lifecycle-ctx this tenant-id)))))))
 
   (delete-resource [this tenant-id resource-type id]
     (fp/delete-resource this tenant-id resource-type id nil))
@@ -1664,7 +1758,10 @@
                                        :resource-type resource-type
                                        :id id
                                        :fullUrl fullUrl
-                                       :resource resource}))
+                                       :resource resource
+                                       :if-match (fp/normalize-if-match
+                                                  (or (:ifMatch request)
+                                                      (get request "ifMatch")))}))
                                   entries)
                             (sort-by #(method-order (:method %)))
                             vec)
@@ -1696,8 +1793,11 @@
           ;; bypassing the INSERT planner entirely. execute-tx accepts both
           ;; shapes (and a mix with [:sql ASSERT ...]) in one atomic call.
           xtql-mode? (= query-mode :xtql)
+          lc-ctx (lifecycle-ctx this tenant-id)
+          ;; `resource` is the lifecycle-PREPARED body for POST/PUT, never
+          ;; the entry's submitted one.
           emit-write-op
-          (fn [{:keys [method resource-type id resource] :as _em} vid]
+          (fn [{:keys [method resource-type id] :as _em} resource vid]
             (case method
               ("POST" "PUT")
               (if xtql-mode?
@@ -1714,46 +1814,68 @@
                 [:delete-docs (keyword resource-type) id]
                 [:sql (format "DELETE FROM %s WHERE _id = ?" (table-name resource-type))
                  [id]])))
-          {:keys [tx-ops entry-results]}
+          ;; POST/PUT entries run the lifecycle here, once each id is chosen
+          ;; and before anything is encoded. Their tx-ops are collected per
+          ;; entry and appended after ALL of the bundle's own write ops.
+          {:keys [tx-ops lifecycle-writes entry-results]}
           (ftrace/trace!
            {:id :store/transact-transaction.sql-encode
             :data {:entry-count (count entry-metas) :query-mode query-mode}}
            (reduce (fn [acc {:keys [method resource-type id] :as em}]
                      (case method
-                       "POST"
-                       (let [vid "1"
-                             final (-> (:resource em)
-                                       (assoc :id id)
-                                       (assoc-in [:meta :versionId] vid)
-                                       (assoc-in [:meta :lastUpdated] last-updated))]
-                         (-> acc
-                             (update :tx-ops conj (emit-write-op em vid))
-                             (update :entry-results conj (assoc em :resource final :vid vid))))
-                       "PUT"
+                       ("POST" "PUT")
                        (let [current (get-in put-versions-by-type [resource-type id])
-                             vid (next-version current)
-                             final (-> (:resource em)
+                             if-match (when (= "PUT" method)
+                                        (entry-if-match em current))
+                             vid (if (= "POST" method)
+                                   "1"
+                                   (next-version current))
+                             write (lifecycle-write lc-ctx node
+                                                    (if (= "POST" method) :create :update)
+                                                    resource-type id (:resource em))
+                             prepared (:resource write)
+                             final (-> prepared
                                        (assoc :id id)
                                        (assoc-in [:meta :versionId] vid)
                                        (assoc-in [:meta :lastUpdated] last-updated))]
                          (-> acc
-                             (update :tx-ops conj (emit-write-op em vid))
+                             (update :tx-ops into
+                                     (cond-> []
+                                       if-match (conj (version-assert-op resource-type id if-match))
+                                       true (conj (emit-write-op em prepared vid))))
+                             (update :lifecycle-writes conj write)
                              (update :entry-results conj (assoc em :resource final :vid vid))))
                        "DELETE"
                        (-> acc
-                           (update :tx-ops conj (emit-write-op em nil))
+                           (update :tx-ops conj (emit-write-op em nil nil))
                            (update :entry-results conj em))
                        ;; GET / HEAD inside a transaction: we still have to
                        ;; read the resource to satisfy the response. Defer
                        ;; these to the read-back phase by leaving :resource
                        ;; nil on entry-results.
                        (update acc :entry-results conj em)))
-                   {:tx-ops [] :entry-results []}
-                   entry-metas))]
+                   {:tx-ops [] :lifecycle-writes [] :entry-results []}
+                   entry-metas))
+          own-op-count (count tx-ops)
+          guarded? (some :if-match entry-metas)
+          tx-ops (into tx-ops (mapcat :tx-ops) lifecycle-writes)]
       (let [tx-key (ftrace/trace!
                     {:id :store/transact-transaction.execute-tx
                      :data {:op-count (count tx-ops)}}
-                    (xt/execute-tx node tx-ops))]
+                    (try
+                      (xt/execute-tx node tx-ops)
+                      (catch Exception e
+                        ;; A guarded PUT whose version moved after it was
+                        ;; read fails its own ASSERT: a precondition failure.
+                        (if (and guarded? (not (lifecycle-op-failure? e own-op-count)))
+                          (throw (ex-info (str "Version conflict: " (ex-message e))
+                                          {:fhir/status 412 :fhir/code "conflict"}
+                                          e))
+                          (throw e)))))]
+      ;; Once for the whole Bundle. A Bundle of only DELETE/GET entries
+      ;; handed nothing to the lifecycle, so it has nothing to report.
+      (when (seq lifecycle-writes)
+        (fire-after-commit! lc-ctx lifecycle-writes tx-key))
       ;; Build the response. Writes return from in-memory metadata (no
       ;; round-trips). GET/HEAD entries, if any, still need a read — batched
       ;; per resource-type to avoid N sequential SELECTs.
@@ -2088,17 +2210,23 @@
      dynamic SQL + INSERT/DELETE. :xtql uses XTQL reads and put-docs/delete-docs
      writes, with [:sql ASSERT ...] retained for optimistic concurrency.
    - :pool-opts         — per-tenant HikariCP connection-pool overrides
-     (:max-size, :min-idle, :connection-timeout-ms); see default-pool-opts."
-  [{:keys [resource/schemas node-config query-mode pool-opts]
-    :or {node-config {} schemas [] query-mode :sql pool-opts {}}}]
+     (:max-size, :min-idle, :connection-timeout-ms); see default-pool-opts.
+   - :resource/lifecycle — a write lifecycle (qualified symbol, value, or
+     constructor fn of this config map); resolved once here and kept on the
+     store under :resource/lifecycle. See fhir-store.lifecycle."
+  [{:keys [resource/schemas node-config query-mode pool-opts resource/lifecycle]
+    :or {node-config {} schemas [] query-mode :sql pool-opts {}}
+    :as config}]
   (assert (contains? #{:sql :xtql} query-mode)
           (str "query-mode must be :sql or :xtql, got " query-mode))
   (let [storage-encoders (xf/build-storage-encoders schemas)
         read-decoders    (xf/build-read-decoders schemas)
         store (->XTDBStore (atom {}) node-config storage-encoders read-decoders query-mode
                            (or pool-opts {}))]
-    (assoc store :operations {:valueset-expand xtdb-valueset-expand
-                              :valueset-lookup xtdb-valueset-lookup})))
+    (assoc store
+           :operations {:valueset-expand xtdb-valueset-expand
+                        :valueset-lookup xtdb-valueset-lookup}
+           :resource/lifecycle (lc/resolve-lifecycle lifecycle config))))
 
 (defmethod ig/init-key :fhir-store/xtdb2-node [_ config]
   ;; Kept for backward compatibility; returns the config map for use by the store.
@@ -2109,13 +2237,14 @@
   ;; No-op: nodes are managed by the store now
   nil)
 
-(defmethod ig/init-key :fhir-store/xtdb2-store [_ {:keys [node resource/schemas query-mode pool-opts]}]
+(defmethod ig/init-key :fhir-store/xtdb2-store [_ {:keys [node resource/schemas query-mode pool-opts resource/lifecycle]}]
   (println "Starting XTDB2 FHIR Store (per-tenant node isolation)"
            (str "[query-mode=" (or query-mode :sql) "]"))
   (create-xtdb-store {:resource/schemas schemas
                       :node-config node
                       :query-mode (or query-mode :sql)
-                      :pool-opts pool-opts}))
+                      :pool-opts pool-opts
+                      :resource/lifecycle lifecycle}))
 
 (defmethod ig/halt-key! :fhir-store/xtdb2-store [_ store]
   (println "Stopping XTDB2 FHIR Store - closing all tenant pools + nodes")

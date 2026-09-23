@@ -267,32 +267,38 @@
 ;; transaction, and this avoids translating the ASSERT into an XTQL predicate.
 ;; ---------------------------------------------------------------------------
 
-(defn create-xtql [node resource-type id resource storage-encoders]
+(defn create-xtql [node resource-type id resource storage-encoders lc-ctx]
   (ftrace/trace!
    {:id :xtql/create
     :data {:resource-type (name resource-type) :id id}}
    (let [version "1"
          rt-name (name resource-type)
+         write (core/lifecycle-write lc-ctx node :create resource-type id resource)
+         resource (:resource write)
          doc (core/encode-resource-doc resource-type id resource storage-encoders
                                        :version version)
          put-doc (core/doc->put-doc doc)
          assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" rt-name)
                     [id]]
          put-op [:put-docs (rt-kw resource-type) put-doc]
+         own-ops [assert-op put-op]
          tx-key (try
-                  (xt/execute-tx node [assert-op put-op])
+                  (xt/execute-tx node (into own-ops (:tx-ops write)))
                   (catch Exception e
+                    (when (core/lifecycle-op-failure? e (count own-ops))
+                      (throw e))
                     (throw (ex-info (str "Resource already exists: " rt-name "/" id)
                                     {:fhir/status 409 :fhir/code "conflict"
                                      :resource-type rt-name :id id}
                                     e))))]
+     (core/fire-after-commit! lc-ctx [write] tx-key)
      (core/with-basis
        (-> resource
            (assoc :id id)
            (assoc-in [:meta :versionId] version))
        tx-key))))
 
-(defn update-xtql [node resource-type id resource opts storage-encoders]
+(defn update-xtql [node resource-type id resource opts storage-encoders lc-ctx]
   (ftrace/trace!
    {:id :xtql/update
     :data {:resource-type (name resource-type) :id id}}
@@ -309,6 +315,8 @@
                               :expected if-match :actual current})))
          expected-vid (or if-match current)
          new-version (core/next-version expected-vid)
+         write (core/lifecycle-write lc-ctx node :update resource-type id resource)
+         resource (:resource write)
          doc (core/encode-resource-doc resource-type id resource storage-encoders
                                        :version new-version)
          put-doc (core/doc->put-doc doc)
@@ -320,9 +328,12 @@
                                    rt-name)
                       [id]])
          put-op [:put-docs (rt-kw resource-type) put-doc]
+         own-ops [assert-op put-op]
          tx-key (try
-                  (xt/execute-tx node [assert-op put-op])
+                  (xt/execute-tx node (into own-ops (:tx-ops write)))
                   (catch Exception e
+                    (when (core/lifecycle-op-failure? e (count own-ops))
+                      (throw e))
                     (if if-match
                       (throw (ex-info (str "Version conflict: " (ex-message e))
                                       {:fhir/status 412 :fhir/code "conflict"
@@ -331,6 +342,7 @@
                       (throw (ex-info (str "Conflict: " (ex-message e))
                                       {:fhir/status 409 :fhir/code "conflict"}
                                       e)))))]
+     (core/fire-after-commit! lc-ctx [write] tx-key)
      (core/with-basis
        (-> resource
            (assoc :id id)

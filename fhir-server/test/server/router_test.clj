@@ -8,6 +8,8 @@
    it take effect at that position in the chain."
   (:require [clojure.test :refer [deftest is testing]]
             [buddy.sign.jwt :as jwt]
+            [fhir-store.lifecycle :as lifecycle]
+            [fhir-store.protocol :as db]
             [fhir-store.mock.core :as mock]
             [hato.client :as hc]
             [jsonista.core :as json]
@@ -302,6 +304,58 @@
               ::router/keto-authorization]
              (subvec on (- (count on) 4)))))))
 
+(def presenting-lifecycle
+  "Named by symbol in the ::lifecycle tests below, so it must stay public."
+  (reify lifecycle/IReadLifecycle
+    (present [_ _ resource] resource)))
+
+(deftest default-middleware-injects-a-lifecycle-when-opts-carry-one
+  (testing "absent :lifecycle adds no entry"
+    (is (not-any? #{::router/lifecycle}
+                  (mapv :name (router/default-middleware nil resolved-opts)))))
+
+  (testing "a qualified symbol is resolved and injected as :fhir/lifecycle,
+            immediately after ::narrative"
+    (let [mw    (router/default-middleware
+                  nil (assoc resolved-opts :lifecycle `presenting-lifecycle))
+          names (mapv :name mw)
+          entry (first (filter #(= ::router/lifecycle (:name %)) mw))
+          seen  (atom nil)]
+      (is (= (let [[before after] (split-with #(not= ::router/bulk-job-store %)
+                                              default-middleware-names)]
+               (vec (concat before [::router/lifecycle] after)))
+             names))
+      (((:wrap entry) (fn [req] (reset! seen req))) {})
+      (is (identical? presenting-lifecycle (:fhir/lifecycle @seen)))))
+
+  (testing "a lifecycle value is injected as is"
+    (let [lc    (reify lifecycle/IReadLifecycle (present [_ _ r] r))
+          entry (->> (router/default-middleware nil (assoc resolved-opts :lifecycle lc))
+                     (filter #(= ::router/lifecycle (:name %)))
+                     first)
+          seen  (atom nil)]
+      (((:wrap entry) (fn [req] (reset! seen req))) {})
+      (is (identical? lc (:fhir/lifecycle @seen)))))
+
+  (testing "a symbol that does not resolve fails at construction"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not resolve"
+                          (router/default-middleware
+                            nil (assoc resolved-opts :lifecycle 'no.such.ns/lifecycle))))))
+
+(deftest a-lifecycle-passed-to-fhir-app-presents-read-responses
+  (let [store (mock/create-mock-store {})
+        _     (db/create-resource store tenant :Patient "p-1"
+                                  {:resourceType "Patient" :id "p-1"})
+        lc    (reify lifecycle/IReadLifecycle
+                (present [_ read resource]
+                  (assoc resource :language (:resource-type read))))
+        app   (sc/fhir-app store test-schemas (assoc app-opts :lifecycle lc))]
+    (with-auth
+      (let [resp (app (GET (str "/" tenant "/fhir/Patient/p-1")
+                           :headers {"authorization" (bearer-token)}))]
+        (is (= 200 (:status resp)))
+        (is (= "Patient" (get (json-body resp) "language")))))))
+
 (def ^:private marker-middleware
   "Short-circuits on X-Marker so its position in the chain is observable."
   {:name ::marker
@@ -424,6 +478,7 @@
                 :enforce-smart-scopes? false
                 :cors-allowed-origins "https://a.example, https://b.example"
                 :terminology :term
+                :lifecycle `presenting-lifecycle
                 :bulk-job-store :jobs})]
     (is (= jwks-url (:jwks-url opts)))
     (is (= keto-url (:keto-url opts)))
@@ -431,7 +486,9 @@
     (is (= #{"https://a.example" "https://b.example"} (:cors-origins opts))
         "a comma-separated string is split and trimmed into a set")
     (is (= :term (:terminology opts)))
-    (is (= :jobs (:bulk-job-store opts)))))
+    (is (= :jobs (:bulk-job-store opts)))
+    (is (= `presenting-lifecycle (:lifecycle opts))
+        ":lifecycle is carried through unresolved; default-middleware resolves it")))
 
 (deftest parse-cors-origins-normalizes-every-accepted-shape
   (is (nil? (router/parse-cors-origins nil)))

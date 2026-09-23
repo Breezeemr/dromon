@@ -400,6 +400,9 @@
    - :resource/schemas  — vector of compiled malli schemas (one per supported
                           resource type, each carrying :resourceType, :fhir/cap-schema,
                           :fhir/interactions, :fhir/search-registry in properties)
+   - :resource/lifecycle — optional host hook into writes and reads (a
+                          qualified symbol, a value, or a constructor fn).
+                          See `fhir-store.lifecycle` for the ordering contract.
    - Implementation-specific keys (e.g., XTDB node config)"
   [impl-fn config]
   (impl-fn config))

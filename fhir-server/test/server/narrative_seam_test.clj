@@ -10,11 +10,18 @@
      therefore unchanged by this seam existing;
    - the function is applied at every write path;
    - it sees the FINAL body, so a PATCH cannot author its own narrative;
-   - a host that throws loses its narrative, not the write."
+   - a host that throws loses its narrative, not the write.
+
+   The second half pins presentation: an `IReadLifecycle` injected as
+   `:fhir/lifecycle` fills read, write and transaction/batch responses, never
+   storage and never search results, and a throwing one costs the
+   presentation, not the read."
   (:require [clojure.test :refer [deftest is testing]]
+            [fhir-store.lifecycle :as lifecycle]
             [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as db]
             [server.handlers :as handlers]
+            [server.middleware :as middleware]
             [server.narrative :as narrative]))
 
 (def ^:private tenant "default")
@@ -132,3 +139,178 @@
   (let [entries [{:request {:method "PUT" :url "Substance/b"} :resource {:id "b"}}]
         out     (narrative/ensure-bundle-narrative marker entries)]
     (is (= "<div>Substance/b</div>" (get-in out [0 :resource :text :div])))))
+
+;; ---------------------------------------------------------------------------
+;; Presentation: the injected `fhir-store.lifecycle/IReadLifecycle`
+;; ---------------------------------------------------------------------------
+
+(def ^:private presented-text
+  {:status "generated" :div "<div>presented</div>"})
+
+(defn- recording-lifecycle
+  "A toy read lifecycle that fills :text on the response and records every
+   read map it was handed."
+  [calls]
+  (reify lifecycle/IReadLifecycle
+    (present [_ read resource]
+      (swap! calls conj read)
+      (assoc resource :text presented-text))))
+
+(def ^:private throwing-lifecycle
+  (reify lifecycle/IReadLifecycle
+    (present [_ _ _] (throw (ex-info "presenter bug" {})))))
+
+(defn- lc-req [st resource-type lc & {:as more}]
+  (cond-> (apply req st resource-type (mapcat identity more))
+    lc (assoc :fhir/lifecycle lc)))
+
+(defn- run [handler request]
+  ((middleware/wrap-fhir-exceptions handler) request))
+
+(defn- seed! [st id]
+  (db/create-resource st tenant :Substance id {:resourceType "Substance" :id id}))
+
+(deftest a-read-response-is-presented-and-storage-is-not
+  (let [st    (store)
+        _     (seed! st "s-1")
+        calls (atom [])
+        r     (lc-req st "Substance" (recording-lifecycle calls) :id "s-1")
+        resp  (handlers/read-resource r)]
+    (is (= 200 (:status resp)))
+    (is (= presented-text (:text (:body resp))))
+    (is (not (contains? (saved st "Substance" "s-1") :text))
+        "a direct store read returns what was stored")
+    (testing "the read map names the tenant, type, store and request"
+      (let [[read] @calls]
+        (is (= 1 (count @calls)))
+        (is (= tenant (:tenant-id read)))
+        (is (= "Substance" (:resource-type read)))
+        (is (identical? st (:store read)))
+        (is (identical? r (:request read)))))))
+
+(deftest create-update-and-patch-responses-are-presented
+  (let [st    (store)
+        lc    (recording-lifecycle (atom []))
+        post  (handlers/create-resource
+               (lc-req st "Substance" lc :body {:resourceType "Substance"}))
+        id    (get-in post [:body :id])
+        put   (handlers/update-resource
+               (lc-req st "Substance" lc :id id
+                       :body {:resourceType "Substance" :id id :status "active"}))
+        upsrt (handlers/update-resource
+               (lc-req st "Substance" lc :id "s-new"
+                       :body {:resourceType "Substance" :id "s-new"}))
+        patch (handlers/patch-resource
+               (lc-req st "Substance" lc :id id
+                       :body [{:op "replace" :path "/status" :value "inactive"}]))]
+    (is (= [201 200 201 200] (mapv :status [post put upsrt patch])))
+    (is (every? #(= presented-text (get-in % [:body :text])) [post put upsrt patch]))
+    (is (not (contains? (saved st "Substance" id) :text))
+        "presentation never reaches storage")
+    (is (not (contains? (saved st "Substance" "s-new") :text)))))
+
+(deftest guarded-and-conditional-write-responses-are-presented
+  (let [st    (store)
+        _     (seed! st "s-1")
+        lc    (recording-lifecycle (atom []))
+        vid   (get-in (saved st "Substance" "s-1") [:meta :versionId])
+        guarded (handlers/update-resource
+                 (-> (lc-req st "Substance" lc :id "s-1"
+                             :body {:resourceType "Substance" :id "s-1" :status "active"})
+                     (assoc-in [:headers "if-match"] (str "W/\"" vid "\""))))
+        conditional (fn [handler criteria body]
+                      (handler (-> (lc-req st "Substance" lc :body body)
+                                   (assoc :query-params criteria
+                                          :fhir/search-registry {}))))
+        cond-create (conditional handlers/conditional-update {"_id" "s-none"}
+                                 {:resourceType "Substance" :id "s-cond"})
+        cond-update (conditional handlers/conditional-update {"_id" "s-1"}
+                                 {:resourceType "Substance" :status "inactive"})
+        cond-patch  (conditional handlers/conditional-patch {"_id" "s-1"}
+                                 [{:op "replace" :path "/status" :value "active"}])]
+    (is (= [200 201 200 200] (mapv :status [guarded cond-create cond-update cond-patch])))
+    (is (every? #(= presented-text (get-in % [:body :text]))
+                [guarded cond-create cond-update cond-patch]))
+    (is (= "active" (:status (saved st "Substance" "s-1"))) "the patch was stored")
+    (is (not (contains? (saved st "Substance" "s-1") :text))
+        "presentation never reaches storage")
+    (is (not (contains? (saved st "Substance" "s-cond") :text)))))
+
+(deftest a-conditional-create-match-is-presented
+  (let [st   (store)
+        _    (seed! st "s-1")
+        resp (handlers/create-resource
+              (-> (lc-req st "Substance" (recording-lifecycle (atom []))
+                          :body {:resourceType "Substance"})
+                  (assoc-in [:headers "if-none-exist"] "_id=s-1")
+                  (assoc :fhir/search-registry {})))]
+    (is (= 200 (:status resp)))
+    (is (= "s-1" (get-in resp [:body :id])))
+    (is (= presented-text (get-in resp [:body :text])))))
+
+(deftest a-throwing-lifecycle-leaves-the-stored-resource-on-the-response
+  (let [st   (store)
+        _    (seed! st "s-1")
+        resp (handlers/read-resource (lc-req st "Substance" throwing-lifecycle :id "s-1"))]
+    (is (= 200 (:status resp)))
+    (is (= (saved st "Substance" "s-1") (:body resp)))))
+
+(deftest without-an-injected-lifecycle-responses-are-unchanged
+  (let [st   (store)
+        _    (seed! st "s-1")
+        resp (handlers/read-resource (lc-req st "Substance" nil :id "s-1"))]
+    (is (= (saved st "Substance" "s-1") (:body resp))))
+  (testing "a write-only lifecycle presents nothing"
+    (let [st   (store)
+          _    (seed! st "s-1")
+          lc   (reify lifecycle/IWriteLifecycle
+                 (prepare [_ w] (:resource w))
+                 (tx-ops [_ _] nil)
+                 (after-commit [_ _] nil))
+          resp (handlers/read-resource (lc-req st "Substance" lc :id "s-1"))]
+      (is (= (saved st "Substance" "s-1") (:body resp))))))
+
+(deftest search-results-are-not-presented
+  (let [st    (store)
+        _     (seed! st "s-1")
+        calls (atom [])
+        resp  (handlers/search-type
+               (-> (lc-req st "Substance" (recording-lifecycle calls))
+                   (assoc :fhir/search-registry {})))]
+    (is (= 200 (:status resp)))
+    (is (= 1 (count (get-in resp [:body :entry]))))
+    (is (not-any? #(contains? (:resource %) :text) (get-in resp [:body :entry])))
+    (is (empty? @calls))))
+
+(defn- bundle-of [bundle-type]
+  {:resourceType "Bundle"
+   :type bundle-type
+   :entry [{:request  {:method "POST" :url "Substance"}
+            :resource {:resourceType "Substance"}}
+           {:request  {:method "PUT" :url "Substance/s-2"}
+            :resource {:resourceType "Substance" :id "s-2"}}]})
+
+(deftest transaction-and-batch-response-entries-are-presented
+  (doseq [bundle-type ["transaction" "batch"]]
+    (testing bundle-type
+      (let [st    (store)
+            calls (atom [])
+            resp  (run (handlers/transaction {})
+                       {:fhir/store     st
+                        :fhir/lifecycle (recording-lifecycle calls)
+                        :path-params    {:tenant-id tenant}
+                        :body-params    (bundle-of bundle-type)})
+            entries (get-in resp [:body :entry])]
+        (is (= 200 (:status resp)))
+        (is (= (str bundle-type "-response") (get-in resp [:body :type])))
+        (is (= 2 (count entries)))
+        (is (every? #(= presented-text (get-in % [:resource :text])) entries))
+        (is (= #{"Substance"} (set (map :resource-type @calls))))
+        (is (not (contains? (saved st "Substance" "s-2") :text)))))))
+
+(deftest present-bundle-response-leaves-other-bundle-types-alone
+  (let [bundle {:resourceType "Bundle" :type "searchset"
+                :entry [{:resource {:resourceType "Substance" :id "a"}}]}
+        r      {:path-params {:tenant-id tenant}
+                :fhir/lifecycle (recording-lifecycle (atom []))}]
+    (is (identical? bundle (narrative/present-bundle-response r bundle)))))
