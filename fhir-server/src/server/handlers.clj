@@ -260,7 +260,7 @@
     (if res
       (if (not-modified? res req)
         {:status 304 :body nil}
-        {:status 200 :body res})
+        {:status 200 :body (narrative/present-response tenant-id resource-type res)})
       (if (db/resource-deleted? store tenant-id (keyword resource-type) id)
         (gone-response resource-type id)
         (not-found-response resource-type id)))))
@@ -398,7 +398,7 @@
       expected-version
       (let [res (db/update-resource store tenant-id (keyword resource-type) id
                                     resource-body {:if-match expected-version})]
-        {:status 200 :body res})
+        {:status 200 :body (narrative/present-response tenant-id resource-type res)})
 
       ;; Without If-Match: preserve the create-with-client-id upsert path
       ;; for nonexistent resources. Existing resources take the normal
@@ -407,13 +407,13 @@
       (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
         (if existing
           (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
-            {:status 200 :body res})
+            {:status 200 :body (narrative/present-response tenant-id resource-type res)})
           (let [res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
                 base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
                 vid (get-in res [:meta :versionId])]
             {:status 201
              :headers {"Location" (str base-url "/_history/" vid)}
-             :body res}))))))
+             :body (narrative/present-response tenant-id resource-type res)}))))))
 
 (defn patch-resource
   "Handler for PATCH /[type]/:id RESTful interaction.
@@ -458,7 +458,7 @@
             result (if opts
                      (db/update-resource store tenant-id (keyword resource-type) id patched opts)
                      (db/update-resource store tenant-id (keyword resource-type) id patched))]
-        {:status 200 :body result}))))
+        {:status 200 :body (narrative/present-response tenant-id resource-type result)}))))
 
 (defn delete-resource
   "Handler for DELETE /[type]/:id RESTful interaction."
@@ -598,7 +598,7 @@
         vid (get-in res [:meta :versionId])]
     {:status 201
      :headers {"Location" (str base-url "/_history/" vid)}
-     :body res}))
+     :body (narrative/present-response tenant-id resource-type res)}))
 
 (defn create-resource
   "Handler for POST /[type] RESTful interaction.
@@ -630,7 +630,8 @@
                           (:fhir/narrative req))
 
                (= 1 match-count)
-               {:status 200 :body (first results)}
+               {:status 200
+                :body (narrative/present-response tenant-id resource-type (first results))}
 
                :else
                {:status 412
@@ -1031,7 +1032,7 @@
                vid (get-in res [:meta :versionId])]
            {:status 201
             :headers {"Location" (str base-url "/_history/" vid)}
-            :body res})
+            :body (narrative/present-response tenant-id resource-type res)})
 
          (= 1 match-count)
          ;; One match: update it
@@ -1044,7 +1045,8 @@
                      :issue [{:severity "error" :code "invalid"
                               :diagnostics (str "Resource id in body (" body-id ") does not match resolved id (" id ")")}]}}
              (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
-               {:status 200 :body res})))
+               {:status 200
+                :body (narrative/present-response tenant-id resource-type res)})))
 
          :else
          {:status 412
@@ -1108,7 +1110,8 @@
                         resource-type
                         (json-patch/apply-patch existing patch-ops))
                result (db/update-resource store tenant-id (keyword resource-type) id patched)]
-           {:status 200 :body result})
+           {:status 200
+            :body (narrative/present-response tenant-id resource-type result)})
 
          :else
          {:status 412
@@ -1918,7 +1921,11 @@
                 entries (narrative/ensure-bundle-narrative
                          (:fhir/narrative req)
                          (resolve-patch-entries store tenant-id entries))]
-            (bundle-response (db/transact-transaction store tenant-id entries) entries))
+            (bundle-response
+             (narrative/present-bundle-response
+              tenant-id
+              (db/transact-transaction store tenant-id entries))
+             entries))
           ;; Batch: each entry independent. Decode entries (with per-entry
           ;; spans), then hand off to the store's batch impl which emits
           ;; :store/transact-bundle around its work. A PATCH this server
@@ -1946,7 +1953,9 @@
                                     (vreset! from-store tail)
                                     head)))
                             resolved)]
-            (bundle-response (assoc res :entry woven) decoded)))
+            (bundle-response
+             (narrative/present-bundle-response tenant-id (assoc res :entry woven))
+             decoded)))
         {:status 400
          :body {:resourceType "OperationOutcome"
                 :issue [{:severity "error"
