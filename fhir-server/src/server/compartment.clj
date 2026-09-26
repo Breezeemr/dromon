@@ -26,7 +26,8 @@
    The owner self-entry (and the non-searchable `{def}` placeholder) is omitted
    from each table; the owner type is handled by `_id`. One entry (Patient/Task)
    is a documented forward-port from R5; see the comment at its site."
-  (:require [fhir-store.protocol :as db]
+  (:require [clojure.string :as str]
+            [fhir-store.protocol :as db]
             [server.scope :as scope]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]))
@@ -391,18 +392,28 @@
 ;; Compartment-filtering store decorator
 ;; ---------------------------------------------------------------------------
 
+(defn- column-values
+  "The elements a column descriptor addresses in `resource`, as a seq of maps.
+
+   A descriptor names a top-level element (`:col`) and, for a nested link
+   parameter, the path beneath it (`:sub-col`, dot-separated). Every step may
+   be a single element or an array, so arrays are flattened at each level:
+   Appointment's `actor` is {:col \"participant\" :sub-col \"actor\"} and yields
+   the actor of every participant. Reading only `:col` would find no `actor` on
+   an Appointment and fail every write closed."
+  [resource {:keys [col sub-col]}]
+  (let [elements (fn [v] (cond (map? v) [v] (sequential? v) (filter map? v) :else []))]
+    (reduce (fn [values k] (mapcat #(elements (get % k)) values))
+            (elements (get resource (keyword col)))
+            (when sub-col (map keyword (str/split sub-col #"\."))))))
+
 (defn- reference-matches?
   "True when any of the given column descriptors holds a Reference to `target`
-   (e.g. \"Patient/123\") in `resource`. Supports the common
-   {:reference \"Patient/<id>\"} shape, single or array-valued."
+   (e.g. \"Patient/123\") in `resource`, at the top level or nested beneath it."
   [resource columns target]
   (boolean
-    (some (fn [{:keys [col]}]
-            (let [v (get resource (keyword col))]
-              (cond
-                (map? v)        (= (:reference v) target)
-                (sequential? v) (some #(and (map? %) (= (:reference %) target)) v)
-                :else           false)))
+    (some (fn [column]
+            (some #(= (:reference %) target) (column-values resource column)))
           columns)))
 
 (defn- write-in-compartment?

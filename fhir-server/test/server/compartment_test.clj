@@ -191,6 +191,41 @@
     (testing "deleting an in-compartment resource succeeds"
       (is (true? (db/delete-resource store tenant :Observation "obs-mine"))))))
 
+;; Appointment's only Patient-compartment link param, `actor`, resolves to the
+;; nested Appointment.participant.actor, which the registry describes as a
+;; parent column plus a :sub-col.
+(def ^:private appointment-registry
+  {"actor" {:type "reference"
+            :columns [{:col "participant" :array? true :sub-col "actor"}]}})
+
+(defn- appt [id & actor-refs]
+  {:resourceType "Appointment" :id id :status "booked"
+   :participant (mapv (fn [r] {:actor {:reference r} :status "accepted"}) actor-refs)})
+
+(deftest writes-follow-nested-link-columns
+  (let [store (compartment/filtering-store
+               (mock/create-mock-store {})
+               {:patient-id "123"
+                :all-registries (assoc registries "Appointment" appointment-registry)})]
+    (testing "an Appointment naming the launch patient as a participant actor is writable"
+      (is (= "a1" (:id (db/create-resource store tenant :Appointment "a1"
+                                           (appt "a1" "Practitioner/9" "Patient/123"))))))
+    (testing "an Appointment whose participants are all someone else is refused"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the patient compartment"
+            (db/create-resource store tenant :Appointment "a2"
+                                (appt "a2" "Practitioner/9" "Patient/999")))))
+    (testing "a participant without an actor does not break the match"
+      (is (= "a3" (:id (db/create-resource store tenant :Appointment "a3"
+                                           (update (appt "a3" "Patient/123") :participant
+                                                   conj {:type [{:text "location"}]}))))))))
+
+(deftest in-memory-membership-follows-nested-link-columns
+  (testing "bulk export's membership test reaches participant.actor too"
+    (is (true? (compartment/resource-in-any-compartment?
+                "Patient" #{"123"} "Appointment" (appt "a1" "Patient/123") appointment-registry)))
+    (is (false? (compartment/resource-in-any-compartment?
+                 "Patient" #{"123"} "Appointment" (appt "a2" "Patient/999") appointment-registry)))))
+
 (deftest cross-patient-write-rejection-carries-403
   (let [store (fstore (seeded-store))]
     (is (= 403 (try (db/create-resource store tenant :Observation "x" (obs "x" "Patient/999"))
