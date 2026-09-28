@@ -1,5 +1,8 @@
 {:paths ["src"]
  :deps {fhir-store/server {:local/root "../fhir-server"}
+        ;; The server's SLF4J backend: Jetty and the store backends log through
+        ;; SLF4J, and this routes them into telemere next to server.logging's output.
+        com.taoensso/telemere-slf4j {:mvn/version "1.2.1"}
         fhir-terminology/fhir-terminology {:local/root "../fhir-terminology"}
         integrant/integrant {:mvn/version "0.13.1"}
         metosin/malli {:mvn/version "0.20.1"}
