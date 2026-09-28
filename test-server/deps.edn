@@ -2,7 +2,8 @@
  :deps {fhir-store/server {:local/root "../fhir-server"}
         fhir-terminology/fhir-terminology {:local/root "../fhir-terminology"}
         integrant/integrant {:mvn/version "0.13.1"}
-        metosin/malli {:mvn/version "0.20.1"}}
+        metosin/malli {:mvn/version "0.20.1"}
+        org.clojure/clojure {:mvn/version "1.12.6"}}
  :aliases
  {;; --- OpenTelemetry (opt-in via -M:otel) ---
   ;; Pulls the OTel SDK + OTLP exporter onto the classpath so Telemere's

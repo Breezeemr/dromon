@@ -1,5 +1,5 @@
 {:paths ["src"]
- :deps  {org.clojure/clojure           {:mvn/version "1.12.4"}
+ :deps  {org.clojure/clojure           {:mvn/version "1.12.6"}
          metosin/malli                 {:mvn/version "0.20.1"}
          com.breezeehr/fhir-primitives {:local/root "../fhir-primitives"}}
  :aliases

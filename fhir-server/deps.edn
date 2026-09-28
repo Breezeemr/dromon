@@ -1,5 +1,5 @@
 {:paths ["src" "resources"]
- :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         info.sunng/ring-jetty9-adapter {:mvn/version "0.39.2"}
         metosin/reitit {:mvn/version "0.10.1"} ;; latest reitit
         metosin/malli {:mvn/version "0.20.1"}       ;; latest malli

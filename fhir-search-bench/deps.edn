@@ -1,5 +1,5 @@
 {:paths ["src" "resources"]
- :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         ;; Brings in fhir-server (server.core, search-registry) transitively and
         ;; the canonical uscore8 schema spec vector (test-server.schemas.uscore8).
         test-server/test-server {:local/root "../test-server"}
