@@ -28,6 +28,24 @@ OpenTelemetry handler, a Jaeger all-in-one dev container, and span coverage acro
 fhir-decode, store ops, store node start, and bundle entries). Telemere also provides structured
 logging. See `docs/tasks/otel-telemere-instrumentation.md`.
 
+## Known limitations
+
+### Telehealth signalling is single-instance
+
+`Appointment/{id}/$telehealth-signal` (`server.telehealth`) keeps its mailbox
+sessions in process memory. Signalling state is ephemeral by design and peers
+renegotiate after a reconnect, but it means a deployment must run a single
+server instance or route both participants of an appointment to the same
+instance (sticky sessions). With several unsticky instances, a message posted to
+one instance is invisible to a long poll parked on another, and the call fails
+silently. Sessions are dropped when a `bye` is consumed and swept after two
+hours idle. Long polls are capped at 55 seconds, below common proxy idle
+timeouts.
+
+Patient tokens need `patient/Appointment.cu`: the POST is scored as `create`
+and the waiting room updates `Appointment.reasonCode`. The scope is registered
+in `bb/src/server/smart_grant.clj` and requested by the cabotage2 portal.
+
 ## Open items
 Remaining open server decisions are tracked in
 [`../open-decisions.md`](../open-decisions.md) (HTTP/2 support).

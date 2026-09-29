@@ -136,3 +136,58 @@
     (is (= 55 (parse-timeout "3600")) "capped below proxy idle timeouts")
     (is (= 0 (parse-timeout "-5")) "negative clamps to immediate return")
     (is (= 25 (parse-timeout "garbage")) "unparseable falls back to default")))
+
+;; ---------------------------------------------------------------------------
+;; Catalog entry point: two participants, end to end
+;; ---------------------------------------------------------------------------
+
+(defn- signal! [method appt-id & {:keys [body query]}]
+  (th/signal-operation
+   {:request (cond-> {:request-method method
+                      :path-params {:tenant-id "default" :id appt-id}}
+               body  (assoc :body-params body)
+               query (assoc :query-params query))}))
+
+(defn- publish! [appt-id role type & [payload]]
+  (signal! :post appt-id
+           :body (apply parameters-body
+                        ["role" :valueCode role]
+                        ["type" :valueCode type]
+                        (when payload [["payload" :valueString payload]]))))
+
+(defn- poll! [appt-id role]
+  (->> (signal! :get appt-id :query {"role" role "timeout" "0"})
+       :body :parameter
+       (mapv (fn [{:keys [part]}]
+               (into {} (map (fn [{:keys [name valueCode valueString]}]
+                               [(keyword name) (or valueCode valueString)]))
+                     part)))))
+
+(deftest signal-operation-offer-answer-candidate-exchange
+  (is (= 200 (:status (publish! "a5" "patient" "offer" "sdp-offer"))))
+  (is (= [{:type "offer" :payload "sdp-offer"}] (poll! "a5" "provider")))
+  (is (= 200 (:status (publish! "a5" "provider" "answer" "sdp-answer"))))
+  (is (= 200 (:status (publish! "a5" "provider" "candidate" "ice-p1"))))
+  (is (= 200 (:status (publish! "a5" "patient" "candidate" "ice-c1"))))
+  (is (= [{:type "answer" :payload "sdp-answer"}
+          {:type "candidate" :payload "ice-p1"}]
+         (poll! "a5" "patient")))
+  (is (= [{:type "candidate" :payload "ice-c1"}] (poll! "a5" "provider")))
+  (is (= [] (poll! "a5" "patient")) "an inbox is empty once drained"))
+
+(deftest signal-operation-bye-tears-down-both-inboxes
+  (publish! "a6" "patient" "offer" "sdp-offer")
+  (publish! "a6" "provider" "candidate" "ice-p1")
+  (publish! "a6" "patient" "bye")
+  (is (= [{:type "offer" :payload "sdp-offer"} {:type "bye"}]
+         (poll! "a6" "provider"))
+      "the bye arrives after what was queued before it")
+  (is (not (contains? @@#'th/sessions ["default" "a6"])))
+  (testing "the peer's undelivered message went with the session"
+    (is (= [] (poll! "a6" "patient"))))
+  (testing "a later exchange on the same appointment starts clean"
+    (publish! "a6" "patient" "offer" "sdp-2")
+    (is (= [{:type "offer" :payload "sdp-2"}] (poll! "a6" "provider")))))
+
+(deftest signal-operation-rejects-other-methods
+  (is (= 400 (:status (signal! :put "a7")))))
