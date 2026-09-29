@@ -42,9 +42,15 @@ silently. Sessions are dropped when a `bye` is consumed and swept after two
 hours idle. Long polls are capped at 55 seconds, below common proxy idle
 timeouts.
 
-Patient tokens need `patient/Appointment.cu`: the POST is scored as `create`
-and the waiting room updates `Appointment.reasonCode`. The scope is registered
-in `bb/src/server/smart_grant.clj` and requested by the cabotage2 portal.
+Patient tokens need `patient/Appointment.cu`. The POST is scored as `create`
+(`patient/Appointment.c` alone satisfies the signalling call), and the waiting
+room additionally writes `Appointment.reasonCode`, an `update`, which is why the
+portal requests `.cu` rather than `.c`. The grant predates this section: it is
+registered in `bb/src/server/smart_grant.clj` and requested by the cabotage2
+portal (`oauth.cljd`), and the two lists must change together.
+`server.telehealth-scope-test` drives the operation through the router and
+`server.scope/wrap-smart-scope` and asserts that the portal scope set is allowed
+and a `patient/*.read` + `patient/Patient.c` set is refused on the POST.
 
 ## Open items
 Remaining open server decisions are tracked in
