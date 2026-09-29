@@ -3,9 +3,9 @@
             [server.telehealth :as th]))
 
 (defn- reset-sessions! [f]
-  (reset! @#'th/sessions {})
-  (f)
-  (reset! @#'th/sessions {}))
+  (let [previous (th/install-mailbox! (th/in-memory-mailbox))]
+    (try (f)
+         (finally (th/install-mailbox! previous)))))
 
 (use-fixtures :each reset-sessions!)
 
@@ -126,7 +126,7 @@
   (let [resp (th/poll-signal (get-req "default" "a4" {"role" "provider" "timeout" "0"}))]
     (is (= [{:name "message" :part [{:name "type" :valueCode "bye"}]}]
            (get-in resp [:body :parameter])))
-    (is (not (contains? @@#'th/sessions ["default" "a4"]))
+    (is (not (contains? @(:sessions (th/installed-mailbox)) ["default" "a4"]))
         "session state is dropped once the peer consumes the bye")))
 
 (deftest timeout-is-clamped
@@ -136,3 +136,72 @@
     (is (= 55 (parse-timeout "3600")) "capped below proxy idle timeouts")
     (is (= 0 (parse-timeout "-5")) "negative clamps to immediate return")
     (is (= 25 (parse-timeout "garbage")) "unparseable falls back to default")))
+
+;; ---------------------------------------------------------------------------
+;; Mailbox seam
+;; ---------------------------------------------------------------------------
+
+(defn- recording-mailbox
+  "A Mailbox that records its calls and answers polls from `inbox`."
+  [calls inbox]
+  (reify th/Mailbox
+    (post! [_ k from-role message] (swap! calls conj [:post k from-role message]) nil)
+    (poll! [_ k role timeout-ms] (swap! calls conj [:poll k role timeout-ms]) @inbox)
+    (end! [_ k] (swap! calls conj [:end k]) nil)))
+
+(deftest handlers-use-the-mailbox-they-are-bound-to
+  (let [calls (atom [])
+        inbox (atom [{:type "offer" :payload "sdp"}])
+        {:keys [post-signal poll-signal]} (th/handlers (recording-mailbox calls inbox))]
+    (post-signal (post-req "default" "s1" (parameters-body ["role" :valueCode "patient"]
+                                                           ["type" :valueCode "offer"]
+                                                           ["payload" :valueString "p"])))
+    (is (= [[:post ["default" "s1"] "patient" {:type "offer" :payload "p"}]] @calls))
+    (is (= "offer" (-> (poll-signal (get-req "default" "s1" {"role" "provider" "timeout" "3"}))
+                       (get-in [:body :parameter 0 :part 0 :valueCode]))))
+    (is (= [:poll ["default" "s1"] "provider" 3000] (peek @calls)))
+    (is (= [] (th/poll-messages! ["default" "s1"] "provider" 0))
+        "the installed in-memory mailbox saw none of it")))
+
+(deftest consumed-bye-ends-the-bound-mailbox-session
+  (let [calls (atom [])
+        inbox (atom [{:type "bye"}])
+        {:keys [poll-signal]} (th/handlers (recording-mailbox calls inbox))]
+    (poll-signal (get-req "default" "s2" {"role" "patient" "timeout" "0"}))
+    (is (= [:end ["default" "s2"]] (peek @calls)))))
+
+(deftest installed-mailbox-is-read-per-request
+  (let [calls (atom [])
+        previous (th/install-mailbox! (recording-mailbox calls (atom [])))]
+    (try
+      (th/post-signal (post-req "default" "s3" (parameters-body ["role" :valueCode "patient"]
+                                                                ["type" :valueCode "bye"])))
+      (is (= [[:post ["default" "s3"] "patient" {:type "bye"}]] @calls))
+      (finally (th/install-mailbox! previous)))))
+
+(deftest handlers-share-state-through-a-shared-mailbox
+  (let [shared (th/in-memory-mailbox)
+        a (th/handlers shared)
+        b (th/handlers shared)
+        poller (future ((:poll-signal b) (get-req "default" "s4" {"role" "provider" "timeout" "5"})))]
+    (Thread/sleep 100)
+    ((:post-signal a) (post-req "default" "s4" (parameters-body ["role" :valueCode "patient"]
+                                                                ["type" :valueCode "offer"]
+                                                                ["payload" :valueString "x"])))
+    (is (= "offer" (get-in (deref poller 2000 nil) [:body :parameter 0 :part 0 :valueCode])))))
+
+(deftest inbox-and-payload-are-bounded
+  (testing "a full inbox answers 429"
+    (let [req (post-req "default" "s5" (parameters-body ["role" :valueCode "patient"]
+                                                        ["type" :valueCode "candidate"]
+                                                        ["payload" :valueString "c"]))
+          statuses (vec (repeatedly (inc th/max-pending-messages) #(:status (th/post-signal req))))]
+      (is (every? #{200} (butlast statuses)))
+      (is (= 429 (last statuses)))))
+  (testing "an oversized payload answers 400"
+    (is (= 400 (:status (th/post-signal
+                         (post-req "default" "s6"
+                                   (parameters-body ["role" :valueCode "patient"]
+                                                    ["type" :valueCode "offer"]
+                                                    ["payload" :valueString
+                                                     (apply str (repeat (inc th/max-payload-chars) "x"))]))))))))
