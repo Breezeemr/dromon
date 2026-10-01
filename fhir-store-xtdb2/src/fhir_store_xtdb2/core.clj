@@ -76,12 +76,76 @@
   [resource-type]
   (str "\"" (str/lower-case (name resource-type)) "\""))
 
+(defn ^:no-doc refuse-unencodable-text!
+  "Refuses a write whose id or body holds an unpaired UTF-16 surrogate, which
+   XTDB would store as \"?\" (see xf/unpaired-surrogate-paths). Throws a 400
+   naming each offending element path, as the message and as
+   `:fhir/expression`. Never the value: both the message and the ex-data
+   reach the log."
+  [resource-type id resource-map]
+  (let [rt-name (name resource-type)
+        id-bad? (and (string? id) (xf/unpaired-surrogate? id))
+        paths (into [] (distinct)
+                    (concat (when id-bad? [(str rt-name ".id")])
+                            (xf/unpaired-surrogate-paths rt-name resource-map)))]
+    (when (seq paths)
+      (throw (ex-info (str "Unpaired UTF-16 surrogate in " (str/join ", " paths)
+                           ": not valid Unicode, so it cannot be stored unchanged")
+                      (cond-> {:fhir/status 400 :fhir/code "invalid"
+                               :fhir/expression paths
+                               :resource-type rt-name}
+                        (not id-bad?) (assoc :id id)))))))
+
+(defn ^:no-doc refuse-unencodable-input!
+  "Refuses a store call whose resource type, id, version id or params hold an
+   unpaired UTF-16 surrogate. pgjdbc sends one as \"?\" (see
+   xf/unpaired-surrogate-paths), so the call would act on a different table,
+   row or match than the one named: a read finds the row whose id has a \"?\"
+   there, a search matches a stored \"?\" -- one written before writes refused
+   them, say. The type is spliced into SQL as a table name, and declared before
+   anything else runs, so this goes first in every verb.
+
+   Throws a 400 naming each offending input, never its text. A parameter whose
+   value is the problem is also named `http.<name>` in `:fhir/location`, FHIR's
+   convention for an HTTP parameter; one whose NAME is the problem is only
+   counted, since naming it would repeat the text."
+  [{:keys [resource-type id vid params]}]
+  (let [bad-value? (fn [v] (some xf/unencodable? (tree-seq coll? seq v)))
+        bad-names (count (filter xf/unencodable? (keys params)))
+        bad-params (into [] (keep (fn [[k v]]
+                                    (when (and (not (xf/unencodable? k)) (bad-value? v))
+                                      (name k))))
+                         params)
+        bad-type? (xf/unencodable? resource-type)
+        bad-id? (xf/unencodable? id)
+        what (cond-> []
+               bad-type?             (conj "the resource type")
+               bad-id?               (conj "the id")
+               (xf/unencodable? vid) (conj "the version id")
+               (pos? bad-names)      (conj "a parameter's name")
+               (seq bad-params)      (into (map #(str "parameter '" % "'")) bad-params))]
+    (when (seq what)
+      (throw (ex-info (str "Unpaired UTF-16 surrogate in " (str/join ", " what)
+                           ": not valid Unicode, so the store cannot use it unchanged")
+                      (cond-> {:fhir/status 400 :fhir/code "invalid"}
+                        (seq bad-params)
+                        (assoc :fhir/location (mapv #(str "http." %) bad-params))
+
+                        (and resource-type (not bad-type?))
+                        (assoc :resource-type (name resource-type))
+
+                        (and id (not bad-id?))
+                        (assoc :id id)))))))
+
 (defn ^:no-doc encode-resource-doc
   "Runs the malli storage encoder for the given resource type and returns the
    raw XTDB document map (pre-SQL-serialization) with :_id and :fhir_version
    injected. Used by both the SQL INSERT builder and the put-docs path —
-   the put-docs path renames :_id → :xt/id before handing the doc to XTDB."
+   the put-docs path renames :_id → :xt/id before handing the doc to XTDB.
+   Every write path encodes through here, so this is where a body XTDB
+   cannot store unchanged is refused (see refuse-unencodable-text!)."
   [resource-type id resource-map storage-encoders & {:keys [version]}]
+  (refuse-unencodable-text! resource-type id resource-map)
   (let [rt-name (name resource-type)
         encode-fn (get storage-encoders rt-name (get storage-encoders :default))]
     (cond-> (encode-fn resource-map)
@@ -231,6 +295,33 @@
         prepared  (lc/prepare-write lifecycle write)
         ops-write (assoc write :resource prepared :submitted resource)]
     (assoc ops-write :tx-ops (lc/write-tx-ops lifecycle ops-write))))
+
+(defn ^:no-doc lifecycle-tx-ops
+  "`write`'s lifecycle ops, refused when any of them holds an unpaired UTF-16
+   surrogate, which would reach XTDB as \"?\" like any other text (see
+   xf/unpaired-surrogate-paths). Every XTDB tx-op form is plain data -- a SQL
+   string, or a vector of strings, keywords, docs and arg rows -- so walking
+   an op reaches all of its text.
+
+   Call it after the write's own body is encoded, which refuses a body holding
+   one with its element paths. A hit here therefore came from elsewhere: from
+   the submitted body, which `prepare` rewrote but the ops still carry -- the
+   client's text, so the same 400 a body refusal gives -- or from the
+   lifecycle's own data, a 500. Call it outside any catch that maps execute-tx
+   failures to a 409 or 412. Names ops by position, never their text."
+  [{:keys [resource-type id submitted tx-ops]}]
+  (let [bad (into [] (keep-indexed (fn [i op]
+                                     (when (some xf/unencodable? (tree-seq coll? seq op)) i)))
+                  tx-ops)]
+    (when (seq bad)
+      (refuse-unencodable-text! resource-type id submitted)
+      (throw (ex-info (str "Lifecycle tx-ops " (str/join ", " bad) " for " resource-type
+                           " hold an unpaired UTF-16 surrogate: not valid Unicode, so they"
+                           " cannot be sent unchanged")
+                      {:fhir/status 500 :fhir/code "exception"
+                       :resource-type resource-type :id id
+                       :lifecycle/tx-op-indexes bad})))
+    tx-ops))
 
 (defn ^:no-doc fire-after-commit!
   "Hand one committed transaction's writes to the lifecycle. Contained: a
@@ -1518,8 +1609,9 @@
                                 (table-name resource-type))
                    [id]]
         own-ops [assert-op [:sql sql args]]
+        tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
-                 (xt/execute-tx node (into own-ops (:tx-ops write)))
+                 (xt/execute-tx node tx-ops)
                  (catch Exception e
                    (when (lifecycle-op-failure? e (count own-ops))
                      (throw e))
@@ -1564,8 +1656,9 @@
                                   rt-name)
                      [id]])
         own-ops [assert-op [:sql sql args]]
+        tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
-                 (xt/execute-tx node (into own-ops (:tx-ops write)))
+                 (xt/execute-tx node tx-ops)
                  (catch Exception e
                    (when (lifecycle-op-failure? e (count own-ops))
                      (throw e))
@@ -1820,6 +1913,7 @@
   IFHIRStore
 
   (create-resource [this tenant-id resource-type id resource]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1832,6 +1926,7 @@
                        (lifecycle-ctx this tenant-id)))))))
 
   (read-resource [this tenant-id resource-type id]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/read
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1842,6 +1937,7 @@
            (read-sql conn resource-type id read-decoders))))))
 
   (vread-resource [this tenant-id resource-type id vid]
+    (refuse-unencodable-input! {:resource-type resource-type :id id :vid vid})
     (ftrace/trace!
      {:id :store/vread
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id :vid vid}}
@@ -1855,6 +1951,7 @@
     (fp/update-resource this tenant-id resource-type id resource nil))
 
   (update-resource [this tenant-id resource-type id resource opts]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1870,6 +1967,7 @@
     (fp/delete-resource this tenant-id resource-type id nil))
 
   (delete-resource [this tenant-id resource-type id opts]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1881,6 +1979,7 @@
 
   (resource-deleted? [this tenant-id resource-type id]
     ;; A resource is "deleted" if it has history (existed in the past) but no current row
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/resource-deleted?
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1891,6 +1990,7 @@
            (deleted?-sql conn resource-type id))))))
 
   (search [this tenant-id resource-type params search-registry]
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/search
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -1915,6 +2015,7 @@
            [])))))
 
   (count-resources [this tenant-id resource-type params search-registry]
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/count
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -1938,6 +2039,7 @@
           0)))))
 
   (history [this tenant-id resource-type id]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/history
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1948,6 +2050,7 @@
            (history-sql conn resource-type id read-decoders))))))
 
   (history-type [this tenant-id resource-type params]
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/history-type
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -1998,6 +2101,8 @@
                        (update em :resource resolve-urn-uuid-references urn-mapping)
                        em))
                    metas)))
+          _ (run! #(refuse-unencodable-input! (select-keys % [:resource-type :id]))
+                  entry-metas)
           ;; Every op below runs in ONE transaction, so a single undeclared
           ;; table (a DELETE or If-Match PUT on a type never written) would
           ;; abort the whole Bundle at planning.
@@ -2090,7 +2195,7 @@
                    entry-metas))
           own-op-count (count tx-ops)
           guarded? (some :if-match entry-metas)
-          tx-ops (into tx-ops (mapcat :tx-ops) lifecycle-writes)]
+          tx-ops (into tx-ops (mapcat lifecycle-tx-ops) lifecycle-writes)]
       (let [tx-key (ftrace/trace!
                     {:id :store/transact-transaction.execute-tx
                      :data {:op-count (count tx-ops)}}
@@ -2228,11 +2333,16 @@
                                                    :code "invalid"
                                                    :diagnostics (str "Unsupported method: " method)}]}}}))
                 (catch Exception e
-                  {:response {:status "400 Bad Request"
-                              :outcome {:resourceType "OperationOutcome"
-                                        :issue [{:severity "error"
-                                                 :code "exception"
-                                                 :diagnostics (str "Entry failed: " (ex-message e))}]}}})))
+                  (let [{:fhir/keys [expression location]}
+                        (some #(when (:fhir/status (ex-data %)) (ex-data %))
+                              (take-while some? (iterate ex-cause e)))]
+                    {:response {:status "400 Bad Request"
+                                :outcome {:resourceType "OperationOutcome"
+                                          :issue [(cond-> {:severity "error"
+                                                           :code "exception"
+                                                           :diagnostics (str "Entry failed: " (ex-message e))}
+                                                    (seq expression) (assoc :expression expression)
+                                                    (seq location) (assoc :location location))]}}}))))
             entries)]
        {:resourceType "Bundle"
         :type "batch-response"
@@ -2319,6 +2429,7 @@
     ;; same lowercased tables, so `FOR SYSTEM_TIME AS OF` reads are valid
     ;; regardless of the write pathway). The reducible borrows a pooled
     ;; connection lazily inside its reduce, i.e. at download/consumption time.
+    (refuse-unencodable-input! {:resource-type resource-type})
     (ftrace/trace!
      {:id :store/scan-type-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -2327,6 +2438,7 @@
                                   read-decoders scan-page-size))))
 
   (count-as-of [this tenant-id resource-type basis]
+    (refuse-unencodable-input! {:resource-type resource-type})
     (ftrace/trace!
      {:id :store/count-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -2347,6 +2459,7 @@
 
   (read-as-of [this tenant-id resource-type id basis]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/read-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -2356,6 +2469,7 @@
 
   (search-as-of [this tenant-id resource-type params search-registry basis]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/search-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -2366,6 +2480,7 @@
 
   (count-as-of-basis [this tenant-id resource-type params search-registry basis]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/count-as-of-basis
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -2376,6 +2491,7 @@
 
   (resource-timeline [this tenant-id resource-type id _opts]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/resource-timeline
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -2387,6 +2503,7 @@
 
   (put-valid-time [this tenant-id resource-type id resource vt]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/put-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -2399,6 +2516,7 @@
 
   (close-valid-time [this tenant-id resource-type id valid-from valid-to]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/close-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
