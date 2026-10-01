@@ -108,6 +108,8 @@
 ;;   - any search-param with :columns nested metadata (CodeableConcept, HumanName,
 ;;     Period, Reference-across-types, ...) — the SQL builder already knows how
 ;;     to express these via UNNEST/EXISTS; translating them is deferred.
+;;   - composite and `X.exists() and X != false` parameters (:composite,
+;;     :exists-not-false), which only the SQL builder compiles.
 ;;   - any _sort: the SQL path maps sort fields to columns (sort-field->sql-col)
 ;;     and drops ones it cannot map, where an XTQL order-by on an undeclared
 ;;     column fails at planning from XTDB 2.2.0-rc0.
@@ -149,6 +151,12 @@
 (defn- build-single-xtql
   [pname v search-param]
   (cond
+    ;; Composite and presence parameters name no column of their own (their
+    ;; :columns is empty), so neither branch below may read pname as one --
+    ;; not even for a boolean value.
+    (and search-param (or (:composite search-param) (:exists-not-false search-param)))
+    fallback
+
     ;; Boolean flat column — SQL path recognizes boolean? param-value; mirror it.
     (boolean? v)
     {:where (list '= (flat-col-sym pname) v)}

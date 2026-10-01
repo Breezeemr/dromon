@@ -415,17 +415,32 @@
    answers from the token array). Names starting with `_` are XTDB system
    columns (`_id`, `_system_from`) and are never declared; neither is a :col
    that is not a plain name (an unparsed FHIRPath fragment), which no write
-   could ever produce."
-  [{:keys [type columns]}]
+   could ever produce.
+
+   A presence entry reads its :exists-not-false columns. A composite reads,
+   per scope, the element column it UNNESTs, or for the resource-level scope
+   each component's columns."
+  [{:keys [type columns exists-not-false composite]}]
   (let [flat-token? (and (= "token" type)
                          (seq columns)
                          (every? #(and (#{"CodeableConcept" "Coding"} (:fhir-type %))
                                        (not (:sub-col %)))
-                                 columns))]
-    (for [{:keys [col]} columns
-          :when (and (string? col) (re-matches #"[A-Za-z][A-Za-z0-9_-]*" col))
-          c (if flat-token? [col (str col "_tokens")] [col])]
-      c)))
+                                 columns))
+        plain? #(and (string? %) (re-matches #"[A-Za-z][A-Za-z0-9_-]*" %))]
+    (concat
+     (for [{:keys [col]} columns
+           :when (plain? col)
+           c (if flat-token? [col (str col "_tokens")] [col])]
+       c)
+     (for [{:keys [col]} exists-not-false
+           :when (plain? col)]
+       col)
+     (for [{:keys [element components]} composite
+           col (if element
+                 [(:col element)]
+                 (for [component components, c (:columns component)] (:col c)))
+           :when (plain? col)]
+       col))))
 
 (defn- registry-columns
   "Column names the schema's own `:fhir/search-registry` property (attached

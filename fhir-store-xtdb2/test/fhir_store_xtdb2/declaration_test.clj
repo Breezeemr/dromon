@@ -538,6 +538,37 @@
            (xf/declared-columns (m/schema [:map {:resourceType "Flag"}
                                            [:resourceType :string] [:status :string]]))))))
 
+(deftest composite-and-presence-columns-are-declared
+  ;; Both kinds carry an empty :columns; what they read sits under their own
+  ;; registry key.
+  (let [quantity-component {:type "quantity"
+                            :columns [{:col "valueQuantity" :fhir-type "Quantity" :array? false}]}
+        code-component {:type "token"
+                        :columns [{:col "code" :fhir-type "CodeableConcept" :array? false}]}
+        registry {"combo-code-value-quantity"
+                  {:type "composite" :columns []
+                   :composite [{:element nil :components [code-component quantity-component]}
+                               {:element {:col "component" :fhir-type "BackboneElement" :array? true}
+                                :components [{:type "token"
+                                              :columns [{:col "componentOnlyCode"
+                                                         :fhir-type "CodeableConcept"
+                                                         :array? false}]}
+                                             quantity-component]}]}
+                  "deceased"
+                  {:type "token" :columns []
+                   :exists-not-false [{:col "deceasedBoolean" :fhir-type "boolean" :array? false}
+                                      {:col "deceasedDateTime" :fhir-type "dateTime" :array? false}]}}
+        cols (xf/declared-columns
+              (m/schema [:map {:resourceType "Observation" :fhir/search-registry registry}
+                         [:status {:optional true} :string]]))]
+    (testing "the resource-level scope declares each component's column"
+      (is (every? (set cols) ["code" "valueQuantity"])))
+    (testing "an element scope declares the element, not the fields read inside it"
+      (is (contains? (set cols) "component"))
+      (is (not (contains? (set cols) "componentOnlyCode"))))
+    (testing "a presence parameter declares the columns it tests"
+      (is (every? (set cols) ["deceasedBoolean" "deceasedDateTime"])))))
+
 (deftest search-matches-the-real-column-beside-a-stranger
   (doseq [query-mode [:sql :xtql]]
     (testing (str query-mode)
