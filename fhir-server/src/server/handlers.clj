@@ -1763,6 +1763,13 @@
 
 (def ^:private json-patch-media-type "application/json-patch+json")
 
+(def ^:private patch-document-mapper
+  "Decodes a patch document the way the router decodes an
+   `application/json-patch+json` body (`server.router/java-time-decode-mapper`,
+   which this namespace cannot require): keyword keys, and decimals as
+   BigDecimal so a FHIR decimal keeps its scale."
+  (json/object-mapper {:decode-key-fn keyword :bigdecimals true}))
+
 (defn- decode-patch-document
   "The JSON Patch operations a Bundle PATCH entry carries.
 
@@ -1784,7 +1791,7 @@
       (let [decoded (String. (.decode (java.util.Base64/getDecoder)
                                       ^String (:data resource))
                              java.nio.charset.StandardCharsets/UTF_8)
-            ops (json/read-value decoded (json/object-mapper {:decode-key-fn keyword}))]
+            ops (json/read-value decoded patch-document-mapper)]
         (when (sequential? ops) (vec ops)))
       (catch Exception _ nil))
 
