@@ -482,6 +482,35 @@
                 "the replay's transaction and one declaration"))))
       (finally (delete-recursive! (java.io.File. base))))))
 
+(deftest reopened-tenant-keeps-its-schemaless-declarations
+  (let [[node-config base] (temp-node-config)
+        open #(core-db/create-xtdb-store {:node-config node-config})
+        tenant "t1"]
+    (try
+      (let [store (open)]
+        (try
+          (db/create-resource store tenant :X12ControlSequence "x" {:value 1})
+          ;; Written by something other than the store: no fhir_version or meta.
+          (xt/execute-tx (node-of store tenant)
+                         [[:sql "INSERT INTO claimnote (_id) VALUES ('n1')"]])
+          (finally (close-store-nodes! store))))
+      (let [store (open)]
+        (try
+          (db/create-tenant store tenant)
+          (let [node (node-of store tenant)
+                before (tx-log node)]
+            (testing "a schemaless type already on disk is not declared again"
+              (is (= 1 (:value (db/read-resource store tenant :X12ControlSequence "x"))))
+              (is (= before (tx-log node)))
+              (is (= :committed (stamp-after node (second (peek before))))))
+            (testing "a table on disk without the store columns is declared on first use"
+              (let [txs (tx-log node)]
+                (is (= "n1" (:id (db/read-resource store tenant :ClaimNote "n1"))))
+                (is (every? (column-names node "claimnote") xf/store-columns))
+                (is (= (inc (count txs)) (count (tx-log node)))))))
+          (finally (close-store-nodes! store))))
+      (finally (delete-recursive! (java.io.File. base))))))
+
 (deftest reopened-tenant-starts-at-the-end-of-its-log
   ;; start-node returns before a reopened node has replayed its log, and a
   ;; read waits only for transactions submitted through its own node. A

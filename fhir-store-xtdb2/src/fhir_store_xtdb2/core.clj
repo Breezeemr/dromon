@@ -1346,14 +1346,24 @@
    first, no transaction is written: a declaration committed at wall-clock now
    would refuse every later transaction stamped with an earlier explicit
    :system-time, such as a historical import into the same directory.
+
+   Returns [node tables]: `tables` is every table ensure-declared! need not
+   declare, the schema tables and each table the node already lists with
+   every transform/store-columns column, so a reopened tenant does not
+   declare its schemaless types again either. A table missing one of them,
+   written by something other than the store or before a column joined
+   store-columns, is left out and declared on its first use.
    Closes the node and names the tenant when any of this fails."
   [store tid]
   (let [node (start-node (:node-config store)
                          {:pipelined-replica-appends? (:pipelined-replica-appends? store)})]
     (try
-      (declare-tables! node (missing-declarations (:declared-columns store)
-                                                  (columns-on-node node)))
-      node
+      (let [declarations (:declared-columns store)
+            on-node (columns-on-node node)]
+        (declare-tables! node (missing-declarations declarations on-node))
+        [node (into (set (keys declarations))
+                    (keep (fn [[table cols]] (when (every? cols xf/store-columns) table)))
+                    on-node)])
       (catch Throwable e
         (try (.close ^java.lang.AutoCloseable node) (catch Throwable _ nil))
         (throw (ex-info (str "Could not declare tables for tenant " tid ": " (ex-message e))
@@ -1365,7 +1375,8 @@
    creating them if absent. compare-and-set via swap! handles concurrent
    creation; the loser of a race closes the pool+node it created and uses the
    winner's entry. :declared holds the table names declared on the node so
-   far, seeded with every schema table (see start-tenant-node, ensure-declared!)."
+   far, seeded with the tables start-tenant-node finds or declares (see
+   ensure-declared!)."
   [store tenant-id]
   (let [nodes (:nodes store)
         tid (str tenant-id)]
@@ -1373,10 +1384,10 @@
         (ftrace/trace!
          {:id :store/node.start
           :data {:tenant-id tid}}
-         (let [new-node (start-tenant-node store tid)
+         (let [[new-node declared] (start-tenant-node store tid)
                new-pool (make-pool new-node tid (:pool-opts store))
                new-entry {:node new-node :pool new-pool
-                          :declared (atom (set (keys (:declared-columns store))))}
+                          :declared (atom declared)}
                existing (get (swap! nodes (fn [m]
                                             (if (contains? m tid)
                                               m
@@ -1390,10 +1401,11 @@
 (defn- ensure-declared!
   "Declares `resource-type`'s table on the entry's node, with the only columns
    the store itself reads on a type no schema enumerates (transform/
-   store-columns), unless it is already declared. Schema types are declared
-   at node start, so this costs one set lookup per call; the first touch of an
-   unenumerated type per tenant costs one small transaction. Two callers racing
-   here both declare, which is harmless: CREATE TABLE is idempotent."
+   store-columns), unless it is already declared. Schema types, and types the
+   node already had at start, are seeded into `declared`, so this costs one
+   set lookup per call; the first touch of any other type per tenant costs
+   one small transaction. Two callers racing here both declare, which is
+   harmless: CREATE TABLE is idempotent."
   [{:keys [node declared]} resource-type]
   (when resource-type
     (let [table (table-name resource-type)]
@@ -2613,8 +2625,9 @@
 
    Every tenant node declares the table and columns of each schema type that
    it lacks when it starts, and writes no transaction when it lacks none (see
-   start-tenant-node); a type no schema names is declared with `_id` and
-   `fhir_version` on its first use per tenant."
+   start-tenant-node); a type no schema names is declared with
+   transform/store-columns on its first use per tenant, unless the node
+   already had them all when it started."
   [{:keys [resource/schemas node-config query-mode pool-opts resource/lifecycle
            pipelined-replica-appends?]
     :or {node-config {} schemas [] query-mode :sql pool-opts {}}

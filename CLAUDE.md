@@ -320,6 +320,8 @@ telemere trace -> wrap-params -> muuntaja format -> fhir-exceptions -> fhir-deco
   It reads `information_schema.columns` and issues `CREATE TABLE` only for
   what is absent, because a wall-clock-stamped transaction would refuse a
   later import that stamps an earlier `:system-time` into the same directory.
+  The same read seeds the lazy per-type declarations: a table already carrying
+  every `transform/store-columns` column is not declared again on first use.
 - `target/staging/src` must be created with `mkdir -p` before running schema generation (classloader needs it at JVM startup)
 - Tenant ID `default` is used in dev/test
 - Test patient ID is `Patient/123` (hardcoded in inferno runner)
