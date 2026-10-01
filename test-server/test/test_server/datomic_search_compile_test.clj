@@ -48,10 +48,13 @@
    compiling fails the test, so the allowlist cannot go stale.
 
    - Patient/deceased: the R4B expression is
-     `Patient.deceased.exists() and Patient.deceased != false`, which the
-     registry resolves to `:sub-col \"exists() and Patient.deceased != false\"`,
-     an unparsed FHIRPath fragment no store translates. Same class as the
-     `phone` defect this test was written for; not yet fixed."
+     `Patient.deceased.exists() and Patient.deceased != false`. The registry
+     describes it under `:exists-not-false` (deceasedBoolean,
+     deceasedDateTime) with an empty `:columns`, because equality at a column
+     is not its semantics: `false` must also match a Patient with no deceased
+     element. fhir-store-xtdb2 compiles that key; this store does not yet, so
+     it finds no column and reports the parameter unsupported rather than
+     answering it as a plain token."
   {"Patient" #{"deceased"}})
 
 (defn- schema-for [type-name]

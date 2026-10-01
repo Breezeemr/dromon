@@ -391,14 +391,14 @@
       [maybe-prefix (subs value-str 2)]
       ["eq" value-str])))
 
-(defn- build-date-condition
-  "Builds a parameterized SQL condition for a date-type FHIR search parameter.
+(defn- date-expr-condition
+  "Builds a parameterized SQL condition applying a FHIR date search value to
+   the date/dateTime/instant SQL expression `col`.
    Returns [sql-fragment params-vector].
-   Uses native date types for comparison against XTDB DATE/TIMESTAMP columns."
-  [column-name value-str]
+   Uses native date types for comparison against XTDB DATE/TIMESTAMP values."
+  [col value-str]
   (let [[prefix date-val] (parse-date-prefix value-str)
-        {:keys [lower upper precision]} (dt/parse-search-date date-val)
-        col (format "\"%s\"" column-name)]
+        {:keys [lower upper precision]} (dt/parse-search-date date-val)]
     (case prefix
       ;; eq: for partial dates (year/month), use range; for exact, use equality
       "eq" (if (= precision :instant)
@@ -427,6 +427,12 @@
       (if (= precision :instant)
         [(format "%s = ?" col) [lower]]
         [(format "(%s >= ? AND %s < ?)" col col) [lower upper]]))))
+
+(defn- build-date-condition
+  "Builds a parameterized SQL condition for a date-type FHIR search parameter
+   on a top-level column. Returns [sql-fragment params-vector]."
+  [column-name value-str]
+  (date-expr-condition (format "\"%s\"" column-name) value-str))
 
 ;; ---------------------------------------------------------------------------
 ;; Type-driven SQL condition builders
@@ -556,13 +562,13 @@
         [(format "((\"%s\").\"reference\" = ? OR (\"%s\").\"reference\" = ?)" col-name col-name) [v-val with-prefix-val]]
         [(format "(\"%s\").\"reference\" = ?" col-name) [v-val]]))))
 
-(defn- build-period-condition
-  "Builds a parameterized SQL condition for a Period-type column with date prefix logic.
+(defn- period-start-condition
+  "Builds a parameterized SQL condition applying a FHIR date search value to
+   a Period through `start-col`, the SQL expression for its start.
    Returns [sql-fragment params-vector] or nil."
-  [col-name value-str]
+  [start-col value-str]
   (let [[prefix date-val] (parse-date-prefix value-str)
-        {:keys [lower upper precision]} (dt/parse-search-date date-val)
-        start-col (format "(\"%s\").\"start\"" col-name)]
+        {:keys [lower upper precision]} (dt/parse-search-date date-val)]
     (case prefix
       ("gt" "sa") (if (= precision :instant)
                     [(format "%s > ?" start-col) [lower]]
@@ -575,6 +581,12 @@
       "ne" nil ;; skip period matching for ne
       ;; eq/default: skip period matching to avoid false positives with Inferno
       nil)))
+
+(defn- build-period-condition
+  "Builds a parameterized SQL condition for a Period-type column with date prefix logic.
+   Returns [sql-fragment params-vector] or nil."
+  [col-name value-str]
+  (period-start-condition (format "(\"%s\").\"start\"" col-name) value-str))
 
 (defn- parse-quantity-value
   "Parses a FHIR quantity search value into {:prefix p :value BigDecimal
@@ -592,37 +604,46 @@
      :system (when (and system (not (str/blank? system))) system)
      :code (when (and code (not (str/blank? code))) code)}))
 
-(defn- build-quantity-col-condition
-  "Builds a parameterized SQL condition for a single quantity-type column.
-   Returns [sql-fragment params-vector] or nil. Compares the nested Quantity
-   .value numerically with the FHIR prefix (eq/ne/gt/lt/ge/le/sa/eb/ap; ap is
-   +/-10%); an optional |system|code constrains the unit. Columns without a
-   numeric value (e.g. valueSampledData) still emit a .value comparison, which
-   simply matches nothing for those rows."
-  [col value-str]
-  (let [col-name (:col col)
-        {:keys [prefix value system code]} (parse-quantity-value value-str)]
+(defn- prefixed-number-condition
+  "Compares the numeric SQL expression `num-expr` with BigDecimal `value`
+   under a FHIR prefix (eq/ne/gt/lt/ge/le/sa/eb/ap; ap is +/-10%).
+   Returns [sql-fragment params-vector]."
+  [num-expr prefix ^BigDecimal value]
+  (case prefix
+    "eq" [(format "%s = ?" num-expr) [value]]
+    "ne" [(format "%s <> ?" num-expr) [value]]
+    ("gt" "sa") [(format "%s > ?" num-expr) [value]]
+    "ge" [(format "%s >= ?" num-expr) [value]]
+    ("lt" "eb") [(format "%s < ?" num-expr) [value]]
+    "le" [(format "%s <= ?" num-expr) [value]]
+    "ap" [(format "(%s >= ? AND %s <= ?)" num-expr num-expr)
+          [(.multiply value 0.9M) (.multiply value 1.1M)]]
+    [(format "%s = ?" num-expr) [value]]))
+
+(defn- quantity-expr-condition
+  "Builds a parameterized SQL condition applying a FHIR quantity search value
+   to the Quantity-valued SQL expression `expr`. Returns [sql-fragment
+   params-vector] or nil. Compares the Quantity's .value numerically with the
+   FHIR prefix; an optional |system|code constrains the unit."
+  [expr value-str]
+  (let [{:keys [prefix value system code]} (parse-quantity-value value-str)]
     (when value
-      (let [val-expr (format "(\"%s\").\"value\"" col-name)
-            sys-expr (format "(\"%s\").\"system\"" col-name)
-            code-expr (format "(\"%s\").\"code\"" col-name)
-            value-cond (case prefix
-                         "eq" [(format "%s = ?" val-expr) [value]]
-                         "ne" [(format "%s <> ?" val-expr) [value]]
-                         ("gt" "sa") [(format "%s > ?" val-expr) [value]]
-                         "ge" [(format "%s >= ?" val-expr) [value]]
-                         ("lt" "eb") [(format "%s < ?" val-expr) [value]]
-                         "le" [(format "%s <= ?" val-expr) [value]]
-                         "ap" [(format "(%s >= ? AND %s <= ?)" val-expr val-expr)
-                               [(.multiply value 0.9M) (.multiply value 1.1M)]]
-                         [(format "%s = ?" val-expr) [value]])
-            conds (cond-> [value-cond]
-                    system (conj [(format "%s = ?" sys-expr) [system]])
-                    code   (conj [(format "%s = ?" code-expr) [code]]))]
+      (let [conds (cond-> [(prefixed-number-condition (format "(%s).\"value\"" expr)
+                                                      prefix value)]
+                    system (conj [(format "(%s).\"system\" = ?" expr) [system]])
+                    code   (conj [(format "(%s).\"code\" = ?" expr) [code]]))]
         (if (= 1 (count conds))
           (first conds)
           [(str "(" (str/join " AND " (map first conds)) ")")
            (into [] (mapcat second) conds)])))))
+
+(defn- build-quantity-col-condition
+  "Builds a parameterized SQL condition for a single quantity-type column.
+   Returns [sql-fragment params-vector] or nil. Columns without a numeric
+   value (e.g. valueSampledData) still emit a .value comparison, which simply
+   matches nothing for those rows."
+  [col value-str]
+  (quantity-expr-condition (format "\"%s\"" (:col col)) value-str))
 
 (defn- build-quantity-condition
   "Builds a parameterized SQL condition for a quantity search parameter across
@@ -707,51 +728,8 @@
       ;; Nested date in struct
       sub-col
       (if (= sub-fhir-type "Period")
-        ;; Period inside a struct: access start through nested struct path
-        (let [[prefix date-val] (parse-date-prefix v-str)
-              {:keys [lower upper precision]} (dt/parse-search-date date-val)
-              start-expr (format "(\"%s\").\"%s\".\"start\"" col-name sub-col)]
-          (case prefix
-            ("gt" "sa") (if (= precision :instant)
-                          [(format "%s > ?" start-expr) [lower]]
-                          [(format "%s >= ?" start-expr) [upper]])
-            ("lt" "eb") [(format "%s < ?" start-expr) [lower]]
-            "ge" [(format "%s >= ?" start-expr) [lower]]
-            "le" (if (= precision :instant)
-                   [(format "%s <= ?" start-expr) [lower]]
-                   [(format "%s < ?" start-expr) [upper]])
-            "ne" nil
-            nil))
-        ;; Non-Period date in struct: use struct accessor syntax with native types
-        (let [[prefix date-val] (parse-date-prefix v-str)
-              {:keys [lower upper precision]} (dt/parse-search-date date-val)
-              col-expr (format "(\"%s\").\"%s\"" col-name sub-col)]
-          (case prefix
-            "eq" (if (= precision :instant)
-                   [(format "%s = ?" col-expr) [lower]]
-                   [(format "(%s >= ? AND %s < ?)" col-expr col-expr) [lower upper]])
-            "ne" (if (= precision :instant)
-                   [(format "%s <> ?" col-expr) [lower]]
-                   [(format "(%s < ? OR %s >= ?)" col-expr col-expr) [lower upper]])
-            "lt" [(format "%s < ?" col-expr) [lower]]
-            "gt" (if (= precision :instant)
-                   [(format "%s > ?" col-expr) [lower]]
-                   [(format "%s >= ?" col-expr) [upper]])
-            "ge" [(format "%s >= ?" col-expr) [lower]]
-            "le" (if (= precision :instant)
-                   [(format "%s <= ?" col-expr) [lower]]
-                   [(format "%s < ?" col-expr) [upper]])
-            "sa" (if (= precision :instant)
-                   [(format "%s > ?" col-expr) [lower]]
-                   [(format "%s >= ?" col-expr) [upper]])
-            "eb" [(format "%s < ?" col-expr) [lower]]
-            "ap" (if (= precision :instant)
-                   [(format "%s = ?" col-expr) [lower]]
-                   [(format "(%s >= ? AND %s < ?)" col-expr col-expr) [lower upper]])
-            ;; default eq
-            (if (= precision :instant)
-              [(format "%s = ?" col-expr) [lower]]
-              [(format "(%s >= ? AND %s < ?)" col-expr col-expr) [lower upper]]))))
+        (period-start-condition (format "(\"%s\").\"%s\".\"start\"" col-name sub-col) v-str)
+        (date-expr-condition (format "(\"%s\").\"%s\"" col-name sub-col) v-str))
 
       ;; Period type
       (= fhir-type "Period")
@@ -1016,6 +994,192 @@
       "_profile"     (build-meta-profile-condition param-str)
       (build-meta-coding-condition (get meta-coding-fields pname) param-str))))
 
+;; ---------------------------------------------------------------------------
+;; Presence (`X.exists() and X != false`) and composite parameters
+;;
+;; Both arrive with an empty :columns and their own registry key (see
+;; server.search-registry/build-resource-registry). The builders below work on
+;; SQL value expressions rather than column names, so one component builder
+;; serves a top-level column ("code") and a field of an UNNESTed element
+;; ((cs.val)."code") alike.
+;; ---------------------------------------------------------------------------
+
+(defn- present-and-not-false-sql
+  "SQL that is never NULL: true when the column holds a value other than
+   boolean false. A repeating column is skipped (nil): `X != false` has no
+   single answer for a collection."
+  [{:keys [col array? sub-col fhir-type sub-fhir-type]}]
+  (when-not array?
+    (let [expr (if sub-col
+                 (format "(\"%s\").\"%s\"" col sub-col)
+                 (format "\"%s\"" col))]
+      (if (= "boolean" (if sub-col sub-fhir-type fhir-type))
+        (format "COALESCE(%s, FALSE)" expr)
+        (format "%s IS NOT NULL" expr)))))
+
+(defn- build-exists-not-false-condition
+  "Token `true` matches a resource where some column holds a value other than
+   boolean false (deceasedBoolean true, or any deceasedDateTime); `false`
+   matches every other resource, including one without the element. Any other
+   value matches nothing."
+  [columns value-str]
+  (let [present (keep present-and-not-false-sql columns)]
+    (if (empty? present)
+      ["FALSE" []]
+      (let [any-present (str "(" (str/join " OR " present) ")")]
+        (case value-str
+          "true"  [any-present []]
+          "false" [(str "NOT " any-present) []]
+          ["FALSE" []])))))
+
+(defn- split-unescaped
+  "Splits `s` on each `sep` not escaped by a backslash and unescapes `\\<sep>`
+   in the parts (FHIR R4B 3.1.1.5.10). Keeps empty parts."
+  [s sep]
+  (let [q (java.util.regex.Pattern/quote (str sep))]
+    (mapv #(str/replace % (str "\\" sep) (str sep))
+          (str/split s (re-pattern (str "(?<!\\\\)" q)) -1))))
+
+(defn- parse-token
+  "FHIR token value -> {:system :code}. `system|code` constrains both,
+   `|code` requires the system to be absent (:system ::absent), `system|`
+   matches any code in the system, and a bare `code` any system."
+  [v]
+  (if-let [i (str/index-of v "|")]
+    (let [system (subs v 0 i)
+          code (subs v (inc i))]
+      {:system (if (str/blank? system) ::absent system)
+       :code (when-not (str/blank? code) code)})
+    {:code v}))
+
+(defn- system-value-match
+  "AND of the token's constraints on a struct expression with a system field
+   and a value field (`code` for Coding, `value` for Identifier)."
+  [expr value-field {:keys [system code]}]
+  (let [conds (cond-> []
+                (string? system)    (conj [(format "(%s).\"system\" = ?" expr) [system]])
+                (= ::absent system) (conj [(format "(%s).\"system\" IS NULL" expr) []])
+                code                (conj [(format "(%s).\"%s\" = ?" expr value-field) [code]]))]
+    (when (seq conds)
+      [(str/join " AND " (map first conds)) (into [] (mapcat second) conds)])))
+
+(defn- token-expr-condition
+  [fhir-type expr value-str]
+  (let [token (parse-token value-str)]
+    (case fhir-type
+      "CodeableConcept"
+      (when-let [[sql params] (system-value-match "cd.val" "code" token)]
+        [(format "EXISTS (SELECT 1 FROM UNNEST((%s).\"coding\") AS cd(val) WHERE %s)" expr sql)
+         params])
+      "Coding"     (system-value-match expr "code" token)
+      "Identifier" (system-value-match expr "value" token)
+      "boolean"    (case (:code token)
+                     "true"  [(format "%s = TRUE" expr) []]
+                     "false" [(format "%s = FALSE" expr) []]
+                     nil)
+      ;; code, string, uri, id, canonical: the system is implied by the element
+      (when-let [code (:code token)]
+        [(format "%s = ?" expr) [code]]))))
+
+(defn- reference-expr-condition
+  [expr value-str target]
+  (let [ref-expr (format "(%s).\"reference\"" expr)
+        target-type (first target)]
+    (if (and target-type (not (str/includes? value-str "/")))
+      [(format "(%s = ? OR %s = ?)" ref-expr ref-expr) [value-str (str target-type "/" value-str)]]
+      [(format "%s = ?" ref-expr) [value-str]])))
+
+(defn- component-value-condition
+  "One composite part applied to one value of a component column, or nil when
+   the part cannot be read as that column's type (a Period under `eq`, an
+   unparseable number)."
+  [{:keys [type target]} fhir-type expr part]
+  (case type
+    "token"     (token-expr-condition fhir-type expr part)
+    "quantity"  (quantity-expr-condition expr part)
+    "date"      (if (= "Period" fhir-type)
+                  (period-start-condition (format "(%s).\"start\"" expr) part)
+                  (date-expr-condition expr part))
+    "string"    [(string-prefix-sql expr) [(str/lower-case part)]]
+    "reference" (reference-expr-condition expr part target)
+    "number"    (let [[prefix number] (parse-date-prefix part)]
+                  (when-let [n (try (BigDecimal. (str/trim number)) (catch Exception _ nil))]
+                    (prefixed-number-condition expr prefix n)))
+    "uri"       [(format "%s = ?" expr) [part]]
+    nil))
+
+(defn- column-value-condition
+  "Applies `f` to the SQL expression for each value one column descriptor
+   selects under `base` (nil: the row itself), UNNESTing repeating levels so
+   `f` sees one value at a time. Returns [sql params] or nil."
+  [base {:keys [col array? sub-col sub-array?]} f]
+  (let [over (fn [expr repeating? alias g]
+               (if repeating?
+                 (when-let [[sql params] (g (str alias ".val"))]
+                   [(format "EXISTS (SELECT 1 FROM UNNEST(%s) AS %s(val) WHERE %s)" expr alias sql)
+                    params])
+                 (g expr)))
+        col-expr (if base (format "(%s).\"%s\"" base col) (format "\"%s\"" col))]
+    (over col-expr array? "cv"
+          (fn [v]
+            (if sub-col
+              (over (format "(%s).\"%s\"" v sub-col) sub-array? "cw" f)
+              (f v))))))
+
+(defn- or-conditions
+  [conds]
+  (case (count conds)
+    0 nil
+    1 (first conds)
+    [(str "(" (str/join " OR " (map first conds)) ")") (into [] (mapcat second) conds)]))
+
+(defn- composite-scope-condition
+  "Every part matched within one scope: on the row itself, or -- for an
+   element scope -- all on the SAME element, so `8480-6$gt100` never pairs
+   one component's code with another component's value."
+  [{:keys [element components]} parts]
+  (let [repeating? (:array? element)
+        base (cond
+               (nil? element) nil
+               repeating? "cs.val"
+               :else (format "\"%s\"" (:col element)))
+        conds (mapv (fn [component part]
+                      (or-conditions
+                       (keep (fn [col]
+                               (column-value-condition
+                                base col
+                                #(component-value-condition
+                                  component
+                                  (if (:sub-col col) (:sub-fhir-type col) (:fhir-type col))
+                                  % part)))
+                             (:columns component))))
+                    components parts)]
+    (when (every? some? conds)
+      (let [sql (str/join " AND " (map first conds))
+            params (into [] (mapcat second) conds)]
+        (if repeating?
+          [(format "EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS cs(val) WHERE %s)" (:col element) sql)
+           params]
+          [(str "(" sql ")") params])))))
+
+(defn- build-composite-condition
+  "A composite search value: `,` separates alternatives (OR), `$` separates
+   the parts of one alternative in the order of the SearchParameter's
+   components. An alternative matches in any scope (`combo-*` has two: the
+   Observation and each of its components). An alternative with the wrong
+   number of parts, or a part its column cannot read, matches nothing."
+  [search-param value-str]
+  (let [scopes (:composite search-param)]
+    (or (or-conditions
+         (keep (fn [alternative]
+                 (let [parts (split-unescaped alternative \$)]
+                   (or-conditions
+                    (keep #(when (= (count parts) (count (:components %)))
+                             (composite-scope-condition % parts))
+                          scopes))))
+               (split-unescaped value-str \,)))
+        ["FALSE" []])))
+
 (defn- build-condition-struct
   "Builds a parameterized SQL WHERE condition for a given FHIR search parameter.
    Returns [sql-fragment params-vector].
@@ -1026,18 +1190,30 @@
   [param-name param-value search-param]
   (let [param-str (if (keyword? param-value) (name param-value) (str param-value))
         comma-values (str/split param-str #",")]
-    (if (> (count comma-values) 1)
+    (cond
+      ;; A composite splits its own value: `,` and `$` may be escaped inside
+      ;; a part, which the plain split below does not honour.
+      (:composite search-param)
+      (build-composite-condition search-param param-str)
+
+      (> (count comma-values) 1)
       ;; Multiple comma-separated values: OR them together
       (let [conditions (map #(build-condition-struct param-name % search-param) comma-values)
             sqls (mapv first conditions)
             params (into [] (mapcat second) conditions)]
         [(str "(" (str/join " OR " sqls) ")") params])
-      ;; Single value
+
+      :else
       (let [val-parts (str/split param-str #"\|")
             v-str (last val-parts)
             system-str (when (= 2 (count val-parts)) (first val-parts))
             pname (name param-name)]
         (cond
+          ;; Ahead of the boolean branch: a direct caller may pass true/false
+          ;; itself, and the parameter name is not a column here.
+          (:exists-not-false search-param)
+          (build-exists-not-false-condition (:exists-not-false search-param) param-str)
+
           ;; Boolean values are not parameterized (SQL TRUE/FALSE literals)
           (boolean? param-value)
           [(format "\"%s\" = %s" pname (if param-value "TRUE" "FALSE")) []]
