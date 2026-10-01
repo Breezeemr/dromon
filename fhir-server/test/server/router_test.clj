@@ -14,6 +14,7 @@
             [hato.client :as hc]
             [jsonista.core :as json]
             [malli.core :as m]
+            [muuntaja.core :as muuntaja]
             [reitit.core :as r]
             [reitit.ring :as ring]
             [server.auth :as auth]
@@ -468,6 +469,38 @@
     (is (identical? sc/wrap-terminology router/wrap-terminology))
     (is (identical? sc/wrap-bulk-job-store router/wrap-bulk-job-store))
     (is (identical? sc/wrap-keto-url router/wrap-keto-url))))
+
+;; ---------------------------------------------------------------------------
+;; Request body decoding
+;; ---------------------------------------------------------------------------
+
+(defn- decode-body
+  "`json` decoded the way the router decodes a request body sent as
+   `content-type`."
+  [content-type ^String json]
+  (:body-params
+    (muuntaja/negotiate-and-format-request
+      router/muuntaja-instance
+      {:headers {"content-type" content-type}
+       :body (ByteArrayInputStream. (.getBytes json "UTF-8"))})))
+
+(deftest json-decimals-decode-as-bigdecimal-with-their-scale
+  (doseq [content-type ["application/json"
+                        "application/fhir+json"
+                        "application/fhir+json; charset=utf-8"
+                        "application/json-patch+json"]]
+    (testing content-type
+      (let [body (decode-body content-type
+                              (str "[{\"value\":80.50,"
+                                   "\"precise\":3.14159265358979323846}]"))
+            value (get-in body [0 :value])
+            precise (get-in body [0 :precise])]
+        (is (instance? BigDecimal value) (pr-str value))
+        (is (= 80.50M value))
+        (is (= 2 (.scale ^BigDecimal value))
+            "FHIR requires the trailing zero be preserved")
+        (is (= "3.14159265358979323846" (str precise))
+            "digits past a double's precision survive")))))
 
 ;; ---------------------------------------------------------------------------
 ;; resolve-options

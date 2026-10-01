@@ -14,8 +14,9 @@
 ;;
 ;; The stored side is what a store reads back: fhir-store-datomic returns a
 ;; FHIR decimal as a BigDecimal. The expected side is what the PATCH body
-;; decoded to, which for a JSON number is an Integer, Long or Double. Clojure
-;; `=` keeps those apart; `test` must not.
+;; decoded to, which for a JSON number is an Integer, Long or BigDecimal. A
+;; Double is covered too, for a caller that applies a patch it built itself.
+;; Clojure `=` keeps those apart; `test` must not.
 ;; ---------------------------------------------------------------------------
 
 (def ^:private observation
@@ -197,3 +198,14 @@
   (let [[resp stored] (patch! (guarded-replace "/valueQuantity/value" "72.6"))]
     (is (= 400 (:status resp)))
     (is (= "final" (:status stored)))))
+
+(deftest a-replaced-decimal-reaches-the-store-with-its-scale
+  ;; A PATCH result is written without request coercion, so the store gets
+  ;; exactly what the decoder made of the JSON number.
+  (let [[resp stored] (patch! (str "[{\"op\":\"replace\",\"path\":\"/valueQuantity/value\","
+                                   "\"value\":80.50}]"))
+        value (get-in stored [:valueQuantity :value])]
+    (is (= 200 (:status resp)) (body-of resp))
+    (is (instance? BigDecimal value) (pr-str value))
+    (is (= 80.50M value))
+    (is (= 2 (.scale ^BigDecimal value)))))
