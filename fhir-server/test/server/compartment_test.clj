@@ -604,3 +604,115 @@
                                          :query-params {}})]
         (is (not-any? #(= "obs-other" (get-in % [:resource :id]))
                       (get-in resp [:body :entry])))))))
+
+;; ---------------------------------------------------------------------------
+;; Declared exemptions
+;;
+;; An operation may need to write outside the compartment -- a Slot it books,
+;; a server-owned counter -- and says so in its route data. The exemption is
+;; by resource type and never reaches another patient's compartment.
+;; ---------------------------------------------------------------------------
+
+(def ^:private basic-registry
+  {"patient" {:type "reference" :columns [{:col "subject"}]}
+   "author"  {:type "reference" :columns [{:col "author"}]}})
+
+(defn- exempt-store [base & types]
+  (compartment/filtering-store base {:patient-id "123"
+                                     :all-registries (assoc registries "Basic" basic-registry)
+                                     :exempt-write-types types}))
+
+(deftest types-outside-the-compartment-are-not-writable-by-default
+  (let [store (fstore (seeded-store))]
+    (is (= 403 (refusal-status
+                #(db/create-resource store tenant :Slot "s1"
+                                     {:resourceType "Slot" :id "s1" :status "busy"}))))
+    (is (= 403 (refusal-status
+                #(db/transact-transaction store tenant
+                                          [(entry "PUT" "Practitioner/p1"
+                                                  {:resourceType "Practitioner" :id "p1"})]))))))
+
+(deftest a-declared-exemption-admits-shared-records
+  (let [base (seeded-store)
+        store (exempt-store base "Slot" "Basic")]
+    (testing "a type outside the compartment"
+      (is (= "transaction-response"
+             (:type (db/transact-transaction store tenant
+                                             [(entry "PUT" "Slot/s1"
+                                                     {:resourceType "Slot" :id "s1" :status "busy"})]))))
+      (is (= "busy" (:status (db/read-resource base tenant :Slot "s1")))))
+    (testing "a member type holding no patient link, such as a server-owned counter"
+      (is (= "counter" (:id (db/create-resource store tenant :Basic "counter"
+                                                {:resourceType "Basic" :id "counter"}))))
+      (is (= "Basic" (:resourceType (db/update-resource store tenant :Basic "counter"
+                                                        {:resourceType "Basic" :id "counter"
+                                                         :code {:text "next"}}))))))
+  (testing "the exemption is per route: another type is still refused"
+    (let [store (exempt-store (seeded-store) "Slot")]
+      (is (= 403 (refusal-status
+                  #(db/create-resource store tenant :Practitioner "p1"
+                                       {:resourceType "Practitioner" :id "p1"})))))))
+
+(deftest a-declared-exemption-never-reaches-another-patient
+  (testing "a new record linking another patient is refused"
+    (let [base (seeded-store)
+          store (exempt-store base "Observation")]
+      (is (= 403 (refusal-status
+                  #(db/transact-transaction store tenant
+                                            [(entry "POST" "Observation" (new-obs "Patient/999"))]))))
+      (is (= seeded-subjects (observation-subjects base)))))
+  (testing "replacing another patient's record is refused, whatever the new body links"
+    (let [base (seeded-store)
+          store (exempt-store base "Observation")]
+      (is (= 403 (refusal-status
+                  #(db/update-resource store tenant :Observation "obs-other"
+                                       {:resourceType "Observation" :id "obs-other"}))))
+      (is (= "Patient/999" (get (observation-subjects base) "obs-other")))))
+  (testing "deleting another patient's record is refused"
+    (let [base (seeded-store)
+          store (exempt-store base "Observation")]
+      (is (= 403 (refusal-status #(db/delete-resource store tenant :Observation "obs-other"))))
+      (is (= "Patient/999" (get (observation-subjects base) "obs-other")))))
+  (testing "another patient's Patient record is refused"
+    (let [store (exempt-store (seeded-store) "Patient")]
+      (is (= 403 (refusal-status
+                  #(db/create-resource store tenant :Patient "999"
+                                       {:resourceType "Patient" :id "999"}))))))
+  (testing "a member type with no registered link parameter cannot be judged, so it is refused"
+    (let [store (compartment/filtering-store (seeded-store)
+                                             {:patient-id "123" :all-registries registries
+                                              :exempt-write-types ["Basic"]})]
+      (is (= 403 (refusal-status
+                  #(db/create-resource store tenant :Basic "b1"
+                                       {:resourceType "Basic" :id "b1"})))))))
+
+(deftest middleware-passes-the-routes-exemptions-to-the-store
+  (let [resp ((wrapped) (-> (base-req "patient/*.*" :patient "123" :method :post
+                                      :uri "/default/fhir/Appointment/$book")
+                            (assoc-in [:reitit.core/match :data :compartment/exempt-write-types]
+                                      ["Slot"])))]
+    (is (instance? CompartmentFilteringStore (:body resp)))
+    (is (= #{"Slot"} (:exempt-write-types (:body resp))))))
+
+(deftest middleware-wraps-the-store-for-a-system-endpoint
+  (let [resp ((wrapped) (base-req "patient/*.*" :patient "123" :method :post
+                                  :uri "/default/fhir"))]
+    (is (instance? CompartmentFilteringStore (:body resp)))))
+
+(deftest malformed-entries-are-refused
+  (let [base (seeded-store)
+        store (exempt-store base "Slot")]
+    (testing "a body of another type cannot ride under an exempt url"
+      (is (= 403 (refusal-status
+                  #(db/transact-transaction store tenant
+                                            [(entry "POST" "Slot" (new-obs "Patient/999"))]))))
+      (is (= seeded-subjects (observation-subjects base))))
+    (testing "an entry naming no type"
+      (is (= 403 (refusal-status
+                  #(db/transact-transaction store tenant
+                                            [(entry "POST" "" (new-obs "Patient/123"))])))))
+    (testing "a conditional entry"
+      (is (= 403 (refusal-status
+                  #(db/transact-transaction store tenant
+                                            [(entry "PUT" "Observation?code=x"
+                                                    (new-obs "Patient/123"))])))))))
