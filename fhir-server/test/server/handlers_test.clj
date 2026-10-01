@@ -967,6 +967,21 @@
           "anchored to the version just read")
       (is (= "female" (:gender (:resource resolved)))))))
 
+(deftest a-decimal-in-a-binary-patch-document-keeps-its-scale
+  (let [store (make-store)
+        [id _] (seed-patient! store)
+        ops-json (str "[{\"op\":\"add\",\"path\":\"/extension\",\"value\":"
+                      "[{\"url\":\"http://example.org/weight\",\"valueDecimal\":80.50}]}]")
+        entry {:resource {:resourceType "Binary"
+                          :contentType "application/json-patch+json"
+                          :data (base64 ops-json)}
+               :request {:method "PATCH" :url (str resource-type "/" id)}}
+        resolved (#'handlers/resolve-patch-entry store tenant entry)
+        value (get-in resolved [:resource :extension 0 :valueDecimal])]
+    (is (instance? BigDecimal value) (pr-str value))
+    (is (= 80.50M value))
+    (is (= 2 (.scale ^BigDecimal value)))))
+
 (deftest a-client-supplied-guard-on-a-patch-entry-is-not-replaced
   (testing "a stale guard the client sent is refused, not swapped for the
             version the server just read"

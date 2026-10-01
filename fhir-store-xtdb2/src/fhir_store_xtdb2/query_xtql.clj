@@ -284,11 +284,7 @@
                                      :resource-type rt-name :id id}
                                     e))))]
      (core/fire-after-commit! lc-ctx [write] tx-key)
-     (core/with-basis
-       (-> resource
-           (assoc :id id)
-           (assoc-in [:meta :versionId] version))
-       tx-key))))
+     (core/committed resource id version tx-key))))
 
 (defn update-xtql [node resource-type id resource opts storage-encoders lc-ctx]
   (ftrace/trace!
@@ -335,11 +331,7 @@
                                       {:fhir/status 409 :fhir/code "conflict"}
                                       e)))))]
      (core/fire-after-commit! lc-ctx [write] tx-key)
-     (core/with-basis
-       (-> resource
-           (assoc :id id)
-           (assoc-in [:meta :versionId] new-version))
-       tx-key))))
+     (core/committed resource id new-version tx-key))))
 
 (defn delete-xtql [node resource-type id opts]
   (ftrace/trace!
