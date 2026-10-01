@@ -225,6 +225,13 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   rather than for the call. Where the engine does raise, it is
   `xtdb.error.Incorrect` and a store span rethrows it wrapped, so that code
   sits on the cause.
+- A string holding an unpaired UTF-16 surrogate (a lone `\uD83D`) is stored as
+  `?`, silently (verified on 2.2.0-beta3). pgjdbc's parameter encoding replaces
+  it in every `[:sql ...]` arg, and XTDB's Arrow `Utf8Vector` replaces it on the
+  server for `:put-docs`, whose transit payload still carries it. The store's
+  own encoder keeps it. So `encode-resource-doc`, which every write path goes
+  through, refuses such an id or body with a 400 naming each element path in
+  `:fhir/expression` (the server's `issue.expression`), never the value.
 
 ### Transaction metadata (`:tx-metadata`)
 

@@ -158,6 +158,90 @@
                                             v))})}}}))
 
 ;; ---------------------------------------------------------------------------
+;; Unpaired UTF-16 surrogates
+;;
+;; A Java string can hold a surrogate code unit with no partner (the JSON
+;; escape "\uD83D" on its own decodes to one), but UTF-8 has no encoding for
+;; it. Every String -> UTF-8 step between the store and XTDB's storage swaps it
+;; for "?" without complaint. Verified on 2.2.0-beta3: pgjdbc's parameter
+;; encoding does it to every [:sql ...] arg, and XTDB's Arrow Utf8Vector does
+;; it on the server for :put-docs, whose transit payload still carries the
+;; code unit intact. The storage encoder above leaves strings untouched. Once
+;; written, the "?" is indistinguishable from a real one, so the store refuses
+;; such a value instead (see core/refuse-unencodable-text!).
+;; ---------------------------------------------------------------------------
+
+(defn unpaired-surrogate?
+  "True when `s` holds a UTF-16 surrogate code unit that is not half of a
+   high-low pair, i.e. text UTF-8 cannot encode."
+  [^String s]
+  (let [n (.length s)]
+    (loop [i 0]
+      (if (< i n)
+        (let [c (.charAt s i)]
+          (cond
+            (Character/isHighSurrogate c)
+            (if (and (< (inc i) n) (Character/isLowSurrogate (.charAt s (inc i))))
+              (recur (+ i 2))
+              true)
+
+            (Character/isLowSurrogate c)
+            true
+
+            :else
+            (recur (inc i))))
+        false))))
+
+(defn- unencodable?
+  "True for a string or keyword whose text holds an unpaired surrogate."
+  [x]
+  (cond
+    (string? x)  (unpaired-surrogate? x)
+    (keyword? x) (or (some-> (namespace x) unpaired-surrogate?)
+                     (unpaired-surrogate? (name x)))
+    :else        false))
+
+(defn- render-path
+  "`root-name` followed by `segments`, which the walk keeps innermost first:
+   an index renders as `[i]`, a key as `.name`."
+  [root-name segments]
+  (apply str root-name
+         (map (fn [seg]
+                (cond
+                  (int? seg)     (str "[" seg "]")
+                  (keyword? seg) (str "." (name seg))
+                  :else          (str "." seg)))
+              (reverse segments))))
+
+(defn unpaired-surrogate-paths
+  "FHIRPath-style paths (`Practitioner.name[0].family`), rooted at
+   `root-name`, of every element in `resource` whose value holds an unpaired
+   surrogate, in walk order without repeats. An element whose NAME holds one
+   is reported at its parent's path, so no path ever carries the offending
+   text. Empty when the resource has none.
+
+   Runs on every write, so a path is rendered only when something is found."
+  [root-name resource]
+  (letfn [(walk [acc segments v]
+            (cond
+              (map? v)
+              (reduce-kv (fn [acc k v']
+                           (if (unencodable? k)
+                             (conj! acc (render-path root-name segments))
+                             (walk acc (conj segments k) v')))
+                         acc v)
+
+              (sequential? v)
+              (reduce-kv (fn [acc i v'] (walk acc (conj segments i) v'))
+                         acc (vec v))
+
+              (unencodable? v)
+              (conj! acc (render-path root-name segments))
+
+              :else acc))]
+    (into [] (distinct) (persistent! (walk (transient []) () resource)))))
+
+;; ---------------------------------------------------------------------------
 ;; Denormalized token columns
 ;;
 ;; Token searches on Coding/CodeableConcept fields (e.g. Observation.code,

@@ -76,12 +76,35 @@
   [resource-type]
   (str "\"" (str/lower-case (name resource-type)) "\""))
 
+(defn ^:no-doc refuse-unencodable-text!
+  "Refuses a write whose id or body holds an unpaired UTF-16 surrogate, which
+   XTDB would store as \"?\" (see xf/unpaired-surrogate-paths). Throws a 400
+   naming each offending element path, as the message and as
+   `:fhir/expression`. Never the value: both the message and the ex-data
+   reach the log."
+  [resource-type id resource-map]
+  (let [rt-name (name resource-type)
+        id-bad? (and (string? id) (xf/unpaired-surrogate? id))
+        paths (into [] (distinct)
+                    (concat (when id-bad? [(str rt-name ".id")])
+                            (xf/unpaired-surrogate-paths rt-name resource-map)))]
+    (when (seq paths)
+      (throw (ex-info (str "Unpaired UTF-16 surrogate in " (str/join ", " paths)
+                           ": not valid Unicode, so it cannot be stored unchanged")
+                      (cond-> {:fhir/status 400 :fhir/code "invalid"
+                               :fhir/expression paths
+                               :resource-type rt-name}
+                        (not id-bad?) (assoc :id id)))))))
+
 (defn ^:no-doc encode-resource-doc
   "Runs the malli storage encoder for the given resource type and returns the
    raw XTDB document map (pre-SQL-serialization) with :_id and :fhir_version
    injected. Used by both the SQL INSERT builder and the put-docs path —
-   the put-docs path renames :_id → :xt/id before handing the doc to XTDB."
+   the put-docs path renames :_id → :xt/id before handing the doc to XTDB.
+   Every write path encodes through here, so this is where a body XTDB
+   cannot store unchanged is refused (see refuse-unencodable-text!)."
   [resource-type id resource-map storage-encoders & {:keys [version]}]
+  (refuse-unencodable-text! resource-type id resource-map)
   (let [rt-name (name resource-type)
         encode-fn (get storage-encoders rt-name (get storage-encoders :default))]
     (cond-> (encode-fn resource-map)
@@ -2136,11 +2159,14 @@
                                                    :code "invalid"
                                                    :diagnostics (str "Unsupported method: " method)}]}}}))
                 (catch Exception e
-                  {:response {:status "400 Bad Request"
-                              :outcome {:resourceType "OperationOutcome"
-                                        :issue [{:severity "error"
-                                                 :code "exception"
-                                                 :diagnostics (str "Entry failed: " (ex-message e))}]}}})))
+                  (let [expression (some #(:fhir/expression (ex-data %))
+                                         (take-while some? (iterate ex-cause e)))]
+                    {:response {:status "400 Bad Request"
+                                :outcome {:resourceType "OperationOutcome"
+                                          :issue [(cond-> {:severity "error"
+                                                           :code "exception"
+                                                           :diagnostics (str "Entry failed: " (ex-message e))}
+                                                    (seq expression) (assoc :expression expression))]}}}))))
             entries)]
        {:resourceType "Bundle"
         :type "batch-response"
