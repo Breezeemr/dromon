@@ -968,32 +968,47 @@
                 {:field s :dir :asc})))
           (str/split sort-str #","))))
 
+(def ^:private resource-sort-columns
+  "Sort fields every resource type accepts, mapped to the system columns that
+   hold them: Resource.meta.lastUpdated is the row's system time here, as the
+   registry's `_lastUpdated` filter already maps it."
+  {"_lastUpdated" "_system_from"
+   "_id"          "_id"})
+
 (defn- sort-field->sql-col
-  "Maps a FHIR sort field name to a SQL column expression.
-   Uses the search registry to find the column name when available,
-   otherwise falls back to the field name directly."
+  "Maps a FHIR sort field name to a SQL column expression, or nil when the
+   field names nothing this store can sort by. Resource-level fields map to
+   their system columns; anything else goes through the search registry's
+   first column for the field.
+
+   An unknown field is dropped rather than quoted as a column: from XTDB
+   2.2.0-rc0 an ORDER BY on a column nothing declared fails at planning, which
+   search turns into an empty page. FHIR lets a server ignore a sort it does
+   not support."
   [field search-registry]
-  (if-let [sp (get search-registry field)]
-    ;; Use the first column from the registry entry
-    (let [col (first (:columns sp))]
-      (when col
-        (let [col-name (:col col)
-              sub-col (:sub-col col)]
-          (if sub-col
-            ;; Nested field: use struct accessor
-            (format "(\"%s\").\"%s\"" col-name sub-col)
-            (format "\"%s\"" col-name)))))
-    ;; Fallback: use field name directly as column name
-    (format "\"%s\"" field)))
+  (if-let [sys-col (get resource-sort-columns field)]
+    (format "\"%s\"" sys-col)
+    (when-let [col (first (:columns (get search-registry field)))]
+      (let [col-name (:col col)
+            sub-col (:sub-col col)]
+        (if sub-col
+          ;; Nested field: use struct accessor
+          (format "(\"%s\").\"%s\"" col-name sub-col)
+          (format "\"%s\"" col-name))))))
 
 (defn- build-order-by-clause
   "Builds a SQL ORDER BY clause from parsed sort specs.
-   Returns nil if no valid sort specs."
+   Returns nil if no valid sort specs. Each spec sort-field->sql-col cannot
+   map is left out with a warn naming the field."
   [sort-specs search-registry]
   (when (seq sort-specs)
     (let [clauses (keep (fn [{:keys [field dir]}]
-                          (when-let [col-expr (sort-field->sql-col field search-registry)]
-                            (str col-expr (if (= dir :desc) " DESC" " ASC"))))
+                          (if-let [col-expr (sort-field->sql-col field search-registry)]
+                            (str col-expr (if (= dir :desc) " DESC" " ASC"))
+                            (do (t/event! ::sort-field-ignored
+                                          {:level :warn
+                                           :data {:field field}})
+                                nil)))
                         sort-specs)]
       (when (seq clauses)
         (str " ORDER BY " (str/join ", " clauses))))))
@@ -1025,10 +1040,107 @@
   (when pool (try (.close ^HikariDataSource pool) (catch Throwable _ nil)))
   (when node (try (.close ^java.lang.AutoCloseable node) (catch Throwable _ nil))))
 
+;; ---------------------------------------------------------------------------
+;; Node start: pipelined replica-log appends and table declarations.
+;; ---------------------------------------------------------------------------
+
+(defn ->xtdb-config
+  "The xtdb.api.Xtdb$Config a store node starts from: `node-config` (a node
+   config map, or an Xtdb$Config, which is then modified in place) with
+   pipelined replica-log appends set from `:pipelined-replica-appends?`
+   (on unless it is false).
+
+   Pipelining (XTDB 2.2.0-beta3) lets the log leader send the next replica-log
+   append without waiting for the previous one; beta3 leaves it off so
+   mixed-version clusters can roll, and the next release turns it on
+   unconditionally. The node config map has no key for it, so it is set on
+   the config's IndexerConfig after the map's own :indexer keys are applied.
+   The store sets it explicitly either way, so XTDB_PIPELINED_REPLICA_APPENDS
+   has no effect on the nodes it starts.
+
+   Every node this store starts is a single in-process node on its own local
+   or in-memory log, always its own leader, so the beta3 caveat about older
+   nodes reading a pipelining leader's log cannot arise. Pass false only for a
+   deployment that must roll back below beta3: turn it off on every node, wait
+   for a block to be written, then downgrade."
+  ^xtdb.api.Xtdb$Config [node-config {:keys [pipelined-replica-appends?]}]
+  (let [cfg (xtn/->config node-config)]
+    (.pipelinedReplicaAppends ^xtdb.api.IndexerConfig (.getIndexer cfg)
+                              (not (false? pipelined-replica-appends?)))
+    cfg))
+
+(defn start-node
+  "Starts an in-process XTDB node the way the store starts each tenant's: see
+   ->xtdb-config for `opts`. Public so bulk importers (fhir-datomic-decant's
+   xtdb target) start their nodes with the same settings."
+  ([node-config] (start-node node-config {}))
+  ([node-config opts]
+   (xtn/start-node (->xtdb-config node-config opts))))
+
+(defn- quote-ident
+  "Double-quoted, case-exact SQL identifier."
+  [s]
+  (str "\"" (str/replace s "\"" "\"\"") "\""))
+
+(defn ^:no-doc schema-declarations
+  "table-name -> column vector to declare, for every schema that names its
+   :resourceType. Keys are table-name's spelling, so a declaration lands on
+   exactly the table the reads and writes use."
+  [schemas]
+  (reduce-kv (fn [acc rt cols]
+               (update acc (table-name rt)
+                       (fn [prev] (into [] (distinct) (concat prev cols)))))
+             {}
+             (xf/build-declared-columns schemas)))
+
+(defn ^:no-doc declaration-op
+  "One `CREATE TABLE <table> (<cols>)` tx op. CREATE TABLE is additive and
+   idempotent: on an existing table it adds the columns it lacks and keeps
+   every column it has, so re-running it is how an existing on-disk tenant
+   picks up new types and columns."
+  [table cols]
+  [:sql (format "CREATE TABLE %s (%s)" table (str/join ", " (map quote-ident cols)))])
+
+(defn ^:no-doc declare-tables!
+  "Declares every table in `declarations` (table-name -> columns, as
+   schema-declarations builds it) in ONE transaction. From XTDB 2.2.0-rc0 a
+   SELECT, COUNT, temporal read, DELETE, ASSERT or :delete-docs that names a
+   table or column nothing has written fails at planning (\"Table not found\" /
+   \"Column not found\"); INSERT and :put-docs are exempt. A declared,
+   never-written column plans as untyped, so reads answer empty.
+
+   `tx-opts` goes to xt/execute-tx. A caller that stamps later transactions
+   with an explicit historical :system-time must pass an earlier one here:
+   a declaration committed at wall-clock now refuses every later stamp."
+  ([node declarations] (declare-tables! node declarations nil))
+  ([node declarations tx-opts]
+   (when (seq declarations)
+     (let [ops (mapv (fn [[table cols]] (declaration-op table cols)) declarations)]
+       (if tx-opts
+         (xt/execute-tx node ops tx-opts)
+         (xt/execute-tx node ops))))))
+
+(defn- start-tenant-node
+  "Starts a tenant's node and declares the store's schema tables on it,
+   closing the node and naming the tenant when the declaration fails."
+  [store tid]
+  (let [node (start-node (:node-config store)
+                         {:pipelined-replica-appends? (:pipelined-replica-appends? store)})]
+    (try
+      (declare-tables! node (:declared-columns store))
+      node
+      (catch Throwable e
+        (try (.close ^java.lang.AutoCloseable node) (catch Throwable _ nil))
+        (throw (ex-info (str "Could not declare tables for tenant " tid ": " (ex-message e))
+                        {:tenant-id tid :tables (count (:declared-columns store))}
+                        e))))))
+
 (defn- get-or-create-entry
-  "Returns {:node node :pool HikariDataSource} for the tenant, creating both if
-   absent. compare-and-set via swap! handles concurrent creation; the loser of a
-   race closes the pool+node it created and uses the winner's entry."
+  "Returns {:node node :pool HikariDataSource :declared atom} for the tenant,
+   creating them if absent. compare-and-set via swap! handles concurrent
+   creation; the loser of a race closes the pool+node it created and uses the
+   winner's entry. :declared holds the table names declared on the node so
+   far, seeded with every schema table (see start-tenant-node, ensure-declared!)."
   [store tenant-id]
   (let [nodes (:nodes store)
         tid (str tenant-id)]
@@ -1036,9 +1148,10 @@
         (ftrace/trace!
          {:id :store/node.start
           :data {:tenant-id tid}}
-         (let [new-node (xtn/start-node (:node-config store))
+         (let [new-node (start-tenant-node store tid)
                new-pool (make-pool new-node tid (:pool-opts store))
-               new-entry {:node new-node :pool new-pool}
+               new-entry {:node new-node :pool new-pool
+                          :declared (atom (set (keys (:declared-columns store))))}
                existing (get (swap! nodes (fn [m]
                                             (if (contains? m tid)
                                               m
@@ -1048,6 +1161,27 @@
              new-entry
              (do (close-entry! new-entry)
                  existing)))))))
+
+(defn- ensure-declared!
+  "Declares `resource-type`'s table on the entry's node, with the only columns
+   the store itself reads on a type no schema enumerates (`_id`,
+   `fhir_version`), unless it is already declared. Schema types are declared
+   at node start, so this costs one set lookup per call; the first touch of an
+   unenumerated type per tenant costs one small transaction. Two callers racing
+   here both declare, which is harmless: CREATE TABLE is idempotent."
+  [{:keys [node declared]} resource-type]
+  (when resource-type
+    (let [table (table-name resource-type)]
+      (when-not (contains? @declared table)
+        (declare-tables! node {table ["_id" "fhir_version"]})
+        (swap! declared conj table))))
+  nil)
+
+(defn- entry-for
+  "The tenant's entry, with `resource-type`'s table declared on its node."
+  [store tenant-id resource-type]
+  (doto (get-or-create-entry store tenant-id)
+    (ensure-declared! resource-type)))
 
 (defn- get-or-create-node
   "Back-compat accessor returning just the node, for callers that don't borrow a
@@ -1105,7 +1239,7 @@
 ;; query still runs. Every builder below returns [sql-fragment params] so the
 ;; ordering is carried by construction rather than by convention.
 ;;
-;; Verified against xtdb-core 2.2.0-beta1: both `FOR ALL VALID_TIME` and
+;; Verified against xtdb-core 2.2.0-beta3: both `FOR ALL VALID_TIME` and
 ;; `FOR VALID_TIME ALL` parse (this ns uses the `FOR ALL ...` form already
 ;; established by history-sql), `AS OF ?` binds a JDBC param on both axes, and
 ;; Instant / LocalDate / ISO-string all coerce correctly as the bound value.
@@ -1407,7 +1541,8 @@
    {:tx-id <long-or-nil> :system-time <Instant>}. system-time is the commit
    time of that transaction, normalized to a java.time.Instant; on a node with
    no committed transactions it falls back to the wall-clock now so the returned
-   token is always usable by `FOR SYSTEM_TIME AS OF`."
+   token is always usable by `FOR SYSTEM_TIME AS OF`. A store-started node
+   always has one: the table declarations are its first transaction."
   [node]
   (let [tx-key (-> (xt/status node) :latest-completed-txs vals first first)
         st     (:system-time tx-key)
@@ -1511,7 +1646,7 @@
 ;; WITHOUT-OVERLAPS handling splits the surrounding rectangles and the new
 ;; version carries only the columns written, so an element absent from the new
 ;; resource does not survive from the version it replaces. Verified on
-;; 2.2.0-beta1 -- writing {payer} over a [Mar,Apr) portion of a row that also
+;; 2.2.0-beta3 -- writing {payer} over a [Mar,Apr) portion of a row that also
 ;; had {note} yields payer-only inside the portion and the original on both
 ;; sides. No preceding delete is needed, and a merge-style `UPDATE ... SET`
 ;; would be WRONG here: it would leave stale columns behind.
@@ -1520,7 +1655,7 @@
 ;; time. Backdated truth must always name its portion.
 ;;
 ;; A portion DELETE is a cut, not a lookup, and the same rectangle splitting
-;; applies. Verified on 2.2.0-beta1: `FROM ? TO ?` erases exactly the
+;; applies. Verified on 2.2.0-beta3: `FROM ? TO ?` erases exactly the
 ;; intersection of the portion with what is there, so a bound inside a
 ;; rectangle leaves the part beyond it standing, a bound equal to a later
 ;; rectangle's valid-from leaves that rectangle and its _system_from untouched
@@ -1596,7 +1731,7 @@
     (ftrace/trace!
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (create-xtql node resource-type id resource storage-encoders
                             (lifecycle-ctx this tenant-id))
@@ -1608,7 +1743,7 @@
     (ftrace/trace!
      {:id :store/read
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (read-xtql node resource-type id read-decoders)
          (with-open [conn (jdbc/get-connection pool)]
@@ -1618,7 +1753,7 @@
     (ftrace/trace!
      {:id :store/vread
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id :vid vid}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (vread-xtql node resource-type id vid read-decoders)
          (with-open [conn (jdbc/get-connection pool)]
@@ -1631,7 +1766,7 @@
     (ftrace/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (update-xtql node resource-type id resource opts storage-encoders
                             (lifecycle-ctx this tenant-id))
@@ -1646,7 +1781,7 @@
     (ftrace/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (delete-xtql node resource-type id opts)
          (with-open [conn (jdbc/get-connection pool)]
@@ -1657,7 +1792,7 @@
     (ftrace/trace!
      {:id :store/resource-deleted?
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (deleted?-xtql node resource-type id)
          (with-open [conn (jdbc/get-connection pool)]
@@ -1667,7 +1802,7 @@
     (ftrace/trace!
      {:id :store/search
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)
            args (prepare-search-args params search-registry)
            ;; node-based thunk: only used as the XTQL pathway's SQL fallback.
            sql-thunk #(search-sql node resource-type args read-decoders)]
@@ -1691,7 +1826,7 @@
     (ftrace/trace!
      {:id :store/count
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)
            args (prepare-search-args params search-registry)
            ;; node-based thunk: only used as the XTQL pathway's SQL fallback.
            sql-thunk #(count-sql node resource-type args)]
@@ -1714,7 +1849,7 @@
     (ftrace/trace!
      {:id :store/history
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (history-xtql node resource-type id read-decoders)
          (with-open [conn (jdbc/get-connection pool)]
@@ -1724,7 +1859,7 @@
     (ftrace/trace!
      {:id :store/history-type
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [{:keys [node pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (history-type-xtql node resource-type params read-decoders)
          (with-open [conn (jdbc/get-connection pool)]
@@ -1737,7 +1872,7 @@
     (ftrace/trace!
      {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
-    (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+    (let [{:keys [pool] :as entry} (get-or-create-entry this tenant-id)]
      (with-open [conn (jdbc/get-connection pool)]
       (let [node conn
           entry-metas
@@ -1771,6 +1906,11 @@
                        (update em :resource resolve-urn-uuid-references urn-mapping)
                        em))
                    metas)))
+          ;; Every op below runs in ONE transaction, so a single undeclared
+          ;; table (a DELETE or If-Match PUT on a type never written) would
+          ;; abort the whole Bundle at planning.
+          _ (run! #(ensure-declared! entry %)
+                  (distinct (remove str/blank? (keep :resource-type entry-metas))))
           ;; Bulk-fetch current versions for every PUT in one query per
           ;; distinct resource type, replacing N sequential round-trips.
           put-versions-by-type
@@ -2090,7 +2230,7 @@
     (ftrace/trace!
      {:id :store/scan-type-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (scan-type-as-of-reducible pool resource-type (basis->system-time basis)
                                   read-decoders scan-page-size))))
 
@@ -2098,7 +2238,7 @@
     (ftrace/trace!
      {:id :store/count-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (try
          (with-open [conn (jdbc/get-connection pool)]
            (count-as-of-sql conn resource-type (basis->system-time basis)))
@@ -2118,7 +2258,7 @@
     (ftrace/trace!
      {:id :store/read-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (with-open [conn (jdbc/get-connection pool)]
          (read-sql conn resource-type id read-decoders basis)))))
 
@@ -2127,7 +2267,7 @@
     (ftrace/trace!
      {:id :store/search-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [{:keys [pool]} (get-or-create-entry this tenant-id)
+     (let [{:keys [pool]} (entry-for this tenant-id resource-type)
            args (prepare-search-args params search-registry)]
        (with-open [conn (jdbc/get-connection pool)]
          (search-sql conn resource-type args read-decoders basis)))))
@@ -2137,7 +2277,7 @@
     (ftrace/trace!
      {:id :store/count-as-of-basis
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
-     (let [{:keys [pool]} (get-or-create-entry this tenant-id)
+     (let [{:keys [pool]} (entry-for this tenant-id resource-type)
            args (prepare-search-args params search-registry)]
        (with-open [conn (jdbc/get-connection pool)]
          (count-sql conn resource-type args basis)))))
@@ -2147,7 +2287,7 @@
     (ftrace/trace!
      {:id :store/resource-timeline
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (with-open [conn (jdbc/get-connection pool)]
          (timeline-sql conn resource-type id read-decoders)))))
 
@@ -2158,7 +2298,7 @@
     (ftrace/trace!
      {:id :store/put-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (with-open [conn (jdbc/get-connection pool)]
          (put-valid-time-sql conn resource-type id resource vt storage-encoders)))))
 
@@ -2170,7 +2310,7 @@
     (ftrace/trace!
      {:id :store/close-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [pool]} (get-or-create-entry this tenant-id)]
+     (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (with-open [conn (jdbc/get-connection pool)]
          (close-valid-time-sql conn resource-type id valid-from valid-to))))))
 
@@ -2213,8 +2353,17 @@
      (:max-size, :min-idle, :connection-timeout-ms); see default-pool-opts.
    - :resource/lifecycle — a write lifecycle (qualified symbol, value, or
      constructor fn of this config map); resolved once here and kept on the
-     store under :resource/lifecycle. See fhir-store.lifecycle."
-  [{:keys [resource/schemas node-config query-mode pool-opts resource/lifecycle]
+     store under :resource/lifecycle. See fhir-store.lifecycle.
+   - :pipelined-replica-appends? — pipelined replica-log appends on every
+     node the store starts (default: on; only false turns it off). false is
+     the opt-out for a deployment that must roll back below XTDB 2.2.0-beta3;
+     see ->xtdb-config.
+
+   Every tenant node declares the table and columns of each schema type when
+   it starts (see declare-tables!); a type no schema names is declared with
+   `_id` and `fhir_version` on its first use per tenant."
+  [{:keys [resource/schemas node-config query-mode pool-opts resource/lifecycle
+           pipelined-replica-appends?]
     :or {node-config {} schemas [] query-mode :sql pool-opts {}}
     :as config}]
   (assert (contains? #{:sql :xtql} query-mode)
@@ -2224,6 +2373,8 @@
         store (->XTDBStore (atom {}) node-config storage-encoders read-decoders query-mode
                            (or pool-opts {}))]
     (assoc store
+           :declared-columns (schema-declarations schemas)
+           :pipelined-replica-appends? (not (false? pipelined-replica-appends?))
            :operations {:valueset-expand xtdb-valueset-expand
                         :valueset-lookup xtdb-valueset-lookup}
            :resource/lifecycle (lc/resolve-lifecycle lifecycle config))))
@@ -2237,14 +2388,17 @@
   ;; No-op: nodes are managed by the store now
   nil)
 
-(defmethod ig/init-key :fhir-store/xtdb2-store [_ {:keys [node resource/schemas query-mode pool-opts resource/lifecycle]}]
+(defmethod ig/init-key :fhir-store/xtdb2-store
+  [_ {:keys [node resource/schemas query-mode pool-opts resource/lifecycle
+             pipelined-replica-appends?]}]
   (println "Starting XTDB2 FHIR Store (per-tenant node isolation)"
            (str "[query-mode=" (or query-mode :sql) "]"))
   (create-xtdb-store {:resource/schemas schemas
                       :node-config node
                       :query-mode (or query-mode :sql)
                       :pool-opts pool-opts
-                      :resource/lifecycle lifecycle}))
+                      :resource/lifecycle lifecycle
+                      :pipelined-replica-appends? pipelined-replica-appends?}))
 
 (defmethod ig/halt-key! :fhir-store/xtdb2-store [_ store]
   (println "Stopping XTDB2 FHIR Store - closing all tenant pools + nodes")

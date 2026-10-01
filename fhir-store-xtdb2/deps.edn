@@ -1,6 +1,6 @@
 {:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.6"}
-        com.xtdb/xtdb-core {:mvn/version "2.2.0-beta1"}
+        com.xtdb/xtdb-core {:mvn/version "2.2.0-beta3"}
         com.github.seancorfield/next.jdbc {:mvn/version "1.3.1093"}
         com.zaxxer/HikariCP {:mvn/version "6.2.1"}
         cheshire/cheshire {:mvn/version "5.13.0"}
@@ -20,4 +20,8 @@
                     ;; JEP 498 (Java 24+): Arrow's netty allocator needs Unsafe
                     ;; memory access; without this the node init dies in
                     ;; DefaultAllocationManagerFactory.<clinit>.
-                    "--sun-misc-unsafe-memory-access=allow"]}}}
+                    "--sun-misc-unsafe-memory-access=allow"
+                    ;; XTDB 2.2.0-beta3 asks for this on JDK 25+: Netty disables
+                    ;; sun.misc.Unsafe there unless told otherwise. Today Netty
+                    ;; also infers it from the flag above; this keeps it explicit.
+                    "-Dio.netty.noUnsafe=false"]}}}

@@ -108,7 +108,9 @@
 ;;   - any search-param with :columns nested metadata (CodeableConcept, HumanName,
 ;;     Period, Reference-across-types, ...) — the SQL builder already knows how
 ;;     to express these via UNNEST/EXISTS; translating them is deferred.
-;;   - order-by with sort-specs we cannot map 1:1
+;;   - any _sort: the SQL path maps sort fields to columns (sort-field->sql-col)
+;;     and drops ones it cannot map, where an XTQL order-by on an undeclared
+;;     column fails at planning from XTDB 2.2.0-rc0.
 ;; ---------------------------------------------------------------------------
 
 (def ^:private fallback ::fallback)
@@ -175,21 +177,13 @@
       (build-comma-or param-name comma search-param build-single-xtql)
       (build-single-xtql param-name param-value search-param))))
 
-(defn- xtql-order-by [sort-specs]
-  (when (seq sort-specs)
-    (mapv (fn [{:keys [field dir]}]
-            {:val (flat-col-sym field) :dir dir})
-          sort-specs)))
-
 (defn- compose-search-query
   "Assembles a runtime XTQL pipeline form for a search:
    (-> (from :RT [xt/system-from *]) (where ...) ...)"
-  [resource-type wheres sort-specs limit offset]
+  [resource-type wheres limit offset]
   (let [base (from-star (rt-kw resource-type))
         pipeline (cond-> [base]
                    (seq wheres) (conj (cons 'where wheres))
-                   (seq sort-specs)
-                   (conj (cons 'order-by (xtql-order-by sort-specs)))
                    (and limit (pos? limit)) (conj (list 'limit limit))
                    (and offset (pos? offset)) (conj (list 'offset offset)))]
     (apply list '-> pipeline)))
@@ -200,10 +194,7 @@
   (ftrace/trace!
    {:id :xtql/search
     :data {:resource-type (name resource-type)}}
-   (let [order-by-fallback? (and (seq sort-specs)
-                                 ;; sort on fields we don't model as flat columns
-                                 ;; — defer to SQL, which uses sort-field->sql-col.
-                                 (some #(contains? (or search-registry {}) (:field %)) sort-specs))
+   (let [order-by-fallback? (seq sort-specs)
          conditions (when (seq filter-params)
                       (mapv (fn [[k v]]
                               (build-xtql-condition k v (get search-registry (name k))))
@@ -226,7 +217,7 @@
 
        :else
        (let [wheres (mapv :where conditions)
-             q (compose-search-query resource-type wheres sort-specs limit offset)
+             q (compose-search-query resource-type wheres limit offset)
              rows (xt/q node q)]
          (mapv #(core/xtdb->fhir % read-decoders) rows))))))
 
@@ -278,7 +269,8 @@
          doc (core/encode-resource-doc resource-type id resource storage-encoders
                                        :version version)
          put-doc (core/doc->put-doc doc)
-         assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" rt-name)
+         assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
+                                 (core/table-name resource-type))
                     [id]]
          put-op [:put-docs (rt-kw resource-type) put-doc]
          own-ops [assert-op put-op]
@@ -302,8 +294,7 @@
   (ftrace/trace!
    {:id :xtql/update
     :data {:resource-type (name resource-type) :id id}}
-   (let [rt-name (name resource-type)
-         if-match (:if-match opts)
+   (let [if-match (:if-match opts)
          current (core/current-version node resource-type id)
          _ (when (and if-match (nil? current))
              (throw (ex-info "Version conflict: resource does not exist"
@@ -322,10 +313,10 @@
          put-doc (core/doc->put-doc doc)
          assert-op (if expected-vid
                      [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                   rt-name)
+                                   (core/table-name resource-type))
                       [id expected-vid]]
                      [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
-                                   rt-name)
+                                   (core/table-name resource-type))
                       [id]])
          put-op [:put-docs (rt-kw resource-type) put-doc]
          own-ops [assert-op put-op]
@@ -353,8 +344,7 @@
   (ftrace/trace!
    {:id :xtql/delete
     :data {:resource-type (name resource-type) :id id}}
-   (let [rt-name (name resource-type)
-         if-match (:if-match opts)
+   (let [if-match (:if-match opts)
          current (when if-match (core/current-version node resource-type id))
          _ (when (and if-match (nil? current))
              (throw (ex-info "Version conflict: resource does not exist"
@@ -366,7 +356,7 @@
                               :expected if-match :actual current})))
          assert-op (when if-match
                      [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                   rt-name)
+                                   (core/table-name resource-type))
                       [id if-match]])
          delete-op [:delete-docs (rt-kw resource-type) id]
          tx-ops (if assert-op [assert-op delete-op] [delete-op])

@@ -364,14 +364,42 @@
                   ;; Last resort
                   [{:col path :fhir-type nil :array? false}])))))))))
 
+(def ^:private any-resource-roots
+  "Leading segments that apply to every resource type (Resource.id,
+   Resource.meta.lastUpdated, DomainResource.text)."
+  #{"Resource" "DomainResource"})
+
+(defn- foreign-alternative?
+  "True when one `|` alternative of an expression is rooted at a resource
+   type other than `resource-type`: its leading segment, past any opening
+   parenthesis, is a capitalised name (FHIRPath element names are lower
+   camel case, type names upper) that is neither `resource-type` nor a
+   Resource / DomainResource root. A nil `resource-type` keeps everything."
+  [alternative resource-type]
+  (when resource-type
+    (when-let [root (second (re-find #"^[\s(]*([A-Za-z][A-Za-z0-9]*)" alternative))]
+      (and (Character/isUpperCase (.charAt ^String root 0))
+           (not= root resource-type)
+           (not (contains? any-resource-roots root))))))
+
 (defn- resolve-search-param-expression
   "Resolves a SearchParameter's expression into column descriptors.
-   Handles pipe-delimited alternatives (e.g. 'Location.name|Location.alias')."
-  [expression field-map search-type]
-  (when expression
-    (let [alternatives (str/split expression #"\|(?![^(]*\))")
-          columns (into [] (mapcat #(resolve-expression % field-map search-type)) alternatives)]
-      (vec (distinct columns)))))
+   Handles pipe-delimited alternatives (e.g. 'Location.name|Location.alias').
+
+   Shared SearchParameters (clinical-identifier, clinical-patient,
+   clinical-encounter, clinical-code, clinical-date, ...) list one path per
+   base type: 'Observation.identifier | DocumentReference.masterIdentifier'.
+   Alternatives rooted at another type are dropped before resolving; stripping
+   their prefix instead would turn `DocumentReference.masterIdentifier` into a
+   `masterIdentifier` column of Observation, which no Observation has."
+  ([expression field-map search-type]
+   (resolve-search-param-expression expression field-map search-type nil))
+  ([expression field-map search-type resource-type]
+   (when expression
+     (let [alternatives (->> (str/split expression #"\|(?![^(]*\))")
+                             (remove #(foreign-alternative? % resource-type)))
+           columns (into [] (mapcat #(resolve-expression % field-map search-type)) alternatives)]
+       (vec (distinct columns))))))
 
 ;; ---------------------------------------------------------------------------
 ;; SearchParameter resource loading from classpath
@@ -430,7 +458,10 @@
   [search-param-refs cap-schema]
   (let [field-map (if cap-schema
                     (extract-field-map-from-cap-schema cap-schema)
-                    {})]
+                    {})
+        resource-type (when cap-schema
+                        (:resourceType (try (m/properties cap-schema)
+                                            (catch Exception _ nil))))]
     (reduce
      (fn [acc sp-ref]
        (let [sp-name (:name sp-ref)
@@ -439,7 +470,8 @@
              full-sp (load-search-param-json definition-url)
              expression (:expression full-sp)
              target (:target full-sp)
-             columns (resolve-search-param-expression expression field-map sp-type)]
+             columns (resolve-search-param-expression expression field-map sp-type
+                                                      resource-type)]
          (if (seq columns)
            (assoc acc sp-name
                   {:type sp-type
