@@ -92,6 +92,53 @@
           ;; Replace the parent with the modified version
           (set-at doc (vec (concat (butlast parent-path) [(last parent-path)])) new-parent))))))
 
+(defn- decimal-value
+  "A number's value as a BigDecimal, or nil for a NaN or infinite double,
+   which has none. `bigdec` reads a double through its shortest decimal
+   form, so the double 72.5 becomes 72.5M rather than its exact binary
+   expansion."
+  ^BigDecimal [x]
+  (when-not (and (float? x) (or (NaN? x) (infinite? x)))
+    (bigdec x)))
+
+(defn- numerically-equal? [a b]
+  (let [a-value (decimal-value a)
+        b-value (decimal-value b)]
+    (if (and a-value b-value)
+      (zero? (.compareTo a-value b-value))
+      (= a b))))
+
+(defn- json-equal?
+  "Equality for the `test` operation, per RFC 6902 section 4.6.
+
+   Clojure `=` keeps Long, Double and BigDecimal apart, but the two sides of
+   a test rarely share a representation: a PATCH body decodes a JSON number
+   as an Integer, Long or BigDecimal, while a store reads a FHIR decimal back
+   as a BigDecimal. Numbers therefore compare by value, so 72, 72.0 and
+   72.00M are equal, inside objects and arrays too. Every other value
+   compares with `=`.
+
+   A string never equals a number, even one holding the same digits: the RFC
+   requires both values to have the same JSON type, and `test` does not know
+   the schema, so it cannot tell a decimal position from a string one. A
+   client that keeps decimals as strings must send a test value as a JSON
+   number."
+  [a b]
+  (cond
+    (and (number? a) (number? b))
+    (numerically-equal? a b)
+
+    (and (map? a) (map? b))
+    (and (= (count a) (count b))
+         (every? (fn [[k v]] (and (contains? b k) (json-equal? v (get b k)))) a))
+
+    (and (sequential? a) (sequential? b))
+    (and (= (count a) (count b))
+         (every? true? (map json-equal? a b)))
+
+    :else
+    (= a b)))
+
 (defn- apply-op
   "Apply a single JSON Patch operation to a document."
   [doc {:keys [op path value from]}]
@@ -128,7 +175,7 @@
 
       "test"
       (let [actual (get-at doc parsed-path)]
-        (if (= actual value)
+        (if (json-equal? actual value)
           doc
           (throw (ex-info "Test operation failed"
                           {:op "test" :path path :expected value :actual actual}))))

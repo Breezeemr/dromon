@@ -158,6 +158,93 @@
                                             v))})}}}))
 
 ;; ---------------------------------------------------------------------------
+;; Unpaired UTF-16 surrogates
+;;
+;; A Java string can hold a surrogate code unit with no partner (the JSON
+;; escape "\uD83D" on its own decodes to one), but UTF-8 has no encoding for
+;; it. Every String -> UTF-8 step between the store and XTDB's storage swaps it
+;; for "?" without complaint. Verified on 2.2.0-beta3: pgjdbc's parameter
+;; encoding does it to every [:sql ...] arg, and XTDB's Arrow Utf8Vector does
+;; it on the server for :put-docs, whose transit payload still carries the
+;; code unit intact. The storage encoder above leaves strings untouched. Once
+;; written, the "?" is indistinguishable from a real one, so the store refuses
+;; such a value instead (see core/refuse-unencodable-text!). Reads and searches
+;; take the same pgjdbc path, where a "?" would MATCH a stored one, so they
+;; refuse it too (see core/refuse-unencodable-input!).
+;; ---------------------------------------------------------------------------
+
+(defn unpaired-surrogate?
+  "True when `s` holds a UTF-16 surrogate code unit that is not half of a
+   high-low pair, i.e. text UTF-8 cannot encode."
+  [^String s]
+  (let [n (.length s)]
+    (loop [i 0]
+      (if (< i n)
+        (let [c (.charAt s i)]
+          (cond
+            (Character/isHighSurrogate c)
+            (if (and (< (inc i) n) (Character/isLowSurrogate (.charAt s (inc i))))
+              (recur (+ i 2))
+              true)
+
+            (Character/isLowSurrogate c)
+            true
+
+            :else
+            (recur (inc i))))
+        false))))
+
+(defn unencodable?
+  "True for a string or keyword whose text holds an unpaired surrogate; false
+   for anything else, nil included."
+  [x]
+  (cond
+    (string? x)  (unpaired-surrogate? x)
+    (keyword? x) (or (some-> (namespace x) unpaired-surrogate?)
+                     (unpaired-surrogate? (name x)))
+    :else        false))
+
+(defn- render-path
+  "`root-name` followed by `segments`, which the walk keeps innermost first:
+   an index renders as `[i]`, a key as `.name`."
+  [root-name segments]
+  (apply str root-name
+         (map (fn [seg]
+                (cond
+                  (int? seg)     (str "[" seg "]")
+                  (keyword? seg) (str "." (name seg))
+                  :else          (str "." seg)))
+              (reverse segments))))
+
+(defn unpaired-surrogate-paths
+  "FHIRPath-style paths (`Practitioner.name[0].family`), rooted at
+   `root-name`, of every element in `resource` whose value holds an unpaired
+   surrogate, in walk order without repeats. An element whose NAME holds one
+   is reported at its parent's path, so no path ever carries the offending
+   text. Empty when the resource has none.
+
+   Runs on every write, so a path is rendered only when something is found."
+  [root-name resource]
+  (letfn [(walk [acc segments v]
+            (cond
+              (map? v)
+              (reduce-kv (fn [acc k v']
+                           (if (unencodable? k)
+                             (conj! acc (render-path root-name segments))
+                             (walk acc (conj segments k) v')))
+                         acc v)
+
+              (sequential? v)
+              (reduce-kv (fn [acc i v'] (walk acc (conj segments i) v'))
+                         acc (vec v))
+
+              (unencodable? v)
+              (conj! acc (render-path root-name segments))
+
+              :else acc))]
+    (into [] (distinct) (persistent! (walk (transient []) () resource)))))
+
+;; ---------------------------------------------------------------------------
 ;; Denormalized token columns
 ;;
 ;; Token searches on Coding/CodeableConcept fields (e.g. Observation.code,
@@ -328,17 +415,32 @@
    answers from the token array). Names starting with `_` are XTDB system
    columns (`_id`, `_system_from`) and are never declared; neither is a :col
    that is not a plain name (an unparsed FHIRPath fragment), which no write
-   could ever produce."
-  [{:keys [type columns]}]
+   could ever produce.
+
+   A presence entry reads its :exists-not-false columns. A composite reads,
+   per scope, the element column it UNNESTs, or for the resource-level scope
+   each component's columns."
+  [{:keys [type columns exists-not-false composite]}]
   (let [flat-token? (and (= "token" type)
                          (seq columns)
                          (every? #(and (#{"CodeableConcept" "Coding"} (:fhir-type %))
                                        (not (:sub-col %)))
-                                 columns))]
-    (for [{:keys [col]} columns
-          :when (and (string? col) (re-matches #"[A-Za-z][A-Za-z0-9_-]*" col))
-          c (if flat-token? [col (str col "_tokens")] [col])]
-      c)))
+                                 columns))
+        plain? #(and (string? %) (re-matches #"[A-Za-z][A-Za-z0-9_-]*" %))]
+    (concat
+     (for [{:keys [col]} columns
+           :when (plain? col)
+           c (if flat-token? [col (str col "_tokens")] [col])]
+       c)
+     (for [{:keys [col]} exists-not-false
+           :when (plain? col)]
+       col)
+     (for [{:keys [element components]} composite
+           col (if element
+                 [(:col element)]
+                 (for [component components, c (:columns component)] (:col c)))
+           :when (plain? col)]
+       col))))
 
 (defn- registry-columns
   "Column names the schema's own `:fhir/search-registry` property (attached
@@ -355,17 +457,23 @@
     (when (map? registry)
       (mapcat registry-param-columns (vals registry)))))
 
+(def store-columns
+  "Columns the store itself reads on every resource type, whatever its schema
+   enumerates: `_id` and `fhir_version` (written by every store write and read
+   by every current-version check and ASSERT) and `meta` (read by the
+   resource-level `_tag`, `_profile` and `_security` searches, see
+   core/resource-level-param?)."
+  ["_id" "fhir_version" "meta"])
+
 (defn declared-columns
-  "Column names to declare for one resource schema, in order: `_id` and
-   `fhir_version` (written by every store write and read by every
-   current-version check and ASSERT), then each top-level entry under its
-   storage name, with a `<col>_tokens` column after each CodeableConcept /
-   Coding entry, then every column the schema's search registry reads that
-   the entries did not already name (see registry-columns). Distinct, and
-   never empty."
+  "Column names to declare for one resource schema, in order: store-columns,
+   then each top-level entry under its storage name, with a `<col>_tokens`
+   column after each CodeableConcept / Coding entry, then every column the
+   schema's search registry reads that the entries did not already name (see
+   registry-columns). Distinct, and never empty."
   [schema]
   (into [] (distinct)
-        (concat ["_id" "fhir_version"]
+        (concat store-columns
                 (mapcat entry-columns (schema-entries schema))
                 (registry-columns schema))))
 

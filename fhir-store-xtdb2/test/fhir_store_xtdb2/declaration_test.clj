@@ -4,9 +4,10 @@
    From 2.2.0-rc0 a read, DELETE, ASSERT or :delete-docs that names a table or
    column nothing has ever written fails at planning (\"Table not found\" /
    \"Column not found\") instead of answering empty. The store declares every
-   schema type's table when a tenant node starts and every other type on first
-   use; these tests pin that the empty answers stay empty, quietly, and that a
-   later write is still found by the same queries."
+   schema type's table and columns the node lacks when a tenant node starts,
+   and every other type on first use; these tests pin that the empty answers
+   stay empty, quietly, that a later write is still found by the same queries,
+   and that a reopened tenant lacking nothing writes no transaction."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [malli.core :as m]
@@ -114,8 +115,8 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest declared-columns-derivation
-  (testing "a plain :map: _id and fhir_version first, then every entry by its storage name"
-    (is (= ["_id" "fhir_version" "resourceType" "status"]
+  (testing "a plain :map: the store's own columns first, then every entry by its storage name"
+    (is (= ["_id" "fhir_version" "meta" "resourceType" "status"]
            (xf/declared-columns
             (m/schema [:map {:resourceType "Flag"} [:resourceType :string] [:status :string]])))))
 
@@ -141,7 +142,7 @@
                          [:us-core [:map {:resourceType "Patient"}
                                     [:race {:optional true :fhir/extension true :url "http://example.org/race"}
                                      [:map [:text {:optional true} :string]]]]]])]
-      (is (= ["_id" "fhir_version" "gender" "race"] (xf/declared-columns sch)))))
+      (is (= ["_id" "fhir_version" "meta" "gender" "race"] (xf/declared-columns sch)))))
 
   (testing "schemas are keyed by table-name's spelling"
     (is (= #{"\"patient\"" "\"observation\"" "\"flag\""}
@@ -419,6 +420,121 @@
           (finally (close-store-nodes! store-b))))
       (finally (delete-recursive! (java.io.File. base))))))
 
+(defn- temp-node-config
+  "A node config on a fresh on-disk log and storage, and the directory that
+   holds both."
+  []
+  (let [base (str (java.nio.file.Files/createTempDirectory
+                   "dromon-xtdb2-decl-" (into-array java.nio.file.attribute.FileAttribute [])))]
+    [{:log [:local {:path (str base "/log")}]
+      :storage [:local {:path (str base "/storage")}]}
+     base]))
+
+(defn- with-started-tenant
+  "Starts `tenant` on `store`, returns (f node), and closes the store's nodes."
+  [store tenant f]
+  (try
+    (db/create-tenant store tenant)
+    (f (node-of store tenant))
+    (finally (close-store-nodes! store))))
+
+(defn- tx-log
+  "Every transaction on the node, oldest first, as [tx-id system-time]."
+  [node]
+  (mapv (juxt :xt/id :system-time)
+        (xt/q node ["SELECT _id, system_time FROM xt.txs ORDER BY _id"])))
+
+(defn- stamp-after
+  "Executes a write stamped 1us after `system-time`, the way a historical
+   import does, returning :committed or the refusal's error code."
+  [node ^java.time.ZonedDateTime system-time]
+  (try
+    (xt/execute-tx node [[:sql "INSERT INTO replay_probe (_id) VALUES (1)"]]
+                   {:system-time (.toInstant (.plusNanos system-time 1000))})
+    :committed
+    (catch Exception e (:xtdb.error/code (ex-data e)))))
+
+(def ^:private patient-schema-with-gender
+  (m/schema (conj (m/form patient-schema) [:gender {:optional true} :string]) schema-opts))
+
+(deftest reopened-tenant-declares-only-what-is-missing
+  (let [[node-config base] (temp-node-config)
+        open (fn [schemas] (core-db/create-xtdb-store {:node-config node-config
+                                                       :resource/schemas schemas}))
+        tenant "t1"]
+    (try
+      (let [first-start (with-started-tenant (open [patient-schema]) tenant tx-log)
+            [second-start replay]
+            (with-started-tenant (open [patient-schema]) tenant
+              (fn [node] [(tx-log node) (stamp-after node (second (peek first-start)))]))]
+        (is (= 1 (count first-start)) "the first start declares, in one transaction")
+        (testing "the same schemas again: nothing is missing, so no transaction"
+          (is (= first-start second-start)))
+        (testing "so a historical import may stamp between that declaration and now"
+          (is (= :committed replay)))
+        (testing "a schema that adds a column declares it, in one transaction"
+          (let [[third-start cols]
+                (with-started-tenant (open [patient-schema-with-gender]) tenant
+                  (fn [node] [(tx-log node) (column-names node "patient")]))]
+            (is (contains? cols "gender"))
+            (is (contains? cols "maritalStatus") "the earlier declaration is kept")
+            (is (= (+ (count first-start) 2) (count third-start))
+                "the replay's transaction and one declaration"))))
+      (finally (delete-recursive! (java.io.File. base))))))
+
+(deftest reopened-tenant-keeps-its-schemaless-declarations
+  (let [[node-config base] (temp-node-config)
+        open #(core-db/create-xtdb-store {:node-config node-config})
+        tenant "t1"]
+    (try
+      (let [store (open)]
+        (try
+          (db/create-resource store tenant :X12ControlSequence "x" {:value 1})
+          ;; Written by something other than the store: no fhir_version or meta.
+          (xt/execute-tx (node-of store tenant)
+                         [[:sql "INSERT INTO claimnote (_id) VALUES ('n1')"]])
+          (finally (close-store-nodes! store))))
+      (let [store (open)]
+        (try
+          (db/create-tenant store tenant)
+          (let [node (node-of store tenant)
+                before (tx-log node)]
+            (testing "a schemaless type already on disk is not declared again"
+              (is (= 1 (:value (db/read-resource store tenant :X12ControlSequence "x"))))
+              (is (= before (tx-log node)))
+              (is (= :committed (stamp-after node (second (peek before))))))
+            (testing "a table on disk without the store columns is declared on first use"
+              (let [txs (tx-log node)]
+                (is (= "n1" (:id (db/read-resource store tenant :ClaimNote "n1"))))
+                (is (every? (column-names node "claimnote") xf/store-columns))
+                (is (= (inc (count txs)) (count (tx-log node)))))))
+          (finally (close-store-nodes! store))))
+      (finally (delete-recursive! (java.io.File. base))))))
+
+(deftest reopened-tenant-starts-at-the-end-of-its-log
+  ;; start-node returns before a reopened node has replayed its log, and a
+  ;; read waits only for transactions submitted through its own node. A
+  ;; reopen that declares nothing has no transaction of its own to wait on,
+  ;; so node start awaits the log's end. Schemaless, so the reopen has nothing
+  ;; to declare even while its catalog is still replaying, and current-basis
+  ;; names no type, so no lazy declaration waits for it either. The log is
+  ;; long enough that a node which skipped the wait is still replaying.
+  (let [[node-config base] (temp-node-config)
+        open #(core-db/create-xtdb-store {:node-config node-config})
+        tenant "t1"
+        insert "INSERT INTO probe (_id) VALUES (?)"]
+    (try
+      (let [last-tx (with-started-tenant (open) tenant
+                      (fn [node]
+                        (dotimes [i 1999]
+                          (xt/submit-tx node [[:sql insert [i]]]))
+                        (:tx-id (xt/execute-tx node [[:sql insert [1999]]]))))
+            store (open)]
+        (try
+          (is (= last-tx (:tx-id (db/current-basis store tenant))))
+          (finally (close-store-nodes! store))))
+      (finally (delete-recursive! (java.io.File. base))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Pipelined replica-log appends
 ;; ---------------------------------------------------------------------------
@@ -527,16 +643,47 @@
 (deftest registry-columns-are-declared
   (let [cols (xf/declared-columns registry-observation-schema)]
     (testing "a registry column the schema lacks is declared after the schema's own"
-      (is (= ["_id" "fhir_version" "resourceType" "status" "identifier" "encounter"
+      (is (= ["_id" "fhir_version" "meta" "resourceType" "status" "identifier" "encounter"
               "code" "code_tokens" "masterIdentifier" "context"
               "medicationCodeableConcept" "medicationCodeableConcept_tokens"]
              cols)))
     (testing "system columns and unparsed FHIRPath are never declared"
       (is (not-any? #{"_system_from" "value.exists() and value != false"} cols))))
-  (testing "a schema without a registry declares only its entries"
-    (is (= ["_id" "fhir_version" "resourceType" "status"]
+  (testing "a schema without a registry declares only the store's columns and its entries"
+    (is (= ["_id" "fhir_version" "meta" "resourceType" "status"]
            (xf/declared-columns (m/schema [:map {:resourceType "Flag"}
                                            [:resourceType :string] [:status :string]]))))))
+
+(deftest composite-and-presence-columns-are-declared
+  ;; Both kinds carry an empty :columns; what they read sits under their own
+  ;; registry key.
+  (let [quantity-component {:type "quantity"
+                            :columns [{:col "valueQuantity" :fhir-type "Quantity" :array? false}]}
+        code-component {:type "token"
+                        :columns [{:col "code" :fhir-type "CodeableConcept" :array? false}]}
+        registry {"combo-code-value-quantity"
+                  {:type "composite" :columns []
+                   :composite [{:element nil :components [code-component quantity-component]}
+                               {:element {:col "component" :fhir-type "BackboneElement" :array? true}
+                                :components [{:type "token"
+                                              :columns [{:col "componentOnlyCode"
+                                                         :fhir-type "CodeableConcept"
+                                                         :array? false}]}
+                                             quantity-component]}]}
+                  "deceased"
+                  {:type "token" :columns []
+                   :exists-not-false [{:col "deceasedBoolean" :fhir-type "boolean" :array? false}
+                                      {:col "deceasedDateTime" :fhir-type "dateTime" :array? false}]}}
+        cols (xf/declared-columns
+              (m/schema [:map {:resourceType "Observation" :fhir/search-registry registry}
+                         [:status {:optional true} :string]]))]
+    (testing "the resource-level scope declares each component's column"
+      (is (every? (set cols) ["code" "valueQuantity"])))
+    (testing "an element scope declares the element, not the fields read inside it"
+      (is (contains? (set cols) "component"))
+      (is (not (contains? (set cols) "componentOnlyCode"))))
+    (testing "a presence parameter declares the columns it tests"
+      (is (every? (set cols) ["deceasedBoolean" "deceasedDateTime"])))))
 
 (deftest search-matches-the-real-column-beside-a-stranger
   (doseq [query-mode [:sql :xtql]]

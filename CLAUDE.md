@@ -225,6 +225,48 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   rather than for the call. Where the engine does raise, it is
   `xtdb.error.Incorrect` and a store span rethrows it wrapped, so that code
   sits on the cause.
+- (2.2.0-beta3) `TIMESTAMP ?` does not parse (`:xtdb/sql-error`), and a
+  string bound against a timestamp column fails at execution. Bind a
+  java.time value. Prefer an `Instant`: a `LocalDate` bound through the pool
+  (pgwire) is cast in the JVM's default zone, while the same value passed to
+  the node's `xt/q` is cast as UTC.
+- `vread`'s `vid` is the FHIR versionId, the `fhir_version` column, as in the
+  mock and datomic stores. It is matched across `FOR ALL SYSTEM_TIME`, never
+  read `AS OF` a time; point-in-time reads are `$as-of`.
+- A string holding an unpaired UTF-16 surrogate (a lone `\uD83D`) is stored as
+  `?`, silently (verified on 2.2.0-beta3). pgjdbc's parameter encoding replaces
+  it in every `[:sql ...]` arg, and XTDB's Arrow `Utf8Vector` replaces it on the
+  server for `:put-docs`, whose transit payload still carries it. The store's
+  own encoder keeps it. So `encode-resource-doc`, which every write path goes
+  through, refuses such an id or body with a 400 naming each element path in
+  `:fhir/expression` (the server's `issue.expression`), never the value.
+  Reads, searches and deletes are no safer: the `?` they send MATCHES a stored
+  one, so a delete by `p\uD83D` removes `p?`. Every store verb therefore starts
+  with `refuse-unencodable-input!` (type, id, version id, params; a bad param
+  is named `http.<name>` in `:fhir/location`). Over HTTP only JSON bodies can
+  carry one: ring decodes the UTF-8 bytes of a URL to U+FFFD instead. A
+  lifecycle's tx-ops ride the same transaction, so `lifecycle-tx-ops` walks
+  them after the body is encoded: text the submitted body carried is the
+  client's 400, anything else in the ops a 500.
+- A write that adds a column changes a `SELECT *` row type, and pgwire refuses
+  a statement described under the old one ("cached plan must not change result
+  type", `:prepared-query-out-of-date`, SQLSTATE 0A000; verified on 2.2.0-beta3).
+  Hikari evicts on 0A000, after which `xt/q`'s `ROLLBACK` reports only
+  `Connection is closed`. The store's pool sets `prepareThreshold=0` and keeps
+  the connection, and `run-query` re-runs the read: Parse and Bind each open
+  the latest snapshot, so a write landing between them still trips it.
+- Every `unsupported` anomaly is also SQLSTATE 0A000: an SQL feature pgwire
+  lacks (`WITH RECURSIVE`), a parameter type it cannot read (a bound
+  `OffsetTime`). Every `incorrect` anomaly without a code of its own is 08P01,
+  which Hikari evicts like any `08` state: a parse or plan error, `1/0`,
+  `CAST('abc' AS INTEGER)`. Either way pgwire refuses that one statement and
+  keeps serving the connection (verified on 2.2.0-beta3), so the pool keeps
+  any 0A000 the server sent and any 08P01 whose detail decodes to an
+  `incorrect` anomaly (`statement-refusal?`). XTDB's JDBC driver sets
+  `fallback_output_format=transit`, so the detail is transit. pgwire's own
+  protocol violations are 08P01 with no detail, and the ones that end a
+  session close the socket without sending anything; those, and either state
+  pgjdbc raises itself, are left to Hikari.
 
 ### Transaction metadata (`:tx-metadata`)
 
@@ -294,6 +336,19 @@ telemere trace -> wrap-params -> muuntaja format -> fhir-exceptions -> fhir-deco
 
 - The project is named `fhir-defintions-to-malli` (note the typo in "defintions") -- use this spelling consistently in paths and references
 - Java 21+ is required (XTDB v2 dependency)
+- **A reopened XTDB node answers from part of its log until a read awaits
+  the log's end** (2.2.0-beta3). `start-node` returns before an on-disk node
+  has replayed, and a read waits only for transactions submitted through that
+  node, so the first reads can miss tables, columns and rows. The store's
+  tenant start awaits `SHOW LATEST_SUBMITTED_MSG_IDS` as a token before it
+  reads the catalog; anything else that opens a node and reads at once must
+  do the same.
+- **Tenant node start writes no transaction when no declaration is missing.**
+  It reads `information_schema.columns` and issues `CREATE TABLE` only for
+  what is absent, because a wall-clock-stamped transaction would refuse a
+  later import that stamps an earlier `:system-time` into the same directory.
+  The same read seeds the lazy per-type declarations: a table already carrying
+  every `transform/store-columns` column is not declared again on first use.
 - `target/staging/src` must be created with `mkdir -p` before running schema generation (classloader needs it at JVM startup)
 - Tenant ID `default` is used in dev/test
 - Test patient ID is `Patient/123` (hardcoded in inferno runner)

@@ -1,5 +1,6 @@
 (ns fhir-store-xtdb2.core
   (:require [xtdb.api :as xt]
+            [xtdb.basis :as basis]
             [xtdb.node :as xtn]
             [next.jdbc :as jdbc]
             [clojure.string :as str]
@@ -13,9 +14,15 @@
             [integrant.core :as ig]
             [fhir-store.protocol :as fp :refer [IFHIRStore]]
             [fhir-store-xtdb2.datetime :as dt]
-            [fhir-store-xtdb2.transform :as xf])
-  (:import [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime LocalTime Year YearMonth]
-           [com.zaxxer.hikari HikariConfig HikariDataSource]))
+            [fhir-store-xtdb2.transform :as xf]
+            [xtdb.serde :as serde])
+  (:import [java.sql SQLException]
+           [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime ZoneOffset LocalTime Year YearMonth]
+           [java.time.format DateTimeFormatter]
+           [com.zaxxer.hikari HikariConfig HikariDataSource SQLExceptionOverride SQLExceptionOverride$Override]
+           [org.postgresql.util PSQLException ServerErrorMessage]
+           [xtdb.api DataSource$ConnectionBuilder]
+           [xtdb.api.error Incorrect]))
 
 (defn- method-order
   "Returns sort key for FHIR transaction entry processing order per §3.1.0.11.2:
@@ -76,12 +83,76 @@
   [resource-type]
   (str "\"" (str/lower-case (name resource-type)) "\""))
 
+(defn ^:no-doc refuse-unencodable-text!
+  "Refuses a write whose id or body holds an unpaired UTF-16 surrogate, which
+   XTDB would store as \"?\" (see xf/unpaired-surrogate-paths). Throws a 400
+   naming each offending element path, as the message and as
+   `:fhir/expression`. Never the value: both the message and the ex-data
+   reach the log."
+  [resource-type id resource-map]
+  (let [rt-name (name resource-type)
+        id-bad? (and (string? id) (xf/unpaired-surrogate? id))
+        paths (into [] (distinct)
+                    (concat (when id-bad? [(str rt-name ".id")])
+                            (xf/unpaired-surrogate-paths rt-name resource-map)))]
+    (when (seq paths)
+      (throw (ex-info (str "Unpaired UTF-16 surrogate in " (str/join ", " paths)
+                           ": not valid Unicode, so it cannot be stored unchanged")
+                      (cond-> {:fhir/status 400 :fhir/code "invalid"
+                               :fhir/expression paths
+                               :resource-type rt-name}
+                        (not id-bad?) (assoc :id id)))))))
+
+(defn ^:no-doc refuse-unencodable-input!
+  "Refuses a store call whose resource type, id, version id or params hold an
+   unpaired UTF-16 surrogate. pgjdbc sends one as \"?\" (see
+   xf/unpaired-surrogate-paths), so the call would act on a different table,
+   row or match than the one named: a read finds the row whose id has a \"?\"
+   there, a search matches a stored \"?\" -- one written before writes refused
+   them, say. The type is spliced into SQL as a table name, and declared before
+   anything else runs, so this goes first in every verb.
+
+   Throws a 400 naming each offending input, never its text. A parameter whose
+   value is the problem is also named `http.<name>` in `:fhir/location`, FHIR's
+   convention for an HTTP parameter; one whose NAME is the problem is only
+   counted, since naming it would repeat the text."
+  [{:keys [resource-type id vid params]}]
+  (let [bad-value? (fn [v] (some xf/unencodable? (tree-seq coll? seq v)))
+        bad-names (count (filter xf/unencodable? (keys params)))
+        bad-params (into [] (keep (fn [[k v]]
+                                    (when (and (not (xf/unencodable? k)) (bad-value? v))
+                                      (name k))))
+                         params)
+        bad-type? (xf/unencodable? resource-type)
+        bad-id? (xf/unencodable? id)
+        what (cond-> []
+               bad-type?             (conj "the resource type")
+               bad-id?               (conj "the id")
+               (xf/unencodable? vid) (conj "the version id")
+               (pos? bad-names)      (conj "a parameter's name")
+               (seq bad-params)      (into (map #(str "parameter '" % "'")) bad-params))]
+    (when (seq what)
+      (throw (ex-info (str "Unpaired UTF-16 surrogate in " (str/join ", " what)
+                           ": not valid Unicode, so the store cannot use it unchanged")
+                      (cond-> {:fhir/status 400 :fhir/code "invalid"}
+                        (seq bad-params)
+                        (assoc :fhir/location (mapv #(str "http." %) bad-params))
+
+                        (and resource-type (not bad-type?))
+                        (assoc :resource-type (name resource-type))
+
+                        (and id (not bad-id?))
+                        (assoc :id id)))))))
+
 (defn ^:no-doc encode-resource-doc
   "Runs the malli storage encoder for the given resource type and returns the
    raw XTDB document map (pre-SQL-serialization) with :_id and :fhir_version
    injected. Used by both the SQL INSERT builder and the put-docs path —
-   the put-docs path renames :_id → :xt/id before handing the doc to XTDB."
+   the put-docs path renames :_id → :xt/id before handing the doc to XTDB.
+   Every write path encodes through here, so this is where a body XTDB
+   cannot store unchanged is refused (see refuse-unencodable-text!)."
   [resource-type id resource-map storage-encoders & {:keys [version]}]
+  (refuse-unencodable-text! resource-type id resource-map)
   (let [rt-name (name resource-type)
         encode-fn (get storage-encoders rt-name (get storage-encoders :default))]
     (cond-> (encode-fn resource-map)
@@ -118,12 +189,57 @@
         args (mapv doc cols)]
     [sql args]))
 
+;; ---------------------------------------------------------------------------
+;; Stale plans.
+;;
+;; A `SELECT *` row type is the table's column set, so a write that adds a
+;; column, or a type to one, changes it. pgwire refuses to run a statement
+;; described under the old row type ("cached plan must not change result
+;; type", SQLSTATE 0A000, :prepared-query-out-of-date). Two ways to get one:
+;;   - a pooled connection keeps a named server-side statement across
+;;     requests. The pool turns those off (see default-pool-opts).
+;;   - a write lands between one execution's Parse and its Bind. No client
+;;     setting closes that window, so run-query re-runs the read.
+;; ---------------------------------------------------------------------------
+
+(defn ^:no-doc stale-plan?
+  "True when `e`, or a cause of it, is pgwire refusing a statement whose row
+   type changed after it was described: either the pgjdbc SQLException the
+   pool sees, or the anomaly xt/q rethrows it as."
+  [^Throwable e]
+  (boolean
+   (some (fn [^Throwable c]
+           (or (= :prepared-query-out-of-date (:xtdb.error/code (ex-data c)))
+               (and (instance? SQLException c)
+                    (= "0A000" (.getSQLState ^SQLException c))
+                    (str/includes? (str (ex-message c)) "cached plan must not change result type"))))
+         (take-while some? (iterate ex-cause e)))))
+
+(def ^:private stale-plan-attempts 3)
+
+(defn ^:no-doc run-query
+  "xt/q, re-run when pgwire refuses it as a stale plan. The refusal comes
+   before any row and every caller is a read, so a re-run repeats nothing; it
+   is described afresh against the current schema."
+  [conn query+args]
+  (loop [attempt 1]
+    (let [result (try
+                   (xt/q conn query+args)
+                   (catch Exception e
+                     (if (and (< attempt stale-plan-attempts) (stale-plan? e))
+                       ::stale-plan
+                       (throw e))))]
+      (if (identical? ::stale-plan result)
+        (do (t/event! ::stale-plan-rerun {:level :debug :data {:attempt attempt}})
+            (recur (inc attempt)))
+        result))))
+
 (defn ^:no-doc current-version
   "Reads the current fhir_version column for a resource row. Returns the version
    string or nil if no row exists."
   [node resource-type id]
   (let [query (format "SELECT fhir_version FROM %s WHERE _id = ?" (table-name resource-type))
-        row (first (xt/q node [query id]))]
+        row (first (run-query node [query id]))]
     (when row
       (when-let [v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
         (str v)))))
@@ -142,7 +258,7 @@
       ;; of id count, so it hits XTDB's plan cache instead of recompiling per size.
       (let [query (format "SELECT _id, fhir_version FROM %s WHERE _id = ANY(?)"
                           (table-name resource-type))
-            rows (xt/q node [query (vec ids)])]
+            rows (run-query node [query (vec ids)])]
         (into {}
               (keep (fn [row]
                       (let [rid (or (:xt/id row) (:_id row) (get row "_id"))
@@ -169,7 +285,7 @@
       {}
       (let [query (format "SELECT *, _system_from FROM %s WHERE _id = ANY(?)"
                           (table-name resource-type))
-            rows (xt/q node [query (vec ids)])]
+            rows (run-query node [query (vec ids)])]
         (into {}
               (keep (fn [row]
                       (let [res (xtdb->fhir row read-decoders)]
@@ -198,6 +314,33 @@
    on a write return value (see the IFHIRStore protocol docstring)."
   [ret tx-key]
   (vary-meta ret assoc :fhir-store/basis (tx-key->basis tx-key)))
+
+(defn ^:no-doc last-updated-string
+  "`meta.lastUpdated` for system time `t` (an Instant, or the ZonedDateTime
+   `_system_from` reads as): UTC, the fractional second without trailing
+   zeros. fhir-server's response coercion decodes a FHIR instant to an
+   OffsetDateTime and writes it back in this form on a single-resource
+   response, and passes history and search Bundles through as the store
+   rendered them. `Instant.toString` keeps trailing zeros (`.120380`), which a
+   read then answered as `.12038`, so the two disagreed about one version."
+  [t]
+  (let [t (if (instance? ZonedDateTime t) (.toInstant ^ZonedDateTime t) t)]
+    (if (instance? Instant t)
+      (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME (.atOffset ^Instant t ZoneOffset/UTC))
+      (str t))))
+
+(defn ^:no-doc committed
+  "What a write of `resource` returns once `tx-key` has committed it as
+   `version`: `meta.lastUpdated` is the transaction's system time, which is
+   the `_system_from` every later read of that version reports, never the
+   one the caller sent."
+  [resource id version tx-key]
+  (with-basis
+    (-> resource
+        (assoc :id id)
+        (assoc-in [:meta :versionId] version)
+        (assoc-in [:meta :lastUpdated] (last-updated-string (:system-time tx-key))))
+    tx-key))
 
 ;; ---------------------------------------------------------------------------
 ;; Write lifecycle (see fhir-store.lifecycle for the ordering contract).
@@ -231,6 +374,33 @@
         prepared  (lc/prepare-write lifecycle write)
         ops-write (assoc write :resource prepared :submitted resource)]
     (assoc ops-write :tx-ops (lc/write-tx-ops lifecycle ops-write))))
+
+(defn ^:no-doc lifecycle-tx-ops
+  "`write`'s lifecycle ops, refused when any of them holds an unpaired UTF-16
+   surrogate, which would reach XTDB as \"?\" like any other text (see
+   xf/unpaired-surrogate-paths). Every XTDB tx-op form is plain data -- a SQL
+   string, or a vector of strings, keywords, docs and arg rows -- so walking
+   an op reaches all of its text.
+
+   Call it after the write's own body is encoded, which refuses a body holding
+   one with its element paths. A hit here therefore came from elsewhere: from
+   the submitted body, which `prepare` rewrote but the ops still carry -- the
+   client's text, so the same 400 a body refusal gives -- or from the
+   lifecycle's own data, a 500. Call it outside any catch that maps execute-tx
+   failures to a 409 or 412. Names ops by position, never their text."
+  [{:keys [resource-type id submitted tx-ops]}]
+  (let [bad (into [] (keep-indexed (fn [i op]
+                                     (when (some xf/unencodable? (tree-seq coll? seq op)) i)))
+                  tx-ops)]
+    (when (seq bad)
+      (refuse-unencodable-text! resource-type id submitted)
+      (throw (ex-info (str "Lifecycle tx-ops " (str/join ", " bad) " for " resource-type
+                           " hold an unpaired UTF-16 surrogate: not valid Unicode, so they"
+                           " cannot be sent unchanged")
+                      {:fhir/status 500 :fhir/code "exception"
+                       :resource-type resource-type :id id
+                       :lifecycle/tx-op-indexes bad})))
+    tx-ops))
 
 (defn ^:no-doc fire-after-commit!
   "Hand one committed transaction's writes to the lifecycle. Contained: a
@@ -279,15 +449,12 @@
 (defn- inject-meta
   "Injects :meta :versionId and :meta :lastUpdated onto a decoded FHIR resource.
    XTDB returns _system_from as a ZonedDateTime whose str form carries a zone
-   suffix (\"...Z[UTC]\") that is not a valid FHIR instant, so it is converted
-   to an Instant first."
+   suffix (\"...Z[UTC]\") that is not a valid FHIR instant; see
+   [[last-updated-string]]."
   [result version system-from]
   (cond-> result
     version     (assoc-in [:meta :versionId] (str version))
-    system-from (assoc-in [:meta :lastUpdated]
-                          (str (if (instance? ZonedDateTime system-from)
-                                 (.toInstant ^ZonedDateTime system-from)
-                                 system-from)))))
+    system-from (assoc-in [:meta :lastUpdated] (last-updated-string system-from))))
 
 (defn- parse-date-prefix
   "Parses a FHIR date search value into [prefix date-string].
@@ -299,14 +466,14 @@
       [maybe-prefix (subs value-str 2)]
       ["eq" value-str])))
 
-(defn- build-date-condition
-  "Builds a parameterized SQL condition for a date-type FHIR search parameter.
+(defn- date-expr-condition
+  "Builds a parameterized SQL condition applying a FHIR date search value to
+   the date/dateTime/instant SQL expression `col`.
    Returns [sql-fragment params-vector].
-   Uses native date types for comparison against XTDB DATE/TIMESTAMP columns."
-  [column-name value-str]
+   Uses native date types for comparison against XTDB DATE/TIMESTAMP values."
+  [col value-str]
   (let [[prefix date-val] (parse-date-prefix value-str)
-        {:keys [lower upper precision]} (dt/parse-search-date date-val)
-        col (format "\"%s\"" column-name)]
+        {:keys [lower upper precision]} (dt/parse-search-date date-val)]
     (case prefix
       ;; eq: for partial dates (year/month), use range; for exact, use equality
       "eq" (if (= precision :instant)
@@ -335,6 +502,12 @@
       (if (= precision :instant)
         [(format "%s = ?" col) [lower]]
         [(format "(%s >= ? AND %s < ?)" col col) [lower upper]]))))
+
+(defn- build-date-condition
+  "Builds a parameterized SQL condition for a date-type FHIR search parameter
+   on a top-level column. Returns [sql-fragment params-vector]."
+  [column-name value-str]
+  (date-expr-condition (format "\"%s\"" column-name) value-str))
 
 ;; ---------------------------------------------------------------------------
 ;; Type-driven SQL condition builders
@@ -464,13 +637,13 @@
         [(format "((\"%s\").\"reference\" = ? OR (\"%s\").\"reference\" = ?)" col-name col-name) [v-val with-prefix-val]]
         [(format "(\"%s\").\"reference\" = ?" col-name) [v-val]]))))
 
-(defn- build-period-condition
-  "Builds a parameterized SQL condition for a Period-type column with date prefix logic.
+(defn- period-start-condition
+  "Builds a parameterized SQL condition applying a FHIR date search value to
+   a Period through `start-col`, the SQL expression for its start.
    Returns [sql-fragment params-vector] or nil."
-  [col-name value-str]
+  [start-col value-str]
   (let [[prefix date-val] (parse-date-prefix value-str)
-        {:keys [lower upper precision]} (dt/parse-search-date date-val)
-        start-col (format "(\"%s\").\"start\"" col-name)]
+        {:keys [lower upper precision]} (dt/parse-search-date date-val)]
     (case prefix
       ("gt" "sa") (if (= precision :instant)
                     [(format "%s > ?" start-col) [lower]]
@@ -483,6 +656,12 @@
       "ne" nil ;; skip period matching for ne
       ;; eq/default: skip period matching to avoid false positives with Inferno
       nil)))
+
+(defn- build-period-condition
+  "Builds a parameterized SQL condition for a Period-type column with date prefix logic.
+   Returns [sql-fragment params-vector] or nil."
+  [col-name value-str]
+  (period-start-condition (format "(\"%s\").\"start\"" col-name) value-str))
 
 (defn- parse-quantity-value
   "Parses a FHIR quantity search value into {:prefix p :value BigDecimal
@@ -500,37 +679,46 @@
      :system (when (and system (not (str/blank? system))) system)
      :code (when (and code (not (str/blank? code))) code)}))
 
-(defn- build-quantity-col-condition
-  "Builds a parameterized SQL condition for a single quantity-type column.
-   Returns [sql-fragment params-vector] or nil. Compares the nested Quantity
-   .value numerically with the FHIR prefix (eq/ne/gt/lt/ge/le/sa/eb/ap; ap is
-   +/-10%); an optional |system|code constrains the unit. Columns without a
-   numeric value (e.g. valueSampledData) still emit a .value comparison, which
-   simply matches nothing for those rows."
-  [col value-str]
-  (let [col-name (:col col)
-        {:keys [prefix value system code]} (parse-quantity-value value-str)]
+(defn- prefixed-number-condition
+  "Compares the numeric SQL expression `num-expr` with BigDecimal `value`
+   under a FHIR prefix (eq/ne/gt/lt/ge/le/sa/eb/ap; ap is +/-10%).
+   Returns [sql-fragment params-vector]."
+  [num-expr prefix ^BigDecimal value]
+  (case prefix
+    "eq" [(format "%s = ?" num-expr) [value]]
+    "ne" [(format "%s <> ?" num-expr) [value]]
+    ("gt" "sa") [(format "%s > ?" num-expr) [value]]
+    "ge" [(format "%s >= ?" num-expr) [value]]
+    ("lt" "eb") [(format "%s < ?" num-expr) [value]]
+    "le" [(format "%s <= ?" num-expr) [value]]
+    "ap" [(format "(%s >= ? AND %s <= ?)" num-expr num-expr)
+          [(.multiply value 0.9M) (.multiply value 1.1M)]]
+    [(format "%s = ?" num-expr) [value]]))
+
+(defn- quantity-expr-condition
+  "Builds a parameterized SQL condition applying a FHIR quantity search value
+   to the Quantity-valued SQL expression `expr`. Returns [sql-fragment
+   params-vector] or nil. Compares the Quantity's .value numerically with the
+   FHIR prefix; an optional |system|code constrains the unit."
+  [expr value-str]
+  (let [{:keys [prefix value system code]} (parse-quantity-value value-str)]
     (when value
-      (let [val-expr (format "(\"%s\").\"value\"" col-name)
-            sys-expr (format "(\"%s\").\"system\"" col-name)
-            code-expr (format "(\"%s\").\"code\"" col-name)
-            value-cond (case prefix
-                         "eq" [(format "%s = ?" val-expr) [value]]
-                         "ne" [(format "%s <> ?" val-expr) [value]]
-                         ("gt" "sa") [(format "%s > ?" val-expr) [value]]
-                         "ge" [(format "%s >= ?" val-expr) [value]]
-                         ("lt" "eb") [(format "%s < ?" val-expr) [value]]
-                         "le" [(format "%s <= ?" val-expr) [value]]
-                         "ap" [(format "(%s >= ? AND %s <= ?)" val-expr val-expr)
-                               [(.multiply value 0.9M) (.multiply value 1.1M)]]
-                         [(format "%s = ?" val-expr) [value]])
-            conds (cond-> [value-cond]
-                    system (conj [(format "%s = ?" sys-expr) [system]])
-                    code   (conj [(format "%s = ?" code-expr) [code]]))]
+      (let [conds (cond-> [(prefixed-number-condition (format "(%s).\"value\"" expr)
+                                                      prefix value)]
+                    system (conj [(format "(%s).\"system\" = ?" expr) [system]])
+                    code   (conj [(format "(%s).\"code\" = ?" expr) [code]]))]
         (if (= 1 (count conds))
           (first conds)
           [(str "(" (str/join " AND " (map first conds)) ")")
            (into [] (mapcat second) conds)])))))
+
+(defn- build-quantity-col-condition
+  "Builds a parameterized SQL condition for a single quantity-type column.
+   Returns [sql-fragment params-vector] or nil. Columns without a numeric
+   value (e.g. valueSampledData) still emit a .value comparison, which simply
+   matches nothing for those rows."
+  [col value-str]
+  (quantity-expr-condition (format "\"%s\"" (:col col)) value-str))
 
 (defn- build-quantity-condition
   "Builds a parameterized SQL condition for a quantity search parameter across
@@ -615,51 +803,8 @@
       ;; Nested date in struct
       sub-col
       (if (= sub-fhir-type "Period")
-        ;; Period inside a struct: access start through nested struct path
-        (let [[prefix date-val] (parse-date-prefix v-str)
-              {:keys [lower upper precision]} (dt/parse-search-date date-val)
-              start-expr (format "(\"%s\").\"%s\".\"start\"" col-name sub-col)]
-          (case prefix
-            ("gt" "sa") (if (= precision :instant)
-                          [(format "%s > ?" start-expr) [lower]]
-                          [(format "%s >= ?" start-expr) [upper]])
-            ("lt" "eb") [(format "%s < ?" start-expr) [lower]]
-            "ge" [(format "%s >= ?" start-expr) [lower]]
-            "le" (if (= precision :instant)
-                   [(format "%s <= ?" start-expr) [lower]]
-                   [(format "%s < ?" start-expr) [upper]])
-            "ne" nil
-            nil))
-        ;; Non-Period date in struct: use struct accessor syntax with native types
-        (let [[prefix date-val] (parse-date-prefix v-str)
-              {:keys [lower upper precision]} (dt/parse-search-date date-val)
-              col-expr (format "(\"%s\").\"%s\"" col-name sub-col)]
-          (case prefix
-            "eq" (if (= precision :instant)
-                   [(format "%s = ?" col-expr) [lower]]
-                   [(format "(%s >= ? AND %s < ?)" col-expr col-expr) [lower upper]])
-            "ne" (if (= precision :instant)
-                   [(format "%s <> ?" col-expr) [lower]]
-                   [(format "(%s < ? OR %s >= ?)" col-expr col-expr) [lower upper]])
-            "lt" [(format "%s < ?" col-expr) [lower]]
-            "gt" (if (= precision :instant)
-                   [(format "%s > ?" col-expr) [lower]]
-                   [(format "%s >= ?" col-expr) [upper]])
-            "ge" [(format "%s >= ?" col-expr) [lower]]
-            "le" (if (= precision :instant)
-                   [(format "%s <= ?" col-expr) [lower]]
-                   [(format "%s < ?" col-expr) [upper]])
-            "sa" (if (= precision :instant)
-                   [(format "%s > ?" col-expr) [lower]]
-                   [(format "%s >= ?" col-expr) [upper]])
-            "eb" [(format "%s < ?" col-expr) [lower]]
-            "ap" (if (= precision :instant)
-                   [(format "%s = ?" col-expr) [lower]]
-                   [(format "(%s >= ? AND %s < ?)" col-expr col-expr) [lower upper]])
-            ;; default eq
-            (if (= precision :instant)
-              [(format "%s = ?" col-expr) [lower]]
-              [(format "(%s >= ? AND %s < ?)" col-expr col-expr) [lower upper]]))))
+        (period-start-condition (format "(\"%s\").\"%s\".\"start\"" col-name sub-col) v-str)
+        (date-expr-condition (format "(\"%s\").\"%s\"" col-name sub-col) v-str))
 
       ;; Period type
       (= fhir-type "Period")
@@ -837,6 +982,279 @@
           [(str "(" (str/join " OR " (map first per-col)) ")")
            (vec (mapcat second per-col))])))))
 
+;; ---------------------------------------------------------------------------
+;; Resource-level search parameters
+;;
+;; FHIR defines _lastUpdated, _tag, _profile and _security on Resource, so they
+;; mean the same thing on every type and need no registry entry (the server
+;; grants the meta three on every type; see
+;; server.search-registry/resource-level-params). They are answered here, ahead
+;; of the registry: without that, build-condition-struct quotes the parameter
+;; name as a column, and from XTDB 2.2.0-rc0 a column nothing declared fails the
+;; whole query at planning, which search turns into an empty page.
+;; ---------------------------------------------------------------------------
+
+(def ^:private last-updated-search-param
+  "Resource.meta.lastUpdated is the row's system time here, so the filter reads
+   `_system_from`, the column server.search-registry resolves the expression
+   to when a registry does declare `_lastUpdated`."
+  {:type "date"
+   :columns [{:col "_system_from" :fhir-type "instant" :array? false}]})
+
+(def ^:private meta-coding-fields
+  "Token parameters over a Coding array in the stored `meta` struct."
+  {"_tag" "tag"
+   "_security" "security"})
+
+(defn ^:no-doc resource-level-param?
+  "True when `pname` is a search parameter every resource type answers from
+   resource-level storage rather than its search registry."
+  [pname]
+  (or (= "_lastUpdated" pname)
+      (= "_profile" pname)
+      (contains? meta-coding-fields pname)))
+
+(defn- meta-coding-predicate
+  "[sql params] matching one FHIR token value against the Coding `m.val`, or
+   nil for a value naming neither a system nor a code:
+   `code` any system, `system|code` both, `system|` any code in that system,
+   `|code` that code with no system."
+  [token]
+  (let [[a b :as parts] (str/split token #"\|" 2)
+        piped? (= 2 (count parts))
+        system (when piped? (not-empty a))
+        code (not-empty (if piped? b a))
+        clauses (cond-> []
+                  system                    (conj ["(m.val).\"system\" = ?" [system]])
+                  (and piped? (not system)) (conj ["(m.val).\"system\" IS NULL" []])
+                  code                      (conj ["(m.val).\"code\" = ?" [code]]))]
+    (when (or system code)
+      [(str "(" (str/join " AND " (map first clauses)) ")")
+       (into [] (mapcat second) clauses)])))
+
+(defn- build-meta-coding-condition
+  "`_tag` / `_security`: one EXISTS over the meta Coding array, its comma-
+   separated values OR'd inside it. A value matching nothing at all (every
+   alternative empty) is FALSE rather than unconstrained."
+  [field value-str]
+  (let [preds (keep meta-coding-predicate (str/split value-str #","))]
+    (if (empty? preds)
+      ["FALSE" []]
+      [(format "EXISTS (SELECT 1 FROM UNNEST((\"meta\").\"%s\") AS m(val) WHERE %s)"
+               field (str/join " OR " (map first preds)))
+       (into [] (mapcat second) preds)])))
+
+(defn- build-meta-profile-condition
+  "`_profile`: exact uri match against any entry of the meta profile array,
+   comma-separated values OR'd. The value is matched whole, so a canonical
+   carrying `|version` matches only a profile stored with that version."
+  [value-str]
+  (let [uris (into [] (remove str/blank?) (str/split value-str #","))]
+    (if (empty? uris)
+      ["FALSE" []]
+      [(format "EXISTS (SELECT 1 FROM UNNEST((\"meta\").\"profile\") AS p(v) WHERE p.v IN (%s))"
+               (str/join ", " (repeat (count uris) "?")))
+       uris])))
+
+(declare build-condition-struct)
+
+(defn- build-resource-level-condition
+  "[sql params] for a parameter resource-level-param? accepts. The registry is
+   not consulted: a `_lastUpdated` entry resolves to the same column, and no
+   per-type entry can describe the meta struct."
+  [pname param-value]
+  (let [param-str (if (keyword? param-value) (name param-value) (str param-value))]
+    (case pname
+      "_lastUpdated" (build-condition-struct pname param-str last-updated-search-param)
+      "_profile"     (build-meta-profile-condition param-str)
+      (build-meta-coding-condition (get meta-coding-fields pname) param-str))))
+
+;; ---------------------------------------------------------------------------
+;; Presence (`X.exists() and X != false`) and composite parameters
+;;
+;; Both arrive with an empty :columns and their own registry key (see
+;; server.search-registry/build-resource-registry). The builders below work on
+;; SQL value expressions rather than column names, so one component builder
+;; serves a top-level column ("code") and a field of an UNNESTed element
+;; ((cs.val)."code") alike.
+;; ---------------------------------------------------------------------------
+
+(defn- present-and-not-false-sql
+  "SQL that is never NULL: true when the column holds a value other than
+   boolean false. A repeating column is skipped (nil): `X != false` has no
+   single answer for a collection."
+  [{:keys [col array? sub-col fhir-type sub-fhir-type]}]
+  (when-not array?
+    (let [expr (if sub-col
+                 (format "(\"%s\").\"%s\"" col sub-col)
+                 (format "\"%s\"" col))]
+      (if (= "boolean" (if sub-col sub-fhir-type fhir-type))
+        (format "COALESCE(%s, FALSE)" expr)
+        (format "%s IS NOT NULL" expr)))))
+
+(defn- build-exists-not-false-condition
+  "Token `true` matches a resource where some column holds a value other than
+   boolean false (deceasedBoolean true, or any deceasedDateTime); `false`
+   matches every other resource, including one without the element. Any other
+   value matches nothing."
+  [columns value-str]
+  (let [present (keep present-and-not-false-sql columns)]
+    (if (empty? present)
+      ["FALSE" []]
+      (let [any-present (str "(" (str/join " OR " present) ")")]
+        (case value-str
+          "true"  [any-present []]
+          "false" [(str "NOT " any-present) []]
+          ["FALSE" []])))))
+
+(defn- split-unescaped
+  "Splits `s` on each `sep` not escaped by a backslash and unescapes `\\<sep>`
+   in the parts (FHIR R4B 3.1.1.5.10). Keeps empty parts."
+  [s sep]
+  (let [q (java.util.regex.Pattern/quote (str sep))]
+    (mapv #(str/replace % (str "\\" sep) (str sep))
+          (str/split s (re-pattern (str "(?<!\\\\)" q)) -1))))
+
+(defn- parse-token
+  "FHIR token value -> {:system :code}. `system|code` constrains both,
+   `|code` requires the system to be absent (:system ::absent), `system|`
+   matches any code in the system, and a bare `code` any system."
+  [v]
+  (if-let [i (str/index-of v "|")]
+    (let [system (subs v 0 i)
+          code (subs v (inc i))]
+      {:system (if (str/blank? system) ::absent system)
+       :code (when-not (str/blank? code) code)})
+    {:code v}))
+
+(defn- system-value-match
+  "AND of the token's constraints on a struct expression with a system field
+   and a value field (`code` for Coding, `value` for Identifier)."
+  [expr value-field {:keys [system code]}]
+  (let [conds (cond-> []
+                (string? system)    (conj [(format "(%s).\"system\" = ?" expr) [system]])
+                (= ::absent system) (conj [(format "(%s).\"system\" IS NULL" expr) []])
+                code                (conj [(format "(%s).\"%s\" = ?" expr value-field) [code]]))]
+    (when (seq conds)
+      [(str/join " AND " (map first conds)) (into [] (mapcat second) conds)])))
+
+(defn- token-expr-condition
+  [fhir-type expr value-str]
+  (let [token (parse-token value-str)]
+    (case fhir-type
+      "CodeableConcept"
+      (when-let [[sql params] (system-value-match "cd.val" "code" token)]
+        [(format "EXISTS (SELECT 1 FROM UNNEST((%s).\"coding\") AS cd(val) WHERE %s)" expr sql)
+         params])
+      "Coding"     (system-value-match expr "code" token)
+      "Identifier" (system-value-match expr "value" token)
+      "boolean"    (case (:code token)
+                     "true"  [(format "%s = TRUE" expr) []]
+                     "false" [(format "%s = FALSE" expr) []]
+                     nil)
+      ;; code, string, uri, id, canonical: the system is implied by the element
+      (when-let [code (:code token)]
+        [(format "%s = ?" expr) [code]]))))
+
+(defn- reference-expr-condition
+  [expr value-str target]
+  (let [ref-expr (format "(%s).\"reference\"" expr)
+        target-type (first target)]
+    (if (and target-type (not (str/includes? value-str "/")))
+      [(format "(%s = ? OR %s = ?)" ref-expr ref-expr) [value-str (str target-type "/" value-str)]]
+      [(format "%s = ?" ref-expr) [value-str]])))
+
+(defn- component-value-condition
+  "One composite part applied to one value of a component column, or nil when
+   the part cannot be read as that column's type (a Period under `eq`, an
+   unparseable number)."
+  [{:keys [type target]} fhir-type expr part]
+  (case type
+    "token"     (token-expr-condition fhir-type expr part)
+    "quantity"  (quantity-expr-condition expr part)
+    "date"      (if (= "Period" fhir-type)
+                  (period-start-condition (format "(%s).\"start\"" expr) part)
+                  (date-expr-condition expr part))
+    "string"    [(string-prefix-sql expr) [(str/lower-case part)]]
+    "reference" (reference-expr-condition expr part target)
+    "number"    (let [[prefix number] (parse-date-prefix part)]
+                  (when-let [n (try (BigDecimal. (str/trim number)) (catch Exception _ nil))]
+                    (prefixed-number-condition expr prefix n)))
+    "uri"       [(format "%s = ?" expr) [part]]
+    nil))
+
+(defn- column-value-condition
+  "Applies `f` to the SQL expression for each value one column descriptor
+   selects under `base` (nil: the row itself), UNNESTing repeating levels so
+   `f` sees one value at a time. Returns [sql params] or nil."
+  [base {:keys [col array? sub-col sub-array?]} f]
+  (let [over (fn [expr repeating? alias g]
+               (if repeating?
+                 (when-let [[sql params] (g (str alias ".val"))]
+                   [(format "EXISTS (SELECT 1 FROM UNNEST(%s) AS %s(val) WHERE %s)" expr alias sql)
+                    params])
+                 (g expr)))
+        col-expr (if base (format "(%s).\"%s\"" base col) (format "\"%s\"" col))]
+    (over col-expr array? "cv"
+          (fn [v]
+            (if sub-col
+              (over (format "(%s).\"%s\"" v sub-col) sub-array? "cw" f)
+              (f v))))))
+
+(defn- or-conditions
+  [conds]
+  (case (count conds)
+    0 nil
+    1 (first conds)
+    [(str "(" (str/join " OR " (map first conds)) ")") (into [] (mapcat second) conds)]))
+
+(defn- composite-scope-condition
+  "Every part matched within one scope: on the row itself, or -- for an
+   element scope -- all on the SAME element, so `8480-6$gt100` never pairs
+   one component's code with another component's value."
+  [{:keys [element components]} parts]
+  (let [repeating? (:array? element)
+        base (cond
+               (nil? element) nil
+               repeating? "cs.val"
+               :else (format "\"%s\"" (:col element)))
+        conds (mapv (fn [component part]
+                      (or-conditions
+                       (keep (fn [col]
+                               (column-value-condition
+                                base col
+                                #(component-value-condition
+                                  component
+                                  (if (:sub-col col) (:sub-fhir-type col) (:fhir-type col))
+                                  % part)))
+                             (:columns component))))
+                    components parts)]
+    (when (every? some? conds)
+      (let [sql (str/join " AND " (map first conds))
+            params (into [] (mapcat second) conds)]
+        (if repeating?
+          [(format "EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS cs(val) WHERE %s)" (:col element) sql)
+           params]
+          [(str "(" sql ")") params])))))
+
+(defn- build-composite-condition
+  "A composite search value: `,` separates alternatives (OR), `$` separates
+   the parts of one alternative in the order of the SearchParameter's
+   components. An alternative matches in any scope (`combo-*` has two: the
+   Observation and each of its components). An alternative with the wrong
+   number of parts, or a part its column cannot read, matches nothing."
+  [search-param value-str]
+  (let [scopes (:composite search-param)]
+    (or (or-conditions
+         (keep (fn [alternative]
+                 (let [parts (split-unescaped alternative \$)]
+                   (or-conditions
+                    (keep #(when (= (count parts) (count (:components %)))
+                             (composite-scope-condition % parts))
+                          scopes))))
+               (split-unescaped value-str \,)))
+        ["FALSE" []])))
+
 (defn- build-condition-struct
   "Builds a parameterized SQL WHERE condition for a given FHIR search parameter.
    Returns [sql-fragment params-vector].
@@ -847,18 +1265,30 @@
   [param-name param-value search-param]
   (let [param-str (if (keyword? param-value) (name param-value) (str param-value))
         comma-values (str/split param-str #",")]
-    (if (> (count comma-values) 1)
+    (cond
+      ;; A composite splits its own value: `,` and `$` may be escaped inside
+      ;; a part, which the plain split below does not honour.
+      (:composite search-param)
+      (build-composite-condition search-param param-str)
+
+      (> (count comma-values) 1)
       ;; Multiple comma-separated values: OR them together
       (let [conditions (map #(build-condition-struct param-name % search-param) comma-values)
             sqls (mapv first conditions)
             params (into [] (mapcat second) conditions)]
         [(str "(" (str/join " OR " sqls) ")") params])
-      ;; Single value
+
+      :else
       (let [val-parts (str/split param-str #"\|")
             v-str (last val-parts)
             system-str (when (= 2 (count val-parts)) (first val-parts))
             pname (name param-name)]
         (cond
+          ;; Ahead of the boolean branch: a direct caller may pass true/false
+          ;; itself, and the parameter name is not a column here.
+          (:exists-not-false search-param)
+          (build-exists-not-false-condition (:exists-not-false search-param) param-str)
+
           ;; Boolean values are not parameterized (SQL TRUE/FALSE literals)
           (boolean? param-value)
           [(format "\"%s\" = %s" pname (if param-value "TRUE" "FALSE")) []]
@@ -885,24 +1315,29 @@
           [(format "\"%s\" = ?" pname) [v-str]])))))
 
 (defn- build-condition
-  "Builds a parameterized SQL WHERE condition for a search parameter. For token
-   searches on top-level Coding/CodeableConcept fields, uses the denormalized
+  "Builds a parameterized SQL WHERE condition for a search parameter.
+   Resource-level parameters (see resource-level-param?) are answered from
+   resource-level storage whatever the registry says. For token searches on
+   top-level Coding/CodeableConcept fields, uses the denormalized
    `<col>_tokens` array (a single scalar UNNEST ... IN) which is far cheaper than
    UNNEST-ing an array of structs under ORDER BY; everything else falls through
    to the struct path."
   [param-name param-value search-param]
-  (let [param-str (if (keyword? param-value) (name param-value) (str param-value))]
-    (or (when search-param
-          (when-let [cols (flat-token-columns search-param)]
-            ;; The flat array only beats the struct UNNEST when the struct would
-            ;; do extra work: a comma-OR (one mark-join per value) or an array-of
-            ;; -CodeableConcept column (a nested UNNEST). For a single value on a
-            ;; single CodeableConcept the struct equality is already optimal and
-            ;; slightly faster, so keep it.
-            (when (or (str/includes? param-str ",")
-                      (some :array? cols))
-              (build-flat-token-condition cols param-str))))
-        (build-condition-struct param-name param-value search-param))))
+  (let [pname (name param-name)
+        param-str (if (keyword? param-value) (name param-value) (str param-value))]
+    (if (resource-level-param? pname)
+      (build-resource-level-condition pname param-value)
+      (or (when search-param
+            (when-let [cols (flat-token-columns search-param)]
+              ;; The flat array only beats the struct UNNEST when the struct would
+              ;; do extra work: a comma-OR (one mark-join per value) or an array-of
+              ;; -CodeableConcept column (a nested UNNEST). For a single value on a
+              ;; single CodeableConcept the struct equality is already optimal and
+              ;; slightly faster, so keep it.
+              (when (or (str/includes? param-str ",")
+                        (some :array? cols))
+                (build-flat-token-condition cols param-str))))
+          (build-condition-struct param-name param-value search-param)))))
 (defn- drop-empty-sequentials
   "Recursively removes map entries whose value is an empty sequential collection
    (`[]` or an empty list). FHIR wire semantics require a repeating element with
@@ -971,7 +1406,7 @@
 (def ^:private resource-sort-columns
   "Sort fields every resource type accepts, mapped to the system columns that
    hold them: Resource.meta.lastUpdated is the row's system time here, as the
-   registry's `_lastUpdated` filter already maps it."
+   `_lastUpdated` filter maps it (last-updated-search-param)."
   {"_lastUpdated" "_system_from"
    "_id"          "_id"})
 
@@ -1019,15 +1454,90 @@
    pooled connections eliminates that per-request session churn. A bounded pool
    caps concurrent pgwire sessions while virtual threads cheaply park on borrow.
    min-idle is modest (the win is connection reuse up to max-size, not pre-warming);
-   raise it per deployment if first-request cold-open latency matters."
-  {:max-size 24 :min-idle 4 :connection-timeout-ms 10000})
+   raise it per deployment if first-request cold-open latency matters.
+
+   prepare-threshold is pgjdbc's prepareThreshold: the executions of one SQL
+   text on a connection after which it becomes a named server-side statement.
+   A named statement keeps the row type it was described with, and a pooled
+   connection keeps it across requests, so it goes stale as soon as a write
+   adds a column (see stale-plan?). 0 never names one. That costs a parse and
+   describe per execution, about 0.1 ms; XTDB's plan cache is node-wide and
+   keyed by the query, not the statement, so searches still hit it."
+  {:max-size 24 :min-idle 4 :connection-timeout-ms 10000 :prepare-threshold 0})
+
+(defn- connection-source
+  "`node` as a DataSource whose connections carry pgjdbc's prepareThreshold."
+  ^javax.sql.DataSource [^xtdb.api.DataSource node prepare-threshold]
+  (letfn [(build [^DataSource$ConnectionBuilder builder]
+            ;; pgjdbc reads connection properties as strings.
+            (.build (.option builder "prepareThreshold" (str prepare-threshold))))]
+    (reify javax.sql.DataSource
+      (getConnection [_] (build (.createConnectionBuilder node)))
+      (getConnection [_ user password]
+        (build (-> (.createConnectionBuilder node) (.user user) (.password password))))
+      (getLogWriter [_] (.getLogWriter node))
+      (setLogWriter [_ writer] (.setLogWriter node writer))
+      (getLoginTimeout [_] (.getLoginTimeout node))
+      (setLoginTimeout [_ seconds] (.setLoginTimeout node seconds))
+      (getParentLogger [_] (.getParentLogger node))
+      (unwrap [_ iface] (.unwrap node iface))
+      (isWrapperFor [_ iface] (.isWrapperFor node iface)))))
+
+(defn- incorrect-anomaly-detail?
+  "True when a server error's detail is an XTDB `incorrect` anomaly. pgwire
+   encodes the anomaly in the fallback output format, which XTDB's JDBC
+   driver sets to transit on every connection it opens."
+  [^ServerErrorMessage message]
+  (when-let [detail (.getDetail message)]
+    (try
+      (instance? Incorrect (serde/read-transit detail :json))
+      (catch Exception _ false))))
+
+(defn ^:no-doc statement-refusal?
+  "True when the XTDB server sent `e` to refuse one statement: SQLSTATE 0A000,
+   or 08P01 carrying an `incorrect` anomaly.
+
+   pgwire sends 0A000 for a stale plan and for every `unsupported` anomaly: an
+   SQL feature it lacks, a parameter type it cannot read. It sends 08P01 for
+   every `incorrect` anomaly without a code of its own: a parse or plan error,
+   division by zero, a failed cast. Either way it answers one statement and
+   keeps serving the connection: the error goes out as an ErrorResponse,
+   messages are skipped until Sync, and an open transaction is marked failed
+   for the caller's ROLLBACK.
+
+   Any other 08P01 is left to Hikari. pgwire's own protocol violations carry
+   no anomaly, and the ones that do end a session (a malformed or unreadable
+   message) close the socket without sending anything. Neither state counts
+   when pgjdbc raises it itself, since it then carries no server message."
+  [^SQLException e]
+  (boolean
+   (when (instance? PSQLException e)
+     (when-let [message (.getServerErrorMessage ^PSQLException e)]
+       (case (.getSQLState e)
+         "0A000" true
+         "08P01" (incorrect-anomaly-detail? message)
+         false)))))
+
+(def ^:private keep-connection-on-statement-refusal
+  "Hikari evicts a connection on SQLSTATE 0A000 and on any 08 state, but
+   XTDB sends 0A000 and 08P01 to refuse one statement on a healthy connection
+   (see statement-refusal?). Evicting it also hides the refusal: xt/q then
+   runs ROLLBACK on the closed connection, and \"Connection is closed\" is all
+   that reaches the caller."
+  (reify SQLExceptionOverride
+    (adjudicate [_ e]
+      (if (statement-refusal? e)
+        SQLExceptionOverride$Override/DO_NOT_EVICT
+        SQLExceptionOverride$Override/CONTINUE_EVICT))))
 
 (defn- make-pool
   "Builds a HikariCP pool over the XTDB node (which is a javax.sql.DataSource)."
-  ^HikariDataSource [^javax.sql.DataSource node tenant-id pool-opts]
-  (let [{:keys [max-size min-idle connection-timeout-ms]} (merge default-pool-opts pool-opts)
+  ^HikariDataSource [node tenant-id pool-opts]
+  (let [{:keys [max-size min-idle connection-timeout-ms prepare-threshold]}
+        (merge default-pool-opts pool-opts)
         cfg (doto (HikariConfig.)
-              (.setDataSource node)
+              (.setDataSource (connection-source node prepare-threshold))
+              (.setExceptionOverride keep-connection-on-statement-refusal)
               (.setMaximumPoolSize (int max-size))
               (.setMinimumIdle (int min-idle))
               (.setConnectionTimeout (long connection-timeout-ms))
@@ -1096,10 +1606,45 @@
 (defn ^:no-doc declaration-op
   "One `CREATE TABLE <table> (<cols>)` tx op. CREATE TABLE is additive and
    idempotent: on an existing table it adds the columns it lacks and keeps
-   every column it has, so re-running it is how an existing on-disk tenant
-   picks up new types and columns."
+   every column it has, so it is how an existing on-disk tenant picks up new
+   types and columns. `cols` need not repeat `_id` for a table that exists."
   [table cols]
   [:sql (format "CREATE TABLE %s (%s)" table (str/join ", " (map quote-ident cols)))])
+
+(defn- log-end-token
+  "An await token for every message on the node's log when this is called.
+   start-node returns before a node opened on an existing log has replayed
+   it, and a read waits only for transactions submitted through the node
+   itself, so until a read awaits this token the node can answer from part
+   of its catalog and part of its rows."
+  [node]
+  (basis/->tx-basis-str
+   (-> (group-by :db-name (xt/q node ["SHOW LATEST_SUBMITTED_MSG_IDS"]))
+       (update-vals #(mapv :msg-id %)))))
+
+(defn- columns-on-node
+  "table-name -> set of the column names the node's catalog lists, read once
+   the node has replayed its whole log. Every later read on the node sees at
+   least that much of the log."
+  [node]
+  (reduce (fn [acc {:keys [table-name column-name]}]
+            (update acc (quote-ident table-name) (fnil conj #{}) column-name))
+          {}
+          (xt/q node [(str "SELECT table_name, column_name FROM information_schema.columns"
+                           " WHERE table_schema = 'public'")]
+                {:await-token (log-end-token node)})))
+
+(defn ^:no-doc missing-declarations
+  "The part of `declarations` (table-name -> columns) that `on-node` (as
+   columns-on-node returns it) lacks: every column of a table the node does
+   not list, only the absent columns of one it does. Empty when nothing is
+   missing."
+  [declarations on-node]
+  (reduce-kv (fn [acc table cols]
+               (let [missing (into [] (remove (get on-node table #{})) cols)]
+                 (cond-> acc (seq missing) (assoc table missing))))
+             {}
+             declarations))
 
 (defn ^:no-doc declare-tables!
   "Declares every table in `declarations` (table-name -> columns, as
@@ -1121,14 +1666,30 @@
          (xt/execute-tx node ops))))))
 
 (defn- start-tenant-node
-  "Starts a tenant's node and declares the store's schema tables on it,
-   closing the node and naming the tenant when the declaration fails."
+  "Starts a tenant's node, waits for it to replay its log, and declares the
+   store's schema tables and columns the node does not already have. When it
+   has them all, as a reopened on-disk tenant does on every start after its
+   first, no transaction is written: a declaration committed at wall-clock now
+   would refuse every later transaction stamped with an earlier explicit
+   :system-time, such as a historical import into the same directory.
+
+   Returns [node tables]: `tables` is every table ensure-declared! need not
+   declare, the schema tables and each table the node already lists with
+   every transform/store-columns column, so a reopened tenant does not
+   declare its schemaless types again either. A table missing one of them,
+   written by something other than the store or before a column joined
+   store-columns, is left out and declared on its first use.
+   Closes the node and names the tenant when any of this fails."
   [store tid]
   (let [node (start-node (:node-config store)
                          {:pipelined-replica-appends? (:pipelined-replica-appends? store)})]
     (try
-      (declare-tables! node (:declared-columns store))
-      node
+      (let [declarations (:declared-columns store)
+            on-node (columns-on-node node)]
+        (declare-tables! node (missing-declarations declarations on-node))
+        [node (into (set (keys declarations))
+                    (keep (fn [[table cols]] (when (every? cols xf/store-columns) table)))
+                    on-node)])
       (catch Throwable e
         (try (.close ^java.lang.AutoCloseable node) (catch Throwable _ nil))
         (throw (ex-info (str "Could not declare tables for tenant " tid ": " (ex-message e))
@@ -1140,7 +1701,8 @@
    creating them if absent. compare-and-set via swap! handles concurrent
    creation; the loser of a race closes the pool+node it created and uses the
    winner's entry. :declared holds the table names declared on the node so
-   far, seeded with every schema table (see start-tenant-node, ensure-declared!)."
+   far, seeded with the tables start-tenant-node finds or declares (see
+   ensure-declared!)."
   [store tenant-id]
   (let [nodes (:nodes store)
         tid (str tenant-id)]
@@ -1148,10 +1710,10 @@
         (ftrace/trace!
          {:id :store/node.start
           :data {:tenant-id tid}}
-         (let [new-node (start-tenant-node store tid)
+         (let [[new-node declared] (start-tenant-node store tid)
                new-pool (make-pool new-node tid (:pool-opts store))
                new-entry {:node new-node :pool new-pool
-                          :declared (atom (set (keys (:declared-columns store))))}
+                          :declared (atom declared)}
                existing (get (swap! nodes (fn [m]
                                             (if (contains? m tid)
                                               m
@@ -1164,16 +1726,17 @@
 
 (defn- ensure-declared!
   "Declares `resource-type`'s table on the entry's node, with the only columns
-   the store itself reads on a type no schema enumerates (`_id`,
-   `fhir_version`), unless it is already declared. Schema types are declared
-   at node start, so this costs one set lookup per call; the first touch of an
-   unenumerated type per tenant costs one small transaction. Two callers racing
-   here both declare, which is harmless: CREATE TABLE is idempotent."
+   the store itself reads on a type no schema enumerates (transform/
+   store-columns), unless it is already declared. Schema types, and types the
+   node already had at start, are seeded into `declared`, so this costs one
+   set lookup per call; the first touch of any other type per tenant costs
+   one small transaction. Two callers racing here both declare, which is
+   harmless: CREATE TABLE is idempotent."
   [{:keys [node declared]} resource-type]
   (when resource-type
     (let [table (table-name resource-type)]
       (when-not (contains? @declared table)
-        (declare-tables! node {table ["_id" "fhir_version"]})
+        (declare-tables! node {table xf/store-columns})
         (swap! declared conj table))))
   nil)
 
@@ -1281,27 +1844,34 @@
    (let [[for-sql for-params] (basis->for-clause basis)
          query (format "SELECT *, _system_from FROM %s%s WHERE _id = ?"
                        (table-name resource-type) for-sql)
-         results (into [] (xt/q node (into [query] (conj for-params id))))]
+         results (into [] (run-query node (into [query] (conj for-params id))))]
      (xtdb->fhir (first results) read-decoders))))
 
-(defn- vread-sql [node resource-type id vid read-decoders]
-  (let [query (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (table-name resource-type))
-        results (into [] (xt/q node [query vid id]))]
+(defn- vread-sql
+  "`vid` is the FHIR versionId, i.e. the `fhir_version` every write stamps, so
+   the version is selected by value across system time rather than read AS OF
+   a point. Same qualifier as history-sql, so every versionId instance history
+   lists can be read back. The column holds strings; an integer vid would
+   otherwise match nothing."
+  [node resource-type id vid read-decoders]
+  (let [query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME WHERE _id = ? AND fhir_version = ?"
+                      (table-name resource-type))
+        results (into [] (run-query node [query id (str vid)]))]
     (xtdb->fhir (first results) read-decoders)))
 
 (defn- deleted?-sql [node resource-type id]
   (let [table (table-name resource-type)
         current-query (format "SELECT _id FROM %s WHERE _id = ?" table)
-        current-results (into [] (xt/q node [current-query id]))]
+        current-results (into [] (run-query node [current-query id]))]
     (if (seq current-results)
       false
       (let [history-query (format "SELECT _id FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" table)
-            history-results (into [] (xt/q node [history-query id]))]
+            history-results (into [] (run-query node [history-query id]))]
         (boolean (seq history-results))))))
 
 (defn- history-sql [node resource-type id read-decoders]
   (let [query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (table-name resource-type))]
-    (mapv #(xtdb->fhir % read-decoders) (xt/q node [query id]))))
+    (mapv #(xtdb->fhir % read-decoders) (run-query node [query id]))))
 
 (def ^:private ^:no-doc result-params
   #{"_count" "_skip" "_offset" "_sort" "_include" "_revinclude"
@@ -1359,9 +1929,9 @@
   (if (empty? ids)
     []
     (let [[for-sql for-params] (basis->for-clause basis)
-          rows (xt/q node (into [(format "SELECT *, _system_from FROM %s%s WHERE _id = ANY(?)"
-                                         (table-name resource-type) for-sql)]
-                                (conj for-params (vec ids))))
+          rows (run-query node (into [(format "SELECT *, _system_from FROM %s%s WHERE _id = ANY(?)"
+                                              (table-name resource-type) for-sql)]
+                                     (conj for-params (vec ids))))
           by-id (into {} (map (fn [r] [(row-id r) r])) rows)]
       (into [] (keep #(some-> (get by-id %) (xtdb->fhir read-decoders))) ids))))
 
@@ -1385,12 +1955,12 @@
       ;; (only the WHERE + sort-key columns are read), then fetch the page's
       ;; full rows by id and restore the sorted order.
       (let [id-q (format "SELECT _id FROM %s%s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))
-            ids (mapv row-id (xt/q node (into [id-q] (conj params limit offset))))]
+            ids (mapv row-id (run-query node (into [id-q] (conj params limit offset))))]
         (fetch-by-ids node resource-type ids read-decoders basis))
       ;; No sort: a single SELECT * with LIMIT streams the first `limit` rows and
       ;; stops (early-termination), so the wide projection cost is already bounded.
       (let [q (format "SELECT *, _system_from FROM %s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))]
-        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [q] (conj params limit offset)))))))))
+        (mapv #(xtdb->fhir % read-decoders) (run-query node (into [q] (conj params limit offset)))))))))
 
 (defn- count-sql
   ([node resource-type args] (count-sql node resource-type args nil))
@@ -1408,7 +1978,7 @@
                  where-clause (str/join " AND " (map first conditions))
                  p (into for-params (mapcat second) conditions)]
              [(format "SELECT COUNT(*) AS cnt FROM %s WHERE %s" rt where-clause) p]))
-         result (first (xt/q node (into [query-str] all-params)))]
+         result (first (run-query node (into [query-str] all-params)))]
      (or (:cnt result) 0))))
 
 ;; ---------------------------------------------------------------------------
@@ -1426,8 +1996,9 @@
                                 (table-name resource-type))
                    [id]]
         own-ops [assert-op [:sql sql args]]
+        tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
-                 (xt/execute-tx node (into own-ops (:tx-ops write)))
+                 (xt/execute-tx node tx-ops)
                  (catch Exception e
                    (when (lifecycle-op-failure? e (count own-ops))
                      (throw e))
@@ -1436,11 +2007,7 @@
                                     :resource-type rt-name :id id}
                                    e))))]
     (fire-after-commit! lc-ctx [write] tx-key)
-    (with-basis
-      (-> resource
-          (assoc :id id)
-          (assoc-in [:meta :versionId] version))
-      tx-key)))
+    (committed resource id version tx-key)))
 
 (defn- update-sql [node resource-type id resource opts storage-encoders lc-ctx]
   (let [rt-name (table-name resource-type)
@@ -1472,8 +2039,9 @@
                                   rt-name)
                      [id]])
         own-ops [assert-op [:sql sql args]]
+        tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
-                 (xt/execute-tx node (into own-ops (:tx-ops write)))
+                 (xt/execute-tx node tx-ops)
                  (catch Exception e
                    (when (lifecycle-op-failure? e (count own-ops))
                      (throw e))
@@ -1486,11 +2054,7 @@
                                      {:fhir/status 409 :fhir/code "conflict"}
                                      e)))))]
     (fire-after-commit! lc-ctx [write] tx-key)
-    (with-basis
-      (-> resource
-          (assoc :id id)
-          (assoc-in [:meta :versionId] new-version))
-      tx-key)))
+    (committed resource id new-version tx-key)))
 
 (defn- delete-sql [node resource-type id opts]
   (let [rt-name (table-name resource-type)
@@ -1583,7 +2147,7 @@
         (let [q (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id > ? ORDER BY _id LIMIT ?"
                         (table-name resource-type))]
           (loop [after "" acc init]
-            (let [rows (xt/q conn [q as-of after page-size])
+            (let [rows (run-query conn [q as-of after page-size])
                   n    (count rows)]
               (if (zero? n)
                 acc
@@ -1600,24 +2164,93 @@
 (defn ^:no-doc count-as-of-sql
   "COUNT(*) of `resource-type` as of `as-of` (an Instant)."
   [conn resource-type ^java.time.Instant as-of]
-  (let [result (first (xt/q conn [(format "SELECT COUNT(*) AS cnt FROM %s FOR SYSTEM_TIME AS OF ?"
-                                          (table-name resource-type))
-                                  as-of]))]
+  (let [result (first (run-query conn [(format "SELECT COUNT(*) AS cnt FROM %s FOR SYSTEM_TIME AS OF ?"
+                                               (table-name resource-type))
+                                       as-of]))]
     (or (:cnt result) 0)))
+
+;; ---------------------------------------------------------------------------
+;; Type history window: `_since` and `_at`.
+;;
+;; Both reach the store as raw query strings and must be bound as java.time
+;; values: XTDB refuses `TIMESTAMP ?` at parse time, and a string bound against
+;; `_system_from` fails at execution. Bounds are Instants because a LocalDate
+;; bound through the pool is read in the JVM's zone while the same bound handed
+;; to the node is read as UTC; an Instant means one thing on both paths.
+;; ---------------------------------------------------------------------------
+
+(def ^:private fhir-instant-pattern
+  "FHIR `instant`: seconds required, fraction optional, zone required."
+  #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+
+(defn- invalid-history-param [pname value reason]
+  (ex-info (format "Invalid %s value '%s': %s" pname value reason)
+           {:fhir/status 400 :fhir/code "invalid"
+            :fhir/location [(str "http." pname)]}))
+
+(defn- parse-since
+  "`_since` is a FHIR instant. A value without a zone names no instant at all,
+   so it is refused rather than guessed: ignoring it would answer a wider
+   question than the one asked."
+  [v]
+  (cond
+    (instance? Instant v) v
+    (and (string? v) (re-matches fhir-instant-pattern v))
+    (try (.toInstant (OffsetDateTime/parse v))
+         (catch java.time.format.DateTimeParseException _
+           (throw (invalid-history-param "_since" v "not a valid date and time"))))
+    :else
+    (throw (invalid-history-param "_since" v "expected a FHIR instant with seconds and a zone, e.g. 2026-01-01T00:00:00Z"))))
+
+(defn- parse-at
+  "`_at` is a FHIR date(Time) naming a period, parsed as a `_lastUpdated`
+   search value is. Returns {:as-of t} for an instant, or {:from t :to t} for
+   the half-open period a reduced-precision value names, its days starting at
+   UTC midnight (the zone the date parser assumes for a zone-less value)."
+  [v]
+  (if (instance? Instant v)
+    {:as-of v}
+    (let [{:keys [lower upper precision]}
+          (try (dt/parse-search-date (str v))
+               (catch Exception _
+                 (throw (invalid-history-param "_at" v "expected a FHIR date or dateTime"))))
+          ->instant (fn [d] (if (instance? LocalDate d)
+                              (.toInstant (.atStartOfDay ^LocalDate d java.time.ZoneOffset/UTC))
+                              (.toInstant ^OffsetDateTime d)))]
+      (if (= :instant precision)
+        {:as-of (->instant lower)}
+        {:from (->instant lower) :to (->instant upper)}))))
+
+(defn ^:no-doc history-type-window
+  "The `_since` / `_at` restrictions of a type-history call, either key nil
+   when its parameter is absent or blank. FHIR R4B http.html#history:
+     _since  versions created at or after the instant  -> `_system_from >= since`
+     _at     versions current at some point during the period
+             -> a system-time qualifier, `AS OF` a point or `FROM .. TO` a period.
+   Both may be given; each narrows the result."
+  [params]
+  (let [param (fn [k] (let [v (or (get params (keyword k)) (get params k))]
+                        (when-not (and (string? v) (str/blank? v)) v)))]
+    {:since (some-> (param "_since") parse-since)
+     :at    (some-> (param "_at") parse-at)}))
 
 (defn- history-type-sql [node resource-type params read-decoders]
   (let [raw-count (or (get params :_count) (get params "_count") "50")
         limit (if (string? raw-count) (parse-long raw-count) raw-count)
-        since (or (get params :_since) (get params "_since"))
-        at (or (get params :_at) (get params "_at"))
-        [where-clause where-params]
+        {:keys [since at]} (history-type-window params)
+        [for-clause for-params]
         (cond
-          since [" WHERE _system_from > TIMESTAMP ?" [since]]
-          at    [" WHERE _system_from <= TIMESTAMP ?" [at]]
-          :else ["" []])
-        query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT ?"
-                      (table-name resource-type) where-clause)
-        results (into [] (xt/q node (into [query] (conj where-params limit))))]
+          (nil? at)   [" FOR ALL SYSTEM_TIME" []]
+          (:as-of at) [" FOR SYSTEM_TIME AS OF ?" [(:as-of at)]]
+          :else       [" FOR SYSTEM_TIME FROM ? TO ?" [(:from at) (:to at)]])
+        [where-clause where-params]
+        (if since
+          [" WHERE _system_from >= ?" [since]]
+          ["" []])
+        query (format "SELECT *, _system_from FROM %s%s%s ORDER BY _system_from DESC LIMIT ?"
+                      (table-name resource-type) for-clause where-clause)
+        ;; The temporal qualifier follows the table name, so its params come first.
+        results (into [] (run-query node (-> [query] (into for-params) (into where-params) (conj limit))))]
     (mapv #(xtdb->fhir % read-decoders) results)))
 
 (defn ^:no-doc row->timeline-entry
@@ -1637,7 +2270,7 @@
   (let [query (format (str "SELECT *, _valid_from, _valid_to, _system_from, _system_to "
                            "FROM %s%s WHERE _id = ? ORDER BY _system_from, _valid_from")
                       (table-name resource-type) (all-time-clause))]
-    (mapv #(row->timeline-entry % read-decoders) (xt/q node [query id]))))
+    (mapv #(row->timeline-entry % read-decoders) (run-query node [query id]))))
 
 ;; ---------------------------------------------------------------------------
 ;; Valid-time writes.
@@ -1681,11 +2314,7 @@
                                           :version new-version
                                           :valid-time vt)
         tx-key (xt/execute-tx node [[:sql sql args]])]
-    (with-basis
-      (-> resource
-          (assoc :id id)
-          (assoc-in [:meta :versionId] new-version))
-      tx-key)))
+    (committed resource id new-version tx-key)))
 
 (defn- refuse-empty-portion!
   "Refuses an empty or inverted portion before the statement is issued.
@@ -1728,6 +2357,7 @@
   IFHIRStore
 
   (create-resource [this tenant-id resource-type id resource]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1740,6 +2370,7 @@
                        (lifecycle-ctx this tenant-id)))))))
 
   (read-resource [this tenant-id resource-type id]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/read
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1750,6 +2381,7 @@
            (read-sql conn resource-type id read-decoders))))))
 
   (vread-resource [this tenant-id resource-type id vid]
+    (refuse-unencodable-input! {:resource-type resource-type :id id :vid vid})
     (ftrace/trace!
      {:id :store/vread
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id :vid vid}}
@@ -1763,6 +2395,7 @@
     (fp/update-resource this tenant-id resource-type id resource nil))
 
   (update-resource [this tenant-id resource-type id resource opts]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1778,6 +2411,7 @@
     (fp/delete-resource this tenant-id resource-type id nil))
 
   (delete-resource [this tenant-id resource-type id opts]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1789,6 +2423,7 @@
 
   (resource-deleted? [this tenant-id resource-type id]
     ;; A resource is "deleted" if it has history (existed in the past) but no current row
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/resource-deleted?
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1799,6 +2434,7 @@
            (deleted?-sql conn resource-type id))))))
 
   (search [this tenant-id resource-type params search-registry]
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/search
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -1823,6 +2459,7 @@
            [])))))
 
   (count-resources [this tenant-id resource-type params search-registry]
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/count
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -1846,6 +2483,7 @@
           0)))))
 
   (history [this tenant-id resource-type id]
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/history
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -1856,6 +2494,7 @@
            (history-sql conn resource-type id read-decoders))))))
 
   (history-type [this tenant-id resource-type params]
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/history-type
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -1906,6 +2545,8 @@
                        (update em :resource resolve-urn-uuid-references urn-mapping)
                        em))
                    metas)))
+          _ (run! #(refuse-unencodable-input! (select-keys % [:resource-type :id]))
+                  entry-metas)
           ;; Every op below runs in ONE transaction, so a single undeclared
           ;; table (a DELETE or If-Match PUT on a type never written) would
           ;; abort the whole Bundle at planning.
@@ -1922,7 +2563,6 @@
                    {}
                    (group-by :resource-type
                              (filter #(= "PUT" (:method %)) entry-metas))))
-          last-updated (java.time.Instant/now)
           ;; Single pass over entry-metas: emit tx-ops AND the per-entry
           ;; response metadata (new version, final resource with :id+:meta
           ;; populated). This lets the response builder assemble the Bundle
@@ -1976,8 +2616,7 @@
                              prepared (:resource write)
                              final (-> prepared
                                        (assoc :id id)
-                                       (assoc-in [:meta :versionId] vid)
-                                       (assoc-in [:meta :lastUpdated] last-updated))]
+                                       (assoc-in [:meta :versionId] vid))]
                          (-> acc
                              (update :tx-ops into
                                      (cond-> []
@@ -1998,7 +2637,7 @@
                    entry-metas))
           own-op-count (count tx-ops)
           guarded? (some :if-match entry-metas)
-          tx-ops (into tx-ops (mapcat :tx-ops) lifecycle-writes)]
+          tx-ops (into tx-ops (mapcat lifecycle-tx-ops) lifecycle-writes)]
       (let [tx-key (ftrace/trace!
                     {:id :store/transact-transaction.execute-tx
                      :data {:op-count (count tx-ops)}}
@@ -2031,7 +2670,9 @@
                                                        (map :id metas))))
                      {}
                      (group-by :resource-type read-needed))
-             last-mod-str (str last-updated)]
+             ;; Every entry's version is stamped with the commit's system
+             ;; time, the `_system_from` a later read reports for it.
+             last-mod-str (last-updated-string (:system-time tx-key))]
          (with-basis
           {:resourceType "Bundle"
            :type "transaction-response"
@@ -2057,7 +2698,8 @@
                                                 vid (assoc :etag (str "W/\"" vid "\""))
                                                 last-mod-str (assoc :lastModified last-mod-str)
                                                 (= method "POST") (assoc :location (str "/" tenant-id "/fhir/" resource-type "/" id "/_history/" vid)))}
-                             resource (assoc :resource resource))))
+                             resource (assoc :resource
+                                             (assoc-in resource [:meta :lastUpdated] last-mod-str)))))
                        entry-results)}
           tx-key)))))))))
 
@@ -2136,11 +2778,16 @@
                                                    :code "invalid"
                                                    :diagnostics (str "Unsupported method: " method)}]}}}))
                 (catch Exception e
-                  {:response {:status "400 Bad Request"
-                              :outcome {:resourceType "OperationOutcome"
-                                        :issue [{:severity "error"
-                                                 :code "exception"
-                                                 :diagnostics (str "Entry failed: " (ex-message e))}]}}})))
+                  (let [{:fhir/keys [expression location]}
+                        (some #(when (:fhir/status (ex-data %)) (ex-data %))
+                              (take-while some? (iterate ex-cause e)))]
+                    {:response {:status "400 Bad Request"
+                                :outcome {:resourceType "OperationOutcome"
+                                          :issue [(cond-> {:severity "error"
+                                                           :code "exception"
+                                                           :diagnostics (str "Entry failed: " (ex-message e))}
+                                                    (seq expression) (assoc :expression expression)
+                                                    (seq location) (assoc :location location))]}}}))))
             entries)]
        {:resourceType "Bundle"
         :type "batch-response"
@@ -2227,6 +2874,7 @@
     ;; same lowercased tables, so `FOR SYSTEM_TIME AS OF` reads are valid
     ;; regardless of the write pathway). The reducible borrows a pooled
     ;; connection lazily inside its reduce, i.e. at download/consumption time.
+    (refuse-unencodable-input! {:resource-type resource-type})
     (ftrace/trace!
      {:id :store/scan-type-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -2235,6 +2883,7 @@
                                   read-decoders scan-page-size))))
 
   (count-as-of [this tenant-id resource-type basis]
+    (refuse-unencodable-input! {:resource-type resource-type})
     (ftrace/trace!
      {:id :store/count-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -2255,6 +2904,7 @@
 
   (read-as-of [this tenant-id resource-type id basis]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/read-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -2264,6 +2914,7 @@
 
   (search-as-of [this tenant-id resource-type params search-registry basis]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/search-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -2274,6 +2925,7 @@
 
   (count-as-of-basis [this tenant-id resource-type params search-registry basis]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :params params})
     (ftrace/trace!
      {:id :store/count-as-of-basis
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -2284,6 +2936,7 @@
 
   (resource-timeline [this tenant-id resource-type id _opts]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/resource-timeline
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -2295,6 +2948,7 @@
 
   (put-valid-time [this tenant-id resource-type id resource vt]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/put-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -2307,6 +2961,7 @@
 
   (close-valid-time [this tenant-id resource-type id valid-from valid-to]
     (reject-xtql-temporal! query-mode)
+    (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/close-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
@@ -2350,7 +3005,8 @@
      dynamic SQL + INSERT/DELETE. :xtql uses XTQL reads and put-docs/delete-docs
      writes, with [:sql ASSERT ...] retained for optimistic concurrency.
    - :pool-opts         — per-tenant HikariCP connection-pool overrides
-     (:max-size, :min-idle, :connection-timeout-ms); see default-pool-opts.
+     (:max-size, :min-idle, :connection-timeout-ms, :prepare-threshold); see
+     default-pool-opts.
    - :resource/lifecycle — a write lifecycle (qualified symbol, value, or
      constructor fn of this config map); resolved once here and kept on the
      store under :resource/lifecycle. See fhir-store.lifecycle.
@@ -2359,9 +3015,11 @@
      the opt-out for a deployment that must roll back below XTDB 2.2.0-beta3;
      see ->xtdb-config.
 
-   Every tenant node declares the table and columns of each schema type when
-   it starts (see declare-tables!); a type no schema names is declared with
-   `_id` and `fhir_version` on its first use per tenant."
+   Every tenant node declares the table and columns of each schema type that
+   it lacks when it starts, and writes no transaction when it lacks none (see
+   start-tenant-node); a type no schema names is declared with
+   transform/store-columns on its first use per tenant, unless the node
+   already had them all when it started."
   [{:keys [resource/schemas node-config query-mode pool-opts resource/lifecycle
            pipelined-replica-appends?]
     :or {node-config {} schemas [] query-mode :sql pool-opts {}}

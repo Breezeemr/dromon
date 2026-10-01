@@ -232,6 +232,147 @@
       (is (= 2 (count (get-in resp [:body :entry])))))))
 
 ;; ---------------------------------------------------------------------------
+;; _since on instance, type and system history
+;; ---------------------------------------------------------------------------
+
+(def ^:private mixed-precision-versions
+  "One Patient's versions, newest first, with meta.lastUpdated written at the
+   precisions stores emit: whole seconds, millis, and micros with the trailing
+   zero trimmed (.06645) or kept (.066460). As strings these do not sort in
+   time order, because '.' and the digits sort before 'Z'."
+  (mapv (fn [[vid lu]]
+          {:resourceType "Patient" :id "p1" :meta {:versionId vid :lastUpdated lu}})
+        [["6" "2026-10-01T13:44:27.1Z"]
+         ["5" "2026-10-01T13:44:26.066460Z"]
+         ["4" "2026-10-01T13:44:26.06645Z"]
+         ["3" "2026-10-01T13:44:26.066Z"]
+         ["2" "2026-10-01T13:44:26Z"]
+         ["1" "2026-10-01T13:44:25Z"]]))
+
+(defn- history-stub-store
+  "A store answering instance history with `versions`, and type history with
+   `versions` re-typed to the requested type while recording the params it was
+   handed in `received`. Like the Datomic and mock stores, it does not apply
+   `_since` itself."
+  [versions received]
+  (reify db/IFHIRStore
+    (history [_ _tenant _rt _id] versions)
+    (history-type [_ _tenant rt params]
+      (swap! received conj params)
+      (mapv #(assoc % :resourceType (name rt)) versions))))
+
+(defn- version-ids [resp]
+  (mapv #(get-in % [:resource :meta :versionId]) (get-in resp [:body :entry])))
+
+(deftest history-instance-since-compares-instants-not-strings
+  (let [store (history-stub-store mixed-precision-versions (atom []))
+        since (fn [v]
+                (let [resp (handlers/history-instance
+                            (base-request store :id "p1" :params {"_since" v}))]
+                  (is (= 200 (:status resp)) v)
+                  (version-ids resp)))]
+    (testing "whole seconds: the version at _since is kept, and so are the later fractional ones"
+      (is (= ["6" "5" "4" "3" "2"] (since "2026-10-01T13:44:26Z"))))
+    (testing "millis: the whole-second version just before it is dropped"
+      (is (= ["6" "5" "4" "3"] (since "2026-10-01T13:44:26.066Z"))))
+    (testing "micros name the same instant with the trailing zero trimmed or kept"
+      (is (= ["6" "5" "4"] (since "2026-10-01T13:44:26.06645Z")))
+      (is (= ["6" "5" "4"] (since "2026-10-01T13:44:26.066450Z"))))
+    (testing "an offset is another spelling of the same instant"
+      (is (= ["6" "5" "4" "3" "2"] (since "2026-10-01T09:44:26-04:00")))
+      (is (= ["6" "5" "4"] (since "2026-10-01T15:44:26.06645+02:00"))))
+    (testing "a date starts at UTC midnight"
+      (is (= ["6" "5" "4" "3" "2" "1"] (since "2026-10-01")))
+      (is (= [] (since "2026-10-02"))))
+    (testing "a blank _since is absent"
+      (is (= ["6" "5" "4" "3" "2" "1"] (since ""))))
+    (testing "the keyword spelling is read too"
+      (is (= ["6" "5" "4"]
+             (version-ids (handlers/history-instance
+                           (base-request store :id "p1"
+                                         :params {:_since "2026-10-01T13:44:26.06645Z"}))))))))
+
+(deftest history-instance-since-pages-over-the-kept-versions
+  (let [store (history-stub-store mixed-precision-versions (atom []))
+        resp  (handlers/history-instance
+               (base-request store :id "p1"
+                             :params {"_since" "2026-10-01T09:44:26.066-04:00" "_count" "2"}))
+        links (into {} (map (juxt :relation :url)) (get-in resp [:body :link]))]
+    (is (= 4 (get-in resp [:body :total])))
+    (is (= ["6" "5"] (version-ids resp)))
+    (testing "paging links keep the filter, as the instant it was read as"
+      (is (= "/default/fhir/Patient/p1/_history?_count=2&_skip=2&_since=2026-10-01T13:44:26.066Z"
+             (get links "next")))
+      (is (= "/default/fhir/Patient/p1/_history?_count=2&_skip=0&_since=2026-10-01T13:44:26.066Z"
+             (get links "self"))))))
+
+(deftest history-instance-since-reads-instant-last-updated
+  (testing "the mock store stamps lastUpdated as an Instant, not a string"
+    (let [store  (make-store)
+          id     (get-in (create-patient! store) [:body :id])
+          _      (handlers/update-resource
+                  (base-request store :id id :body {:resourceType "Patient" :id id :gender "male"}))
+          v2     (->> (db/history store tenant :Patient id)
+                      (filter #(= "2" (get-in % [:meta :versionId])))
+                      first)
+          ^java.time.Instant t2 (get-in v2 [:meta :lastUpdated])
+          since  (fn [v] (set (version-ids (handlers/history-instance
+                                            (base-request store :id id :params {"_since" v})))))]
+      (is (instance? java.time.Instant t2))
+      (is (= #{"2"} (since (str t2))))
+      (is (= #{} (since (str (.plusNanos t2 1000))))))))
+
+(deftest history-since-unparseable-is-400
+  (let [store    (history-stub-store mixed-precision-versions (atom []))
+        handlers {"instance" #(handlers/history-instance (base-request store :id "p1" :params %))
+                  "type"     #(handlers/history-type (base-request store :params %))
+                  "system"   #(handlers/system-history
+                               (assoc (base-request store :params %)
+                                      :fhir/all-registries {"Patient" {}}))}]
+    (doseq [[level handler] handlers
+            bad ["yesterday"
+                 "2026-10-01T13:44:26"
+                 "2026-02-30T00:00:00Z"
+                 "2026-10-01T25:00:00Z"]]
+      (testing (str level " history, _since=" bad)
+        (let [resp (handler {"_since" bad})]
+          (is (= 400 (:status resp)))
+          (is (= "OperationOutcome" (get-in resp [:body :resourceType])))
+          (is (= "invalid" (get-in resp [:body :issue 0 :code])))
+          (is (clojure.string/includes? (get-in resp [:body :issue 0 :diagnostics]) "_since")))))))
+
+(deftest history-type-since-compares-instants
+  (let [received (atom [])
+        store    (history-stub-store mixed-precision-versions received)
+        resp     (handlers/history-type
+                  (base-request store :params {"_since" "2026-10-01T09:44:26.066-04:00"}))]
+    (is (= 200 (:status resp)))
+    (is (= ["6" "5" "4" "3"] (version-ids resp)))
+    (is (= 4 (get-in resp [:body :total])))
+    (testing "the store is handed the parsed instant, so one rule reads _since"
+      (is (= (java.time.Instant/parse "2026-10-01T13:44:26.066Z")
+             (get (first @received) "_since"))))
+    (testing "no _since leaves every version and hands the store none"
+      (reset! received [])
+      (is (= ["6" "5" "4" "3" "2" "1"]
+             (version-ids (handlers/history-type (base-request store)))))
+      (is (not (contains? (first @received) "_since"))))))
+
+(deftest system-history-since-compares-instants
+  (let [received (atom [])
+        store    (history-stub-store mixed-precision-versions received)
+        resp     (handlers/system-history
+                  (assoc (base-request store :params {"_since" "2026-10-01T13:44:26.06645Z"})
+                         :fhir/all-registries {"Patient" {} "Observation" {}}))]
+    (is (= 200 (:status resp)))
+    (is (= 6 (get-in resp [:body :total])))
+    (is (= {"Patient" ["6" "5" "4"] "Observation" ["6" "5" "4"]}
+           (update-vals (group-by #(get-in % [:resource :resourceType]) (get-in resp [:body :entry]))
+                        #(mapv (fn [e] (get-in e [:resource :meta :versionId])) %))))
+    (is (every? #(= (java.time.Instant/parse "2026-10-01T13:44:26.06645Z") (get % "_since"))
+                @received))))
+
+;; ---------------------------------------------------------------------------
 ;; compartment-search (GET /:compartment-type/:id/:target-type)
 ;; ---------------------------------------------------------------------------
 
@@ -825,6 +966,21 @@
       (is (= "W/\"1\"" (get-in resolved [:request :ifMatch]))
           "anchored to the version just read")
       (is (= "female" (:gender (:resource resolved)))))))
+
+(deftest a-decimal-in-a-binary-patch-document-keeps-its-scale
+  (let [store (make-store)
+        [id _] (seed-patient! store)
+        ops-json (str "[{\"op\":\"add\",\"path\":\"/extension\",\"value\":"
+                      "[{\"url\":\"http://example.org/weight\",\"valueDecimal\":80.50}]}]")
+        entry {:resource {:resourceType "Binary"
+                          :contentType "application/json-patch+json"
+                          :data (base64 ops-json)}
+               :request {:method "PATCH" :url (str resource-type "/" id)}}
+        resolved (#'handlers/resolve-patch-entry store tenant entry)
+        value (get-in resolved [:resource :extension 0 :valueDecimal])]
+    (is (instance? BigDecimal value) (pr-str value))
+    (is (= 80.50M value))
+    (is (= 2 (.scale ^BigDecimal value)))))
 
 (deftest a-client-supplied-guard-on-a-patch-entry-is-not-replaced
   (testing "a stale guard the client sent is refused, not swapped for the

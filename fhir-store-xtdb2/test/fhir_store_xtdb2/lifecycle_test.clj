@@ -349,9 +349,13 @@
           updated (db/update-resource store tenant :Patient "p1" {:active false})
           resp (db/transact-transaction
                 store tenant
-                [{:request {:method "PUT" :url "Patient/p2"} :resource {:active true}}])]
-      (is (= {:active true :id "p1" :meta {:versionId "1"}} created))
-      (is (= {:active false :id "p1" :meta {:versionId "2"}} updated))
+                [{:request {:method "PUT" :url "Patient/p2"} :resource {:active true}}])
+          last-updated (fn [vid] (get-in (db/vread-resource store tenant :Patient "p1" vid)
+                                         [:meta :lastUpdated]))]
+      (is (= {:active true :id "p1" :meta {:versionId "1" :lastUpdated (last-updated "1")}}
+             created))
+      (is (= {:active false :id "p1" :meta {:versionId "2" :lastUpdated (last-updated "2")}}
+             updated))
       (is (= true (get-in resp [:entry 0 :resource :active])))
       (is (nil? (get-in resp [:entry 0 :resource :language])))
       (is (= false (:active (db/read-resource store tenant :Patient "p1")))))))

@@ -2,11 +2,14 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [malli.core :as m]
+            [malli.experimental.time :as met]
             [xtdb.api :as xt]
             [xtdb.node :as xtn]
             [fhir-store-xtdb2.core :as core-db]
             [fhir-store.protocol :as db]
-            [com.breezeehr.fhir-primitives :as fp]))
+            [com.breezeehr.fhir-primitives :as fp]
+            [com.breezeehr.fhir-json-transform :as fjt])
+  (:import [java.time ZonedDateTime]))
 
 (defn- close-store-nodes!
   "Closes all tenant pools + nodes in a store's nodes atom."
@@ -51,26 +54,23 @@
 
         ;; Test update and history
         (println "Updating resource...")
-        (let [time-before-update (str (java.time.Instant/now))]
-          (Thread/sleep 10) ;; Ensure time progresses
-          (db/update-resource store tenant-id :Patient "123" (assoc patient-doc :active false))
+        (db/update-resource store tenant-id :Patient "123" (assoc patient-doc :active false))
 
-          (println "Testing history...")
-          (let [hist (db/history store tenant-id :Patient "123")]
-            (is (= 2 (count hist)))
-            ;; History contains both the original and updated versions
-            (let [active-versions (filter :active hist)
-                  inactive-versions (remove :active hist)]
-              (is (= 1 (count active-versions)))
-              (is (= 1 (count inactive-versions)))))
+        (println "Testing history...")
+        (let [hist (db/history store tenant-id :Patient "123")]
+          (is (= 2 (count hist)))
+          ;; History contains both the original and updated versions
+          (let [active-versions (filter :active hist)
+                inactive-versions (remove :active hist)]
+            (is (= 1 (count active-versions)))
+            (is (= 1 (count inactive-versions)))))
 
-          ;; Test vread
-          ;; We captured time-before-update, so vread should return the active version
-          (println "Testing vread...")
-          (let [vread-res (db/vread-resource store tenant-id :Patient "123" time-before-update)]
-            (println "Done testing vread.")
-            (is (some? vread-res))
-            (is (= true (:active vread-res)))))
+        ;; Test vread: version 1 is the active version written before the update
+        (println "Testing vread...")
+        (let [vread-res (db/vread-resource store tenant-id :Patient "123" "1")]
+          (println "Done testing vread.")
+          (is (some? vread-res))
+          (is (= true (:active vread-res))))
         (finally
           (close-store-nodes! store))))))
 
@@ -703,38 +703,110 @@
           patient {:resourceType "Patient" :active true :name [{"family" "Stamp"}]}]
       (try
         (db/create-resource store tenant-id :Patient "lu1" patient)
-        (let [time-before-update (str (java.time.Instant/now))]
-          (Thread/sleep 10)
-          (db/update-resource store tenant-id :Patient "lu1" (assoc patient :active false))
+        (db/update-resource store tenant-id :Patient "lu1" (assoc patient :active false))
 
-          (testing "read"
-            (let [res (db/read-resource store tenant-id :Patient "lu1")]
-              (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
+        (testing "read"
+          (let [res (db/read-resource store tenant-id :Patient "lu1")]
+            (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
 
-          (testing "vread"
-            (let [res (db/vread-resource store tenant-id :Patient "lu1" time-before-update)]
-              (is (some? res))
-              (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
+        (testing "vread"
+          (let [res (db/vread-resource store tenant-id :Patient "lu1" "1")]
+            (is (some? res))
+            (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
 
-          (testing "search without sort (single SELECT branch)"
-            (let [res (db/search store tenant-id :Patient {:active false} nil)]
-              (is (= 1 (count res)))
-              (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
+        (testing "search without sort (single SELECT branch)"
+          (let [res (db/search store tenant-id :Patient {:active false} nil)]
+            (is (= 1 (count res)))
+            (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
 
-          (testing "search with sort (two-phase fetch-by-ids branch)"
-            (let [res (db/search store tenant-id :Patient {"_sort" "_id"} nil)]
-              (is (= 1 (count res)))
-              (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
+        (testing "search with sort (two-phase fetch-by-ids branch)"
+          (let [res (db/search store tenant-id :Patient {"_sort" "_id"} nil)]
+            (is (= 1 (count res)))
+            (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
 
-          (testing "instance history"
-            (let [hist (db/history store tenant-id :Patient "lu1")]
-              (is (= 2 (count hist)))
-              (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
+        (testing "instance history"
+          (let [hist (db/history store tenant-id :Patient "lu1")]
+            (is (= 2 (count hist)))
+            (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
 
-          (testing "type history"
-            (let [hist (db/history-type store tenant-id :Patient {})]
-              (is (= 2 (count hist)))
-              (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist)))))
+        (testing "type history"
+          (let [hist (db/history-type store tenant-id :Patient {})]
+            (is (= 2 (count hist)))
+            (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
+        (finally
+          (close-store-nodes! store))))))
+
+(def ^:private fhir-instant-schema
+  "FHIR `instant` as the generated resource schemas declare it
+   (`fhir-defintions-to-malli`), and so as fhir-server's response coercion
+   reads `meta.lastUpdated` on a single-resource response."
+  (m/schema [:or {:fhir/primitive "instant"} :time/offset-date-time :time/instant]
+            {:registry (merge (m/default-schemas) (met/schemas))}))
+
+(defn- as-a-read-answers
+  "`s` as fhir-server answers it on a read: its response coercion decodes the
+   body with the FHIR JSON transformer and encodes it again. A history or
+   search Bundle's entries are not re-rendered."
+  [s]
+  (let [t (fjt/fhir-json-transformer)]
+    (m/encode fhir-instant-schema (m/decode fhir-instant-schema s t) t)))
+
+(deftest last-updated-is-the-string-a-read-answers
+  (testing "every precision a system time can have: the store's lastUpdated is already
+            the string a read answers for it, so a read and a history or search entry
+            report one string for one version"
+    (doseq [[label system-from expected]
+            [["microseconds ending in zero" "2026-10-01T13:44:26.066450Z[UTC]"
+              "2026-10-01T13:44:26.06645Z"]
+             ["milliseconds only" "2026-10-01T13:44:26.120Z[UTC]" "2026-10-01T13:44:26.12Z"]
+             ["a whole second" "2026-10-01T13:44:26Z[UTC]" "2026-10-01T13:44:26Z"]
+             ["six significant digits" "2026-10-01T13:44:26.066451Z[UTC]"
+              "2026-10-01T13:44:26.066451Z"]]]
+      (let [row {:xt/id "p1" :resourcetype "Patient" :fhir_version "1"
+                 :xt/system_from (ZonedDateTime/parse system-from)}
+            last-updated (get-in (#'core-db/xtdb->fhir row {:default identity})
+                                 [:meta :lastUpdated])]
+        (is (= expected last-updated) label)
+        (is (= last-updated (as-a-read-answers last-updated)) label)))))
+
+(deftest a-write-answers-the-last-updated-its-version-is-read-with
+  (testing "create, update, a valid-time put and a transaction PUT each answer the
+            lastUpdated read, vread and history report for the version they committed:
+            not the caller's own meta, and not a clock read before the commit"
+    (let [store (core-db/create-xtdb-store {})
+          tenant-id "tenant-lastupdated-writes"
+          stale "2001-01-01T00:00:00Z"
+          patient {:resourceType "Patient" :active true :name [{"family" "Stamp"}]
+                   :meta {:lastUpdated stale}}
+          reported (fn [id vid]
+                     (into #{(get-in (db/vread-resource store tenant-id :Patient id vid)
+                                     [:meta :lastUpdated])}
+                           (keep #(when (= vid (get-in % [:meta :versionId]))
+                                    (get-in % [:meta :lastUpdated])))
+                           (db/history store tenant-id :Patient id)))
+          check (fn [label id written]
+                  (let [vid (get-in written [:meta :versionId])
+                        last-updated (get-in written [:meta :lastUpdated])]
+                    (is (not= stale last-updated) label)
+                    (is (= #{last-updated} (reported id vid)) label)
+                    (is (= last-updated (get-in (db/read-resource store tenant-id :Patient id)
+                                                [:meta :lastUpdated]))
+                        label)))]
+      (try
+        (check "create" "w1" (db/create-resource store tenant-id :Patient "w1" patient))
+        (check "update" "w1" (db/update-resource store tenant-id :Patient "w1"
+                                                 (assoc patient :active false)))
+        (check "a valid-time put" "w1"
+               (db/put-valid-time store tenant-id :Patient "w1" patient
+                                  {:valid-from (java.time.Instant/parse "2026-01-01T00:00:00Z")}))
+        (let [bundle (db/transact-transaction store tenant-id
+                                              [{:request {:method "PUT" :url "Patient/w2"}
+                                                :resource patient}])
+              entry (first (:entry bundle))]
+          (check "a transaction PUT" "w2" (:resource entry))
+          (is (= (get-in entry [:resource :meta :lastUpdated])
+                 (get-in entry [:response :lastModified]))
+              "and its response.lastModified"))
         (finally
           (close-store-nodes! store))))))
 

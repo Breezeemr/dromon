@@ -492,6 +492,37 @@
              :url (str resource-type "/" (:id res))}
    :response {:status "200"}})
 
+(defn- parse-since
+  "`_since` of a history request: {:since <Instant or nil>}, or {:error <400>}
+   when the value names no point in time."
+  [params]
+  (let [parsed (tmp/parse-since params)]
+    (if (contains? parsed :invalid)
+      {:error (invalid-param-response "_since" (:invalid parsed)
+                                      tmp/temporal-value-expectation)}
+      parsed)))
+
+(defn- versions-since
+  "The versions created at or after `since` (FHIR `_since` includes the
+   instant itself), or all of them when `since` is nil. A version with no
+   readable lastUpdated cannot be shown to qualify and is left out."
+  [^java.time.Instant since versions]
+  (if since
+    (filterv (fn [v]
+               (when-let [t (tmp/last-updated v)]
+                 (not (.isBefore ^java.time.Instant t since))))
+             versions)
+    (vec versions)))
+
+(defn- with-parsed-since
+  "`params` carrying `_since` as the Instant the server read it as. A store that
+   applies `_since` itself (xtdb2 binds it as a system-time bound) then filters
+   on the same instant rather than re-reading the raw string by its own rules.
+   Stores that ignore the parameter are covered by `versions-since`."
+  [params since]
+  (cond-> (dissoc params "_since" :_since)
+    since (assoc "_since" since)))
+
 (defn history-instance
   "Handler for GET /[type]/:id/_history RESTful interaction."
   [req]
@@ -503,26 +534,26 @@
         count-param (or (get params "_count") (get params :_count) "50")
         skip-param (or (get params "_skip") (get params :_skip) "0")
         limit (parse-non-negative-int "_count" (str count-param))
-        skip (parse-non-negative-int "_skip" (str skip-param))]
-    (if-let [err (or (:error limit) (:error skip))]
+        skip (parse-non-negative-int "_skip" (str skip-param))
+        since-param (parse-since params)]
+    (if-let [err (or (:error limit) (:error skip) (:error since-param))]
       err
-      (let [since (or (get params "_since") (get params :_since))
-        raw-results (db/history store tenant-id (keyword resource-type) id)
-        all-results (if since
-                      (filterv (fn [r]
-                                 (when-let [lu (get-in r [:meta :lastUpdated])]
-                                   (pos? (compare (str lu) since))))
-                               raw-results)
-                      raw-results)
+      (let [since (:since since-param)
+        all-results (versions-since since (db/history store tenant-id (keyword resource-type) id))
         total (count all-results)
         results (->> all-results (drop skip) (take limit) vec)
         entries (mapv (partial history-entry tenant-id resource-type) results)
         base-url (str "/" tenant-id "/fhir/" resource-type "/" id "/_history")
-        self-link {:relation "self" :url (str base-url "?_count=" limit "&_skip=" skip)}
+        ;; The Instant's own rendering is UTC and needs no URL encoding; the
+        ;; raw value could carry a '+' offset, which a query string reads as a space.
+        page-url (fn [skip]
+                   (str base-url "?_count=" limit "&_skip=" skip
+                        (when since (str "&_since=" since))))
+        self-link {:relation "self" :url (page-url skip)}
         next-link (when (< (+ skip limit) total)
-                    {:relation "next" :url (str base-url "?_count=" limit "&_skip=" (+ skip limit))})
+                    {:relation "next" :url (page-url (+ skip limit))})
         prev-link (when (> skip 0)
-                    {:relation "previous" :url (str base-url "?_count=" limit "&_skip=" (max 0 (- skip limit)))})
+                    {:relation "previous" :url (page-url (max 0 (- skip limit)))})
         links (filterv some? [self-link next-link prev-link])]
     {:status 200
      :body {:resourceType "Bundle"
@@ -538,13 +569,16 @@
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
         params (or (:query-params req) {})
-        results (db/history-type store tenant-id (keyword resource-type) params)
-        entries (mapv (partial history-entry tenant-id resource-type) results)]
-    {:status 200
-     :body {:resourceType "Bundle"
-            :type "history"
-            :total (count results)
-            :entry entries}}))
+        {:keys [since error]} (parse-since params)]
+    (or error
+        (let [results (versions-since since (db/history-type store tenant-id (keyword resource-type)
+                                                             (with-parsed-since params since)))
+              entries (mapv (partial history-entry tenant-id resource-type) results)]
+          {:status 200
+           :body {:resourceType "Bundle"
+                  :type "history"
+                  :total (count results)
+                  :entry entries}}))))
 
 (defn- parse-query-string
   "Parse a URL query string into a map of string key-value pairs."
@@ -1525,24 +1559,27 @@
         tenant-id (-> req :path-params :tenant-id)
         all-registries (:fhir/all-registries req)
         params (or (:query-params req) {})
-        types (keys all-registries)
-        all-entries (vec
-                      (mapcat
-                        (fn [resource-type]
-                          (let [results (db/history-type store tenant-id (keyword resource-type) params)]
-                            (mapv (fn [res]
-                                    {:fullUrl (str "/" tenant-id "/fhir/" (or (:resourceType res) resource-type) "/" (:id res))
-                                     :resource res
-                                     :request {:method "PUT"
-                                               :url (str (or (:resourceType res) resource-type) "/" (:id res))}
-                                     :response {:status "200"}})
-                                  results)))
-                        types))]
-    {:status 200
-     :body {:resourceType "Bundle"
-            :type "history"
-            :total (count all-entries)
-            :entry all-entries}}))
+        {:keys [since error]} (parse-since params)
+        types (keys all-registries)]
+    (or error
+        (let [type-params (with-parsed-since params since)
+              all-entries (vec
+                            (mapcat
+                              (fn [resource-type]
+                                (let [results (versions-since since (db/history-type store tenant-id (keyword resource-type) type-params))]
+                                  (mapv (fn [res]
+                                          {:fullUrl (str "/" tenant-id "/fhir/" (or (:resourceType res) resource-type) "/" (:id res))
+                                           :resource res
+                                           :request {:method "PUT"
+                                                     :url (str (or (:resourceType res) resource-type) "/" (:id res))}
+                                           :response {:status "200"}})
+                                        results)))
+                              types))]
+          {:status 200
+           :body {:resourceType "Bundle"
+                  :type "history"
+                  :total (count all-entries)
+                  :entry all-entries}}))))
 
 (defn system-search
   "Handler for GET|POST /_search — search across every resource type.
@@ -1763,6 +1800,13 @@
 
 (def ^:private json-patch-media-type "application/json-patch+json")
 
+(def ^:private patch-document-mapper
+  "Decodes a patch document the way the router decodes an
+   `application/json-patch+json` body (`server.router/java-time-decode-mapper`,
+   which this namespace cannot require): keyword keys, and decimals as
+   BigDecimal so a FHIR decimal keeps its scale."
+  (json/object-mapper {:decode-key-fn keyword :bigdecimals true}))
+
 (defn- decode-patch-document
   "The JSON Patch operations a Bundle PATCH entry carries.
 
@@ -1784,7 +1828,7 @@
       (let [decoded (String. (.decode (java.util.Base64/getDecoder)
                                       ^String (:data resource))
                              java.nio.charset.StandardCharsets/UTF_8)
-            ops (json/read-value decoded (json/object-mapper {:decode-key-fn keyword}))]
+            ops (json/read-value decoded patch-document-mapper)]
         (when (sequential? ops) (vec ops)))
       (catch Exception _ nil))
 

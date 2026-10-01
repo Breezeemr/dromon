@@ -38,7 +38,7 @@
    canonical when that IG exists."
   "https://breezeehr.com/fhir/StructureDefinition/purser-")
 
-(defn- parse-temporal-value
+(defn parse-temporal-value
   "Coerce a FHIR instant / dateTime / date string to an Instant, or nil when it
    is not a recognizable point in time. A date-only value means start of that
    day in UTC. Normalizing to one type keeps a single, proven binding path into
@@ -50,8 +50,40 @@
         (try (-> (LocalDate/parse v) (.atStartOfDay ZoneOffset/UTC) .toInstant)
              (catch Exception _ nil)))))
 
+(def temporal-value-expectation
+  "What `parse-temporal-value` accepts, for the diagnostics of a refused value."
+  "expected a FHIR instant, dateTime, or date (e.g. 2026-09-30T00:00:00Z or 2026-09-30).")
+
 (defn- param-value [params k]
   (or (get params k) (get params (keyword k))))
+
+(defn parse-since
+  "Reads `_since` (history, bulk export) out of `params`.
+
+   Returns {:since <Instant>}, {:since nil} when the parameter is absent or
+   blank, or {:invalid <raw value>} when it names no point in time. Callers
+   refuse the last: dropping the filter would answer a wider question than the
+   one asked."
+  [params]
+  (let [raw (param-value params "_since")]
+    (cond
+      (instance? Instant raw) {:since raw}
+      (or (nil? raw) (and (string? raw) (str/blank? raw))) {:since nil}
+      :else (if-let [t (when (string? raw) (parse-temporal-value raw))]
+              {:since t}
+              {:invalid raw}))))
+
+(defn last-updated
+  "`meta.lastUpdated` of `resource` as an Instant, or nil when absent or
+   unreadable. Stores hand it back as an Instant, an OffsetDateTime or a FHIR
+   instant string whose fractional digits vary by store and value, so it is
+   never compared as a string: \"...26.5Z\" sorts before \"...26Z\"."
+  [resource]
+  (let [lu (get-in resource [:meta :lastUpdated])]
+    (cond
+      (instance? Instant lu)        lu
+      (instance? OffsetDateTime lu) (.toInstant ^OffsetDateTime lu)
+      (string? lu)                  (parse-temporal-value lu))))
 
 (defn requested?
   "True when the request carries any temporal selector."
@@ -76,9 +108,8 @@
                           :issue [{:severity "error"
                                    :code "invalid"
                                    :diagnostics
-                                   (str "Invalid value for " pname ": '" raw
-                                        "' — expected a FHIR instant, dateTime, or date "
-                                        "(e.g. 2026-09-30T00:00:00Z or 2026-09-30).")}]}}}))
+                                   (str "Invalid value for " pname ": '" raw "' — "
+                                        temporal-value-expectation)}]}}}))
        acc))
    {:basis nil}
    sr/temporal-params))
