@@ -18,6 +18,7 @@
   (:import [java.sql SQLException]
            [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime LocalTime Year YearMonth]
            [com.zaxxer.hikari HikariConfig HikariDataSource SQLExceptionOverride SQLExceptionOverride$Override]
+           [org.postgresql.util PSQLException]
            [xtdb.api DataSource$ConnectionBuilder]))
 
 (defn- method-order
@@ -1455,14 +1456,27 @@
       (unwrap [_ iface] (.unwrap node iface))
       (isWrapperFor [_ iface] (.isWrapperFor node iface)))))
 
-(def ^:private keep-connection-on-stale-plan
-  "Hikari evicts a connection on SQLSTATE 0A000, but a stale plan refuses one
-   statement on a healthy connection. Evicting it also hides the refusal: xt/q
-   then runs ROLLBACK on the closed connection, and \"Connection is closed\" is
-   all that reaches the caller."
+(defn ^:no-doc statement-refusal?
+  "True when `e` is SQLSTATE 0A000 sent by the XTDB server. pgwire sends it
+   for a stale plan and for every `unsupported` anomaly: an SQL feature it
+   lacks, a parameter type it cannot read. Either way it answers one statement
+   and keeps serving the connection: the error goes out as an ErrorResponse,
+   messages are skipped until Sync, and an open transaction is marked failed
+   for the caller's ROLLBACK. A 0A000 that pgjdbc raises itself carries no
+   server message and is left to Hikari."
+  [^SQLException e]
+  (and (instance? PSQLException e)
+       (= "0A000" (.getSQLState e))
+       (some? (.getServerErrorMessage ^PSQLException e))))
+
+(def ^:private keep-connection-on-statement-refusal
+  "Hikari evicts a connection on SQLSTATE 0A000, but XTDB sends it to refuse
+   one statement on a healthy connection (see statement-refusal?). Evicting it
+   also hides the refusal: xt/q then runs ROLLBACK on the closed connection,
+   and \"Connection is closed\" is all that reaches the caller."
   (reify SQLExceptionOverride
     (adjudicate [_ e]
-      (if (stale-plan? e)
+      (if (statement-refusal? e)
         SQLExceptionOverride$Override/DO_NOT_EVICT
         SQLExceptionOverride$Override/CONTINUE_EVICT))))
 
@@ -1473,7 +1487,7 @@
         (merge default-pool-opts pool-opts)
         cfg (doto (HikariConfig.)
               (.setDataSource (connection-source node prepare-threshold))
-              (.setExceptionOverride keep-connection-on-stale-plan)
+              (.setExceptionOverride keep-connection-on-statement-refusal)
               (.setMaximumPoolSize (int max-size))
               (.setMinimumIdle (int min-idle))
               (.setConnectionTimeout (long connection-timeout-ms))

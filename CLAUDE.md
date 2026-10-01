@@ -247,6 +247,11 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   `Connection is closed`. The store's pool sets `prepareThreshold=0` and keeps
   the connection, and `run-query` re-runs the read: Parse and Bind each open
   the latest snapshot, so a write landing between them still trips it.
+- Every `unsupported` anomaly is also SQLSTATE 0A000: an SQL feature pgwire
+  lacks (`WITH RECURSIVE`), a parameter type it cannot read (a bound
+  `OffsetTime`; verified on 2.2.0-beta3). pgwire refuses that one statement
+  and keeps serving the connection, so the pool keeps any 0A000 the server
+  sent (`statement-refusal?`). A 0A000 pgjdbc raises itself is left to Hikari.
 
 ### Transaction metadata (`:tx-metadata`)
 
