@@ -79,20 +79,18 @@
           patient {:resourceType "Patient" :active true :name [{"family" "H"}]}]
       (try
         (db/create-resource store tenant :Patient "h1" patient)
-        (let [time-before (str (java.time.Instant/now))]
-          (Thread/sleep 10)
-          (db/update-resource store tenant :Patient "h1" (assoc patient :active false))
+        (db/update-resource store tenant :Patient "h1" (assoc patient :active false))
 
-          (testing "history returns both versions"
-            (let [versions (db/history store tenant :Patient "h1")]
-              (is (= 2 (count versions)))
-              (is (every? valid-last-updated? versions))))
+        (testing "history returns both versions"
+          (let [versions (db/history store tenant :Patient "h1")]
+            (is (= 2 (count versions)))
+            (is (every? valid-last-updated? versions))))
 
-          (testing "vread returns the earlier version"
-            (let [v (db/vread-resource store tenant :Patient "h1" time-before)]
-              (is (some? v))
-              (is (= true (:active v)))
-              (is (valid-last-updated? v)))))
+        (testing "vread returns the earlier version"
+          (let [v (db/vread-resource store tenant :Patient "h1" "1")]
+            (is (some? v))
+            (is (= true (:active v)))
+            (is (valid-last-updated? v))))
 
         (testing "history-type returns rows"
           (let [rows (db/history-type store tenant :Patient {})]

@@ -15,11 +15,16 @@
   {:resourceType "OperationOutcome"
    :issue issues})
 
-(defn- error-response [status severity code diagnostics]
-  {:status status
-   :body (build-operation-outcome [{:severity severity
-                                    :code code
-                                    :diagnostics diagnostics}])})
+(defn- error-response
+  ([status severity code diagnostics]
+   (error-response status severity code diagnostics nil))
+  ([status severity code diagnostics {:keys [expression location]}]
+   {:status status
+    :body (build-operation-outcome [(cond-> {:severity severity
+                                             :code code
+                                             :diagnostics diagnostics}
+                                      (seq expression) (assoc :expression (vec expression))
+                                      (seq location) (assoc :location (vec location)))])}))
 
 (defn- json-error-response
   "Returns an error response with body pre-serialized to a JSON InputStream.
@@ -44,7 +49,11 @@
       :else (recur (.getCause x)))))
 
 (defn wrap-fhir-exceptions
-  "Middleware that catches exceptions and formats them into FHIR OperationOutcomes."
+  "Middleware that catches exceptions and formats them into FHIR OperationOutcomes.
+   An ex-info carrying `:fhir/status` sets the status and `:fhir/code` the
+   issue code; a `:fhir/expression` vector of element paths becomes the
+   issue's `expression`, and a `:fhir/location` vector (`http.<param>` for an
+   HTTP parameter, per FHIR) its `location`."
   [handler]
   (fn [request]
     (try
@@ -63,7 +72,9 @@
             (error-response 500 "fatal" "exception" (str "Response validation failed: " (pr-str (:errors data))))
 
             fhir-data
-            (error-response (:fhir/status fhir-data) "error" (:fhir/code fhir-data "processing") msg)
+            (error-response (:fhir/status fhir-data) "error" (:fhir/code fhir-data "processing") msg
+                            {:expression (:fhir/expression fhir-data)
+                             :location   (:fhir/location fhir-data)})
 
             :else
             (error-response 400 "error" "processing" msg))))

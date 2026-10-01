@@ -364,14 +364,42 @@
                   ;; Last resort
                   [{:col path :fhir-type nil :array? false}])))))))))
 
+(def ^:private any-resource-roots
+  "Leading segments that apply to every resource type (Resource.id,
+   Resource.meta.lastUpdated, DomainResource.text)."
+  #{"Resource" "DomainResource"})
+
+(defn- foreign-alternative?
+  "True when one `|` alternative of an expression is rooted at a resource
+   type other than `resource-type`: its leading segment, past any opening
+   parenthesis, is a capitalised name (FHIRPath element names are lower
+   camel case, type names upper) that is neither `resource-type` nor a
+   Resource / DomainResource root. A nil `resource-type` keeps everything."
+  [alternative resource-type]
+  (when resource-type
+    (when-let [root (second (re-find #"^[\s(]*([A-Za-z][A-Za-z0-9]*)" alternative))]
+      (and (Character/isUpperCase (.charAt ^String root 0))
+           (not= root resource-type)
+           (not (contains? any-resource-roots root))))))
+
 (defn- resolve-search-param-expression
   "Resolves a SearchParameter's expression into column descriptors.
-   Handles pipe-delimited alternatives (e.g. 'Location.name|Location.alias')."
-  [expression field-map search-type]
-  (when expression
-    (let [alternatives (str/split expression #"\|(?![^(]*\))")
-          columns (into [] (mapcat #(resolve-expression % field-map search-type)) alternatives)]
-      (vec (distinct columns)))))
+   Handles pipe-delimited alternatives (e.g. 'Location.name|Location.alias').
+
+   Shared SearchParameters (clinical-identifier, clinical-patient,
+   clinical-encounter, clinical-code, clinical-date, ...) list one path per
+   base type: 'Observation.identifier | DocumentReference.masterIdentifier'.
+   Alternatives rooted at another type are dropped before resolving; stripping
+   their prefix instead would turn `DocumentReference.masterIdentifier` into a
+   `masterIdentifier` column of Observation, which no Observation has."
+  ([expression field-map search-type]
+   (resolve-search-param-expression expression field-map search-type nil))
+  ([expression field-map search-type resource-type]
+   (when expression
+     (let [alternatives (->> (str/split expression #"\|(?![^(]*\))")
+                             (remove #(foreign-alternative? % resource-type)))
+           columns (into [] (mapcat #(resolve-expression % field-map search-type)) alternatives)]
+       (vec (distinct columns))))))
 
 ;; ---------------------------------------------------------------------------
 ;; SearchParameter resource loading from classpath
@@ -408,8 +436,181 @@
         (into {} (remove (fn [[k _]] (-> k name (.startsWith "_")))) m)))))
 
 ;; ---------------------------------------------------------------------------
+;; Presence parameters: `X.exists() and X != false`
+;; ---------------------------------------------------------------------------
+
+(defn- parse-exists-not-false
+  "Returns the path X of an expression shaped `X.exists() and X != false`, or
+   nil. Patient.deceased is the R4B instance: its token is true when
+   deceasedBoolean is true or any deceasedDateTime is present, false
+   otherwise -- including when the element is absent."
+  [expression]
+  (when expression
+    (when-let [[_ path again] (re-matches #"\s*(\S+)\.exists\(\)\s+and\s+(\S+)\s*!=\s*false\s*"
+                                          expression)]
+      (when (= path again) path))))
+
+;; ---------------------------------------------------------------------------
+;; Composite parameters
+;; ---------------------------------------------------------------------------
+
+(def ^:private readable-fhir-types
+  "search type -> the FHIR types a value of that search type is evaluated
+   against. A composite component keeps only the columns its search type can
+   read, so no column is compared against the wrong kind of value."
+  {"token"     #{"CodeableConcept" "Coding" "Identifier" "code" "string" "uri"
+                 "id" "boolean" "canonical"}
+   "quantity"  #{"Quantity" "SimpleQuantity" "Age" "Count" "Distance" "Duration"}
+   "date"      #{"date" "dateTime" "instant" "Period"}
+   "string"    #{"string" "markdown"}
+   "reference" #{"Reference"}
+   "number"    #{"decimal" "integer" "positiveInt" "unsignedInt"}
+   "uri"       #{"uri" "url" "canonical"}})
+
+(def ^:private implied-search-type
+  "FHIR type -> the one search type that reads it. Types more than one search
+   type reads (string, uri, canonical) are absent."
+  (let [ambiguous #{"string" "uri" "canonical"}]
+    (into {}
+          (for [[search-type fhir-types] readable-fhir-types
+                fhir-type fhir-types
+                :when (not (ambiguous fhir-type))]
+            [fhir-type search-type]))))
+
+(defn- column-fhir-type
+  [col]
+  (if (:sub-col col) (:sub-fhir-type col) (:fhir-type col)))
+
+(defn- readable-column?
+  [search-type col]
+  (contains? (get readable-fhir-types search-type #{}) (column-fhir-type col)))
+
+(defn- split-alternatives
+  [expression]
+  (map str/trim (str/split expression #"\|(?![^(]*\))")))
+
+(defn- qualify-relative-expression
+  "Roots each `|` alternative of a component's relative expression
+   (`value.as(DateTime) | value.as(Period)`) at a placeholder segment.
+   resolve-expression strips an expression's leading segment as its resource
+   type, which would otherwise eat the component's own first segment."
+  [expression]
+  (str/join " | " (map #(str "Element." %) (split-alternatives expression))))
+
+(defn- unwrap-repeating
+  [schema]
+  (if (#{:sequential :maybe} (m/type schema))
+    (recur (first (m/children schema)))
+    schema))
+
+(defn- datatype-children
+  "Field map of the datatype a capability schema field references
+   (`ValueSet.useContext` -> UsageContext), or nil. Inline BackboneElements
+   already carry :children; a datatype is a :ref, which classification does
+   not follow."
+  [cap-schema field-name]
+  (try
+    (some (fn [[_ _ variant]]
+            (some (fn [[k _ field-schema]]
+                    (when (= field-name (name k))
+                      (let [inner (unwrap-repeating field-schema)]
+                        (when (= :ref (m/type inner))
+                          (extract-children-map (m/deref-all inner) 0)))))
+                  (m/children variant)))
+          (m/children cap-schema))
+    (catch Exception _ nil)))
+
+(defn- composite-scope
+  "The base one composite alternative evaluates its components against:
+   `Observation` is the resource itself (:element nil); `Observation.component`
+   is each element of that field. A deeper path is not resolved."
+  [alternative field-map cap-schema]
+  (let [segments (str/split alternative #"\.")]
+    (case (count segments)
+      1 {:element nil :field-map field-map}
+      2 (let [col (second segments)]
+          (when-let [info (get field-map col)]
+            {:element {:col col
+                       :fhir-type (:fhir-type info)
+                       :array? (:array? info false)}
+             :field-map (or (:children info)
+                            (when cap-schema (datatype-children cap-schema col))
+                            {})}))
+      nil)))
+
+(defn- resolve-composite-component
+  "{:type :columns [:target]} for one component, resolved against its scope's
+   field map, or nil. The expression is relative to the scope. The type is
+   the component's own SearchParameter's, unless that type can read none of
+   the columns and the columns' FHIR type implies exactly one other: R4B's
+   DocumentReference `relationship` pairs the reference definition with
+   `code` and the token definition with `target` (R5 pairs them the other way
+   round), and the expressions, not the definitions, say what is compared."
+  [{:keys [definition expression]} scope-field-map]
+  (let [component-sp (load-search-param-json definition)
+        declared-type (:type component-sp)
+        candidates (when (and declared-type expression)
+                     (resolve-search-param-expression
+                      (qualify-relative-expression expression)
+                      scope-field-map declared-type))
+        readable (filterv #(readable-column? declared-type %) candidates)
+        implied (distinct (map #(implied-search-type (column-fhir-type %)) candidates))
+        [sp-type columns] (cond
+                            (seq readable)
+                            [declared-type readable]
+
+                            (and (= 1 (count implied)) (first implied))
+                            [(first implied) (vec candidates)])]
+    (when (seq columns)
+      (cond-> {:type sp-type :columns columns}
+        (and (= sp-type declared-type) (seq (:target component-sp)))
+        (assoc :target (:target component-sp))))))
+
+(defn- resolve-composite
+  "The scopes of a composite SearchParameter: one per alternative of its
+   expression that is rooted at this type and whose every component resolves.
+   Returns a vector of {:element desc-or-nil :components [component ...]},
+   components in the SearchParameter's order (the order of the `$`-separated
+   value parts), or nil."
+  [full-sp field-map cap-schema resource-type]
+  (let [components (:component full-sp)
+        expression (:expression full-sp)]
+    (when (and expression (seq components))
+      (let [scopes (->> (split-alternatives expression)
+                        (remove #(foreign-alternative? % resource-type))
+                        (keep (fn [alternative]
+                                (when-let [{scope-fields :field-map :as scope}
+                                           (composite-scope alternative field-map cap-schema)]
+                                  (let [resolved (mapv #(resolve-composite-component % scope-fields)
+                                                       components)]
+                                    (when (every? some? resolved)
+                                      {:element (:element scope) :components resolved})))))
+                        distinct
+                        vec)]
+        (when (seq scopes) scopes)))))
+
+;; ---------------------------------------------------------------------------
 ;; Registry builder
 ;; ---------------------------------------------------------------------------
+
+(defn- resolve-param-entry
+  "The enriched registry entry for one SearchParameter, or nil when its
+   expression does not resolve."
+  [sp-type full-sp field-map cap-schema resource-type]
+  (let [expression (:expression full-sp)
+        target (:target full-sp)]
+    (if-let [present-path (parse-exists-not-false expression)]
+      (let [columns (resolve-search-param-expression present-path field-map sp-type
+                                                     resource-type)]
+        (when (and (seq columns) (every? :fhir-type columns))
+          {:type sp-type :target target :columns [] :exists-not-false columns}))
+      (if (= "composite" sp-type)
+        (when-let [scopes (resolve-composite full-sp field-map cap-schema resource-type)]
+          {:type sp-type :target target :columns [] :composite scopes})
+        (let [columns (resolve-search-param-expression expression field-map sp-type
+                                                       resource-type)]
+          (when (seq columns)
+            {:type sp-type :target target :columns columns}))))))
 
 (defn build-resource-registry
   "Builds a search registry for a single resource type.
@@ -419,34 +620,48 @@
    - cap-schema: compiled Malli :multi capability schema (for field type introspection)
 
    Returns a map of {param-name -> enriched-param} where enriched-param is:
-   {:type     \"token\"|\"reference\"|\"date\"|\"string\"
+   {:type     \"token\"|\"reference\"|\"date\"|\"string\"|\"quantity\"|\"composite\"
     :target   [\"Patient\"] or nil
     :columns  [{:col \"fieldName\" :fhir-type \"CodeableConcept\" :array? true
                 :sub-col \"subField\" :sub-fhir-type \"...\" :sub-array? bool
                 :fixed {:system \"phone\"}} ...]}
 
    `:fixed` is present only on columns a `.where(system='X')` expression
-   narrows (`phone`, `email`): the store ANDs that system into the match."
+   narrows (`phone`, `email`): the store ANDs that system into the match.
+
+   `:columns` means \"the value matches at one of these columns\". Two kinds of
+   parameter do not fit that and carry an EMPTY `:columns` plus their own key,
+   so a store that does not know the key finds nothing to compile and treats
+   the parameter as unsupported instead of answering it wrongly:
+
+   - `:exists-not-false [column ...]` -- an expression shaped
+     `X.exists() and X != false` (Patient.deceased). The token is true when
+     any column holds a value other than boolean false, false otherwise.
+   - `:composite [{:element desc-or-nil :components [...]} ...]` -- a
+     composite SearchParameter. Each scope is one base of its expression:
+     `:element nil` is the resource itself, otherwise the column whose
+     elements the components are evaluated within (`component`). Each
+     component is {:type :columns [:target]} in the order of the value's
+     `$`-separated parts, its columns relative to the scope. A value matches
+     when, in some scope, every part matches on the same resource or on the
+     same element. A composite whose components resolve in no scope gets no
+     entry, so it is reported as unsupported."
   [search-param-refs cap-schema]
   (let [field-map (if cap-schema
                     (extract-field-map-from-cap-schema cap-schema)
-                    {})]
+                    {})
+        resource-type (when cap-schema
+                        (:resourceType (try (m/properties cap-schema)
+                                            (catch Exception _ nil))))]
     (reduce
      (fn [acc sp-ref]
        (let [sp-name (:name sp-ref)
-             sp-type (:type sp-ref)
-             definition-url (:definition sp-ref)
-             full-sp (load-search-param-json definition-url)
-             expression (:expression full-sp)
-             target (:target full-sp)
-             columns (resolve-search-param-expression expression field-map sp-type)]
-         (if (seq columns)
-           (assoc acc sp-name
-                  {:type sp-type
-                   :target target
-                   :columns columns})
+             full-sp (load-search-param-json (:definition sp-ref))]
+         (if-let [entry (resolve-param-entry (:type sp-ref) full-sp field-map cap-schema
+                                             resource-type)]
+           (assoc acc sp-name entry)
            (do
-             (when expression
+             (when-let [expression (:expression full-sp)]
                (log/debug "Search param" sp-name "expression unresolved:" expression))
              acc))))
      {}
