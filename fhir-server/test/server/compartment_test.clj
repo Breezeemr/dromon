@@ -2,7 +2,8 @@
   "Tests for R4B patient-compartment row-level enforcement: helpers, the union
    query construction, the CompartmentFilteringStore decorator, and the
    wrap-patient-compartment middleware."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as db]
             [server.compartment :as compartment]
@@ -373,3 +374,233 @@
                                   :uri "/default/fhir/Observation/obs-other"
                                   :id "obs-other" :store base))]
       (is (= 404 (:status resp))))))
+
+;; ---------------------------------------------------------------------------
+;; Writes that can move or overwrite another patient's resource
+;;
+;; `create-resource`, `update-resource` and `delete-resource` are confined, but
+;; the post-image check alone does not stop a write from landing on a resource
+;; the launch patient cannot read, and the two Bundle verbs are not confined at
+;; all. Every write verb is a write, whichever verb it arrives through: an
+;; operation implementation writes through `transact-transaction`, and a
+;; system-level transaction Bundle reaches the store through it too.
+;; ---------------------------------------------------------------------------
+
+(defn- new-obs [patient-ref]
+  {:resourceType "Observation" :subject {:reference patient-ref}})
+
+(defn- entry
+  ([method url] {:request {:method method :url url}})
+  ([method url resource] {:request {:method method :url url} :resource resource}))
+
+(defn- refusal-status
+  "The :fhir/status a refused write throws with, or nil when `f` returned."
+  [f]
+  (try (f) nil
+       (catch clojure.lang.ExceptionInfo e (:fhir/status (ex-data e)))))
+
+(defn- observation-subjects
+  "Every Observation the BASE store holds, as {id subject-reference}. Read from
+   the base rather than through the decorator, so a write the decorator let
+   through to another patient's compartment is visible here."
+  [base]
+  (into {}
+        (map (juxt :id #(get-in % [:subject :reference])))
+        (db/search base tenant :Observation {} nil)))
+
+(def ^:private seeded-subjects
+  {"obs-mine" "Patient/123" "obs-perf" nil "obs-other" "Patient/999"})
+
+(deftest update-cannot-overwrite-another-patients-resource
+  (testing "re-pointing another patient's Observation at the launch patient is refused"
+    (let [base (seeded-store)
+          store (fstore base)]
+      (is (= 403 (refusal-status
+                  #(db/update-resource store tenant :Observation "obs-other"
+                                       (obs "obs-other" "Patient/123")
+                                       {:if-match db/if-match-any}))))
+      (is (= "Patient/999" (get (observation-subjects base) "obs-other"))
+          "obs-other still belongs to Patient/999")))
+  (testing "through the real PUT handler, with the If-Match a client can always send"
+    (let [base (seeded-store)
+          resp (try (handlers/update-resource
+                     {:fhir/store (fstore base)
+                      :fhir/resource-type "Observation"
+                      :path-params {:tenant-id tenant :id "obs-other"}
+                      :headers {"if-match" "*"}
+                      :parameters {:body (obs "obs-other" "Patient/123")}})
+                    (catch clojure.lang.ExceptionInfo e
+                      {:status (:fhir/status (ex-data e))}))]
+      (is (= 403 (:status resp)))
+      (is (= "Patient/999" (get (observation-subjects base) "obs-other"))))))
+
+(deftest transaction-confines-every-entry
+  (testing "a POST entry for another patient fails the whole Bundle with a 403"
+    (let [base (seeded-store)
+          store (fstore base)]
+      (is (= 403 (refusal-status
+                  #(db/transact-transaction store tenant
+                                            [(entry "POST" "Observation" (new-obs "Patient/123"))
+                                             (entry "POST" "Observation" (new-obs "Patient/999"))]))))
+      (is (= seeded-subjects (observation-subjects base))
+          "nothing was written, the in-compartment entry included")))
+  (testing "a PUT entry cannot overwrite another patient's resource"
+    (let [base (seeded-store)
+          store (fstore base)]
+      (is (= 403 (refusal-status
+                  #(db/transact-transaction store tenant
+                                            [(entry "PUT" "Observation/obs-other"
+                                                    (obs "obs-other" "Patient/123"))]))))
+      (is (= seeded-subjects (observation-subjects base)))))
+  (testing "a DELETE entry cannot remove another patient's resource"
+    (let [base (seeded-store)
+          store (fstore base)]
+      (is (= 403 (refusal-status
+                  #(db/transact-transaction store tenant
+                                            [(entry "DELETE" "Observation/obs-other")]))))
+      (is (= seeded-subjects (observation-subjects base)))))
+  (testing "a GET entry does not hand back another patient's resource"
+    (let [store (fstore (seeded-store))
+          res (try (db/transact-transaction store tenant
+                                            [(entry "GET" "Observation/obs-other")])
+                   (catch clojure.lang.ExceptionInfo _ nil))]
+      (is (not-any? #(= "obs-other" (get-in % [:resource :id])) (:entry res)))))
+  (testing "an all-in-compartment Bundle still commits"
+    (let [base (seeded-store)
+          store (fstore base)
+          res (db/transact-transaction store tenant
+                                       [(entry "POST" "Observation" (new-obs "Patient/123"))
+                                        (entry "PUT" "Observation/obs-mine"
+                                               (obs "obs-mine" "Patient/123"))])]
+      (is (= "transaction-response" (:type res)))
+      (is (= 4 (count (observation-subjects base)))))))
+
+(deftest batch-confines-each-entry-on-its-own
+  (let [base (seeded-store)
+        store (fstore base)
+        res (db/transact-bundle store tenant
+                                ;; The GET precedes the writes so that it reads
+                                ;; obs-other as seeded, not as a later entry left it.
+                                [(entry "POST" "Observation" (new-obs "Patient/123"))
+                                 (entry "POST" "Observation" (new-obs "Patient/999"))
+                                 (entry "GET" "Observation/obs-other")
+                                 (entry "PUT" "Observation/obs-other"
+                                        (obs "obs-other" "Patient/123"))
+                                 (entry "DELETE" "Observation/obs-other")])
+        statuses (mapv #(get-in % [:response :status]) (:entry res))]
+    (testing "every entry answers, in input order"
+      (is (= 5 (count statuses))))
+    (testing "the in-compartment entry lands"
+      (is (str/starts-with? (str (get statuses 0)) "201")))
+    (testing "the out-of-compartment read answers as a read does: not found"
+      (is (str/starts-with? (str (get statuses 2)) "404"))
+      (is (nil? (get-in res [:entry 2 :resource]))))
+    (testing "each cross-patient write is refused in place"
+      (is (str/starts-with? (str (get statuses 1)) "403"))
+      (is (str/starts-with? (str (get statuses 3)) "403"))
+      (is (str/starts-with? (str (get statuses 4)) "403")))
+    (testing "only the in-compartment write reached the store"
+      (let [subjects (observation-subjects base)]
+        (is (= 4 (count subjects)))
+        (is (= "Patient/999" (get subjects "obs-other")))
+        (is (= 1 (count (filter #{"Patient/999"} (vals subjects)))))))))
+
+(deftest every-write-verb-takes-the-opts-arity
+  ;; fhir-store.protocol/IFHIRStore rules 1 and 2: the plain arity is the opts
+  ;; arity with nil, and a decorator forwards opts iff it is non-nil. An arity
+  ;; the decorator does not define throws AbstractMethodError on the call, so a
+  ;; caller threading :tx-metadata through a patient-scoped request dies rather
+  ;; than writing.
+  (let [base (seeded-store)
+        store (fstore base)]
+    (testing "create-resource"
+      (is (= "c1" (:id (db/create-resource store tenant :Observation "c1"
+                                           (obs "c1" "Patient/123") nil)))))
+    (testing "transact-transaction, and the opts arity is confined too"
+      (is (= "transaction-response"
+             (:type (db/transact-transaction store tenant
+                                             [(entry "POST" "Observation" (new-obs "Patient/123"))]
+                                             nil))))
+      (is (= 403 (refusal-status
+                  #(db/transact-transaction store tenant
+                                            [(entry "POST" "Observation" (new-obs "Patient/999"))]
+                                            {:tx-metadata {:device {:name "compartment-test"}}})))))
+    (testing "transact-bundle"
+      (is (= "batch-response"
+             (:type (db/transact-bundle store tenant
+                                        [(entry "POST" "Observation" (new-obs "Patient/123"))]
+                                        nil)))))))
+
+;; ---------------------------------------------------------------------------
+;; System-level endpoints
+;;
+;; POST /:tenant-id/fhir resolves to no resource type, so `wrap-smart-scope`
+;; and the type gates in `wrap-patient-compartment` have nothing to judge and
+;; pass it on. The entries are the only place the patient link can be judged,
+;; so the handler must see the filtering store. This composes the two
+;; middlewares that could confine it in their router order; Keto, the only
+;; other gate, checks `write` on "<realm>/system" and knows nothing of the
+;; entries.
+;; ---------------------------------------------------------------------------
+
+(defn- system-bundle-app []
+  (-> (handlers/transaction {})
+      (compartment/wrap-patient-compartment {})
+      (scope/wrap-smart-scope {})))
+
+(defn- post-bundle [base bundle-type entries]
+  (try ((system-bundle-app)
+        {:identity {:sub "u" :scope "patient/*.*" :patient "123"}
+         :request-method :post
+         :uri "/default/fhir"
+         :fhir/store base
+         :path-params {:tenant-id tenant}
+         :reitit.core/match {:data {:fhir/all-registries registries}}
+         :body-params {:resourceType "Bundle" :type bundle-type :entry entries}})
+       (catch clojure.lang.ExceptionInfo e
+         {:status (:fhir/status (ex-data e))})))
+
+(deftest system-transaction-is-confined-to-the-launch-patient
+  (testing "a patient token cannot overwrite another patient's Patient record"
+    (let [base (seeded-store)
+          _ (db/create-resource base tenant :Patient "999"
+                                {:resourceType "Patient" :id "999" :gender "female"})
+          resp (post-bundle base "transaction"
+                            [(entry "PUT" "Patient/999"
+                                    {:resourceType "Patient" :id "999" :gender "male"})])]
+      (is (= 403 (:status resp)))
+      (is (= "female" (:gender (db/read-resource base tenant :Patient "999"))))))
+  (testing "a patient token cannot file an Observation in another patient's chart"
+    (let [base (seeded-store)
+          resp (post-bundle base "transaction"
+                            [(entry "POST" "Observation" (new-obs "Patient/999"))])]
+      (is (= 403 (:status resp)))
+      (is (= seeded-subjects (observation-subjects base)))))
+  (testing "a batch GET does not read another patient's resource"
+    (let [resp (post-bundle (seeded-store) "batch"
+                            [(entry "GET" "Observation/obs-other")])]
+      (is (not-any? #(= "obs-other" (get-in % [:resource :id]))
+                    (get-in resp [:body :entry]))))))
+
+;; ---------------------------------------------------------------------------
+;; History reads
+;;
+;; Not a write, but the same omission: `history` and `history-type` forward to
+;; the base unconfined, and `GET /[type]/_history` is authorized by the
+;; type-level `read` tuple every portal patient holds on every member type.
+;; ---------------------------------------------------------------------------
+
+(deftest history-is-confined-to-the-compartment
+  (let [store (fstore (seeded-store))]
+    (testing "type history returns only the launch patient's versions"
+      (is (= #{"obs-mine" "obs-perf"}
+             (set (map :id (db/history-type store tenant :Observation {}))))))
+    (testing "instance history of another patient's resource is empty"
+      (is (empty? (db/history store tenant :Observation "obs-other"))))
+    (testing "through the real handler"
+      (let [resp (handlers/history-type {:fhir/store store
+                                         :fhir/resource-type "Observation"
+                                         :path-params {:tenant-id tenant}
+                                         :query-params {}})]
+        (is (not-any? #(= "obs-other" (get-in % [:resource :id]))
+                      (get-in resp [:body :entry])))))))
