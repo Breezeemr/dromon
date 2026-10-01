@@ -40,6 +40,7 @@
             [server.handlers :as handlers]
             [server.keto :as keto]
             [server.narrative :as narrative]
+            [server.temporal :as tmp]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace])
   (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
@@ -223,25 +224,21 @@
   (or (seq (get type-filters resource-type)) [{}]))
 
 (defn- parse-since
-  "Parse the `_since` instant, or nil when absent/unparseable (degrade
-   gracefully: an unparseable _since disables the filter rather than failing)."
+  "The `_since` Instant of a job's params, or nil when absent. Kickoff refuses
+   a value that names no point in time (see `start-export!`), so a stored job
+   never carries one."
   [params]
-  (when-let [s (get-param params "_since")]
-    (try (java.time.Instant/parse s) (catch Exception _ nil))))
+  (:since (tmp/parse-since params)))
 
 (defn- after-since?
   "True when `resource` was last updated at/after `since`. _since is applied as
    an in-memory post-scan filter on meta.lastUpdated so it works uniformly
    across backends regardless of whether they support _lastUpdated search. A
-   resource with no lastUpdated is included (cannot prove it is older)."
+   resource with no readable lastUpdated is included (cannot prove it is older)."
   [^java.time.Instant since resource]
   (or (nil? since)
-      (let [lu (get-in resource [:meta :lastUpdated])]
-        (cond
-          (nil? lu)                       true
-          (instance? java.time.Instant lu) (not (.isBefore ^java.time.Instant lu since))
-          :else (try (not (.isBefore (java.time.Instant/parse (str lu)) since))
-                     (catch Exception _ true))))))
+      (let [lu (tmp/last-updated resource)]
+        (or (nil? lu) (not (.isBefore ^java.time.Instant lu since))))))
 
 (defn- matches-type-filter?
   "Best-effort in-memory match of a single _typeFilter search-param map against
@@ -527,6 +524,7 @@
         all-registries (:fhir/all-registries req)
         params         (merge (or (:form-params req) {}) (or (:query-params req) {}))
         output-format  (get-param params "_outputFormat")
+        since-param    (tmp/parse-since params)
         cfg            (bjs/config job-store)
         max-streams    (long (:max-concurrent-streams cfg))]
     (sweep-expired! job-store)
@@ -535,6 +533,13 @@
       (oo-response 400 "invalid"
                    (str "Unsupported _outputFormat: '" output-format
                         "'. Supported: application/fhir+ndjson."))
+
+      ;; Ignoring an unreadable _since would export the whole tenant to a
+      ;; client that asked for the changes since a point.
+      (contains? since-param :invalid)
+      (oo-response 400 "invalid"
+                   (str "Invalid value for _since: '" (:invalid since-param) "' — "
+                        tmp/temporal-value-expectation))
 
       (>= (bjs/active-stream-count job-store) max-streams)
       (oo-response 429 "throttled"
@@ -554,7 +559,7 @@
                             :patient (patient-ids-in-tenant store tenant-id basis)
                             :group   (set (group-patient-ids store tenant-id group-id)))
              types        (requested-types kind params all-registries)
-             since        (parse-since params)
+             since        (:since since-param)
              type-filters (parse-type-filters params)
              files        (build-job-files store tenant-id basis kind owner-ids
                                            all-registries types since type-filters)

@@ -71,8 +71,14 @@
     (.disable SerializationFeature/WRITE_DATES_AS_TIMESTAMPS)))
 
 (def java-time-decode-mapper
-  "Jackson ObjectMapper that deserializes with keyword keys."
-  (json/object-mapper {:decode-key-fn keyword}))
+  "Jackson ObjectMapper that deserializes with keyword keys and reads every
+   JSON decimal as a BigDecimal, so a FHIR decimal keeps its scale (80.50
+   stays 80.50M) and digits past a double's precision. Integers still decode
+   as Integer or Long.
+
+   `:bigdecimals` has to be set here, on the mapper: muuntaja uses a
+   `:mapper` decoder option as-is and ignores every other option beside it."
+  (json/object-mapper {:decode-key-fn keyword :bigdecimals true}))
 
 (def muuntaja-instance
   "Muuntaja instance used by the FHIR router: `application/json` also matches
@@ -84,12 +90,10 @@
         (assoc-in [:formats "application/json" :encoder-opts]
                   {:mapper java-time-encode-mapper})
         (assoc-in [:formats "application/json" :decoder-opts]
-                  {:mapper java-time-decode-mapper
-                   :bigdecimals true})
+                  {:mapper java-time-decode-mapper})
         (assoc-in [:formats "application/json-patch+json"]
                   {:decoder [muuntaja-json/decoder
-                             {:mapper java-time-decode-mapper
-                              :bigdecimals true}]
+                             {:mapper java-time-decode-mapper}]
                    :encoder [muuntaja-json/encoder
                              {:mapper java-time-encode-mapper}]}))))
 

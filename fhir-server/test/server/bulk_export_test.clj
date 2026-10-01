@@ -403,11 +403,19 @@
         after? @#'be/after-since?
         t0     (java.time.Instant/parse "2026-01-01T00:00:00Z")]
     (is (= t0 (parse {"_since" "2026-01-01T00:00:00Z"})))
-    (testing "an unparseable _since degrades to nil (no filter)"
-      (is (nil? (parse {"_since" "not-an-instant"}))))
+    (testing "an offset or a date names an instant too"
+      (is (= t0 (parse {"_since" "2025-12-31T19:00:00-05:00"})))
+      (is (= t0 (parse {"_since" "2026-01-01"}))))
     (testing "resources at/after _since pass; older ones are dropped"
       (is (after? t0 {:meta {:lastUpdated (java.time.Instant/parse "2026-06-01T00:00:00Z")}}))
+      (is (after? t0 {:meta {:lastUpdated t0}}))
       (is (not (after? t0 {:meta {:lastUpdated (java.time.Instant/parse "2025-06-01T00:00:00Z")}}))))
+    (testing "lastUpdated strings are compared as instants, whatever their precision"
+      (let [t (java.time.Instant/parse "2026-10-01T13:44:26.066Z")]
+        (is (after? t {:meta {:lastUpdated "2026-10-01T13:44:26.06645Z"}}))
+        (is (after? t {:meta {:lastUpdated "2026-10-01T13:44:26.066450Z"}}))
+        (is (after? t {:meta {:lastUpdated "2026-10-01T13:44:26.066Z"}}))
+        (is (not (after? t {:meta {:lastUpdated "2026-10-01T13:44:26Z"}})))))
     (testing "a missing _since or missing lastUpdated includes the resource"
       (is (after? nil {:meta {:lastUpdated (java.time.Instant/parse "2000-01-01T00:00:00Z")}}))
       (is (after? t0 {:id "no-meta"})))))
@@ -505,6 +513,55 @@
         ndjson  (stream-body->string (:body f-resp))]
     (set (map #(get (json->clj %) "id")
               (remove str/blank? (str/split-lines ndjson))))))
+
+(defn- system-export-request
+  [store job-store params]
+  (merge {:path-params {:tenant-id "default"}
+          :uri "/default/fhir/$export"
+          :request-method :get
+          :query-params params
+          :headers {"host" "fhir.local:3001"}
+          :scheme :https
+          :identity {:sub "t"}
+          :fhir/store store
+          :fhir/bulk-job-store job-store
+          :fhir/all-registries {"Patient" :reg}
+          :fhir/resource-encoders {}}
+         authorized))
+
+(deftest kickoff-refuses-an-unparseable-since
+  (let [job-store (bjs/create-store)
+        store     (fake-search-store {"Patient" patients})]
+    (doseq [bad ["not-an-instant" "2026-10-01T13:44:26" "2026-02-30T00:00:00Z"]]
+      (testing (str "_since=" bad)
+        (let [resp (be/kickoff (system-export-request store job-store {"_since" bad}))
+              body (json->clj (:body resp))]
+          (is (= 400 (:status resp)))
+          (is (= "OperationOutcome" (get body "resourceType")))
+          (is (= "invalid" (get-in body ["issue" 0 "code"])))
+          (is (str/includes? (get-in body ["issue" 0 "diagnostics"]) bad))
+          (is (nil? (get-in resp [:headers "Content-Location"])) "no job is started"))))))
+
+(deftest export-since-compares-instants-across-precisions
+  (let [lu        (fn [id t] {:resourceType "Patient" :id id :meta {:lastUpdated t}})
+        store     (fake-search-store
+                   {"Patient" [(lu "before" "2026-10-01T13:44:25.999999Z")
+                               (lu "whole"  "2026-10-01T13:44:26Z")
+                               (lu "millis" "2026-10-01T13:44:26.066Z")
+                               (lu "micros" "2026-10-01T13:44:26.06645Z")
+                               (lu "micros0" "2026-10-01T13:44:26.066460Z")]})
+        job-store (bjs/create-store)
+        {:keys [file]} (system-route-handlers {"Patient" :reg} {})
+        export    (fn [since]
+                    (let [req  (system-export-request store job-store {"_since" since})
+                          resp (be/kickoff req)]
+                      (is (= 202 (:status resp)) since)
+                      (stream-output-ids file req job-store "default" (content-location-job-id resp))))]
+    (is (= #{"whole" "millis" "micros" "micros0"} (export "2026-10-01T13:44:26Z")))
+    (is (= #{"millis" "micros" "micros0"} (export "2026-10-01T09:44:26.066-04:00")))
+    (is (= #{"micros" "micros0"} (export "2026-10-01T13:44:26.066450Z")))
+    (is (= #{"before" "whole" "millis" "micros" "micros0"} (export "2026-10-01")))
+    (is (= #{} (export "2026-10-02")))))
 
 (deftest group-export-404-when-group-missing
   (let [store (fake-search-store {})

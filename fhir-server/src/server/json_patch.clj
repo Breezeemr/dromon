@@ -113,10 +113,10 @@
 
    Clojure `=` keeps Long, Double and BigDecimal apart, but the two sides of
    a test rarely share a representation: a PATCH body decodes a JSON number
-   as an Integer, Long or Double, while a store reads a FHIR decimal back as
-   a BigDecimal. Numbers therefore compare by value, so 72, 72.0 and 72.00M
-   are equal, inside objects and arrays too. Every other value compares with
-   `=`.
+   as an Integer, Long or BigDecimal, while a store reads a FHIR decimal back
+   as a BigDecimal. Numbers therefore compare by value, so 72, 72.0 and
+   72.00M are equal, inside objects and arrays too. Every other value
+   compares with `=`.
 
    A string never equals a number, even one holding the same digits: the RFC
    requires both values to have the same JSON type, and `test` does not know
