@@ -1,5 +1,6 @@
 (ns fhir-store-xtdb2.core
   (:require [xtdb.api :as xt]
+            [xtdb.basis :as basis]
             [xtdb.node :as xtn]
             [next.jdbc :as jdbc]
             [clojure.string :as str]
@@ -1279,10 +1280,45 @@
 (defn ^:no-doc declaration-op
   "One `CREATE TABLE <table> (<cols>)` tx op. CREATE TABLE is additive and
    idempotent: on an existing table it adds the columns it lacks and keeps
-   every column it has, so re-running it is how an existing on-disk tenant
-   picks up new types and columns."
+   every column it has, so it is how an existing on-disk tenant picks up new
+   types and columns. `cols` need not repeat `_id` for a table that exists."
   [table cols]
   [:sql (format "CREATE TABLE %s (%s)" table (str/join ", " (map quote-ident cols)))])
+
+(defn- log-end-token
+  "An await token for every message on the node's log when this is called.
+   start-node returns before a node opened on an existing log has replayed
+   it, and a read waits only for transactions submitted through the node
+   itself, so until a read awaits this token the node can answer from part
+   of its catalog and part of its rows."
+  [node]
+  (basis/->tx-basis-str
+   (-> (group-by :db-name (xt/q node ["SHOW LATEST_SUBMITTED_MSG_IDS"]))
+       (update-vals #(mapv :msg-id %)))))
+
+(defn- columns-on-node
+  "table-name -> set of the column names the node's catalog lists, read once
+   the node has replayed its whole log. Every later read on the node sees at
+   least that much of the log."
+  [node]
+  (reduce (fn [acc {:keys [table-name column-name]}]
+            (update acc (quote-ident table-name) (fnil conj #{}) column-name))
+          {}
+          (xt/q node [(str "SELECT table_name, column_name FROM information_schema.columns"
+                           " WHERE table_schema = 'public'")]
+                {:await-token (log-end-token node)})))
+
+(defn ^:no-doc missing-declarations
+  "The part of `declarations` (table-name -> columns) that `on-node` (as
+   columns-on-node returns it) lacks: every column of a table the node does
+   not list, only the absent columns of one it does. Empty when nothing is
+   missing."
+  [declarations on-node]
+  (reduce-kv (fn [acc table cols]
+               (let [missing (into [] (remove (get on-node table #{})) cols)]
+                 (cond-> acc (seq missing) (assoc table missing))))
+             {}
+             declarations))
 
 (defn ^:no-doc declare-tables!
   "Declares every table in `declarations` (table-name -> columns, as
@@ -1304,14 +1340,30 @@
          (xt/execute-tx node ops))))))
 
 (defn- start-tenant-node
-  "Starts a tenant's node and declares the store's schema tables on it,
-   closing the node and naming the tenant when the declaration fails."
+  "Starts a tenant's node, waits for it to replay its log, and declares the
+   store's schema tables and columns the node does not already have. When it
+   has them all, as a reopened on-disk tenant does on every start after its
+   first, no transaction is written: a declaration committed at wall-clock now
+   would refuse every later transaction stamped with an earlier explicit
+   :system-time, such as a historical import into the same directory.
+
+   Returns [node tables]: `tables` is every table ensure-declared! need not
+   declare, the schema tables and each table the node already lists with
+   every transform/store-columns column, so a reopened tenant does not
+   declare its schemaless types again either. A table missing one of them,
+   written by something other than the store or before a column joined
+   store-columns, is left out and declared on its first use.
+   Closes the node and names the tenant when any of this fails."
   [store tid]
   (let [node (start-node (:node-config store)
                          {:pipelined-replica-appends? (:pipelined-replica-appends? store)})]
     (try
-      (declare-tables! node (:declared-columns store))
-      node
+      (let [declarations (:declared-columns store)
+            on-node (columns-on-node node)]
+        (declare-tables! node (missing-declarations declarations on-node))
+        [node (into (set (keys declarations))
+                    (keep (fn [[table cols]] (when (every? cols xf/store-columns) table)))
+                    on-node)])
       (catch Throwable e
         (try (.close ^java.lang.AutoCloseable node) (catch Throwable _ nil))
         (throw (ex-info (str "Could not declare tables for tenant " tid ": " (ex-message e))
@@ -1323,7 +1375,8 @@
    creating them if absent. compare-and-set via swap! handles concurrent
    creation; the loser of a race closes the pool+node it created and uses the
    winner's entry. :declared holds the table names declared on the node so
-   far, seeded with every schema table (see start-tenant-node, ensure-declared!)."
+   far, seeded with the tables start-tenant-node finds or declares (see
+   ensure-declared!)."
   [store tenant-id]
   (let [nodes (:nodes store)
         tid (str tenant-id)]
@@ -1331,10 +1384,10 @@
         (ftrace/trace!
          {:id :store/node.start
           :data {:tenant-id tid}}
-         (let [new-node (start-tenant-node store tid)
+         (let [[new-node declared] (start-tenant-node store tid)
                new-pool (make-pool new-node tid (:pool-opts store))
                new-entry {:node new-node :pool new-pool
-                          :declared (atom (set (keys (:declared-columns store))))}
+                          :declared (atom declared)}
                existing (get (swap! nodes (fn [m]
                                             (if (contains? m tid)
                                               m
@@ -1348,10 +1401,11 @@
 (defn- ensure-declared!
   "Declares `resource-type`'s table on the entry's node, with the only columns
    the store itself reads on a type no schema enumerates (transform/
-   store-columns), unless it is already declared. Schema types are declared
-   at node start, so this costs one set lookup per call; the first touch of an
-   unenumerated type per tenant costs one small transaction. Two callers racing
-   here both declare, which is harmless: CREATE TABLE is idempotent."
+   store-columns), unless it is already declared. Schema types, and types the
+   node already had at start, are seeded into `declared`, so this costs one
+   set lookup per call; the first touch of any other type per tenant costs
+   one small transaction. Two callers racing here both declare, which is
+   harmless: CREATE TABLE is idempotent."
   [{:keys [node declared]} resource-type]
   (when resource-type
     (let [table (table-name resource-type)]
@@ -2569,9 +2623,11 @@
      the opt-out for a deployment that must roll back below XTDB 2.2.0-beta3;
      see ->xtdb-config.
 
-   Every tenant node declares the table and columns of each schema type when
-   it starts (see declare-tables!); a type no schema names is declared with
-   `_id` and `fhir_version` on its first use per tenant."
+   Every tenant node declares the table and columns of each schema type that
+   it lacks when it starts, and writes no transaction when it lacks none (see
+   start-tenant-node); a type no schema names is declared with
+   transform/store-columns on its first use per tenant, unless the node
+   already had them all when it started."
   [{:keys [resource/schemas node-config query-mode pool-opts resource/lifecycle
            pipelined-replica-appends?]
     :or {node-config {} schemas [] query-mode :sql pool-opts {}}

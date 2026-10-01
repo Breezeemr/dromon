@@ -309,6 +309,19 @@ telemere trace -> wrap-params -> muuntaja format -> fhir-exceptions -> fhir-deco
 
 - The project is named `fhir-defintions-to-malli` (note the typo in "defintions") -- use this spelling consistently in paths and references
 - Java 21+ is required (XTDB v2 dependency)
+- **A reopened XTDB node answers from part of its log until a read awaits
+  the log's end** (2.2.0-beta3). `start-node` returns before an on-disk node
+  has replayed, and a read waits only for transactions submitted through that
+  node, so the first reads can miss tables, columns and rows. The store's
+  tenant start awaits `SHOW LATEST_SUBMITTED_MSG_IDS` as a token before it
+  reads the catalog; anything else that opens a node and reads at once must
+  do the same.
+- **Tenant node start writes no transaction when no declaration is missing.**
+  It reads `information_schema.columns` and issues `CREATE TABLE` only for
+  what is absent, because a wall-clock-stamped transaction would refuse a
+  later import that stamps an earlier `:system-time` into the same directory.
+  The same read seeds the lazy per-type declarations: a table already carrying
+  every `transform/store-columns` column is not declared again on first use.
 - `target/staging/src` must be created with `mkdir -p` before running schema generation (classloader needs it at JVM startup)
 - Tenant ID `default` is used in dev/test
 - Test patient ID is `Patient/123` (hardcoded in inferno runner)
