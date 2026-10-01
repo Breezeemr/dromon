@@ -114,8 +114,8 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest declared-columns-derivation
-  (testing "a plain :map: _id and fhir_version first, then every entry by its storage name"
-    (is (= ["_id" "fhir_version" "resourceType" "status"]
+  (testing "a plain :map: the store's own columns first, then every entry by its storage name"
+    (is (= ["_id" "fhir_version" "meta" "resourceType" "status"]
            (xf/declared-columns
             (m/schema [:map {:resourceType "Flag"} [:resourceType :string] [:status :string]])))))
 
@@ -141,7 +141,7 @@
                          [:us-core [:map {:resourceType "Patient"}
                                     [:race {:optional true :fhir/extension true :url "http://example.org/race"}
                                      [:map [:text {:optional true} :string]]]]]])]
-      (is (= ["_id" "fhir_version" "gender" "race"] (xf/declared-columns sch)))))
+      (is (= ["_id" "fhir_version" "meta" "gender" "race"] (xf/declared-columns sch)))))
 
   (testing "schemas are keyed by table-name's spelling"
     (is (= #{"\"patient\"" "\"observation\"" "\"flag\""}
@@ -527,14 +527,14 @@
 (deftest registry-columns-are-declared
   (let [cols (xf/declared-columns registry-observation-schema)]
     (testing "a registry column the schema lacks is declared after the schema's own"
-      (is (= ["_id" "fhir_version" "resourceType" "status" "identifier" "encounter"
+      (is (= ["_id" "fhir_version" "meta" "resourceType" "status" "identifier" "encounter"
               "code" "code_tokens" "masterIdentifier" "context"
               "medicationCodeableConcept" "medicationCodeableConcept_tokens"]
              cols)))
     (testing "system columns and unparsed FHIRPath are never declared"
       (is (not-any? #{"_system_from" "value.exists() and value != false"} cols))))
-  (testing "a schema without a registry declares only its entries"
-    (is (= ["_id" "fhir_version" "resourceType" "status"]
+  (testing "a schema without a registry declares only the store's columns and its entries"
+    (is (= ["_id" "fhir_version" "meta" "resourceType" "status"]
            (xf/declared-columns (m/schema [:map {:resourceType "Flag"}
                                            [:resourceType :string] [:status :string]]))))))
 

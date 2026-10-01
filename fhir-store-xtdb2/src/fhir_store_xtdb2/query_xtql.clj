@@ -111,6 +111,9 @@
 ;;   - any _sort: the SQL path maps sort fields to columns (sort-field->sql-col)
 ;;     and drops ones it cannot map, where an XTQL order-by on an undeclared
 ;;     column fails at planning from XTDB 2.2.0-rc0.
+;;   - the resource-level parameters (_lastUpdated, _tag, _profile, _security):
+;;     none is a flat column, and the SQL builder maps each to the storage that
+;;     holds it (core/resource-level-param?).
 ;; ---------------------------------------------------------------------------
 
 (def ^:private fallback ::fallback)
@@ -153,6 +156,11 @@
     ;; _id always direct equality against xt/id
     (= (name pname) "_id")
     {:where (list '= 'xt/id (if (string? v) v (str v)))}
+
+    ;; _lastUpdated reads _system_from and _tag / _profile / _security the
+    ;; meta struct; the SQL builder owns both mappings.
+    (core/resource-level-param? (name pname))
+    fallback
 
     ;; Any registry entry with :columns metadata indicates nested/complex shape.
     ;; We defer these to the SQL fallback.
