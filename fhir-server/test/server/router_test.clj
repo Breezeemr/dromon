@@ -14,10 +14,12 @@
             [hato.client :as hc]
             [jsonista.core :as json]
             [malli.core :as m]
+            [reitit.core :as r]
             [reitit.ring :as ring]
             [server.auth :as auth]
             [server.core :as sc]
-            [server.router :as router])
+            [server.router :as router]
+            [server.routing :as routing])
   (:import [java.io ByteArrayInputStream InputStream]))
 
 ;; ---------------------------------------------------------------------------
@@ -511,3 +513,17 @@
     (is (some? (get-in opts [:data :coercion])))
     (is (= ["Patient"] (keys (get-in opts [:data :fhir/all-registries]))))
     (is (= mw (get-in opts [:data :middleware])))))
+
+(deftest the-registries-reach-every-route-unwalked
+  ;; reitit rebuilds every nested plain map in route data, once per route per
+  ;; merge, so a registries map that reaches a route as a COPY was walked. On
+  ;; the Breeze IG that walk was ~90% of building the router.
+  (let [mw      (router/default-middleware nil resolved-opts)
+        opts    (router/router-options test-schemas mw)
+        matched (-> (ring/router (routing/build-fhir-routes test-schemas) opts)
+                    (r/match-by-path (str "/" tenant "/fhir/Patient"))
+                    :data
+                    :fhir/all-registries)]
+    (is (= ["Patient"] (keys matched)))
+    (is (identical? (get-in opts [:data :fhir/all-registries]) matched)
+        "the object router-options built, not a copy rebuilt by the merge")))
