@@ -14,12 +14,14 @@
             [integrant.core :as ig]
             [fhir-store.protocol :as fp :refer [IFHIRStore]]
             [fhir-store-xtdb2.datetime :as dt]
-            [fhir-store-xtdb2.transform :as xf])
+            [fhir-store-xtdb2.transform :as xf]
+            [xtdb.serde :as serde])
   (:import [java.sql SQLException]
            [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime LocalTime Year YearMonth]
            [com.zaxxer.hikari HikariConfig HikariDataSource SQLExceptionOverride SQLExceptionOverride$Override]
-           [org.postgresql.util PSQLException]
-           [xtdb.api DataSource$ConnectionBuilder]))
+           [org.postgresql.util PSQLException ServerErrorMessage]
+           [xtdb.api DataSource$ConnectionBuilder]
+           [xtdb.api.error Incorrect]))
 
 (defn- method-order
   "Returns sort key for FHIR transaction entry processing order per §3.1.0.11.2:
@@ -1456,24 +1458,47 @@
       (unwrap [_ iface] (.unwrap node iface))
       (isWrapperFor [_ iface] (.isWrapperFor node iface)))))
 
+(defn- incorrect-anomaly-detail?
+  "True when a server error's detail is an XTDB `incorrect` anomaly. pgwire
+   encodes the anomaly in the fallback output format, which XTDB's JDBC
+   driver sets to transit on every connection it opens."
+  [^ServerErrorMessage message]
+  (when-let [detail (.getDetail message)]
+    (try
+      (instance? Incorrect (serde/read-transit detail :json))
+      (catch Exception _ false))))
+
 (defn ^:no-doc statement-refusal?
-  "True when `e` is SQLSTATE 0A000 sent by the XTDB server. pgwire sends it
-   for a stale plan and for every `unsupported` anomaly: an SQL feature it
-   lacks, a parameter type it cannot read. Either way it answers one statement
-   and keeps serving the connection: the error goes out as an ErrorResponse,
+  "True when the XTDB server sent `e` to refuse one statement: SQLSTATE 0A000,
+   or 08P01 carrying an `incorrect` anomaly.
+
+   pgwire sends 0A000 for a stale plan and for every `unsupported` anomaly: an
+   SQL feature it lacks, a parameter type it cannot read. It sends 08P01 for
+   every `incorrect` anomaly without a code of its own: a parse or plan error,
+   division by zero, a failed cast. Either way it answers one statement and
+   keeps serving the connection: the error goes out as an ErrorResponse,
    messages are skipped until Sync, and an open transaction is marked failed
-   for the caller's ROLLBACK. A 0A000 that pgjdbc raises itself carries no
-   server message and is left to Hikari."
+   for the caller's ROLLBACK.
+
+   Any other 08P01 is left to Hikari. pgwire's own protocol violations carry
+   no anomaly, and the ones that do end a session (a malformed or unreadable
+   message) close the socket without sending anything. Neither state counts
+   when pgjdbc raises it itself, since it then carries no server message."
   [^SQLException e]
-  (and (instance? PSQLException e)
-       (= "0A000" (.getSQLState e))
-       (some? (.getServerErrorMessage ^PSQLException e))))
+  (boolean
+   (when (instance? PSQLException e)
+     (when-let [message (.getServerErrorMessage ^PSQLException e)]
+       (case (.getSQLState e)
+         "0A000" true
+         "08P01" (incorrect-anomaly-detail? message)
+         false)))))
 
 (def ^:private keep-connection-on-statement-refusal
-  "Hikari evicts a connection on SQLSTATE 0A000, but XTDB sends it to refuse
-   one statement on a healthy connection (see statement-refusal?). Evicting it
-   also hides the refusal: xt/q then runs ROLLBACK on the closed connection,
-   and \"Connection is closed\" is all that reaches the caller."
+  "Hikari evicts a connection on SQLSTATE 0A000 and on any 08 state, but
+   XTDB sends 0A000 and 08P01 to refuse one statement on a healthy connection
+   (see statement-refusal?). Evicting it also hides the refusal: xt/q then
+   runs ROLLBACK on the closed connection, and \"Connection is closed\" is all
+   that reaches the caller."
   (reify SQLExceptionOverride
     (adjudicate [_ e]
       (if (statement-refusal? e)

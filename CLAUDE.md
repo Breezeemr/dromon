@@ -249,9 +249,16 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   the latest snapshot, so a write landing between them still trips it.
 - Every `unsupported` anomaly is also SQLSTATE 0A000: an SQL feature pgwire
   lacks (`WITH RECURSIVE`), a parameter type it cannot read (a bound
-  `OffsetTime`; verified on 2.2.0-beta3). pgwire refuses that one statement
-  and keeps serving the connection, so the pool keeps any 0A000 the server
-  sent (`statement-refusal?`). A 0A000 pgjdbc raises itself is left to Hikari.
+  `OffsetTime`). Every `incorrect` anomaly without a code of its own is 08P01,
+  which Hikari evicts like any `08` state: a parse or plan error, `1/0`,
+  `CAST('abc' AS INTEGER)`. Either way pgwire refuses that one statement and
+  keeps serving the connection (verified on 2.2.0-beta3), so the pool keeps
+  any 0A000 the server sent and any 08P01 whose detail decodes to an
+  `incorrect` anomaly (`statement-refusal?`). XTDB's JDBC driver sets
+  `fallback_output_format=transit`, so the detail is transit. pgwire's own
+  protocol violations are 08P01 with no detail, and the ones that end a
+  session close the socket without sending anything; those, and either state
+  pgjdbc raises itself, are left to Hikari.
 
 ### Transaction metadata (`:tx-metadata`)
 
