@@ -240,6 +240,13 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   lifecycle's tx-ops ride the same transaction, so `lifecycle-tx-ops` walks
   them after the body is encoded: text the submitted body carried is the
   client's 400, anything else in the ops a 500.
+- A write that adds a column changes a `SELECT *` row type, and pgwire refuses
+  a statement described under the old one ("cached plan must not change result
+  type", `:prepared-query-out-of-date`, SQLSTATE 0A000; verified on 2.2.0-beta3).
+  Hikari evicts on 0A000, after which `xt/q`'s `ROLLBACK` reports only
+  `Connection is closed`. The store's pool sets `prepareThreshold=0` and keeps
+  the connection, and `run-query` re-runs the read: Parse and Bind each open
+  the latest snapshot, so a write landing between them still trips it.
 
 ### Transaction metadata (`:tx-metadata`)
 

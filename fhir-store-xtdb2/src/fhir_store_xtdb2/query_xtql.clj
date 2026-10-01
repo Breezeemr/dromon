@@ -37,7 +37,7 @@
     :data {:resource-type (name resource-type) :id id}}
    (let [q (list '-> (from-star (rt-kw resource-type))
                  (list 'where (list '= 'xt/id id)))
-         rows (xt/q node q)]
+         rows (core/run-query node q)]
      (core/xtdb->fhir (first rows) read-decoders))))
 
 (defn- parse-vid-instant [vid]
@@ -58,7 +58,7 @@
                 {:for-system-time :all-time})
          q (list '-> (from-star-opts (rt-kw resource-type) opts)
                  (list 'where (list '= 'xt/id id)))
-         rows (xt/q node q)]
+         rows (core/run-query node q)]
      (core/xtdb->fhir (first rows) read-decoders))))
 
 (defn deleted?-xtql [node resource-type id]
@@ -68,14 +68,14 @@
    (let [rt-k (rt-kw resource-type)
          current-q (list '-> (list 'from rt-k '[xt/id])
                          (list 'where (list '= 'xt/id id)))
-         current (xt/q node current-q)]
+         current (core/run-query node current-q)]
      (if (seq current)
        false
        (let [history-q (list '-> (list 'from rt-k
                                        {:for-system-time :all-time
                                         :bind '[xt/id]})
                              (list 'where (list '= 'xt/id id)))
-             history (xt/q node history-q)]
+             history (core/run-query node history-q)]
          (boolean (seq history)))))))
 
 (defn history-xtql [node resource-type id read-decoders]
@@ -85,7 +85,7 @@
    (let [q (list '-> (from-star-opts (rt-kw resource-type)
                                      {:for-system-time :all-time})
                  (list 'where (list '= 'xt/id id)))
-         rows (xt/q node q)]
+         rows (core/run-query node q)]
      (mapv #(core/xtdb->fhir % read-decoders) rows))))
 
 (defn- parse-timestamp [s]
@@ -234,7 +234,7 @@
        :else
        (let [wheres (mapv :where conditions)
              q (compose-search-query resource-type wheres limit offset)
-             rows (xt/q node q)]
+             rows (core/run-query node q)]
          (mapv #(core/xtdb->fhir % read-decoders) rows))))))
 
 (defn count-resources-xtql
@@ -262,7 +262,7 @@
              pipeline (cond-> [base]
                         (seq wheres) (conj (cons 'where wheres)))
              q (apply list '-> pipeline)
-             rows (xt/q node q)]
+             rows (core/run-query node q)]
          (count rows))))))
 
 ;; ---------------------------------------------------------------------------
@@ -412,5 +412,5 @@
                     true  (conj (list 'order-by {:val 'xt/system-from :dir :desc}))
                     true  (conj (list 'limit limit)))
          q (apply list '-> pipeline)
-         rows (xt/q node q)]
+         rows (core/run-query node q)]
      (mapv #(core/xtdb->fhir % read-decoders) rows))))
