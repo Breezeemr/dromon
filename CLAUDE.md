@@ -225,6 +225,14 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   rather than for the call. Where the engine does raise, it is
   `xtdb.error.Incorrect` and a store span rethrows it wrapped, so that code
   sits on the cause.
+- (2.2.0-beta3) `TIMESTAMP ?` does not parse (`:xtdb/sql-error`), and a
+  string bound against a timestamp column fails at execution. Bind a
+  java.time value. Prefer an `Instant`: a `LocalDate` bound through the pool
+  (pgwire) is cast in the JVM's default zone, while the same value passed to
+  the node's `xt/q` is cast as UTC.
+- `vread`'s `vid` is the FHIR versionId, the `fhir_version` column, as in the
+  mock and datomic stores. It is matched across `FOR ALL SYSTEM_TIME`, never
+  read `AS OF` a time; point-in-time reads are `$as-of`.
 - A string holding an unpaired UTF-16 surrogate (a lone `\uD83D`) is stored as
   `?`, silently (verified on 2.2.0-beta3). pgjdbc's parameter encoding replaces
   it in every `[:sql ...]` arg, and XTDB's Arrow `Utf8Vector` replaces it on the
