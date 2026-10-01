@@ -4,9 +4,10 @@
    From 2.2.0-rc0 a read, DELETE, ASSERT or :delete-docs that names a table or
    column nothing has ever written fails at planning (\"Table not found\" /
    \"Column not found\") instead of answering empty. The store declares every
-   schema type's table when a tenant node starts and every other type on first
-   use; these tests pin that the empty answers stay empty, quietly, and that a
-   later write is still found by the same queries."
+   schema type's table and columns the node lacks when a tenant node starts,
+   and every other type on first use; these tests pin that the empty answers
+   stay empty, quietly, that a later write is still found by the same queries,
+   and that a reopened tenant lacking nothing writes no transaction."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [malli.core :as m]
@@ -417,6 +418,92 @@
           (is (not (.exists (java.io.File. log-path))) "log directory, replica log included, removed")
           (is (not (.exists (java.io.File. storage-path))))
           (finally (close-store-nodes! store-b))))
+      (finally (delete-recursive! (java.io.File. base))))))
+
+(defn- temp-node-config
+  "A node config on a fresh on-disk log and storage, and the directory that
+   holds both."
+  []
+  (let [base (str (java.nio.file.Files/createTempDirectory
+                   "dromon-xtdb2-decl-" (into-array java.nio.file.attribute.FileAttribute [])))]
+    [{:log [:local {:path (str base "/log")}]
+      :storage [:local {:path (str base "/storage")}]}
+     base]))
+
+(defn- with-started-tenant
+  "Starts `tenant` on `store`, returns (f node), and closes the store's nodes."
+  [store tenant f]
+  (try
+    (db/create-tenant store tenant)
+    (f (node-of store tenant))
+    (finally (close-store-nodes! store))))
+
+(defn- tx-log
+  "Every transaction on the node, oldest first, as [tx-id system-time]."
+  [node]
+  (mapv (juxt :xt/id :system-time)
+        (xt/q node ["SELECT _id, system_time FROM xt.txs ORDER BY _id"])))
+
+(defn- stamp-after
+  "Executes a write stamped 1us after `system-time`, the way a historical
+   import does, returning :committed or the refusal's error code."
+  [node ^java.time.ZonedDateTime system-time]
+  (try
+    (xt/execute-tx node [[:sql "INSERT INTO replay_probe (_id) VALUES (1)"]]
+                   {:system-time (.toInstant (.plusNanos system-time 1000))})
+    :committed
+    (catch Exception e (:xtdb.error/code (ex-data e)))))
+
+(def ^:private patient-schema-with-gender
+  (m/schema (conj (m/form patient-schema) [:gender {:optional true} :string]) schema-opts))
+
+(deftest reopened-tenant-declares-only-what-is-missing
+  (let [[node-config base] (temp-node-config)
+        open (fn [schemas] (core-db/create-xtdb-store {:node-config node-config
+                                                       :resource/schemas schemas}))
+        tenant "t1"]
+    (try
+      (let [first-start (with-started-tenant (open [patient-schema]) tenant tx-log)
+            [second-start replay]
+            (with-started-tenant (open [patient-schema]) tenant
+              (fn [node] [(tx-log node) (stamp-after node (second (peek first-start)))]))]
+        (is (= 1 (count first-start)) "the first start declares, in one transaction")
+        (testing "the same schemas again: nothing is missing, so no transaction"
+          (is (= first-start second-start)))
+        (testing "so a historical import may stamp between that declaration and now"
+          (is (= :committed replay)))
+        (testing "a schema that adds a column declares it, in one transaction"
+          (let [[third-start cols]
+                (with-started-tenant (open [patient-schema-with-gender]) tenant
+                  (fn [node] [(tx-log node) (column-names node "patient")]))]
+            (is (contains? cols "gender"))
+            (is (contains? cols "maritalStatus") "the earlier declaration is kept")
+            (is (= (+ (count first-start) 2) (count third-start))
+                "the replay's transaction and one declaration"))))
+      (finally (delete-recursive! (java.io.File. base))))))
+
+(deftest reopened-tenant-starts-at-the-end-of-its-log
+  ;; start-node returns before a reopened node has replayed its log, and a
+  ;; read waits only for transactions submitted through its own node. A
+  ;; reopen that declares nothing has no transaction of its own to wait on,
+  ;; so node start awaits the log's end. Schemaless, so the reopen has nothing
+  ;; to declare even while its catalog is still replaying, and current-basis
+  ;; names no type, so no lazy declaration waits for it either. The log is
+  ;; long enough that a node which skipped the wait is still replaying.
+  (let [[node-config base] (temp-node-config)
+        open #(core-db/create-xtdb-store {:node-config node-config})
+        tenant "t1"
+        insert "INSERT INTO probe (_id) VALUES (?)"]
+    (try
+      (let [last-tx (with-started-tenant (open) tenant
+                      (fn [node]
+                        (dotimes [i 1999]
+                          (xt/submit-tx node [[:sql insert [i]]]))
+                        (:tx-id (xt/execute-tx node [[:sql insert [1999]]]))))
+            store (open)]
+        (try
+          (is (= last-tx (:tx-id (db/current-basis store tenant))))
+          (finally (close-store-nodes! store))))
       (finally (delete-recursive! (java.io.File. base))))))
 
 ;; ---------------------------------------------------------------------------
