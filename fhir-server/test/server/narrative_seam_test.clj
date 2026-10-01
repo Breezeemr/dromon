@@ -13,9 +13,15 @@
    - a host that throws loses its narrative, not the write.
 
    The second half pins presentation: an `IReadLifecycle` injected as
-   `:fhir/lifecycle` fills read, write and transaction/batch responses, never
-   storage and never search results, and a throwing one costs the
-   presentation, not the read."
+   `:fhir/lifecycle` fills every response that carries a stored resource --
+   read, vread, history, every search shape including `_include` companions,
+   write and transaction/batch responses -- once per resource, with the read
+   map naming the interaction. It never reaches storage or the server's own
+   internal reads (a PATCH base, an upsert's existence check, conditional
+   matching), and a throwing one costs the presentation, not the read.
+   `$as-of` and `$timeline` are pinned in `server.temporal-test`, whose stores
+   implement `ITemporalReadStore`; the bulk-export stream in
+   `server.bulk-export-test`."
   (:require [clojure.test :refer [deftest is testing]]
             [fhir-store.lifecycle :as lifecycle]
             [fhir-store.mock.core :as mock]
@@ -180,13 +186,68 @@
     (is (= presented-text (:text (:body resp))))
     (is (not (contains? (saved st "Substance" "s-1") :text))
         "a direct store read returns what was stored")
-    (testing "the read map names the tenant, type, store and request"
+    (testing "the read map names the tenant, type, interaction, store and request"
       (let [[read] @calls]
         (is (= 1 (count @calls)))
         (is (= tenant (:tenant-id read)))
         (is (= "Substance" (:resource-type read)))
+        (is (= :read (:interaction read)))
         (is (identical? st (:store read)))
         (is (identical? r (:request read)))))))
+
+(deftest the-read-map-names-the-interaction
+  (testing "every write response is presented exactly once, under the
+            interaction that produced it. Exactly once is the guard on the
+            internal reads: the upsert existence check and the conditional
+            matches are store reads too, and none of them may be presented."
+    (let [st     (store)
+          _      (seed! st "s-1")
+          calls  (atom [])
+          lc     (recording-lifecycle calls)
+          vid    (fn [] (get-in (saved st "Substance" "s-1") [:meta :versionId]))
+          cond-r (fn [criteria body]
+                   (-> (lc-req st "Substance" lc :body body)
+                       (assoc :query-params criteria :fhir/search-registry {})))
+          cases  [[:create
+                   #(handlers/create-resource
+                     (lc-req st "Substance" lc :body {:resourceType "Substance"}))]
+                  [:update
+                   #(handlers/update-resource
+                     (lc-req st "Substance" lc :id "s-1"
+                             :body {:resourceType "Substance" :id "s-1"}))]
+                  [:update
+                   #(handlers/update-resource
+                     (-> (lc-req st "Substance" lc :id "s-1"
+                                 :body {:resourceType "Substance" :id "s-1"})
+                         (assoc-in [:headers "if-match"] (str "W/\"" (vid) "\""))))]
+                  [:update
+                   #(handlers/update-resource
+                     (lc-req st "Substance" lc :id "s-upsert"
+                             :body {:resourceType "Substance" :id "s-upsert"}))]
+                  [:patch
+                   #(handlers/patch-resource
+                     (lc-req st "Substance" lc :id "s-1"
+                             :body [{:op "replace" :path "/status" :value "active"}]))]
+                  [:conditional-create
+                   #(handlers/create-resource
+                     (-> (lc-req st "Substance" lc :body {:resourceType "Substance"})
+                         (assoc-in [:headers "if-none-exist"] "_id=s-1")
+                         (assoc :fhir/search-registry {})))]
+                  [:update
+                   #(handlers/conditional-update
+                     (cond-r {"_id" "s-1"} {:resourceType "Substance"}))]
+                  [:update
+                   #(handlers/conditional-update
+                     (cond-r {"_id" "s-none"} {:resourceType "Substance" :id "s-cond"}))]
+                  [:patch
+                   #(handlers/conditional-patch
+                     (cond-r {"_id" "s-1"} [{:op "replace" :path "/status" :value "inactive"}]))]]]
+      (doseq [[interaction call] cases]
+        (reset! calls [])
+        (let [resp (call)]
+          (is (#{200 201} (:status resp)) (pr-str (:body resp)))
+          (is (= [interaction] (mapv :interaction @calls))
+              (str "expected one " interaction " presentation")))))))
 
 (deftest create-update-and-patch-responses-are-presented
   (let [st    (store)
@@ -270,17 +331,201 @@
           resp (handlers/read-resource (lc-req st "Substance" lc :id "s-1"))]
       (is (= (saved st "Substance" "s-1") (:body resp))))))
 
-(deftest search-results-are-not-presented
+(deftest a-patch-presents-once-never-its-base
+  (testing "the base a PATCH is applied to is read raw: presenting it would
+            write the presentation back as if the client had sent it"
+    (let [st    (store)
+          _     (seed! st "s-1")
+          calls (atom [])
+          resp  (handlers/patch-resource
+                 (lc-req st "Substance" (recording-lifecycle calls) :id "s-1"
+                         :body [{:op "replace" :path "/status" :value "active"}]))]
+      (is (= 200 (:status resp)))
+      (is (= presented-text (get-in resp [:body :text])))
+      (is (= [:patch] (mapv :interaction @calls)) "one presentation, of the result")
+      (is (= "active" (:status (saved st "Substance" "s-1"))))
+      (is (not (contains? (saved st "Substance" "s-1") :text))
+          "the stored resource carries no presented text")))
+  (testing "a transaction PATCH entry resolves against the raw base too"
+    (let [st    (store)
+          _     (seed! st "s-1")
+          calls (atom [])
+          resp  (run (handlers/transaction {})
+                     {:fhir/store     st
+                      :fhir/lifecycle (recording-lifecycle calls)
+                      :path-params    {:tenant-id tenant}
+                      :body-params    {:resourceType "Bundle"
+                                       :type "transaction"
+                                       :entry [{:request  {:method "PATCH" :url "Substance/s-1"}
+                                                :resource [{:op "replace" :path "/status"
+                                                            :value "active"}]}]}})]
+      (is (= 200 (:status resp)) (pr-str (:body resp)))
+      (is (= [:transaction] (mapv :interaction @calls)))
+      (is (= "active" (:status (saved st "Substance" "s-1"))))
+      (is (not (contains? (saved st "Substance" "s-1") :text)))))
+  (testing "a conditional delete presents nothing: its match is internal"
+    (let [st    (store)
+          _     (seed! st "s-1")
+          calls (atom [])
+          resp  (handlers/conditional-delete
+                 (-> (lc-req st "Substance" (recording-lifecycle calls))
+                     (assoc :query-params {"_id" "s-1"} :fhir/search-registry {})))]
+      (is (= 204 (:status resp)))
+      (is (empty? @calls)))))
+
+(deftest search-results-are-presented
   (let [st    (store)
         _     (seed! st "s-1")
+        _     (seed! st "s-2")
         calls (atom [])
         resp  (handlers/search-type
                (-> (lc-req st "Substance" (recording-lifecycle calls))
-                   (assoc :fhir/search-registry {})))]
+                   (assoc :fhir/search-registry {})))
+        entries (get-in resp [:body :entry])]
     (is (= 200 (:status resp)))
-    (is (= 1 (count (get-in resp [:body :entry]))))
-    (is (not-any? #(contains? (:resource %) :text) (get-in resp [:body :entry])))
-    (is (empty? @calls))))
+    (is (= 2 (count entries)))
+    (is (every? #(= presented-text (get-in % [:resource :text])) entries))
+    (is (= 2 (count @calls)) "one read map per entry")
+    (is (every? #(= {:interaction :search-type :resource-type "Substance"}
+                    (select-keys % [:interaction :resource-type]))
+                @calls))
+    (is (not (contains? (saved st "Substance" "s-1") :text))
+        "presentation never reaches storage"))
+  (testing "the lenient-handling OperationOutcome entry is the server's own and is not presented"
+    (let [st    (store)
+          _     (seed! st "s-1")
+          calls (atom [])
+          resp  (handlers/search-type
+                 (-> (lc-req st "Substance" (recording-lifecycle calls))
+                     (assoc :fhir/search-registry {}
+                            :query-params {"bogus" "x"}
+                            :headers {"prefer" "handling=lenient"})))
+          [match outcome] (get-in resp [:body :entry])]
+      (is (= 200 (:status resp)))
+      (is (= presented-text (get-in match [:resource :text])))
+      (is (= "outcome" (get-in outcome [:search :mode])))
+      (is (not (contains? (:resource outcome) :text)))
+      (is (= ["Substance"] (mapv :resource-type @calls))))))
+
+(deftest vread-is-presented
+  (let [st    (store)
+        _     (seed! st "s-1")
+        _     (db/update-resource st tenant :Substance "s-1"
+                                  {:resourceType "Substance" :id "s-1" :status "active"})
+        calls (atom [])
+        resp  (handlers/vread-resource
+               (-> (lc-req st "Substance" (recording-lifecycle calls) :id "s-1")
+                   (assoc-in [:path-params :vid] "1")))]
+    (is (= 200 (:status resp)))
+    (is (= "1" (get-in resp [:body :meta :versionId])))
+    (is (= presented-text (get-in resp [:body :text])))
+    (is (= [:vread] (mapv :interaction @calls)))
+    (is (not (contains? (db/vread-resource st tenant :Substance "s-1" "1") :text)))))
+
+(deftest history-entries-are-presented
+  (let [st (store)
+        _  (seed! st "s-1")
+        _  (db/update-resource st tenant :Substance "s-1"
+                               {:resourceType "Substance" :id "s-1" :status "active"})]
+    (doseq [[interaction handler] [[:history-instance handlers/history-instance]
+                                   [:history-type handlers/history-type]]]
+      (testing (name interaction)
+        (let [calls   (atom [])
+              resp    (handler (lc-req st "Substance" (recording-lifecycle calls) :id "s-1"))
+              entries (get-in resp [:body :entry])]
+          (is (= 200 (:status resp)))
+          (is (= "history" (get-in resp [:body :type])))
+          (is (= 2 (count entries)))
+          (is (every? #(= presented-text (get-in % [:resource :text])) entries))
+          (is (= #{"POST" "PUT"} (set (map #(get-in % [:request :method]) entries)))
+              "entry requests are still built from the stored versions")
+          (is (= [interaction interaction] (mapv :interaction @calls))))))
+    (is (not (contains? (saved st "Substance" "s-1") :text)))))
+
+(def ^:private observation-registry
+  {"subject" {:type "reference" :columns [{:col "subject"}]}})
+
+(defn- seed-patient-and-observation! [st]
+  (db/create-resource st tenant :Patient "p-1" {:resourceType "Patient" :id "p-1"})
+  (db/create-resource st tenant :Observation "o-1"
+                      {:resourceType "Observation" :id "o-1"
+                       :subject {:reference "Patient/p-1"}}))
+
+(deftest include-companions-are-presented-under-their-own-type
+  (testing "_include: the companion's read map names ITS type, not the request's"
+    (let [st    (store)
+          _     (seed-patient-and-observation! st)
+          calls (atom [])
+          resp  (handlers/search-type
+                 (-> (lc-req st "Observation" (recording-lifecycle calls))
+                     (assoc :query-params {"_include" "Observation:subject"}
+                            :fhir/search-registry {}
+                            :fhir/all-registries {})))
+          entries (get-in resp [:body :entry])]
+      (is (= 200 (:status resp)))
+      (is (= [["Observation" "match"] ["Patient" "include"]]
+             (mapv (juxt #(get-in % [:resource :resourceType]) #(get-in % [:search :mode]))
+                   entries)))
+      (is (every? #(= presented-text (get-in % [:resource :text])) entries))
+      (is (= [["Observation" :search-type] ["Patient" :search-type]]
+             (mapv (juxt :resource-type :interaction) @calls)))))
+  (testing "_revinclude, the other direction"
+    (let [st    (store)
+          _     (seed-patient-and-observation! st)
+          calls (atom [])
+          resp  (handlers/search-type
+                 (-> (lc-req st "Patient" (recording-lifecycle calls))
+                     (assoc :query-params {"_revinclude" "Observation:subject"}
+                            :fhir/search-registry {}
+                            :fhir/all-registries {"Observation" observation-registry})))
+          entries (get-in resp [:body :entry])]
+      (is (= 200 (:status resp)))
+      (is (= ["Patient" "Observation"] (mapv #(get-in % [:resource :resourceType]) entries)))
+      (is (every? #(= presented-text (get-in % [:resource :text])) entries))
+      (is (= ["Patient" "Observation"] (mapv :resource-type @calls))))))
+
+(deftest compartment-and-system-level-results-are-presented
+  (let [st (store)
+        _  (seed-patient-and-observation! st)
+        _  (seed! st "s-1")
+        registries {"Patient" {} "Observation" observation-registry "Substance" {}}
+        run-recorded (fn [handler request]
+                       (let [calls (atom [])
+                             resp  (handler (assoc request
+                                                   :fhir/lifecycle (recording-lifecycle calls)
+                                                   :fhir/all-registries registries))]
+                         [resp @calls]))
+        presented? (fn [resp]
+                     (and (seq (get-in resp [:body :entry]))
+                          (every? #(= presented-text (get-in % [:resource :text]))
+                                  (get-in resp [:body :entry]))))
+        base {:fhir/store st :path-params {:tenant-id tenant} :query-params {} :headers {}}]
+    (doseq [[label target] [["compartment search, one type" "Observation"]
+                            ["compartment search, every type" "*"]]]
+      (testing label
+        (let [[resp calls] (run-recorded handlers/compartment-search
+                                         (update base :path-params assoc
+                                                 :compartment-type "Patient"
+                                                 :compartment-id "p-1"
+                                                 :target-type target))]
+          (is (= 200 (:status resp)))
+          (is (presented? resp))
+          (is (contains? (set (map :resource-type calls)) "Observation"))
+          (is (every? #{:compartment-search} (map :interaction calls)))
+          (is (= (count (get-in resp [:body :entry])) (count calls))))))
+    (testing "system _search"
+      (let [[resp calls] (run-recorded handlers/system-search base)]
+        (is (= 200 (:status resp)))
+        (is (presented? resp))
+        (is (= #{"Patient" "Observation" "Substance"} (set (map :resource-type calls))))
+        (is (every? #{:system-search} (map :interaction calls)))))
+    (testing "system _history"
+      (let [[resp calls] (run-recorded handlers/system-history base)]
+        (is (= 200 (:status resp)))
+        (is (presented? resp))
+        (is (= #{"Patient" "Observation" "Substance"} (set (map :resource-type calls))))
+        (is (every? #{:system-history} (map :interaction calls)))))
+    (is (not (contains? (saved st "Observation" "o-1") :text)))))
 
 (defn- bundle-of [bundle-type]
   {:resourceType "Bundle"
@@ -306,11 +551,28 @@
         (is (= 2 (count entries)))
         (is (every? #(= presented-text (get-in % [:resource :text])) entries))
         (is (= #{"Substance"} (set (map :resource-type @calls))))
+        (is (= [(keyword bundle-type) (keyword bundle-type)] (mapv :interaction @calls)))
         (is (not (contains? (saved st "Substance" "s-2") :text)))))))
 
-(deftest present-bundle-response-leaves-other-bundle-types-alone
-  (let [bundle {:resourceType "Bundle" :type "searchset"
-                :entry [{:resource {:resourceType "Substance" :id "a"}}]}
+(deftest present-bundle-response-presents-searchset-and-history
+  (let [bundle-of-type (fn [t] {:resourceType "Bundle" :type t
+                                :entry [{:resource {:resourceType "Substance" :id "a"}}
+                                        {:resource {:resourceType "Patient" :id "b"}}]})
+        calls  (atom [])
         r      {:path-params {:tenant-id tenant}
-                :fhir/lifecycle (recording-lifecycle (atom []))}]
-    (is (identical? bundle (narrative/present-bundle-response r bundle)))))
+                :fhir/lifecycle (recording-lifecycle calls)}]
+    (doseq [t ["searchset" "history" "transaction-response" "batch-response"]]
+      (testing t
+        (reset! calls [])
+        (let [out (narrative/present-bundle-response r :search-type (bundle-of-type t))]
+          (is (every? #(= presented-text (get-in % [:resource :text])) (:entry out)))
+          (is (= ["Substance" "Patient"] (mapv :resource-type @calls))
+              "each entry under its own type"))))
+    (testing "any other bundle type is returned identical"
+      (doseq [t ["document" "collection" "message" nil]]
+        (let [bundle (bundle-of-type t)]
+          (is (identical? bundle (narrative/present-bundle-response r :read bundle)) (str t)))))
+    (testing "without a lifecycle a searchset is returned identical"
+      (let [bundle (bundle-of-type "searchset")]
+        (is (identical? bundle (narrative/present-bundle-response
+                                {:path-params {:tenant-id tenant}} :search-type bundle)))))))
