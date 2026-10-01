@@ -183,7 +183,9 @@
 
    Each operation config maps HTTP method keywords to handler symbols.
    Non-method keys are passed through as Reitit route data, so an operation
-   can carry middleware directives (e.g. :keto/relation, :public?)."
+   can carry middleware directives (e.g. :keto/relation, :smart/interaction,
+   :public?). Route data is shared across methods, so per-method directives
+   such as :smart/interaction take a method-keyed map."
   [fhir-type operations]
   (reduce
    (fn [acc [op-name op-config]]
