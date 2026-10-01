@@ -321,16 +321,53 @@
         [col (str col "_tokens")]
         [col]))))
 
+(defn- registry-param-columns
+  "Column names one search-registry entry makes the search SQL read: each
+   root `:col`, plus `<col>_tokens` for a token parameter whose columns are
+   all top-level CodeableConcept / Coding (the shape core/flat-token-columns
+   answers from the token array). Names starting with `_` are XTDB system
+   columns (`_id`, `_system_from`) and are never declared; neither is a :col
+   that is not a plain name (an unparsed FHIRPath fragment), which no write
+   could ever produce."
+  [{:keys [type columns]}]
+  (let [flat-token? (and (= "token" type)
+                         (seq columns)
+                         (every? #(and (#{"CodeableConcept" "Coding"} (:fhir-type %))
+                                       (not (:sub-col %)))
+                                 columns))]
+    (for [{:keys [col]} columns
+          :when (and (string? col) (re-matches #"[A-Za-z][A-Za-z0-9_-]*" col))
+          c (if flat-token? [col (str col "_tokens")] [col])]
+      c)))
+
+(defn- registry-columns
+  "Column names the schema's own `:fhir/search-registry` property (attached
+   by server.core/capability-schema->server-schema) makes searches read.
+
+   A registry can name a column the schema lacks: a shared SearchParameter
+   such as clinical-identifier lists other types' paths, and the registry
+   resolves each against this type. Before XTDB 2.2.0-rc0 such a column read
+   as null, so the OR'd alternative simply never matched; from rc0 it fails
+   the whole query at planning, so searching on the parameter's real column
+   answered empty. Declared, it plans as an untyped null again."
+  [schema]
+  (let [registry (:fhir/search-registry (try (m/properties schema) (catch Exception _ nil)))]
+    (when (map? registry)
+      (mapcat registry-param-columns (vals registry)))))
+
 (defn declared-columns
   "Column names to declare for one resource schema, in order: `_id` and
    `fhir_version` (written by every store write and read by every
    current-version check and ASSERT), then each top-level entry under its
    storage name, with a `<col>_tokens` column after each CodeableConcept /
-   Coding entry. Distinct, and never empty."
+   Coding entry, then every column the schema's search registry reads that
+   the entries did not already name (see registry-columns). Distinct, and
+   never empty."
   [schema]
   (into [] (distinct)
         (concat ["_id" "fhir_version"]
-                (mapcat entry-columns (schema-entries schema)))))
+                (mapcat entry-columns (schema-entries schema))
+                (registry-columns schema))))
 
 (defn build-declared-columns
   "resource-type string -> declared column vector, for every schema that names

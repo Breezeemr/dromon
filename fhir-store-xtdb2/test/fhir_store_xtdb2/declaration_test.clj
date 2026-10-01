@@ -485,3 +485,134 @@
                          "decl-broken"))
       (is (empty? @(:nodes store)) "no half-started tenant is kept")
       (finally (close-store-nodes! store)))))
+
+;; ---------------------------------------------------------------------------
+;; Registry columns the schema lacks
+;;
+;; A shared SearchParameter lists other types' paths (clinical-identifier is
+;; `Observation.identifier | DocumentReference.masterIdentifier`), and a
+;; registry built from it can name a column this type never stores. The
+;; search ORs every column, so at beta1 the stranger read as null and the real
+;; column still matched; from rc0 the stranger fails the whole query at
+;; planning, and search answered empty.
+;; ---------------------------------------------------------------------------
+
+(def ^:private stranger-registry
+  {"identifier" {:type "token"
+                 :columns [{:col "identifier" :fhir-type "Identifier" :array? true}
+                           {:col "masterIdentifier" :fhir-type nil :array? false}]}
+   "encounter"  {:type "reference" :target ["Encounter"]
+                 :columns [{:col "encounter" :fhir-type "Reference" :array? false}
+                           {:col "context" :fhir-type nil :array? false :sub-col "encounter"}]}
+   "code"       {:type "token"
+                 :columns [{:col "code" :fhir-type "CodeableConcept" :array? false}
+                           {:col "medicationCodeableConcept" :fhir-type "CodeableConcept" :array? false}]}
+   "_lastUpdated" {:type "date"
+                   :columns [{:col "_system_from" :fhir-type "instant" :array? false}]}
+   "unparsed"   {:type "token"
+                 :columns [{:col "value.exists() and value != false"}]}})
+
+(def ^:private registry-observation-schema
+  "Observation as server.core/capability-schema->server-schema hands it to the
+   store: the search registry rides on the schema's properties."
+  (m/schema
+   [:map {:resourceType "Observation" :fhir/search-registry stranger-registry}
+    [:resourceType {:optional true} :string]
+    [:status {:optional true} :string]
+    [:identifier {:optional true} [:sequential [:ref :org.hl7.fhir.StructureDefinition.Identifier/v4-3-0]]]
+    [:encounter {:optional true} [:map [:reference {:optional true} :string]]]
+    [:code {:optional true} [:ref :org.hl7.fhir.StructureDefinition.CodeableConcept/v4-3-0]]]
+   schema-opts))
+
+(deftest registry-columns-are-declared
+  (let [cols (xf/declared-columns registry-observation-schema)]
+    (testing "a registry column the schema lacks is declared after the schema's own"
+      (is (= ["_id" "fhir_version" "resourceType" "status" "identifier" "encounter"
+              "code" "code_tokens" "masterIdentifier" "context"
+              "medicationCodeableConcept" "medicationCodeableConcept_tokens"]
+             cols)))
+    (testing "system columns and unparsed FHIRPath are never declared"
+      (is (not-any? #{"_system_from" "value.exists() and value != false"} cols))))
+  (testing "a schema without a registry declares only its entries"
+    (is (= ["_id" "fhir_version" "resourceType" "status"]
+           (xf/declared-columns (m/schema [:map {:resourceType "Flag"}
+                                           [:resourceType :string] [:status :string]]))))))
+
+(deftest search-matches-the-real-column-beside-a-stranger
+  (doseq [query-mode [:sql :xtql]]
+    (testing (str query-mode)
+      (let [store (core-db/create-xtdb-store {:resource/schemas [registry-observation-schema]
+                                              :query-mode query-mode})
+            tenant "decl-stranger"]
+        (try
+          (db/create-resource store tenant :Observation "o1"
+                              {:resourceType "Observation" :status "final"
+                               :identifier [{:system "sys" :value "val"}]
+                               :encounter {:reference "Encounter/e1"}
+                               :code {:coding [{:system "http://loinc.org" :code "b"}]}})
+          (db/create-resource store tenant :Observation "o2"
+                              {:resourceType "Observation" :status "final"
+                               :identifier [{:system "sys" :value "other"}]})
+          (let [[results failures]
+                (failure-signals
+                 #(vector
+                   (mapv :id (db/search store tenant :Observation {"identifier" "sys|val"} stranger-registry))
+                   (db/count-resources store tenant :Observation {"identifier" "sys|val"} stranger-registry)
+                   (mapv :id (db/search store tenant :Observation {"encounter" "Encounter/e1"} stranger-registry))
+                   (db/count-resources store tenant :Observation {"encounter" "Encounter/e1"} stranger-registry)
+                   (mapv :id (db/search store tenant :Observation {"code" "a,b"} stranger-registry))
+                   (db/count-resources store tenant :Observation {"code" "a,b"} stranger-registry)))]
+            (is (= [["o1"] 1 ["o1"] 1 ["o1"] 1] results))
+            (is (empty? failures) "no search was swallowed as a planning failure"))
+          (finally (close-store-nodes! store)))))))
+
+;; ---------------------------------------------------------------------------
+;; _sort on fields the registry does not name
+;; ---------------------------------------------------------------------------
+
+(defn- sort-ignored-signals
+  "Runs `f` and returns [its value, query-failed signals, sort-field-ignored
+   signals]."
+  [f]
+  (let [{:keys [value signals error]} (t/with-signals (f))]
+    (when error (throw error))
+    [value
+     (filterv #(contains? failure-signal-ids (:id %)) signals)
+     (filterv #(= ::core-db/sort-field-ignored (:id %)) signals)]))
+
+(deftest sort-on-resource-level-and-unknown-fields
+  (doseq [query-mode [:sql :xtql]]
+    (testing (str query-mode)
+      (let [store (core-db/create-xtdb-store {:resource/schemas schemas :query-mode query-mode})
+            tenant "decl-sort"]
+        (try
+          ;; Created out of id order, so a system-time sort is not an id sort.
+          (db/create-resource store tenant :Patient "p2" {:resourceType "Patient" :active true})
+          (db/create-resource store tenant :Patient "p1" {:resourceType "Patient" :active true})
+          (testing "_lastUpdated sorts by system time, whatever the registry declares"
+            (doseq [reg [search-registry nil]]
+              (let [[asc f1 i1] (sort-ignored-signals
+                                 #(mapv :id (db/search store tenant :Patient {"_sort" "_lastUpdated"} reg)))
+                    [desc f2 i2] (sort-ignored-signals
+                                  #(mapv :id (db/search store tenant :Patient {"_sort" "-_lastUpdated"} reg)))]
+                (is (= ["p2" "p1"] asc))
+                (is (= ["p1" "p2"] desc))
+                (is (empty? (concat f1 f2 i1 i2))))))
+          (testing "_id sorts by id without a registry entry"
+            (is (= ["p1" "p2"] (mapv :id (db/search store tenant :Patient {"_sort" "_id"} search-registry))))
+            (is (= ["p2" "p1"] (mapv :id (db/search store tenant :Patient {"_sort" "-_id"} search-registry)))))
+          (testing "an unknown sort field is dropped with a warn and the rows still come back"
+            (let [[ids failures ignored]
+                  (sort-ignored-signals
+                   #(mapv :id (db/search store tenant :Patient {"_sort" "nonsense"} search-registry)))]
+              (is (= #{"p1" "p2"} (set ids)))
+              (is (= 2 (count ids)))
+              (is (empty? failures))
+              (is (= ["nonsense"] (mapv #(get-in % [:data :field]) ignored)))))
+          (testing "the known fields of a mixed sort still order the page"
+            (let [[ids failures] (sort-ignored-signals
+                                  #(mapv :id (db/search store tenant :Patient
+                                                        {"_sort" "nonsense,-_lastUpdated"} search-registry)))]
+              (is (= ["p1" "p2"] ids))
+              (is (empty? failures))))
+          (finally (close-store-nodes! store)))))))

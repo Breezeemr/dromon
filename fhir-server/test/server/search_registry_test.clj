@@ -2,6 +2,7 @@
   "Tests for the search parameter classification the search handlers use to
    decide which query parameters they can actually honour."
   (:require [clojure.test :refer [deftest is testing]]
+            [malli.core :as m]
             [server.search-registry :as sr]))
 
 (def ^:private registry
@@ -150,3 +151,64 @@
     (testing "no descriptor leaks an unparsed FHIRPath fragment as a column name"
       (doseq [col (resolve-expression "Person.telecom.where(system='phone')" field-map "token")]
         (is (not (re-find #"\(" (str (:col col) (:sub-col col)))))))))
+
+(deftest shared-expressions-keep-only-this-types-alternatives
+  ;; Shared SearchParameters list one path per base type. Stripping each
+  ;; alternative's type prefix used to turn `DocumentReference.masterIdentifier`
+  ;; into a `masterIdentifier` column of Observation; XTDB 2.2 refuses to plan a
+  ;; query naming a column nothing wrote, so Observation?identifier= answered
+  ;; empty even with a matching row.
+  (let [resolve-param #'sr/resolve-search-param-expression
+        obs-fields {"identifier" {:fhir-type "Identifier" :array? true}
+                    "encounter"  {:fhir-type "Reference" :array? false}
+                    "subject"    {:fhir-type "Reference" :array? false}}
+        doc-fields {"masterIdentifier" {:fhir-type "Identifier" :array? false}
+                    "identifier"       {:fhir-type "Identifier" :array? true}
+                    "subject"          {:fhir-type "Reference" :array? false}
+                    "context"          {:fhir-type "BackboneElement" :array? false
+                                        :children {"encounter" {:fhir-type "Reference" :array? true}}}}
+        clinical-identifier "AllergyIntolerance.identifier | Observation.identifier | DocumentReference.masterIdentifier | DocumentReference.identifier"
+        clinical-encounter "Observation.encounter | DocumentReference.context.encounter | Procedure.encounter"
+        clinical-patient "Observation.subject.where(resolve() is Patient) | DocumentReference.subject.where(resolve() is Patient) | Patient.link.other"]
+    (testing "another type's alternative never becomes a column of this type"
+      (is (= [{:col "identifier" :fhir-type "Identifier" :array? true}]
+             (resolve-param clinical-identifier obs-fields "token" "Observation")))
+      (is (= [{:col "encounter" :fhir-type "Reference" :array? false}]
+             (resolve-param clinical-encounter obs-fields "reference" "Observation"))))
+    (testing "every alternative rooted at this type is kept"
+      (is (= [{:col "masterIdentifier" :fhir-type "Identifier" :array? false}
+              {:col "identifier" :fhir-type "Identifier" :array? true}]
+             (resolve-param clinical-identifier doc-fields "token" "DocumentReference")))
+      (is (= [{:col "context" :fhir-type "BackboneElement" :array? false
+               :sub-col "encounter" :sub-fhir-type "Reference" :sub-array? true}]
+             (resolve-param clinical-encounter doc-fields "reference" "DocumentReference")))
+      (is (= [{:col "subject" :fhir-type "Reference" :array? false}]
+             (resolve-param clinical-patient doc-fields "reference" "DocumentReference"))))
+    (testing "a parenthesised cast is rooted at the type inside the parenthesis"
+      (is (= [{:col "medicationCodeableConcept" :fhir-type "CodeableConcept" :array? false}]
+             (resolve-param "Medication.code | (MedicationRequest.medication as CodeableConcept)"
+                            {"medicationCodeableConcept" {:fhir-type "CodeableConcept" :array? false}}
+                            "token" "MedicationRequest"))))
+    (testing "Resource-rooted expressions apply to every type"
+      (is (= [{:col "_id" :fhir-type "id" :array? false}]
+             (resolve-param "Resource.id" obs-fields "token" "Observation"))))
+    (testing "without a resource type every alternative is resolved, as before"
+      (is (= ["identifier" "masterIdentifier"]
+             (mapv :col (resolve-param "Observation.identifier | DocumentReference.masterIdentifier"
+                                       obs-fields "token")))))))
+
+(deftest build-resource-registry-scopes-shared-parameters-to-the-schema-type
+  (let [cap-schema (m/schema
+                    [:multi {:dispatch (constantly :base) :resourceType "Observation"}
+                     [:base [:map {:resourceType "Observation"}
+                             [:identifier {:optional true}
+                              [:sequential [:map [:value {:optional true} :string]]]]]]])
+        sp-json {:expression "Observation.identifier | DocumentReference.masterIdentifier"}]
+    (with-redefs [sr/load-search-param-json (constantly sp-json)]
+      (is (= ["identifier"]
+             (mapv :col (get-in (sr/build-resource-registry
+                                 [{:name "identifier" :type "token"
+                                   :definition "http://hl7.org/fhir/SearchParameter/clinical-identifier"}]
+                                 cap-schema)
+                                ["identifier" :columns])))
+          "the resource type comes from the capability schema's properties"))))

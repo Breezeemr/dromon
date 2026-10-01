@@ -108,7 +108,9 @@
 ;;   - any search-param with :columns nested metadata (CodeableConcept, HumanName,
 ;;     Period, Reference-across-types, ...) — the SQL builder already knows how
 ;;     to express these via UNNEST/EXISTS; translating them is deferred.
-;;   - order-by with sort-specs we cannot map 1:1
+;;   - any _sort: the SQL path maps sort fields to columns (sort-field->sql-col)
+;;     and drops ones it cannot map, where an XTQL order-by on an undeclared
+;;     column fails at planning from XTDB 2.2.0-rc0.
 ;; ---------------------------------------------------------------------------
 
 (def ^:private fallback ::fallback)
@@ -175,21 +177,13 @@
       (build-comma-or param-name comma search-param build-single-xtql)
       (build-single-xtql param-name param-value search-param))))
 
-(defn- xtql-order-by [sort-specs]
-  (when (seq sort-specs)
-    (mapv (fn [{:keys [field dir]}]
-            {:val (flat-col-sym field) :dir dir})
-          sort-specs)))
-
 (defn- compose-search-query
   "Assembles a runtime XTQL pipeline form for a search:
    (-> (from :RT [xt/system-from *]) (where ...) ...)"
-  [resource-type wheres sort-specs limit offset]
+  [resource-type wheres limit offset]
   (let [base (from-star (rt-kw resource-type))
         pipeline (cond-> [base]
                    (seq wheres) (conj (cons 'where wheres))
-                   (seq sort-specs)
-                   (conj (cons 'order-by (xtql-order-by sort-specs)))
                    (and limit (pos? limit)) (conj (list 'limit limit))
                    (and offset (pos? offset)) (conj (list 'offset offset)))]
     (apply list '-> pipeline)))
@@ -200,10 +194,7 @@
   (ftrace/trace!
    {:id :xtql/search
     :data {:resource-type (name resource-type)}}
-   (let [order-by-fallback? (and (seq sort-specs)
-                                 ;; sort on fields we don't model as flat columns
-                                 ;; — defer to SQL, which uses sort-field->sql-col.
-                                 (some #(contains? (or search-registry {}) (:field %)) sort-specs))
+   (let [order-by-fallback? (seq sort-specs)
          conditions (when (seq filter-params)
                       (mapv (fn [[k v]]
                               (build-xtql-condition k v (get search-registry (name k))))
@@ -226,7 +217,7 @@
 
        :else
        (let [wheres (mapv :where conditions)
-             q (compose-search-query resource-type wheres sort-specs limit offset)
+             q (compose-search-query resource-type wheres limit offset)
              rows (xt/q node q)]
          (mapv #(core/xtdb->fhir % read-decoders) rows))))))
 

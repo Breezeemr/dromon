@@ -968,32 +968,47 @@
                 {:field s :dir :asc})))
           (str/split sort-str #","))))
 
+(def ^:private resource-sort-columns
+  "Sort fields every resource type accepts, mapped to the system columns that
+   hold them: Resource.meta.lastUpdated is the row's system time here, as the
+   registry's `_lastUpdated` filter already maps it."
+  {"_lastUpdated" "_system_from"
+   "_id"          "_id"})
+
 (defn- sort-field->sql-col
-  "Maps a FHIR sort field name to a SQL column expression.
-   Uses the search registry to find the column name when available,
-   otherwise falls back to the field name directly."
+  "Maps a FHIR sort field name to a SQL column expression, or nil when the
+   field names nothing this store can sort by. Resource-level fields map to
+   their system columns; anything else goes through the search registry's
+   first column for the field.
+
+   An unknown field is dropped rather than quoted as a column: from XTDB
+   2.2.0-rc0 an ORDER BY on a column nothing declared fails at planning, which
+   search turns into an empty page. FHIR lets a server ignore a sort it does
+   not support."
   [field search-registry]
-  (if-let [sp (get search-registry field)]
-    ;; Use the first column from the registry entry
-    (let [col (first (:columns sp))]
-      (when col
-        (let [col-name (:col col)
-              sub-col (:sub-col col)]
-          (if sub-col
-            ;; Nested field: use struct accessor
-            (format "(\"%s\").\"%s\"" col-name sub-col)
-            (format "\"%s\"" col-name)))))
-    ;; Fallback: use field name directly as column name
-    (format "\"%s\"" field)))
+  (if-let [sys-col (get resource-sort-columns field)]
+    (format "\"%s\"" sys-col)
+    (when-let [col (first (:columns (get search-registry field)))]
+      (let [col-name (:col col)
+            sub-col (:sub-col col)]
+        (if sub-col
+          ;; Nested field: use struct accessor
+          (format "(\"%s\").\"%s\"" col-name sub-col)
+          (format "\"%s\"" col-name))))))
 
 (defn- build-order-by-clause
   "Builds a SQL ORDER BY clause from parsed sort specs.
-   Returns nil if no valid sort specs."
+   Returns nil if no valid sort specs. Each spec sort-field->sql-col cannot
+   map is left out with a warn naming the field."
   [sort-specs search-registry]
   (when (seq sort-specs)
     (let [clauses (keep (fn [{:keys [field dir]}]
-                          (when-let [col-expr (sort-field->sql-col field search-registry)]
-                            (str col-expr (if (= dir :desc) " DESC" " ASC"))))
+                          (if-let [col-expr (sort-field->sql-col field search-registry)]
+                            (str col-expr (if (= dir :desc) " DESC" " ASC"))
+                            (do (t/event! ::sort-field-ignored
+                                          {:level :warn
+                                           :data {:field field}})
+                                nil)))
                         sort-specs)]
       (when (seq clauses)
         (str " ORDER BY " (str/join ", " clauses))))))
