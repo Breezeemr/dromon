@@ -17,7 +17,8 @@
             [fhir-store-xtdb2.transform :as xf]
             [xtdb.serde :as serde])
   (:import [java.sql SQLException]
-           [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime LocalTime Year YearMonth]
+           [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime ZoneOffset LocalTime Year YearMonth]
+           [java.time.format DateTimeFormatter]
            [com.zaxxer.hikari HikariConfig HikariDataSource SQLExceptionOverride SQLExceptionOverride$Override]
            [org.postgresql.util PSQLException ServerErrorMessage]
            [xtdb.api DataSource$ConnectionBuilder]
@@ -314,6 +315,33 @@
   [ret tx-key]
   (vary-meta ret assoc :fhir-store/basis (tx-key->basis tx-key)))
 
+(defn ^:no-doc last-updated-string
+  "`meta.lastUpdated` for system time `t` (an Instant, or the ZonedDateTime
+   `_system_from` reads as): UTC, the fractional second without trailing
+   zeros. fhir-server's response coercion decodes a FHIR instant to an
+   OffsetDateTime and writes it back in this form on a single-resource
+   response, and passes history and search Bundles through as the store
+   rendered them. `Instant.toString` keeps trailing zeros (`.120380`), which a
+   read then answered as `.12038`, so the two disagreed about one version."
+  [t]
+  (let [t (if (instance? ZonedDateTime t) (.toInstant ^ZonedDateTime t) t)]
+    (if (instance? Instant t)
+      (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME (.atOffset ^Instant t ZoneOffset/UTC))
+      (str t))))
+
+(defn ^:no-doc committed
+  "What a write of `resource` returns once `tx-key` has committed it as
+   `version`: `meta.lastUpdated` is the transaction's system time, which is
+   the `_system_from` every later read of that version reports, never the
+   one the caller sent."
+  [resource id version tx-key]
+  (with-basis
+    (-> resource
+        (assoc :id id)
+        (assoc-in [:meta :versionId] version)
+        (assoc-in [:meta :lastUpdated] (last-updated-string (:system-time tx-key))))
+    tx-key))
+
 ;; ---------------------------------------------------------------------------
 ;; Write lifecycle (see fhir-store.lifecycle for the ordering contract).
 ;;
@@ -421,15 +449,12 @@
 (defn- inject-meta
   "Injects :meta :versionId and :meta :lastUpdated onto a decoded FHIR resource.
    XTDB returns _system_from as a ZonedDateTime whose str form carries a zone
-   suffix (\"...Z[UTC]\") that is not a valid FHIR instant, so it is converted
-   to an Instant first."
+   suffix (\"...Z[UTC]\") that is not a valid FHIR instant; see
+   [[last-updated-string]]."
   [result version system-from]
   (cond-> result
     version     (assoc-in [:meta :versionId] (str version))
-    system-from (assoc-in [:meta :lastUpdated]
-                          (str (if (instance? ZonedDateTime system-from)
-                                 (.toInstant ^ZonedDateTime system-from)
-                                 system-from)))))
+    system-from (assoc-in [:meta :lastUpdated] (last-updated-string system-from))))
 
 (defn- parse-date-prefix
   "Parses a FHIR date search value into [prefix date-string].
@@ -1982,11 +2007,7 @@
                                     :resource-type rt-name :id id}
                                    e))))]
     (fire-after-commit! lc-ctx [write] tx-key)
-    (with-basis
-      (-> resource
-          (assoc :id id)
-          (assoc-in [:meta :versionId] version))
-      tx-key)))
+    (committed resource id version tx-key)))
 
 (defn- update-sql [node resource-type id resource opts storage-encoders lc-ctx]
   (let [rt-name (table-name resource-type)
@@ -2033,11 +2054,7 @@
                                      {:fhir/status 409 :fhir/code "conflict"}
                                      e)))))]
     (fire-after-commit! lc-ctx [write] tx-key)
-    (with-basis
-      (-> resource
-          (assoc :id id)
-          (assoc-in [:meta :versionId] new-version))
-      tx-key)))
+    (committed resource id new-version tx-key)))
 
 (defn- delete-sql [node resource-type id opts]
   (let [rt-name (table-name resource-type)
@@ -2297,11 +2314,7 @@
                                           :version new-version
                                           :valid-time vt)
         tx-key (xt/execute-tx node [[:sql sql args]])]
-    (with-basis
-      (-> resource
-          (assoc :id id)
-          (assoc-in [:meta :versionId] new-version))
-      tx-key)))
+    (committed resource id new-version tx-key)))
 
 (defn- refuse-empty-portion!
   "Refuses an empty or inverted portion before the statement is issued.
@@ -2550,7 +2563,6 @@
                    {}
                    (group-by :resource-type
                              (filter #(= "PUT" (:method %)) entry-metas))))
-          last-updated (java.time.Instant/now)
           ;; Single pass over entry-metas: emit tx-ops AND the per-entry
           ;; response metadata (new version, final resource with :id+:meta
           ;; populated). This lets the response builder assemble the Bundle
@@ -2604,8 +2616,7 @@
                              prepared (:resource write)
                              final (-> prepared
                                        (assoc :id id)
-                                       (assoc-in [:meta :versionId] vid)
-                                       (assoc-in [:meta :lastUpdated] last-updated))]
+                                       (assoc-in [:meta :versionId] vid))]
                          (-> acc
                              (update :tx-ops into
                                      (cond-> []
@@ -2659,7 +2670,9 @@
                                                        (map :id metas))))
                      {}
                      (group-by :resource-type read-needed))
-             last-mod-str (str last-updated)]
+             ;; Every entry's version is stamped with the commit's system
+             ;; time, the `_system_from` a later read reports for it.
+             last-mod-str (last-updated-string (:system-time tx-key))]
          (with-basis
           {:resourceType "Bundle"
            :type "transaction-response"
@@ -2685,7 +2698,8 @@
                                                 vid (assoc :etag (str "W/\"" vid "\""))
                                                 last-mod-str (assoc :lastModified last-mod-str)
                                                 (= method "POST") (assoc :location (str "/" tenant-id "/fhir/" resource-type "/" id "/_history/" vid)))}
-                             resource (assoc :resource resource))))
+                             resource (assoc :resource
+                                             (assoc-in resource [:meta :lastUpdated] last-mod-str)))))
                        entry-results)}
           tx-key)))))))))
 
