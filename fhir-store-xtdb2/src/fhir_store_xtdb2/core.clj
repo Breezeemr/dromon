@@ -296,6 +296,33 @@
         ops-write (assoc write :resource prepared :submitted resource)]
     (assoc ops-write :tx-ops (lc/write-tx-ops lifecycle ops-write))))
 
+(defn ^:no-doc lifecycle-tx-ops
+  "`write`'s lifecycle ops, refused when any of them holds an unpaired UTF-16
+   surrogate, which would reach XTDB as \"?\" like any other text (see
+   xf/unpaired-surrogate-paths). Every XTDB tx-op form is plain data -- a SQL
+   string, or a vector of strings, keywords, docs and arg rows -- so walking
+   an op reaches all of its text.
+
+   Call it after the write's own body is encoded, which refuses a body holding
+   one with its element paths. A hit here therefore came from elsewhere: from
+   the submitted body, which `prepare` rewrote but the ops still carry -- the
+   client's text, so the same 400 a body refusal gives -- or from the
+   lifecycle's own data, a 500. Call it outside any catch that maps execute-tx
+   failures to a 409 or 412. Names ops by position, never their text."
+  [{:keys [resource-type id submitted tx-ops]}]
+  (let [bad (into [] (keep-indexed (fn [i op]
+                                     (when (some xf/unencodable? (tree-seq coll? seq op)) i)))
+                  tx-ops)]
+    (when (seq bad)
+      (refuse-unencodable-text! resource-type id submitted)
+      (throw (ex-info (str "Lifecycle tx-ops " (str/join ", " bad) " for " resource-type
+                           " hold an unpaired UTF-16 surrogate: not valid Unicode, so they"
+                           " cannot be sent unchanged")
+                      {:fhir/status 500 :fhir/code "exception"
+                       :resource-type resource-type :id id
+                       :lifecycle/tx-op-indexes bad})))
+    tx-ops))
+
 (defn ^:no-doc fire-after-commit!
   "Hand one committed transaction's writes to the lifecycle. Contained: a
    failing after-commit is logged, never rethrown."
@@ -1490,8 +1517,9 @@
                                 (table-name resource-type))
                    [id]]
         own-ops [assert-op [:sql sql args]]
+        tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
-                 (xt/execute-tx node (into own-ops (:tx-ops write)))
+                 (xt/execute-tx node tx-ops)
                  (catch Exception e
                    (when (lifecycle-op-failure? e (count own-ops))
                      (throw e))
@@ -1536,8 +1564,9 @@
                                   rt-name)
                      [id]])
         own-ops [assert-op [:sql sql args]]
+        tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
-                 (xt/execute-tx node (into own-ops (:tx-ops write)))
+                 (xt/execute-tx node tx-ops)
                  (catch Exception e
                    (when (lifecycle-op-failure? e (count own-ops))
                      (throw e))
@@ -2074,7 +2103,7 @@
                    entry-metas))
           own-op-count (count tx-ops)
           guarded? (some :if-match entry-metas)
-          tx-ops (into tx-ops (mapcat :tx-ops) lifecycle-writes)]
+          tx-ops (into tx-ops (mapcat lifecycle-tx-ops) lifecycle-writes)]
       (let [tx-key (ftrace/trace!
                     {:id :store/transact-transaction.execute-tx
                      :data {:op-count (count tx-ops)}}

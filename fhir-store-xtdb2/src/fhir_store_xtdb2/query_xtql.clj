@@ -274,8 +274,9 @@
                     [id]]
          put-op [:put-docs (rt-kw resource-type) put-doc]
          own-ops [assert-op put-op]
+         tx-ops (into own-ops (core/lifecycle-tx-ops write))
          tx-key (try
-                  (xt/execute-tx node (into own-ops (:tx-ops write)))
+                  (xt/execute-tx node tx-ops)
                   (catch Exception e
                     (when (core/lifecycle-op-failure? e (count own-ops))
                       (throw e))
@@ -320,8 +321,9 @@
                       [id]])
          put-op [:put-docs (rt-kw resource-type) put-doc]
          own-ops [assert-op put-op]
+         tx-ops (into own-ops (core/lifecycle-tx-ops write))
          tx-key (try
-                  (xt/execute-tx node (into own-ops (:tx-ops write)))
+                  (xt/execute-tx node tx-ops)
                   (catch Exception e
                     (when (core/lifecycle-op-failure? e (count own-ops))
                       (throw e))

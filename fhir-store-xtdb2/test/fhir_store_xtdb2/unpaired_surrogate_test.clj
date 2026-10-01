@@ -10,6 +10,7 @@
             [xtdb.serde :as serde]
             [fhir-store-xtdb2.core :as core-db]
             [fhir-store-xtdb2.transform :as xf]
+            [fhir-store.lifecycle :as lc]
             [fhir-store.protocol :as db])
   (:import [java.nio.charset StandardCharsets]
            [java.time Instant]
@@ -371,3 +372,85 @@
         (is (= "400 Bad Request" (-> bad :response :status)))
         (is (not (str/includes? (str (-> bad :response :outcome :issue first :diagnostics)) high)))
         (is (= "200 OK" (-> ok :response :status)))))))
+
+;; ---------------------------------------------------------------------------
+;; Lifecycle tx-ops travel in the same transaction, through the same encoders
+;; ---------------------------------------------------------------------------
+
+(defn- lifecycle
+  "Prepares with `prepare-fn` and contributes `(ops-fn write)` as tx-ops."
+  [prepare-fn ops-fn]
+  (reify lc/IWriteLifecycle
+    (prepare [_ write] (prepare-fn (:resource write)))
+    (tx-ops [_ write] (ops-fn write))
+    (after-commit [_ _] nil)))
+
+(defn- repair-family
+  "A host that repairs the stored body: the family name becomes \"Reyes\"."
+  [resource]
+  (assoc-in resource [:name 0 :family] "Reyes"))
+
+(defn- submitted-probe
+  "One probe row holding the SUBMITTED body's family name."
+  [{:keys [id submitted]}]
+  [[:put-docs :lifecycle_probe {:xt/id id :note (get-in submitted [:name 0 :family])}]])
+
+(defn- own-data-probe
+  "A clean op, then two whose own text is unencodable: a SQL arg and a doc key."
+  [{:keys [id]}]
+  [[:put-docs :lifecycle_probe {:xt/id id :note "fine"}]
+   [:sql "INSERT INTO lifecycle_probe (_id, note) VALUES (?, ?)" [(str id "-sql") lone-high]]
+   [:put-docs :lifecycle_probe {:xt/id (str id "-doc") (keyword (str "k" high)) "v"}]])
+
+(defn- probe-notes [store]
+  (let [{:keys [node]} (get @(:nodes store) "t")]
+    (xt/execute-tx node [[:sql "CREATE TABLE lifecycle_probe (_id, note)"]])
+    (into {} (map (juxt :xt/id :note)) (xt/q node "SELECT _id, note FROM lifecycle_probe"))))
+
+(deftest lifecycle-tx-ops-carrying-submitted-text-are-refused-as-the-clients
+  (doseq [mode [:sql :xtql]]
+    (testing (str mode)
+      (with-store [store {:query-mode mode
+                          :resource/lifecycle (lifecycle repair-family submitted-probe)}]
+        (testing "create"
+          (assert-refused (refusal #(db/create-resource store "t" :Practitioner "p1"
+                                                        (practitioner lone-high)))
+                          family-path))
+        (db/create-resource store "t" :Practitioner "p2" (practitioner "Reyes"))
+        (testing "update"
+          (assert-refused (refusal #(db/update-resource store "t" :Practitioner "p2"
+                                                        (practitioner lone-high)))
+                          family-path))
+        (testing "transaction"
+          (assert-refused (refusal #(db/transact-transaction
+                                     store "t"
+                                     [{:request {:method "PUT" :url "Practitioner/p3"}
+                                       :resource (practitioner lone-high)}]))
+                          family-path))
+        (is (nil? (db/read-resource store "t" :Practitioner "p1")))
+        (is (= "1" (get-in (db/read-resource store "t" :Practitioner "p2") [:meta :versionId])))
+        (is (nil? (db/read-resource store "t" :Practitioner "p3")))
+        (is (= {"p2" "Reyes"} (probe-notes store))
+            "only the clean write's probe row landed; no \"Rey?es\"")))))
+
+(deftest lifecycle-tx-ops-with-their-own-unencodable-text-are-a-host-error
+  (doseq [mode [:sql :xtql]]
+    (testing (str mode)
+      (with-store [store {:query-mode mode
+                          :resource/lifecycle (lifecycle identity own-data-probe)}]
+        (let [e (refusal #(db/create-resource store "t" :Practitioner "p1"
+                                              (practitioner "Reyes")))]
+          (is (= 500 (:fhir/status (ex-data e))))
+          (is (= "exception" (:fhir/code (ex-data e))))
+          (is (= [1 2] (:lifecycle/tx-op-indexes (ex-data e)))
+              "SQL args and doc keys are both walked; the clean op is not named")
+          (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) high))))
+        (is (nil? (db/read-resource store "t" :Practitioner "p1")))
+        (is (empty? (probe-notes store)) "none of the lifecycle's ops landed")))))
+
+(deftest a-body-is-refused-by-element-path-before-its-lifecycle-ops-are-checked
+  (with-store [store {:resource/lifecycle (lifecycle identity submitted-probe)}]
+    (let [e (refusal #(db/create-resource store "t" :Practitioner "p1"
+                                          (practitioner lone-high)))]
+      (assert-refused e family-path)
+      (is (= 400 (:fhir/status (ex-data e))) "the client's text, not a host error"))))

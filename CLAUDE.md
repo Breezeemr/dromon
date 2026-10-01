@@ -236,7 +236,10 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   one, so a delete by `p\uD83D` removes `p?`. Every store verb therefore starts
   with `refuse-unencodable-input!` (type, id, version id, params; a bad param
   is named `http.<name>` in `:fhir/location`). Over HTTP only JSON bodies can
-  carry one: ring decodes the UTF-8 bytes of a URL to U+FFFD instead.
+  carry one: ring decodes the UTF-8 bytes of a URL to U+FFFD instead. A
+  lifecycle's tx-ops ride the same transaction, so `lifecycle-tx-ops` walks
+  them after the body is encoded: text the submitted body carried is the
+  client's 400, anything else in the ops a 500.
 
 ### Transaction metadata (`:tx-metadata`)
 
