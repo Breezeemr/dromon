@@ -51,8 +51,13 @@
                           (some? (:tx-id (:result commit)))
                           (every? :tx-ops (:writes commit))])))))
 
-(defn- probe-rows [store]
+(defn- probe-rows
+  "The probe table's rows. It is declared first: when every write that would
+   have created it aborted, the read must still answer empty rather than fail
+   at planning (XTDB 2.2.0-rc0+ refuses a table nothing wrote)."
+  [store]
   (let [node (:node (get @(:nodes store) tenant))]
+    (xt/execute-tx node [[:sql "CREATE TABLE lifecycle_probe (_id, language)"]])
     (->> (xt/q node "SELECT * FROM lifecycle_probe")
          (map (juxt :xt/id :language))
          (into (sorted-set)))))

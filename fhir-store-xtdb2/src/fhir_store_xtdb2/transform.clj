@@ -30,6 +30,13 @@
       (keyword (str pext-prefix (subs n 1)))
       k)))
 
+(defn root-column-name
+  "The column name the storage encoder gives a root-level resource key, as a
+   string: `:_birthDate` -> \"primitive-ext-birthDate\", every other key (and
+   `_id`) by its name, case preserved."
+  [k]
+  (name (fhir-key->xtdb-key k)))
+
 (defn- xtdb-key->fhir-key
   "Reverse the primitive extension key renaming."
   [k]
@@ -237,6 +244,106 @@
                    (assoc acc (keyword (str (name k) "_tokens")) toks)
                    acc)))
              doc doc))
+
+;; ---------------------------------------------------------------------------
+;; Declared columns
+;;
+;; From XTDB 2.2.0-rc0 a read that names a table or column nothing has ever
+;; written fails at planning ("Table not found" / "Column not found") instead
+;; of answering empty. The store declares every schema type's table with
+;; `CREATE TABLE` when a node starts (see core/declare-tables!); this derives
+;; the column list from the same malli schemas the encoders are built from.
+;; ---------------------------------------------------------------------------
+
+(def ^:private token-ref-types
+  "FHIR datatypes add-token-columns denormalizes into `<field>_tokens`, and the
+   search layer reads `<col>_tokens` for (see core/flat-token-columns)."
+  #{"CodeableConcept" "Coding"})
+
+(def ^:private token-value-keys
+  "Promoted-extension :fhir/value-key values the search registry types as
+   CodeableConcept / Coding."
+  #{:valueCodeableConcept :valueCoding})
+
+(defn- schema-entries
+  "The [key props child-schema] entries of a resource schema: a :map's
+   children, the union of every variant of a :multi (one variant per profile,
+   so profile-added and promoted-extension entries are all included), and
+   :ref / :schema / :and wrappers dereferenced. Anything else has none."
+  ([schema] (schema-entries schema 0))
+  ([schema depth]
+   (when (< depth 8)
+     (let [t (try (m/type schema) (catch Exception _ nil))]
+       (case t
+         :map   (m/children schema)
+         :multi (mapcat (fn [[_ _ variant]] (schema-entries variant (inc depth)))
+                        (m/children schema))
+         :and   (mapcat #(schema-entries % (inc depth)) (m/children schema))
+         (:malli.core/schema :schema :ref)
+         (when-let [inner (try (m/deref schema) (catch Exception _ nil))]
+           (when-not (identical? inner schema)
+             (schema-entries inner (inc depth))))
+         nil)))))
+
+(defn- token-ref?
+  "True when an entry schema is a :ref to CodeableConcept or Coding, or a
+   :sequential / :maybe of one. Mirrors the search registry's classification,
+   which names a :ref by the last segment of its key's namespace
+   (:org.hl7.fhir.StructureDefinition.CodeableConcept/v4-3-0 -> CodeableConcept)."
+  ([schema] (token-ref? schema 0))
+  ([schema depth]
+   (when (< depth 4)
+     (let [t (try (m/type schema) (catch Exception _ nil))]
+       (case t
+         (:sequential :maybe)
+         (token-ref? (first (m/children schema)) (inc depth))
+
+         :ref
+         (let [k (first (m/children schema))]
+           (boolean
+            (when-let [ns-str (and (keyword? k) (namespace k))]
+              (contains? token-ref-types (last (str/split ns-str #"\."))))))
+
+         :malli.core/schema
+         (token-ref? (first (m/children schema)) (inc depth))
+
+         false)))))
+
+(defn- entry-columns
+  "Column names one schema entry stores: its root column, plus `<col>_tokens`
+   when the entry is a CodeableConcept / Coding (by :ref, or a promoted
+   extension whose value key is one)."
+  [[k props child]]
+  (when (or (keyword? k) (string? k))
+    (let [col (root-column-name k)]
+      (if (or (token-value-keys (:fhir/value-key props))
+              (token-ref? child))
+        [col (str col "_tokens")]
+        [col]))))
+
+(defn declared-columns
+  "Column names to declare for one resource schema, in order: `_id` and
+   `fhir_version` (written by every store write and read by every
+   current-version check and ASSERT), then each top-level entry under its
+   storage name, with a `<col>_tokens` column after each CodeableConcept /
+   Coding entry. Distinct, and never empty."
+  [schema]
+  (into [] (distinct)
+        (concat ["_id" "fhir_version"]
+                (mapcat entry-columns (schema-entries schema)))))
+
+(defn build-declared-columns
+  "resource-type string -> declared column vector, for every schema that names
+   its :resourceType (the same keying as build-storage-encoders). Two schemas
+   for one type have their columns merged."
+  [schemas]
+  (reduce (fn [acc schema]
+            (if-let [rt (:resourceType (try (m/properties schema) (catch Exception _ nil)))]
+              (update acc rt (fn [cols]
+                               (into [] (distinct) (concat cols (declared-columns schema)))))
+              acc))
+          {}
+          schemas))
 
 (defn build-storage-encoders
   "Build per-resource-type encoder functions from schemas.

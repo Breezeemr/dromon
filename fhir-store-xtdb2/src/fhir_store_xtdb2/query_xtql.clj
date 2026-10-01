@@ -278,7 +278,8 @@
          doc (core/encode-resource-doc resource-type id resource storage-encoders
                                        :version version)
          put-doc (core/doc->put-doc doc)
-         assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" rt-name)
+         assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
+                                 (core/table-name resource-type))
                     [id]]
          put-op [:put-docs (rt-kw resource-type) put-doc]
          own-ops [assert-op put-op]
@@ -302,8 +303,7 @@
   (ftrace/trace!
    {:id :xtql/update
     :data {:resource-type (name resource-type) :id id}}
-   (let [rt-name (name resource-type)
-         if-match (:if-match opts)
+   (let [if-match (:if-match opts)
          current (core/current-version node resource-type id)
          _ (when (and if-match (nil? current))
              (throw (ex-info "Version conflict: resource does not exist"
@@ -322,10 +322,10 @@
          put-doc (core/doc->put-doc doc)
          assert-op (if expected-vid
                      [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                   rt-name)
+                                   (core/table-name resource-type))
                       [id expected-vid]]
                      [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
-                                   rt-name)
+                                   (core/table-name resource-type))
                       [id]])
          put-op [:put-docs (rt-kw resource-type) put-doc]
          own-ops [assert-op put-op]
@@ -353,8 +353,7 @@
   (ftrace/trace!
    {:id :xtql/delete
     :data {:resource-type (name resource-type) :id id}}
-   (let [rt-name (name resource-type)
-         if-match (:if-match opts)
+   (let [if-match (:if-match opts)
          current (when if-match (core/current-version node resource-type id))
          _ (when (and if-match (nil? current))
              (throw (ex-info "Version conflict: resource does not exist"
@@ -366,7 +365,7 @@
                               :expected if-match :actual current})))
          assert-op (when if-match
                      [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                   rt-name)
+                                   (core/table-name resource-type))
                       [id if-match]])
          delete-op [:delete-docs (rt-kw resource-type) id]
          tx-ops (if assert-op [assert-op delete-op] [delete-op])
