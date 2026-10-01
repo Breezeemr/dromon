@@ -355,17 +355,23 @@
     (when (map? registry)
       (mapcat registry-param-columns (vals registry)))))
 
+(def store-columns
+  "Columns the store itself reads on every resource type, whatever its schema
+   enumerates: `_id` and `fhir_version` (written by every store write and read
+   by every current-version check and ASSERT) and `meta` (read by the
+   resource-level `_tag`, `_profile` and `_security` searches, see
+   core/resource-level-param?)."
+  ["_id" "fhir_version" "meta"])
+
 (defn declared-columns
-  "Column names to declare for one resource schema, in order: `_id` and
-   `fhir_version` (written by every store write and read by every
-   current-version check and ASSERT), then each top-level entry under its
-   storage name, with a `<col>_tokens` column after each CodeableConcept /
-   Coding entry, then every column the schema's search registry reads that
-   the entries did not already name (see registry-columns). Distinct, and
-   never empty."
+  "Column names to declare for one resource schema, in order: store-columns,
+   then each top-level entry under its storage name, with a `<col>_tokens`
+   column after each CodeableConcept / Coding entry, then every column the
+   schema's search registry reads that the entries did not already name (see
+   registry-columns). Distinct, and never empty."
   [schema]
   (into [] (distinct)
-        (concat ["_id" "fhir_version"]
+        (concat store-columns
                 (mapcat entry-columns (schema-entries schema))
                 (registry-columns schema))))
 

@@ -837,6 +837,93 @@
           [(str "(" (str/join " OR " (map first per-col)) ")")
            (vec (mapcat second per-col))])))))
 
+;; ---------------------------------------------------------------------------
+;; Resource-level search parameters
+;;
+;; FHIR defines _lastUpdated, _tag, _profile and _security on Resource, so they
+;; mean the same thing on every type and need no registry entry (the server
+;; grants the meta three on every type; see
+;; server.search-registry/resource-level-params). They are answered here, ahead
+;; of the registry: without that, build-condition-struct quotes the parameter
+;; name as a column, and from XTDB 2.2.0-rc0 a column nothing declared fails the
+;; whole query at planning, which search turns into an empty page.
+;; ---------------------------------------------------------------------------
+
+(def ^:private last-updated-search-param
+  "Resource.meta.lastUpdated is the row's system time here, so the filter reads
+   `_system_from`, the column server.search-registry resolves the expression
+   to when a registry does declare `_lastUpdated`."
+  {:type "date"
+   :columns [{:col "_system_from" :fhir-type "instant" :array? false}]})
+
+(def ^:private meta-coding-fields
+  "Token parameters over a Coding array in the stored `meta` struct."
+  {"_tag" "tag"
+   "_security" "security"})
+
+(defn ^:no-doc resource-level-param?
+  "True when `pname` is a search parameter every resource type answers from
+   resource-level storage rather than its search registry."
+  [pname]
+  (or (= "_lastUpdated" pname)
+      (= "_profile" pname)
+      (contains? meta-coding-fields pname)))
+
+(defn- meta-coding-predicate
+  "[sql params] matching one FHIR token value against the Coding `m.val`, or
+   nil for a value naming neither a system nor a code:
+   `code` any system, `system|code` both, `system|` any code in that system,
+   `|code` that code with no system."
+  [token]
+  (let [[a b :as parts] (str/split token #"\|" 2)
+        piped? (= 2 (count parts))
+        system (when piped? (not-empty a))
+        code (not-empty (if piped? b a))
+        clauses (cond-> []
+                  system                    (conj ["(m.val).\"system\" = ?" [system]])
+                  (and piped? (not system)) (conj ["(m.val).\"system\" IS NULL" []])
+                  code                      (conj ["(m.val).\"code\" = ?" [code]]))]
+    (when (or system code)
+      [(str "(" (str/join " AND " (map first clauses)) ")")
+       (into [] (mapcat second) clauses)])))
+
+(defn- build-meta-coding-condition
+  "`_tag` / `_security`: one EXISTS over the meta Coding array, its comma-
+   separated values OR'd inside it. A value matching nothing at all (every
+   alternative empty) is FALSE rather than unconstrained."
+  [field value-str]
+  (let [preds (keep meta-coding-predicate (str/split value-str #","))]
+    (if (empty? preds)
+      ["FALSE" []]
+      [(format "EXISTS (SELECT 1 FROM UNNEST((\"meta\").\"%s\") AS m(val) WHERE %s)"
+               field (str/join " OR " (map first preds)))
+       (into [] (mapcat second) preds)])))
+
+(defn- build-meta-profile-condition
+  "`_profile`: exact uri match against any entry of the meta profile array,
+   comma-separated values OR'd. The value is matched whole, so a canonical
+   carrying `|version` matches only a profile stored with that version."
+  [value-str]
+  (let [uris (into [] (remove str/blank?) (str/split value-str #","))]
+    (if (empty? uris)
+      ["FALSE" []]
+      [(format "EXISTS (SELECT 1 FROM UNNEST((\"meta\").\"profile\") AS p(v) WHERE p.v IN (%s))"
+               (str/join ", " (repeat (count uris) "?")))
+       uris])))
+
+(declare build-condition-struct)
+
+(defn- build-resource-level-condition
+  "[sql params] for a parameter resource-level-param? accepts. The registry is
+   not consulted: a `_lastUpdated` entry resolves to the same column, and no
+   per-type entry can describe the meta struct."
+  [pname param-value]
+  (let [param-str (if (keyword? param-value) (name param-value) (str param-value))]
+    (case pname
+      "_lastUpdated" (build-condition-struct pname param-str last-updated-search-param)
+      "_profile"     (build-meta-profile-condition param-str)
+      (build-meta-coding-condition (get meta-coding-fields pname) param-str))))
+
 (defn- build-condition-struct
   "Builds a parameterized SQL WHERE condition for a given FHIR search parameter.
    Returns [sql-fragment params-vector].
@@ -885,24 +972,29 @@
           [(format "\"%s\" = ?" pname) [v-str]])))))
 
 (defn- build-condition
-  "Builds a parameterized SQL WHERE condition for a search parameter. For token
-   searches on top-level Coding/CodeableConcept fields, uses the denormalized
+  "Builds a parameterized SQL WHERE condition for a search parameter.
+   Resource-level parameters (see resource-level-param?) are answered from
+   resource-level storage whatever the registry says. For token searches on
+   top-level Coding/CodeableConcept fields, uses the denormalized
    `<col>_tokens` array (a single scalar UNNEST ... IN) which is far cheaper than
    UNNEST-ing an array of structs under ORDER BY; everything else falls through
    to the struct path."
   [param-name param-value search-param]
-  (let [param-str (if (keyword? param-value) (name param-value) (str param-value))]
-    (or (when search-param
-          (when-let [cols (flat-token-columns search-param)]
-            ;; The flat array only beats the struct UNNEST when the struct would
-            ;; do extra work: a comma-OR (one mark-join per value) or an array-of
-            ;; -CodeableConcept column (a nested UNNEST). For a single value on a
-            ;; single CodeableConcept the struct equality is already optimal and
-            ;; slightly faster, so keep it.
-            (when (or (str/includes? param-str ",")
-                      (some :array? cols))
-              (build-flat-token-condition cols param-str))))
-        (build-condition-struct param-name param-value search-param))))
+  (let [pname (name param-name)
+        param-str (if (keyword? param-value) (name param-value) (str param-value))]
+    (if (resource-level-param? pname)
+      (build-resource-level-condition pname param-value)
+      (or (when search-param
+            (when-let [cols (flat-token-columns search-param)]
+              ;; The flat array only beats the struct UNNEST when the struct would
+              ;; do extra work: a comma-OR (one mark-join per value) or an array-of
+              ;; -CodeableConcept column (a nested UNNEST). For a single value on a
+              ;; single CodeableConcept the struct equality is already optimal and
+              ;; slightly faster, so keep it.
+              (when (or (str/includes? param-str ",")
+                        (some :array? cols))
+                (build-flat-token-condition cols param-str))))
+          (build-condition-struct param-name param-value search-param)))))
 (defn- drop-empty-sequentials
   "Recursively removes map entries whose value is an empty sequential collection
    (`[]` or an empty list). FHIR wire semantics require a repeating element with
@@ -971,7 +1063,7 @@
 (def ^:private resource-sort-columns
   "Sort fields every resource type accepts, mapped to the system columns that
    hold them: Resource.meta.lastUpdated is the row's system time here, as the
-   registry's `_lastUpdated` filter already maps it."
+   `_lastUpdated` filter maps it (last-updated-search-param)."
   {"_lastUpdated" "_system_from"
    "_id"          "_id"})
 
@@ -1164,8 +1256,8 @@
 
 (defn- ensure-declared!
   "Declares `resource-type`'s table on the entry's node, with the only columns
-   the store itself reads on a type no schema enumerates (`_id`,
-   `fhir_version`), unless it is already declared. Schema types are declared
+   the store itself reads on a type no schema enumerates (transform/
+   store-columns), unless it is already declared. Schema types are declared
    at node start, so this costs one set lookup per call; the first touch of an
    unenumerated type per tenant costs one small transaction. Two callers racing
    here both declare, which is harmless: CREATE TABLE is idempotent."
@@ -1173,7 +1265,7 @@
   (when resource-type
     (let [table (table-name resource-type)]
       (when-not (contains? @declared table)
-        (declare-tables! node {table ["_id" "fhir_version"]})
+        (declare-tables! node {table xf/store-columns})
         (swap! declared conj table))))
   nil)
 
