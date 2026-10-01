@@ -425,6 +425,18 @@
 ;; Router
 ;; ---------------------------------------------------------------------------
 
+;; The {resourceType -> search-registry} map, as a record so reitit treats it as
+;; one opaque value. reitit's route-data merge (`reitit.impl/path-update`) walks
+;; every nested plain map in a route's data, flattens it to path/value pairs and
+;; rebuilds it with assoc-in, and it does this for every route and every method
+;; under it. Records are the one map it does not descend into. As a plain map
+;; the registries were walked once per route per merge, which was ~90% of
+;; building the router (18 s of 19 s for the Breeze IG's 516 routes; 1.3 s as a
+;; record), and every route kept its own rebuilt copy (261 MB retained per
+;; router; 128 MB as a record). A record still answers `get`, `keys` and `seq`
+;; like the map it wraps.
+(defrecord AllRegistries [])
+
 (defn router-options
   "Reitit router options for the FHIR routes built from `schemas`, with
    `middleware` (see [[default-middleware]]) as the route-data stack.
@@ -435,7 +447,8 @@
 
    `:fhir/all-registries` is read by the compartment search and system search
    handlers, which need every resource type's search registry, not just the one
-   the matched route carries.
+   the matched route carries. It is an [[AllRegistries]] record rather than a
+   plain map; compare it with `into {}` if equality matters.
 
    `:muuntaja` is the instance the `::format-negotiate` / `::format-request` /
    `::format-response` middleware compile against."
@@ -443,7 +456,7 @@
   {:conflicts nil
    :data {:coercion fhir-coercion/coercion
           :muuntaja muuntaja-instance
-          :fhir/all-registries (routing/collect-registries schemas)
+          :fhir/all-registries (map->AllRegistries (routing/collect-registries schemas))
           :middleware middleware}})
 
 (defn router
