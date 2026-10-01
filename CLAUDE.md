@@ -232,6 +232,11 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   own encoder keeps it. So `encode-resource-doc`, which every write path goes
   through, refuses such an id or body with a 400 naming each element path in
   `:fhir/expression` (the server's `issue.expression`), never the value.
+  Reads, searches and deletes are no safer: the `?` they send MATCHES a stored
+  one, so a delete by `p\uD83D` removes `p?`. Every store verb therefore starts
+  with `refuse-unencodable-input!` (type, id, version id, params; a bad param
+  is named `http.<name>` in `:fhir/location`). Over HTTP only JSON bodies can
+  carry one: ring decodes the UTF-8 bytes of a URL to U+FFFD instead.
 
 ### Transaction metadata (`:tx-metadata`)
 

@@ -216,11 +216,21 @@
     (is (empty? (db/resource-timeline store "t" :Practitioner "p1" nil)) "nothing was written")))
 
 (deftest an-unencodable-id-is-refused-without-repeating-it
-  (with-store [store {}]
-    (let [bad-id (str "p" high)
-          e (refusal #(db/create-resource store "t" :Practitioner bad-id (practitioner "Reyes")))]
+  (testing "the store refuses it before anything runs"
+    (with-store [store {}]
+      (let [e (refusal #(db/create-resource store "t" :Practitioner (str "p" high)
+                                            (practitioner "Reyes")))]
+        (is (= 400 (:fhir/status (ex-data e))))
+        (is (str/includes? (ex-message e) "the id"))
+        (is (not (str/includes? (ex-message e) high)))
+        (is (not (contains? (ex-data e) :id)) "the id is the value, so ex-data omits it"))))
+
+  (testing "encode-resource-doc refuses it too, for callers that encode directly"
+    (let [e (refusal #(core-db/encode-resource-doc :Practitioner (str "p" high)
+                                                   (practitioner "Reyes")
+                                                   (xf/build-storage-encoders [])))]
       (is (= ["Practitioner.id"] (:fhir/expression (ex-data e))))
-      (is (not (contains? (ex-data e) :id)) "the id is the value, so ex-data omits it"))))
+      (is (not (contains? (ex-data e) :id))))))
 
 (deftest well-formed-text-is-stored-exactly
   (doseq [mode [:sql :xtql]]
@@ -230,3 +240,134 @@
         (is (= (utf16-units emoji)
                (utf16-units (get-in (db/read-resource store "t" :Practitioner "p1")
                                     [:name 0 :family]))))))))
+
+;; ---------------------------------------------------------------------------
+;; Reads, searches and deletes refuse too: pgjdbc would send "?", which
+;; MATCHES a stored one
+;; ---------------------------------------------------------------------------
+
+(def ^:private bad-id (str "p" high))
+
+(defn- seed-legacy-row!
+  "Writes Practitioner/p? with language \"Rey?es\" the way a write did before
+   the store refused lone surrogates: straight through pgjdbc, which turns the
+   lone code unit in both the id and the value into \"?\"."
+  [store]
+  (db/create-tenant store "t" {:if-exists :ignore})
+  (let [{:keys [node]} (get @(:nodes store) "t")]
+    (xt/execute-tx node [[:sql "INSERT INTO \"practitioner\" (_id, fhir_version, \"resourceType\", \"language\") VALUES (?, ?, ?, ?)"
+                          [bad-id "1" "Practitioner" lone-high]]]))
+  (is (= "Rey?es" (:language (db/read-resource store "t" :Practitioner "p?")))
+      "the legacy row exists under the \"?\" spellings"))
+
+(defn- assert-input-refused
+  "The refusal names `what`, carries `location` (nil for none), and repeats
+   nothing of the offending text."
+  [e what location]
+  (is (some? e) "the call was refused")
+  (when e
+    (is (= 400 (:fhir/status (ex-data e))))
+    (is (= "invalid" (:fhir/code (ex-data e))))
+    (is (str/includes? (ex-message e) what) "the message names the input")
+    (is (= location (:fhir/location (ex-data e))))
+    (let [said (str (ex-message e) (pr-str (ex-data e)))]
+      (is (not (str/includes? said "Rey")) "the value is not repeated")
+      (is (not (str/includes? said high)) "the code unit is not repeated"))))
+
+(deftest reads-by-an-unencodable-id-are-refused
+  (with-store [store {}]
+    (seed-legacy-row! store)
+    (doseq [[label f] [["read"        #(db/read-resource store "t" :Practitioner bad-id)]
+                       ["vread"       #(db/vread-resource store "t" :Practitioner bad-id "1")]
+                       ["deleted?"    #(db/resource-deleted? store "t" :Practitioner bad-id)]
+                       ["history"     #(db/history store "t" :Practitioner bad-id)]
+                       ["read-as-of"  #(db/read-as-of store "t" :Practitioner bad-id {})]
+                       ["timeline"    #(db/resource-timeline store "t" :Practitioner bad-id nil)]]]
+      (testing label
+        (assert-input-refused (refusal f) "the id" nil)))
+
+    (testing "vread by an unencodable version id"
+      (assert-input-refused (refusal #(db/vread-resource store "t" :Practitioner "p?" (str "1" high)))
+                            "the version id" nil))))
+
+(deftest deletes-by-an-unencodable-id-are-refused
+  (with-store [store {}]
+    (seed-legacy-row! store)
+    (assert-input-refused (refusal #(db/delete-resource store "t" :Practitioner bad-id))
+                          "the id" nil)
+    (assert-input-refused (refusal #(db/close-valid-time store "t" :Practitioner bad-id
+                                                         (Instant/parse "2026-01-01T00:00:00Z")))
+                          "the id" nil)
+    (is (some? (db/read-resource store "t" :Practitioner "p?"))
+        "Practitioner/p? was not deleted in the unencodable id's place")))
+
+(deftest searches-for-unencodable-text-are-refused
+  (doseq [mode [:sql :xtql]]
+    (testing (str mode)
+      (with-store [store {:query-mode mode}]
+        (seed-legacy-row! store)
+        (is (= ["p?"] (mapv :id (db/search store "t" :Practitioner {"language" "Rey?es"} nil)))
+            "what pgjdbc would have turned the search into does match the legacy row")
+        (assert-input-refused (refusal #(db/search store "t" :Practitioner {"language" lone-high} nil))
+                              "parameter 'language'" ["http.language"])
+        (assert-input-refused (refusal #(db/count-resources store "t" :Practitioner {"language" lone-high} nil))
+                              "parameter 'language'" ["http.language"]))))
+
+  (with-store [store {}]
+    (seed-legacy-row! store)
+    (testing "the temporal searches"
+      (assert-input-refused (refusal #(db/search-as-of store "t" :Practitioner {"language" lone-high} nil {}))
+                            "parameter 'language'" ["http.language"])
+      (assert-input-refused (refusal #(db/count-as-of-basis store "t" :Practitioner {"language" lone-high} nil {}))
+                            "parameter 'language'" ["http.language"]))
+
+    (testing "history-type params"
+      (assert-input-refused (refusal #(db/history-type store "t" :Practitioner {"_since" (str "2026" high)}))
+                            "parameter '_since'" ["http._since"]))
+
+    (testing "a repeated parameter, one of whose values is the problem"
+      (assert-input-refused (refusal #(db/search store "t" :Practitioner
+                                                 {:language ["Reyes" lone-high] "gender" "female"} nil))
+                            "parameter 'language'" ["http.language"]))
+
+    (testing "an unencodable parameter NAME is counted, never spelled out"
+      (assert-input-refused (refusal #(db/search store "t" :Practitioner {(str "lang" high) "x"} nil))
+                            "a parameter's name" nil))))
+
+(deftest an-unencodable-resource-type-is-refused-before-its-table-is-declared
+  (with-store [store {}]
+    (db/create-tenant store "t" nil)
+    (let [bad-type (keyword (str "Practi" high "tioner"))]
+      (doseq [[label f] [["read"   #(db/read-resource store "t" bad-type "p1")]
+                         ["search" #(db/search store "t" bad-type {} nil)]
+                         ["create" #(db/create-resource store "t" bad-type "p1" {:language "x"})]
+                         ["count-as-of" #(db/count-as-of store "t" bad-type {})]]]
+        (testing label
+          (let [e (refusal f)]
+            (assert-input-refused e "the resource type" nil)
+            (is (not (contains? (ex-data e) :resource-type)))))))
+    (is (not-any? xf/unencodable? @(:declared (get @(:nodes store) "t")))
+        "no table was declared under the unencodable name")))
+
+(deftest bundles-refuse-an-unencodable-entry-id
+  (with-store [store {}]
+    (seed-legacy-row! store)
+    (testing "a transaction refuses the whole Bundle"
+      (assert-input-refused
+       (refusal #(db/transact-transaction
+                  store "t"
+                  [{:request {:method "PUT" :url "Practitioner/ok"} :resource (practitioner "Reyes")}
+                   {:request {:method "DELETE" :url (str "Practitioner/" bad-id)}}]))
+       "the id" nil)
+      (is (nil? (db/read-resource store "t" :Practitioner "ok")))
+      (is (some? (db/read-resource store "t" :Practitioner "p?"))))
+
+    (testing "a batch refuses only that entry"
+      (let [res (db/transact-bundle
+                 store "t"
+                 [{:request {:method "GET" :url (str "Practitioner/" bad-id)}}
+                  {:request {:method "GET" :url "Practitioner/p?"}}])
+            [bad ok] (:entry res)]
+        (is (= "400 Bad Request" (-> bad :response :status)))
+        (is (not (str/includes? (str (-> bad :response :outcome :issue first :diagnostics)) high)))
+        (is (= "200 OK" (-> ok :response :status)))))))

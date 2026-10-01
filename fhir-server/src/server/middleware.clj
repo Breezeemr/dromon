@@ -18,12 +18,13 @@
 (defn- error-response
   ([status severity code diagnostics]
    (error-response status severity code diagnostics nil))
-  ([status severity code diagnostics expression]
+  ([status severity code diagnostics {:keys [expression location]}]
    {:status status
     :body (build-operation-outcome [(cond-> {:severity severity
                                              :code code
                                              :diagnostics diagnostics}
-                                      (seq expression) (assoc :expression (vec expression)))])}))
+                                      (seq expression) (assoc :expression (vec expression))
+                                      (seq location) (assoc :location (vec location)))])}))
 
 (defn- json-error-response
   "Returns an error response with body pre-serialized to a JSON InputStream.
@@ -51,7 +52,8 @@
   "Middleware that catches exceptions and formats them into FHIR OperationOutcomes.
    An ex-info carrying `:fhir/status` sets the status and `:fhir/code` the
    issue code; a `:fhir/expression` vector of element paths becomes the
-   issue's `expression`."
+   issue's `expression`, and a `:fhir/location` vector (`http.<param>` for an
+   HTTP parameter, per FHIR) its `location`."
   [handler]
   (fn [request]
     (try
@@ -71,7 +73,8 @@
 
             fhir-data
             (error-response (:fhir/status fhir-data) "error" (:fhir/code fhir-data "processing") msg
-                            (:fhir/expression fhir-data))
+                            {:expression (:fhir/expression fhir-data)
+                             :location   (:fhir/location fhir-data)})
 
             :else
             (error-response 400 "error" "processing" msg))))

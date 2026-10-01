@@ -168,7 +168,9 @@
 ;; it on the server for :put-docs, whose transit payload still carries the
 ;; code unit intact. The storage encoder above leaves strings untouched. Once
 ;; written, the "?" is indistinguishable from a real one, so the store refuses
-;; such a value instead (see core/refuse-unencodable-text!).
+;; such a value instead (see core/refuse-unencodable-text!). Reads and searches
+;; take the same pgjdbc path, where a "?" would MATCH a stored one, so they
+;; refuse it too (see core/refuse-unencodable-input!).
 ;; ---------------------------------------------------------------------------
 
 (defn unpaired-surrogate?
@@ -192,8 +194,9 @@
             (recur (inc i))))
         false))))
 
-(defn- unencodable?
-  "True for a string or keyword whose text holds an unpaired surrogate."
+(defn unencodable?
+  "True for a string or keyword whose text holds an unpaired surrogate; false
+   for anything else, nil included."
   [x]
   (cond
     (string? x)  (unpaired-surrogate? x)

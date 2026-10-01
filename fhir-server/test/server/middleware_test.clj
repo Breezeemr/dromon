@@ -78,7 +78,19 @@
       (is (= 400 (:status response)))
       (is (= "invalid" (:code issue)))
       (is (= ["Practitioner.name[0].family"] (:expression issue)))
-      (is (= "Unpaired UTF-16 surrogate in Practitioner.name[0].family" (:diagnostics issue))))))
+      (is (= "Unpaired UTF-16 surrogate in Practitioner.name[0].family" (:diagnostics issue)))
+      (is (not (contains? issue :location)))))
+
+  (testing ":fhir/location becomes the issue's location (FHIR's http.<param> for a parameter)"
+    (let [refusal (ex-info "Unpaired UTF-16 surrogate in parameter 'name'"
+                           {:fhir/status 400 :fhir/code "invalid"
+                            :fhir/location ["http.name"]})
+          handler (fn [_] (throw (ex-info "span failed" {} refusal)))
+          response ((middleware/wrap-fhir-exceptions handler) {})
+          issue (first (:issue (:body response)))]
+      (is (= 400 (:status response)))
+      (is (= ["http.name"] (:location issue)))
+      (is (not (contains? issue :expression))))))
 
 (deftest wrap-request-id-test
   (let [ok-handler (fn [_] {:status 200 :body "OK"})
