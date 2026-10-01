@@ -14,8 +14,10 @@
             [fhir-store.protocol :as fp :refer [IFHIRStore]]
             [fhir-store-xtdb2.datetime :as dt]
             [fhir-store-xtdb2.transform :as xf])
-  (:import [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime LocalTime Year YearMonth]
-           [com.zaxxer.hikari HikariConfig HikariDataSource]))
+  (:import [java.sql SQLException]
+           [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime LocalTime Year YearMonth]
+           [com.zaxxer.hikari HikariConfig HikariDataSource SQLExceptionOverride SQLExceptionOverride$Override]
+           [xtdb.api DataSource$ConnectionBuilder]))
 
 (defn- method-order
   "Returns sort key for FHIR transaction entry processing order per §3.1.0.11.2:
@@ -182,12 +184,57 @@
         args (mapv doc cols)]
     [sql args]))
 
+;; ---------------------------------------------------------------------------
+;; Stale plans.
+;;
+;; A `SELECT *` row type is the table's column set, so a write that adds a
+;; column, or a type to one, changes it. pgwire refuses to run a statement
+;; described under the old row type ("cached plan must not change result
+;; type", SQLSTATE 0A000, :prepared-query-out-of-date). Two ways to get one:
+;;   - a pooled connection keeps a named server-side statement across
+;;     requests. The pool turns those off (see default-pool-opts).
+;;   - a write lands between one execution's Parse and its Bind. No client
+;;     setting closes that window, so run-query re-runs the read.
+;; ---------------------------------------------------------------------------
+
+(defn ^:no-doc stale-plan?
+  "True when `e`, or a cause of it, is pgwire refusing a statement whose row
+   type changed after it was described: either the pgjdbc SQLException the
+   pool sees, or the anomaly xt/q rethrows it as."
+  [^Throwable e]
+  (boolean
+   (some (fn [^Throwable c]
+           (or (= :prepared-query-out-of-date (:xtdb.error/code (ex-data c)))
+               (and (instance? SQLException c)
+                    (= "0A000" (.getSQLState ^SQLException c))
+                    (str/includes? (str (ex-message c)) "cached plan must not change result type"))))
+         (take-while some? (iterate ex-cause e)))))
+
+(def ^:private stale-plan-attempts 3)
+
+(defn ^:no-doc run-query
+  "xt/q, re-run when pgwire refuses it as a stale plan. The refusal comes
+   before any row and every caller is a read, so a re-run repeats nothing; it
+   is described afresh against the current schema."
+  [conn query+args]
+  (loop [attempt 1]
+    (let [result (try
+                   (xt/q conn query+args)
+                   (catch Exception e
+                     (if (and (< attempt stale-plan-attempts) (stale-plan? e))
+                       ::stale-plan
+                       (throw e))))]
+      (if (identical? ::stale-plan result)
+        (do (t/event! ::stale-plan-rerun {:level :debug :data {:attempt attempt}})
+            (recur (inc attempt)))
+        result))))
+
 (defn ^:no-doc current-version
   "Reads the current fhir_version column for a resource row. Returns the version
    string or nil if no row exists."
   [node resource-type id]
   (let [query (format "SELECT fhir_version FROM %s WHERE _id = ?" (table-name resource-type))
-        row (first (xt/q node [query id]))]
+        row (first (run-query node [query id]))]
     (when row
       (when-let [v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
         (str v)))))
@@ -206,7 +253,7 @@
       ;; of id count, so it hits XTDB's plan cache instead of recompiling per size.
       (let [query (format "SELECT _id, fhir_version FROM %s WHERE _id = ANY(?)"
                           (table-name resource-type))
-            rows (xt/q node [query (vec ids)])]
+            rows (run-query node [query (vec ids)])]
         (into {}
               (keep (fn [row]
                       (let [rid (or (:xt/id row) (:_id row) (get row "_id"))
@@ -233,7 +280,7 @@
       {}
       (let [query (format "SELECT *, _system_from FROM %s WHERE _id = ANY(?)"
                           (table-name resource-type))
-            rows (xt/q node [query (vec ids)])]
+            rows (run-query node [query (vec ids)])]
         (into {}
               (keep (fn [row]
                       (let [res (xtdb->fhir row read-decoders)]
@@ -1202,15 +1249,54 @@
    pooled connections eliminates that per-request session churn. A bounded pool
    caps concurrent pgwire sessions while virtual threads cheaply park on borrow.
    min-idle is modest (the win is connection reuse up to max-size, not pre-warming);
-   raise it per deployment if first-request cold-open latency matters."
-  {:max-size 24 :min-idle 4 :connection-timeout-ms 10000})
+   raise it per deployment if first-request cold-open latency matters.
+
+   prepare-threshold is pgjdbc's prepareThreshold: the executions of one SQL
+   text on a connection after which it becomes a named server-side statement.
+   A named statement keeps the row type it was described with, and a pooled
+   connection keeps it across requests, so it goes stale as soon as a write
+   adds a column (see stale-plan?). 0 never names one. That costs a parse and
+   describe per execution, about 0.1 ms; XTDB's plan cache is node-wide and
+   keyed by the query, not the statement, so searches still hit it."
+  {:max-size 24 :min-idle 4 :connection-timeout-ms 10000 :prepare-threshold 0})
+
+(defn- connection-source
+  "`node` as a DataSource whose connections carry pgjdbc's prepareThreshold."
+  ^javax.sql.DataSource [^xtdb.api.DataSource node prepare-threshold]
+  (letfn [(build [^DataSource$ConnectionBuilder builder]
+            ;; pgjdbc reads connection properties as strings.
+            (.build (.option builder "prepareThreshold" (str prepare-threshold))))]
+    (reify javax.sql.DataSource
+      (getConnection [_] (build (.createConnectionBuilder node)))
+      (getConnection [_ user password]
+        (build (-> (.createConnectionBuilder node) (.user user) (.password password))))
+      (getLogWriter [_] (.getLogWriter node))
+      (setLogWriter [_ writer] (.setLogWriter node writer))
+      (getLoginTimeout [_] (.getLoginTimeout node))
+      (setLoginTimeout [_ seconds] (.setLoginTimeout node seconds))
+      (getParentLogger [_] (.getParentLogger node))
+      (unwrap [_ iface] (.unwrap node iface))
+      (isWrapperFor [_ iface] (.isWrapperFor node iface)))))
+
+(def ^:private keep-connection-on-stale-plan
+  "Hikari evicts a connection on SQLSTATE 0A000, but a stale plan refuses one
+   statement on a healthy connection. Evicting it also hides the refusal: xt/q
+   then runs ROLLBACK on the closed connection, and \"Connection is closed\" is
+   all that reaches the caller."
+  (reify SQLExceptionOverride
+    (adjudicate [_ e]
+      (if (stale-plan? e)
+        SQLExceptionOverride$Override/DO_NOT_EVICT
+        SQLExceptionOverride$Override/CONTINUE_EVICT))))
 
 (defn- make-pool
   "Builds a HikariCP pool over the XTDB node (which is a javax.sql.DataSource)."
-  ^HikariDataSource [^javax.sql.DataSource node tenant-id pool-opts]
-  (let [{:keys [max-size min-idle connection-timeout-ms]} (merge default-pool-opts pool-opts)
+  ^HikariDataSource [node tenant-id pool-opts]
+  (let [{:keys [max-size min-idle connection-timeout-ms prepare-threshold]}
+        (merge default-pool-opts pool-opts)
         cfg (doto (HikariConfig.)
-              (.setDataSource node)
+              (.setDataSource (connection-source node prepare-threshold))
+              (.setExceptionOverride keep-connection-on-stale-plan)
               (.setMaximumPoolSize (int max-size))
               (.setMinimumIdle (int min-idle))
               (.setConnectionTimeout (long connection-timeout-ms))
@@ -1464,27 +1550,27 @@
    (let [[for-sql for-params] (basis->for-clause basis)
          query (format "SELECT *, _system_from FROM %s%s WHERE _id = ?"
                        (table-name resource-type) for-sql)
-         results (into [] (xt/q node (into [query] (conj for-params id))))]
+         results (into [] (run-query node (into [query] (conj for-params id))))]
      (xtdb->fhir (first results) read-decoders))))
 
 (defn- vread-sql [node resource-type id vid read-decoders]
   (let [query (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (table-name resource-type))
-        results (into [] (xt/q node [query vid id]))]
+        results (into [] (run-query node [query vid id]))]
     (xtdb->fhir (first results) read-decoders)))
 
 (defn- deleted?-sql [node resource-type id]
   (let [table (table-name resource-type)
         current-query (format "SELECT _id FROM %s WHERE _id = ?" table)
-        current-results (into [] (xt/q node [current-query id]))]
+        current-results (into [] (run-query node [current-query id]))]
     (if (seq current-results)
       false
       (let [history-query (format "SELECT _id FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" table)
-            history-results (into [] (xt/q node [history-query id]))]
+            history-results (into [] (run-query node [history-query id]))]
         (boolean (seq history-results))))))
 
 (defn- history-sql [node resource-type id read-decoders]
   (let [query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME WHERE _id = ?" (table-name resource-type))]
-    (mapv #(xtdb->fhir % read-decoders) (xt/q node [query id]))))
+    (mapv #(xtdb->fhir % read-decoders) (run-query node [query id]))))
 
 (def ^:private ^:no-doc result-params
   #{"_count" "_skip" "_offset" "_sort" "_include" "_revinclude"
@@ -1542,9 +1628,9 @@
   (if (empty? ids)
     []
     (let [[for-sql for-params] (basis->for-clause basis)
-          rows (xt/q node (into [(format "SELECT *, _system_from FROM %s%s WHERE _id = ANY(?)"
-                                         (table-name resource-type) for-sql)]
-                                (conj for-params (vec ids))))
+          rows (run-query node (into [(format "SELECT *, _system_from FROM %s%s WHERE _id = ANY(?)"
+                                              (table-name resource-type) for-sql)]
+                                     (conj for-params (vec ids))))
           by-id (into {} (map (fn [r] [(row-id r) r])) rows)]
       (into [] (keep #(some-> (get by-id %) (xtdb->fhir read-decoders))) ids))))
 
@@ -1568,12 +1654,12 @@
       ;; (only the WHERE + sort-key columns are read), then fetch the page's
       ;; full rows by id and restore the sorted order.
       (let [id-q (format "SELECT _id FROM %s%s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))
-            ids (mapv row-id (xt/q node (into [id-q] (conj params limit offset))))]
+            ids (mapv row-id (run-query node (into [id-q] (conj params limit offset))))]
         (fetch-by-ids node resource-type ids read-decoders basis))
       ;; No sort: a single SELECT * with LIMIT streams the first `limit` rows and
       ;; stops (early-termination), so the wide projection cost is already bounded.
       (let [q (format "SELECT *, _system_from FROM %s%s LIMIT ? OFFSET ?" rt where-sql (or order-by ""))]
-        (mapv #(xtdb->fhir % read-decoders) (xt/q node (into [q] (conj params limit offset)))))))))
+        (mapv #(xtdb->fhir % read-decoders) (run-query node (into [q] (conj params limit offset)))))))))
 
 (defn- count-sql
   ([node resource-type args] (count-sql node resource-type args nil))
@@ -1591,7 +1677,7 @@
                  where-clause (str/join " AND " (map first conditions))
                  p (into for-params (mapcat second) conditions)]
              [(format "SELECT COUNT(*) AS cnt FROM %s WHERE %s" rt where-clause) p]))
-         result (first (xt/q node (into [query-str] all-params)))]
+         result (first (run-query node (into [query-str] all-params)))]
      (or (:cnt result) 0))))
 
 ;; ---------------------------------------------------------------------------
@@ -1768,7 +1854,7 @@
         (let [q (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id > ? ORDER BY _id LIMIT ?"
                         (table-name resource-type))]
           (loop [after "" acc init]
-            (let [rows (xt/q conn [q as-of after page-size])
+            (let [rows (run-query conn [q as-of after page-size])
                   n    (count rows)]
               (if (zero? n)
                 acc
@@ -1785,9 +1871,9 @@
 (defn ^:no-doc count-as-of-sql
   "COUNT(*) of `resource-type` as of `as-of` (an Instant)."
   [conn resource-type ^java.time.Instant as-of]
-  (let [result (first (xt/q conn [(format "SELECT COUNT(*) AS cnt FROM %s FOR SYSTEM_TIME AS OF ?"
-                                          (table-name resource-type))
-                                  as-of]))]
+  (let [result (first (run-query conn [(format "SELECT COUNT(*) AS cnt FROM %s FOR SYSTEM_TIME AS OF ?"
+                                               (table-name resource-type))
+                                       as-of]))]
     (or (:cnt result) 0)))
 
 (defn- history-type-sql [node resource-type params read-decoders]
@@ -1802,7 +1888,7 @@
           :else ["" []])
         query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT ?"
                       (table-name resource-type) where-clause)
-        results (into [] (xt/q node (into [query] (conj where-params limit))))]
+        results (into [] (run-query node (into [query] (conj where-params limit))))]
     (mapv #(xtdb->fhir % read-decoders) results)))
 
 (defn ^:no-doc row->timeline-entry
@@ -1822,7 +1908,7 @@
   (let [query (format (str "SELECT *, _valid_from, _valid_to, _system_from, _system_to "
                            "FROM %s%s WHERE _id = ? ORDER BY _system_from, _valid_from")
                       (table-name resource-type) (all-time-clause))]
-    (mapv #(row->timeline-entry % read-decoders) (xt/q node [query id]))))
+    (mapv #(row->timeline-entry % read-decoders) (run-query node [query id]))))
 
 ;; ---------------------------------------------------------------------------
 ;; Valid-time writes.
@@ -2560,7 +2646,8 @@
      dynamic SQL + INSERT/DELETE. :xtql uses XTQL reads and put-docs/delete-docs
      writes, with [:sql ASSERT ...] retained for optimistic concurrency.
    - :pool-opts         — per-tenant HikariCP connection-pool overrides
-     (:max-size, :min-idle, :connection-timeout-ms); see default-pool-opts.
+     (:max-size, :min-idle, :connection-timeout-ms, :prepare-threshold); see
+     default-pool-opts.
    - :resource/lifecycle — a write lifecycle (qualified symbol, value, or
      constructor fn of this config map); resolved once here and kept on the
      store under :resource/lifecycle. See fhir-store.lifecycle.
