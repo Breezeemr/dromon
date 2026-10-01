@@ -40,24 +40,14 @@
          rows (core/run-query node q)]
      (core/xtdb->fhir (first rows) read-decoders))))
 
-(defn- parse-vid-instant [vid]
-  (cond
-    (instance? java.time.Instant vid) vid
-    (string? vid) (try (java.time.Instant/parse vid)
-                       (catch Exception _ nil))
-    :else nil))
-
-(defn vread-xtql [node resource-type id vid read-decoders]
+(defn vread-xtql
+  "`vid` is the FHIR versionId; see the SQL sibling, core/vread-sql."
+  [node resource-type id vid read-decoders]
   (ftrace/trace!
    {:id :xtql/vread
     :data {:resource-type (name resource-type) :id id :vid (str vid)}}
-   (let [inst (parse-vid-instant vid)
-         opts (if inst
-                {:for-system-time (list 'at inst)}
-                ;; fall back to all-time + manual filter if we can't parse
-                {:for-system-time :all-time})
-         q (list '-> (from-star-opts (rt-kw resource-type) opts)
-                 (list 'where (list '= 'xt/id id)))
+   (let [q (list '-> (from-star-opts (rt-kw resource-type) {:for-system-time :all-time})
+                 (list 'where (list '= 'xt/id id) (list '= 'fhir_version (str vid))))
          rows (core/run-query node q)]
      (core/xtdb->fhir (first rows) read-decoders))))
 
@@ -87,13 +77,6 @@
                  (list 'where (list '= 'xt/id id)))
          rows (core/run-query node q)]
      (mapv #(core/xtdb->fhir % read-decoders) rows))))
-
-(defn- parse-timestamp [s]
-  (cond
-    (instance? java.time.Instant s) s
-    (string? s) (try (java.time.Instant/parse s)
-                     (catch Exception _ nil))
-    :else nil))
 
 ;; ---------------------------------------------------------------------------
 ;; Search predicate builder
@@ -399,16 +382,17 @@
     :data {:resource-type (name resource-type)}}
    (let [raw-count (or (get params :_count) (get params "_count") "50")
          limit (if (string? raw-count) (parse-long raw-count) raw-count)
-         since (parse-timestamp (or (get params :_since) (get params "_since")))
-         at    (parse-timestamp (or (get params :_at)    (get params "_at")))
+         {:keys [since at]} (core/history-type-window params)
          ;; XTQL `where`/`order-by` can only reference columns bound in the
          ;; `from` — binding xt/system-from (plus *) makes it available.
          base (list 'from (rt-kw resource-type)
-                    {:for-system-time :all-time
+                    {:for-system-time (cond
+                                        (nil? at)   :all-time
+                                        (:as-of at) (list 'at (:as-of at))
+                                        :else       (list 'in (:from at) (:to at)))
                      :bind '[xt/system-from *]})
          pipeline (cond-> [base]
-                    since (conj (list 'where (list '> 'xt/system-from since)))
-                    at    (conj (list 'where (list '<= 'xt/system-from at)))
+                    since (conj (list 'where (list '>= 'xt/system-from since)))
                     true  (conj (list 'order-by {:val 'xt/system-from :dir :desc}))
                     true  (conj (list 'limit limit)))
          q (apply list '-> pipeline)

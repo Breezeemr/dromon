@@ -1822,9 +1822,16 @@
          results (into [] (run-query node (into [query] (conj for-params id))))]
      (xtdb->fhir (first results) read-decoders))))
 
-(defn- vread-sql [node resource-type id vid read-decoders]
-  (let [query (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id = ?" (table-name resource-type))
-        results (into [] (run-query node [query vid id]))]
+(defn- vread-sql
+  "`vid` is the FHIR versionId, i.e. the `fhir_version` every write stamps, so
+   the version is selected by value across system time rather than read AS OF
+   a point. Same qualifier as history-sql, so every versionId instance history
+   lists can be read back. The column holds strings; an integer vid would
+   otherwise match nothing."
+  [node resource-type id vid read-decoders]
+  (let [query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME WHERE _id = ? AND fhir_version = ?"
+                      (table-name resource-type))
+        results (into [] (run-query node [query id (str vid)]))]
     (xtdb->fhir (first results) read-decoders)))
 
 (defn- deleted?-sql [node resource-type id]
@@ -2145,19 +2152,88 @@
                                        as-of]))]
     (or (:cnt result) 0)))
 
+;; ---------------------------------------------------------------------------
+;; Type history window: `_since` and `_at`.
+;;
+;; Both reach the store as raw query strings and must be bound as java.time
+;; values: XTDB refuses `TIMESTAMP ?` at parse time, and a string bound against
+;; `_system_from` fails at execution. Bounds are Instants because a LocalDate
+;; bound through the pool is read in the JVM's zone while the same bound handed
+;; to the node is read as UTC; an Instant means one thing on both paths.
+;; ---------------------------------------------------------------------------
+
+(def ^:private fhir-instant-pattern
+  "FHIR `instant`: seconds required, fraction optional, zone required."
+  #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+
+(defn- invalid-history-param [pname value reason]
+  (ex-info (format "Invalid %s value '%s': %s" pname value reason)
+           {:fhir/status 400 :fhir/code "invalid"
+            :fhir/location [(str "http." pname)]}))
+
+(defn- parse-since
+  "`_since` is a FHIR instant. A value without a zone names no instant at all,
+   so it is refused rather than guessed: ignoring it would answer a wider
+   question than the one asked."
+  [v]
+  (cond
+    (instance? Instant v) v
+    (and (string? v) (re-matches fhir-instant-pattern v))
+    (try (.toInstant (OffsetDateTime/parse v))
+         (catch java.time.format.DateTimeParseException _
+           (throw (invalid-history-param "_since" v "not a valid date and time"))))
+    :else
+    (throw (invalid-history-param "_since" v "expected a FHIR instant with seconds and a zone, e.g. 2026-01-01T00:00:00Z"))))
+
+(defn- parse-at
+  "`_at` is a FHIR date(Time) naming a period, parsed as a `_lastUpdated`
+   search value is. Returns {:as-of t} for an instant, or {:from t :to t} for
+   the half-open period a reduced-precision value names, its days starting at
+   UTC midnight (the zone the date parser assumes for a zone-less value)."
+  [v]
+  (if (instance? Instant v)
+    {:as-of v}
+    (let [{:keys [lower upper precision]}
+          (try (dt/parse-search-date (str v))
+               (catch Exception _
+                 (throw (invalid-history-param "_at" v "expected a FHIR date or dateTime"))))
+          ->instant (fn [d] (if (instance? LocalDate d)
+                              (.toInstant (.atStartOfDay ^LocalDate d java.time.ZoneOffset/UTC))
+                              (.toInstant ^OffsetDateTime d)))]
+      (if (= :instant precision)
+        {:as-of (->instant lower)}
+        {:from (->instant lower) :to (->instant upper)}))))
+
+(defn ^:no-doc history-type-window
+  "The `_since` / `_at` restrictions of a type-history call, either key nil
+   when its parameter is absent or blank. FHIR R4B http.html#history:
+     _since  versions created at or after the instant  -> `_system_from >= since`
+     _at     versions current at some point during the period
+             -> a system-time qualifier, `AS OF` a point or `FROM .. TO` a period.
+   Both may be given; each narrows the result."
+  [params]
+  (let [param (fn [k] (let [v (or (get params (keyword k)) (get params k))]
+                        (when-not (and (string? v) (str/blank? v)) v)))]
+    {:since (some-> (param "_since") parse-since)
+     :at    (some-> (param "_at") parse-at)}))
+
 (defn- history-type-sql [node resource-type params read-decoders]
   (let [raw-count (or (get params :_count) (get params "_count") "50")
         limit (if (string? raw-count) (parse-long raw-count) raw-count)
-        since (or (get params :_since) (get params "_since"))
-        at (or (get params :_at) (get params "_at"))
-        [where-clause where-params]
+        {:keys [since at]} (history-type-window params)
+        [for-clause for-params]
         (cond
-          since [" WHERE _system_from > TIMESTAMP ?" [since]]
-          at    [" WHERE _system_from <= TIMESTAMP ?" [at]]
-          :else ["" []])
-        query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME%s ORDER BY _system_from DESC LIMIT ?"
-                      (table-name resource-type) where-clause)
-        results (into [] (run-query node (into [query] (conj where-params limit))))]
+          (nil? at)   [" FOR ALL SYSTEM_TIME" []]
+          (:as-of at) [" FOR SYSTEM_TIME AS OF ?" [(:as-of at)]]
+          :else       [" FOR SYSTEM_TIME FROM ? TO ?" [(:from at) (:to at)]])
+        [where-clause where-params]
+        (if since
+          [" WHERE _system_from >= ?" [since]]
+          ["" []])
+        query (format "SELECT *, _system_from FROM %s%s%s ORDER BY _system_from DESC LIMIT ?"
+                      (table-name resource-type) for-clause where-clause)
+        ;; The temporal qualifier follows the table name, so its params come first.
+        results (into [] (run-query node (-> [query] (into for-params) (into where-params) (conj limit))))]
     (mapv #(xtdb->fhir % read-decoders) results)))
 
 (defn ^:no-doc row->timeline-entry

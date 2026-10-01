@@ -51,26 +51,23 @@
 
         ;; Test update and history
         (println "Updating resource...")
-        (let [time-before-update (str (java.time.Instant/now))]
-          (Thread/sleep 10) ;; Ensure time progresses
-          (db/update-resource store tenant-id :Patient "123" (assoc patient-doc :active false))
+        (db/update-resource store tenant-id :Patient "123" (assoc patient-doc :active false))
 
-          (println "Testing history...")
-          (let [hist (db/history store tenant-id :Patient "123")]
-            (is (= 2 (count hist)))
-            ;; History contains both the original and updated versions
-            (let [active-versions (filter :active hist)
-                  inactive-versions (remove :active hist)]
-              (is (= 1 (count active-versions)))
-              (is (= 1 (count inactive-versions)))))
+        (println "Testing history...")
+        (let [hist (db/history store tenant-id :Patient "123")]
+          (is (= 2 (count hist)))
+          ;; History contains both the original and updated versions
+          (let [active-versions (filter :active hist)
+                inactive-versions (remove :active hist)]
+            (is (= 1 (count active-versions)))
+            (is (= 1 (count inactive-versions)))))
 
-          ;; Test vread
-          ;; We captured time-before-update, so vread should return the active version
-          (println "Testing vread...")
-          (let [vread-res (db/vread-resource store tenant-id :Patient "123" time-before-update)]
-            (println "Done testing vread.")
-            (is (some? vread-res))
-            (is (= true (:active vread-res)))))
+        ;; Test vread: version 1 is the active version written before the update
+        (println "Testing vread...")
+        (let [vread-res (db/vread-resource store tenant-id :Patient "123" "1")]
+          (println "Done testing vread.")
+          (is (some? vread-res))
+          (is (= true (:active vread-res))))
         (finally
           (close-store-nodes! store))))))
 
@@ -703,38 +700,36 @@
           patient {:resourceType "Patient" :active true :name [{"family" "Stamp"}]}]
       (try
         (db/create-resource store tenant-id :Patient "lu1" patient)
-        (let [time-before-update (str (java.time.Instant/now))]
-          (Thread/sleep 10)
-          (db/update-resource store tenant-id :Patient "lu1" (assoc patient :active false))
+        (db/update-resource store tenant-id :Patient "lu1" (assoc patient :active false))
 
-          (testing "read"
-            (let [res (db/read-resource store tenant-id :Patient "lu1")]
-              (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
+        (testing "read"
+          (let [res (db/read-resource store tenant-id :Patient "lu1")]
+            (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
 
-          (testing "vread"
-            (let [res (db/vread-resource store tenant-id :Patient "lu1" time-before-update)]
-              (is (some? res))
-              (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
+        (testing "vread"
+          (let [res (db/vread-resource store tenant-id :Patient "lu1" "1")]
+            (is (some? res))
+            (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
 
-          (testing "search without sort (single SELECT branch)"
-            (let [res (db/search store tenant-id :Patient {:active false} nil)]
-              (is (= 1 (count res)))
-              (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
+        (testing "search without sort (single SELECT branch)"
+          (let [res (db/search store tenant-id :Patient {:active false} nil)]
+            (is (= 1 (count res)))
+            (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
 
-          (testing "search with sort (two-phase fetch-by-ids branch)"
-            (let [res (db/search store tenant-id :Patient {"_sort" "_id"} nil)]
-              (is (= 1 (count res)))
-              (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
+        (testing "search with sort (two-phase fetch-by-ids branch)"
+          (let [res (db/search store tenant-id :Patient {"_sort" "_id"} nil)]
+            (is (= 1 (count res)))
+            (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
 
-          (testing "instance history"
-            (let [hist (db/history store tenant-id :Patient "lu1")]
-              (is (= 2 (count hist)))
-              (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
+        (testing "instance history"
+          (let [hist (db/history store tenant-id :Patient "lu1")]
+            (is (= 2 (count hist)))
+            (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
 
-          (testing "type history"
-            (let [hist (db/history-type store tenant-id :Patient {})]
-              (is (= 2 (count hist)))
-              (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist)))))
+        (testing "type history"
+          (let [hist (db/history-type store tenant-id :Patient {})]
+            (is (= 2 (count hist)))
+            (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
         (finally
           (close-store-nodes! store))))))
 
