@@ -571,7 +571,7 @@
 
 (defn- in-compartment?
   "Whether an already-read version of `resource-type` belongs to the launch
-   patient's compartment, for confining history. A type outside the
+   patient's compartment, for confining history and vread. A type outside the
    compartment is linked context and passes, as it does for reads."
   [{:keys [patient-id all-registries]} resource-type resource]
   (let [ft (name resource-type)]
@@ -615,9 +615,15 @@
                              :_count 1 :_skip 0}
                             (assoc registry compartment-search-param desc)))))))
 
+  ;; The current version being readable does not make every version readable:
+  ;; one from before the resource entered the compartment (refiled from
+  ;; another chart, a Task whose requester changed) is judged on its own, as
+  ;; history judges it, and reads as absent.
   (vread-resource [this tenant-id resource-type id vid]
     (when (db/read-resource this tenant-id resource-type id)
-      (db/vread-resource base tenant-id resource-type id vid)))
+      (let [version (db/vread-resource base tenant-id resource-type id vid)]
+        (when (and version (in-compartment? this resource-type version))
+          version))))
 
   (resource-deleted? [_ tenant-id resource-type id]
     (db/resource-deleted? base tenant-id resource-type id))

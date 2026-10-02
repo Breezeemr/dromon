@@ -716,3 +716,56 @@
                   #(db/transact-transaction store tenant
                                             [(entry "PUT" "Observation?code=x"
                                                     (new-obs "Patient/123"))])))))))
+
+;; ---------------------------------------------------------------------------
+;; Version reads
+;;
+;; A resource's current version deciding whether ANY of its versions may be
+;; read lets a version from before the resource entered the compartment leak:
+;; an Observation refiled from another patient's chart, or a Task whose
+;; requester changed. Each version is judged on its own, as history judges it.
+;; ---------------------------------------------------------------------------
+
+(defn- refiled-store
+  "A base store holding an Observation first filed for Patient/999 (version 1)
+   and then refiled to the launch patient (version 2), and a Task first
+   requested by Patient/999 (version 1) whose requester became the launch
+   patient (version 2)."
+  []
+  (let [base (seeded-store)]
+    (db/create-resource base tenant :Observation "refiled" (obs "refiled" "Patient/999"))
+    (db/update-resource base tenant :Observation "refiled" (obs "refiled" "Patient/123"))
+    (db/create-resource base tenant :Task "t1"
+                        {:resourceType "Task" :id "t1" :status "requested"
+                         :requester {:reference "Patient/999"}})
+    (db/update-resource base tenant :Task "t1"
+                        {:resourceType "Task" :id "t1" :status "requested"
+                         :requester {:reference "Patient/123"}})
+    base))
+
+(deftest vread-judges-each-version-on-its-own
+  (let [store (fstore (refiled-store))]
+    (testing "the version filed for the launch patient is readable"
+      (is (= "Patient/123" (get-in (db/vread-resource store tenant :Observation "refiled" "2")
+                                   [:subject :reference]))))
+    (testing "the version filed for another patient reads as nil (handler -> 404)"
+      (is (nil? (db/vread-resource store tenant :Observation "refiled" "1"))))
+    (testing "a Task version from before its requester changed reads as nil"
+      (is (= "2" (get-in (db/vread-resource store tenant :Task "t1" "2") [:meta :versionId])))
+      (is (nil? (db/vread-resource store tenant :Task "t1" "1"))))
+    (testing "vread agrees with history on which versions belong to the patient"
+      (is (= #{"2"} (set (map #(get-in % [:meta :versionId])
+                              (db/history store tenant :Observation "refiled"))))))))
+
+(deftest real-vread-handler-blocks-a-version-outside-the-compartment
+  (let [store (fstore (refiled-store))
+        vreq  (fn [vid] (assoc-in (read-req store "refiled") [:path-params :vid] vid))]
+    (is (= 200 (:status (handlers/vread-resource (vreq "2")))))
+    (let [resp (handlers/vread-resource (vreq "1"))]
+      (is (= 404 (:status resp)))
+      (is (nil? (get-in resp [:body :subject]))))))
+
+(deftest vread-of-a-type-outside-the-compartment-passes-through
+  (let [base (mock/create-mock-store {})
+        _    (db/create-resource base tenant :Medication "m1" {:resourceType "Medication" :id "m1"})]
+    (is (= "m1" (:id (db/vread-resource (fstore base) tenant :Medication "m1" "1"))))))
