@@ -68,9 +68,26 @@
    THE READ MAP handed to `present`:
 
      :tenant-id      string
-     :resource-type  string
+     :resource-type  string, the presented resource's own type. A bundle
+                     that mixes types (an `_include` companion, a system-level
+                     search or history) names each entry's type, not the
+                     request's.
+     :interaction    keyword naming the interaction whose response carries
+                     the resource: :read :vread :history-instance
+                     :history-type :system-history :search-type
+                     :compartment-search :system-search :as-of :timeline
+                     :bulk-export :create :conditional-create :update :patch
+                     :transaction :batch. A host MUST treat an absent key as
+                     :read: a dromon that predates the key names none, and
+                     presented only single-resource and transaction/batch
+                     responses.
      :store          the request's `:fhir/store`
      :request        the ring request
+
+   `present` sees what goes on a response, not every read: the server's own
+   reads (a PATCH base, an upsert's existence check, a conditional
+   interaction's matches, bulk-export counts) are never presented, so a
+   lifecycle cannot use `present` to observe reads.
 
    FAILURE, by phase. `prepare` and `tx-ops` exceptions PROPAGATE: they are
    the only way to refuse a write, and an ex-info carrying `:fhir/status` is

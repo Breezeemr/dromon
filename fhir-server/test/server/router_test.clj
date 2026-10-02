@@ -359,6 +359,21 @@
         (is (= 200 (:status resp)))
         (is (= "Patient" (get (json-body resp) "language")))))))
 
+(deftest a-lifecycle-passed-to-fhir-app-presents-search-entries
+  (let [store (mock/create-mock-store {})
+        _     (db/create-resource store tenant :Patient "p-1"
+                                  {:resourceType "Patient" :id "p-1"})
+        lc    (reify lifecycle/IReadLifecycle
+                (present [_ read resource]
+                  (assoc resource :language (name (:interaction read)))))
+        app   (sc/fhir-app store test-schemas (assoc app-opts :lifecycle lc))]
+    (with-auth
+      (let [resp (app (GET (str "/" tenant "/fhir/Patient")
+                           :headers {"authorization" (bearer-token)}))]
+        (is (= 200 (:status resp)))
+        (is (= ["search-type"]
+               (mapv #(get-in % ["resource" "language"]) (get (json-body resp) "entry"))))))))
+
 (def ^:private marker-middleware
   "Short-circuits on X-Marker so its position in the chain is observable."
   {:name ::marker

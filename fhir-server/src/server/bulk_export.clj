@@ -39,6 +39,7 @@
             [server.compartment :as compartment]
             [server.handlers :as handlers]
             [server.keto :as keto]
+            [server.narrative :as narrative]
             [server.temporal :as tmp]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace])
@@ -683,12 +684,16 @@
 (defn- output-stream-body
   "A Ring StreamableResponseBody that lazily streams `descriptor`'s NDJSON as of
    the job's pinned basis, releasing a concurrency slot when done. An :output
-   descriptor scans the type and applies compartment/_typeFilter/_since/dedup;
-   an :error descriptor writes a single OperationOutcome line."
-  [job-store job store all-registries encoders descriptor token]
+   descriptor scans the type and applies compartment/_typeFilter/_since/dedup,
+   then writes each surviving resource as `(present type resource)`; an :error
+   descriptor writes a single OperationOutcome line."
+  [job-store job store all-registries encoders present descriptor token]
   (let [{:keys [kind basis owner-ids params]} job
         {:keys [type diagnostics]} descriptor
-        encode       (partial handlers/encode-resource-by-type encoders)
+        ;; Presented after the export filter, which must judge the stored
+        ;; resource, and before the wire encoding.
+        encode       (comp (partial handlers/encode-resource-by-type encoders)
+                           #(present type %))
         since        (parse-since params)
         type-filters (parse-type-filters params)
         registry     (get all-registries type)]
@@ -723,6 +728,10 @@
             store          (:fhir/store req)
             all-registries (:fhir/all-registries req)
             encoders       (:fhir/resource-encoders req)
+            ;; The job was found under this request's tenant, so the read map
+            ;; `present-response` builds from `req` names the job's tenant.
+            present        (fn [resource-type resource]
+                             (narrative/present-response req :bulk-export resource-type resource))
             _              (sweep-expired! job-store)
             job            (bjs/get-job job-store tenant-id job-id)
             descriptor     (get-in job [:files file-id])
@@ -736,7 +745,8 @@
           (if-let [token (bjs/acquire-stream! job-store max-streams)]
             {:status  200
              :headers {"Content-Type" "application/fhir+ndjson"}
-             :body    (output-stream-body job-store job store all-registries encoders descriptor token)}
+             :body    (output-stream-body job-store job store all-registries encoders present
+                                          descriptor token)}
             (oo-response 429 "throttled"
                          (str "Too many concurrent export streams (limit " max-streams
                               "). Retry after the indicated delay.")

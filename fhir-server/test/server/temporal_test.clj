@@ -7,6 +7,7 @@
    answer to a historical question, which is indistinguishable from success at
    the call site."
   (:require [clojure.test :refer [deftest is testing]]
+            [fhir-store.lifecycle :as lifecycle]
             [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as db]
             [server.handlers :as handlers]
@@ -207,3 +208,51 @@
   (let [resp (handlers/resource-timeline (req (mock/create-mock-store {}) {} :id "x"))]
     (is (= 400 (:status resp)))
     (is (= #{"not-supported"} (issue-codes resp)))))
+
+;; ---------------------------------------------------------------------------
+;; Presentation through an injected IReadLifecycle (see server.narrative).
+;; These live here rather than in server.narrative-seam-test because the mock
+;; store implements no ITemporalReadStore.
+;; ---------------------------------------------------------------------------
+
+(def ^:private presented-text
+  {:status "generated" :div "<div>presented</div>"})
+
+(defn- presenting-lifecycle
+  "Fills :text, drops :meta, and records each read map with the resource it
+   was handed."
+  [calls]
+  (reify lifecycle/IReadLifecycle
+    (present [_ read resource]
+      (swap! calls conj [read resource])
+      (-> resource
+          (assoc :text presented-text)
+          (dissoc :meta)))))
+
+(deftest as-of-is-presented-before-the-basis-is-stamped
+  (let [calls (atom [])
+        resp  (handlers/resource-as-of
+               (assoc (req (->BitemporalStore (atom [])) {"_validAt" "2026-05-14"} :id "x")
+                      :fhir/lifecycle (presenting-lifecycle calls)))
+        [[read seen]] @calls]
+    (is (= 200 (:status resp)))
+    (is (= presented-text (get-in resp [:body :text])))
+    (is (= 1 (count @calls)))
+    (is (= {:interaction :as-of :resource-type "Coverage"}
+           (select-keys read [:interaction :resource-type])))
+    (is (nil? (:meta seen)) "the lifecycle is handed the stored resource, untagged")
+    (is (= #{"system-time" "valid-time"} (set (map :code (get-in resp [:body :meta :tag]))))
+        "a presenter cannot remove the server's statement of its basis")))
+
+(deftest timeline-entries-are-presented
+  (let [calls (atom [])
+        resp  (handlers/resource-timeline
+               (assoc (req (->BitemporalStore (atom [])) {} :id "x")
+                      :fhir/lifecycle (presenting-lifecycle calls)))
+        [entry] (get-in resp [:body :entry])]
+    (is (= 200 (:status resp)))
+    (is (= presented-text (get-in entry [:resource :text])))
+    (is (contains? (set (map :url (:extension entry))) (str tmp/extension-base "valid-from"))
+        "the temporal-bound extensions sit on the entry, untouched")
+    (is (= [[:timeline "Coverage"]]
+           (mapv (fn [[read _]] [(:interaction read) (:resource-type read)]) @calls)))))

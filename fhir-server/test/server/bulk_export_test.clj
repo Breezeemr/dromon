@@ -13,6 +13,7 @@
             [reitit.core :as reitit]
             [reitit.ring :as ring]
             [ring.core.protocols :as ring-protocols]
+            [fhir-store.lifecycle :as lifecycle]
             [fhir-store.protocol :as db]
             [server.bulk-export :as be]
             [server.bulk-job-store :as bjs]
@@ -724,6 +725,43 @@
         (is (= #{"123" "bulk-export-2"} ids)))
       (is (zero? (bjs/active-stream-count job-store))
           "the concurrency slot is released after the stream drains"))))
+
+(def ^:private presented-text
+  {:status "generated" :div "<div>presented</div>"})
+
+(defn- recording-lifecycle [calls]
+  (reify lifecycle/IReadLifecycle
+    (present [_ read resource]
+      (swap! calls conj read)
+      (assoc resource :text presented-text))))
+
+(deftest ndjson-lines-are-presented
+  (let [job-store (bjs/create-store)
+        {:keys [kickoff file]} (system-route-handlers {"Patient" :reg} {})
+        base      (bulk-req job-store (fake-store))
+        job-id    (content-location-job-id (kickoff base))
+        job       (bjs/get-job job-store "default" job-id)
+        pt        (first (filter #(= "Patient" (:type %)) (:output job)))
+        download  (fn [lc]
+                    (let [resp (file (cond-> (assoc base :path-params {:tenant-id "default"
+                                                                       :job-id job-id
+                                                                       :file-id (:file-id pt)})
+                                       lc (assoc :fhir/lifecycle lc)))]
+                      (mapv json->clj (remove str/blank? (str/split-lines
+                                                          (stream-body->string (:body resp)))))))]
+    (is (= 2 (:count pt)) "the manifest count is the stored count")
+    (testing "with a lifecycle injected every streamed line carries the presented text"
+      (let [calls (atom [])
+            lines (download (recording-lifecycle calls))]
+        (is (= 2 (count lines)))
+        (is (every? #(= "<div>presented</div>" (get-in % ["text" "div"])) lines))
+        (is (= [[:bulk-export "Patient" "default"] [:bulk-export "Patient" "default"]]
+               (mapv (juxt :interaction :resource-type :tenant-id) @calls)))))
+    (testing "without one the lines are the stored resources"
+      (let [lines (download nil)]
+        (is (= 2 (count lines)))
+        (is (not-any? #(contains? % "text") lines))))
+    (is (zero? (bjs/active-stream-count job-store)))))
 
 (deftest export-file-streams-error-operationoutcome
   (testing "downloading an :error descriptor streams a single OperationOutcome

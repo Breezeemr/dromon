@@ -30,10 +30,18 @@
    PRESENTATION is the other half and does not touch storage. A host that
    shows a resource differently on a response than it stores it injects a
    `fhir-store.lifecycle/IReadLifecycle` as `:fhir/lifecycle` on the request
-   (`server.router/wrap-lifecycle`). `present-response` and
-   `present-bundle-response` hand it every resource a read, create, update,
-   patch, or transaction/batch response returns; search, history and vread
-   return the stored resource. No injected lifecycle means responses carry
+   (`server.router/wrap-lifecycle`). Every response that carries a stored
+   resource hands it to the lifecycle once, with the read map naming the
+   interaction: read and vread, instance/type/system history, type,
+   compartment and system search (`_include`/`_revinclude` companions each
+   under their own type), `$as-of`, `$timeline`, the bulk-export NDJSON
+   stream, and the create, update, patch and transaction/batch responses.
+
+   The reads the server makes for its own use are NEVER presented: the base a
+   PATCH is applied to, the existence check before an upsert, the matches a
+   conditional interaction selects on, and the bulk-export manifest counts.
+   A presented PATCH base would be written back, persisting presentation as
+   if the client had sent it. No injected lifecycle means responses carry
    exactly what the store returned."
   (:require [clojure.string :as str]
             [fhir-store.lifecycle :as lifecycle]
@@ -62,8 +70,8 @@
     resource))
 
 (defn- entry-resource-type
-  "The type a bundle entry writes: the resource's own `resourceType`, falling
-   back to the first segment of the request URL for a PUT whose body omits it."
+  "The type of a bundle entry's resource: its own `resourceType`, falling back
+   to the first segment of the request URL, as for a PUT whose body omits it."
   [entry]
   (or (get-in entry [:resource :resourceType])
       (some-> (get-in entry [:request :url])
@@ -73,40 +81,66 @@
 
 (defn- read-context
   "The read map `fhir-store.lifecycle/present` receives for a response to
-   `req`."
-  [req resource-type]
-  {:tenant-id     (get-in req [:path-params :tenant-id])
-   :resource-type (some-> resource-type name)
-   :store         (:fhir/store req)
-   :request       req})
+   `req`. `:interaction` is left out when the caller names none, which a host
+   reads as `:read`."
+  [req interaction resource-type]
+  (cond-> {:tenant-id     (get-in req [:path-params :tenant-id])
+           :resource-type (some-> resource-type name)
+           :store         (:fhir/store req)
+           :request       req}
+    interaction (assoc :interaction interaction)))
 
 (defn present-response
-  "The resource to put on the response to `req`: the injected lifecycle's
-   `present`, or `resource` unchanged when `req` carries no `:fhir/lifecycle`.
-   The lifecycle filters its own resource types. A throwing lifecycle leaves
-   the resource unchanged (see `fhir-store.lifecycle/present-resource`): a
-   read must not 500 because presentation failed."
-  [req resource-type resource]
-  (if-let [lc (:fhir/lifecycle req)]
-    (lifecycle/present-resource lc (read-context req resource-type) resource)
-    resource))
+  "The resource to put on the response to `req` for `interaction` (a keyword
+   such as `:read`, `:search-type` or `:bulk-export`; see THE READ MAP in
+   `fhir-store.lifecycle`): the injected lifecycle's `present`, or `resource`
+   unchanged when `req` carries no `:fhir/lifecycle`. The lifecycle filters
+   its own resource types. A throwing lifecycle leaves the resource unchanged
+   (see `fhir-store.lifecycle/present-resource`): a read must not 500 because
+   presentation failed.
+
+   The 3-arity names no interaction."
+  ([req resource-type resource]
+   (present-response req nil resource-type resource))
+  ([req interaction resource-type resource]
+   (if-let [lc (:fhir/lifecycle req)]
+     (lifecycle/present-resource lc (read-context req interaction resource-type) resource)
+     resource)))
+
+(defn present-entries
+  "Present the `:resource` of every bundle entry in `entries` for
+   `interaction`, each under its OWN type: `_include`/`_revinclude`
+   companions and system-level searches and histories mix types in one
+   bundle, so the request's type would misname them.
+
+   An entry without a resource passes through, and so does a `search.mode`
+   \"outcome\" entry: that OperationOutcome is the server's own warning, not a
+   stored resource."
+  [req interaction entries]
+  (if (and (:fhir/lifecycle req) (seq entries))
+    (mapv (fn [entry]
+            (if (and (map? (:resource entry))
+                     (not= "outcome" (get-in entry [:search :mode])))
+              (update entry :resource
+                      #(present-response req interaction (entry-resource-type entry) %))
+              entry))
+          entries)
+    entries))
+
+(def ^:private presented-bundle-types
+  "The bundle types whose entries carry stored resources."
+  #{"transaction-response" "batch-response" "searchset" "history"})
 
 (defn present-bundle-response
-  "Present every entry resource of a transaction or batch response to `req`.
-   Other bundle types pass through, search included: those return the stored
-   resource."
-  [req bundle]
+  "Present every entry resource of a transaction, batch, search or history
+   response bundle to `req` for `interaction` (see `present-entries`). Any
+   other bundle type is returned identical."
+  [req interaction bundle]
   (if (and (:fhir/lifecycle req)
            (map? bundle)
-           (#{"transaction-response" "batch-response"} (:type bundle)))
-    (update bundle :entry
-            (fn [entries]
-              (mapv (fn [entry]
-                      (if (map? (:resource entry))
-                        (update entry :resource
-                                #(present-response req (:resourceType %) %))
-                        entry))
-                    entries)))
+           (presented-bundle-types (:type bundle))
+           (seq (:entry bundle)))
+    (update bundle :entry #(present-entries req interaction %))
     bundle))
 
 (defn ensure-bundle-narrative

@@ -260,7 +260,7 @@
     (if res
       (if (not-modified? res req)
         {:status 304 :body nil}
-        {:status 200 :body (narrative/present-response req resource-type res)})
+        {:status 200 :body (narrative/present-response req :read resource-type res)})
       (if (db/resource-deleted? store tenant-id (keyword resource-type) id)
         (gone-response resource-type id)
         (not-found-response resource-type id)))))
@@ -282,7 +282,7 @@
       {:status 304 :body nil}
 
       :else
-      {:status 200 :body res})))
+      {:status 200 :body (narrative/present-response req :vread resource-type res)})))
 
 (defn- operation-needs-id-response [resource-type op]
   {:status 400
@@ -326,7 +326,12 @@
           (let [basis (tmp/resolve-basis store tenant-id requested-basis)
                 res (db/read-as-of store tenant-id (keyword resource-type) id basis)]
             (if res
-              {:status 200 :body (tmp/stamp-basis res basis)}
+              ;; Presented before the basis is stamped: the lifecycle sees the
+              ;; stored resource, and the basis tags are the server's
+              ;; statement, which presentation cannot remove.
+              {:status 200
+               :body (tmp/stamp-basis (narrative/present-response req :as-of resource-type res)
+                                      basis)}
               (not-found-response resource-type
                                   (str id " at the requested point in time"))))))))
 
@@ -356,9 +361,11 @@
       (let [rows (db/resource-timeline store tenant-id (keyword resource-type) id nil)]
         (if (seq rows)
           {:status 200
-           :body (tmp/timeline-bundle (str "/" tenant-id "/fhir/" resource-type)
-                                      (db/temporal-axes store)
-                                      rows)}
+           :body (narrative/present-bundle-response
+                  req :timeline
+                  (tmp/timeline-bundle (str "/" tenant-id "/fhir/" resource-type)
+                                       (db/temporal-axes store)
+                                       rows))}
           (not-found-response resource-type id))))))
 
 (defn update-resource
@@ -398,7 +405,7 @@
       expected-version
       (let [res (db/update-resource store tenant-id (keyword resource-type) id
                                     resource-body {:if-match expected-version})]
-        {:status 200 :body (narrative/present-response req resource-type res)})
+        {:status 200 :body (narrative/present-response req :update resource-type res)})
 
       ;; Without If-Match: preserve the create-with-client-id upsert path
       ;; for nonexistent resources. Existing resources take the normal
@@ -407,13 +414,13 @@
       (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
         (if existing
           (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
-            {:status 200 :body (narrative/present-response req resource-type res)})
+            {:status 200 :body (narrative/present-response req :update resource-type res)})
           (let [res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
                 base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
                 vid (get-in res [:meta :versionId])]
             {:status 201
              :headers {"Location" (str base-url "/_history/" vid)}
-             :body (narrative/present-response req resource-type res)}))))))
+             :body (narrative/present-response req :update resource-type res)}))))))
 
 (defn patch-resource
   "Handler for PATCH /[type]/:id RESTful interaction.
@@ -458,7 +465,7 @@
             result (if opts
                      (db/update-resource store tenant-id (keyword resource-type) id patched opts)
                      (db/update-resource store tenant-id (keyword resource-type) id patched))]
-        {:status 200 :body (narrative/present-response req resource-type result)}))))
+        {:status 200 :body (narrative/present-response req :patch resource-type result)}))))
 
 (defn delete-resource
   "Handler for DELETE /[type]/:id RESTful interaction."
@@ -542,7 +549,9 @@
         all-results (versions-since since (db/history store tenant-id (keyword resource-type) id))
         total (count all-results)
         results (->> all-results (drop skip) (take limit) vec)
-        entries (mapv (partial history-entry tenant-id resource-type) results)
+        entries (narrative/present-entries
+                 req :history-instance
+                 (mapv (partial history-entry tenant-id resource-type) results))
         base-url (str "/" tenant-id "/fhir/" resource-type "/" id "/_history")
         ;; The Instant's own rendering is UTC and needs no URL encoding; the
         ;; raw value could carry a '+' offset, which a query string reads as a space.
@@ -573,7 +582,9 @@
     (or error
         (let [results (versions-since since (db/history-type store tenant-id (keyword resource-type)
                                                              (with-parsed-since params since)))
-              entries (mapv (partial history-entry tenant-id resource-type) results)]
+              entries (narrative/present-entries
+                       req :history-type
+                       (mapv (partial history-entry tenant-id resource-type) results))]
           {:status 200
            :body {:resourceType "Bundle"
                   :type "history"
@@ -632,7 +643,7 @@
         vid (get-in res [:meta :versionId])]
     {:status 201
      :headers {"Location" (str base-url "/_history/" vid)}
-     :body (narrative/present-response req resource-type res)}))
+     :body (narrative/present-response req :create resource-type res)}))
 
 (defn create-resource
   "Handler for POST /[type] RESTful interaction.
@@ -664,7 +675,8 @@
 
                (= 1 match-count)
                {:status 200
-                :body (narrative/present-response req resource-type (first results))}
+                :body (narrative/present-response req :conditional-create resource-type
+                                                  (first results))}
 
                :else
                {:status 412
@@ -1023,13 +1035,17 @@
                               results)
   
                 all-registries (:fhir/all-registries req)
+                ;; Includes follow references out of the STORED results;
+                ;; presentation runs afterwards, over the finished entries.
                 inc-entries (resolve-includes store tenant-id results include-param all-registries)
                 revinc-entries (resolve-revincludes store tenant-id results revinclude all-registries)
   
-                all-entries (cond-> entries
-                              (seq inc-entries) (into inc-entries)
-                              (seq revinc-entries) (into revinc-entries)
-                              outcome-entry (conj outcome-entry))]
+                all-entries (narrative/present-entries
+                             req :search-type
+                             (cond-> entries
+                               (seq inc-entries) (into inc-entries)
+                               (seq revinc-entries) (into revinc-entries)
+                               outcome-entry (conj outcome-entry)))]
             {:status 200
              :body (cond-> {:resourceType "Bundle"
                             :type "searchset"
@@ -1064,7 +1080,7 @@
                vid (get-in res [:meta :versionId])]
            {:status 201
             :headers {"Location" (str base-url "/_history/" vid)}
-            :body (narrative/present-response req resource-type res)})
+            :body (narrative/present-response req :update resource-type res)})
 
          (= 1 match-count)
          ;; One match: update it
@@ -1078,7 +1094,7 @@
                               :diagnostics (str "Resource id in body (" body-id ") does not match resolved id (" id ")")}]}}
              (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
                {:status 200
-                :body (narrative/present-response req resource-type res)})))
+                :body (narrative/present-response req :update resource-type res)})))
 
          :else
          {:status 412
@@ -1143,7 +1159,7 @@
                         (json-patch/apply-patch existing patch-ops))
                result (db/update-resource store tenant-id (keyword resource-type) id patched)]
            {:status 200
-            :body (narrative/present-response req resource-type result)})
+            :body (narrative/present-response req :patch resource-type result)})
 
          :else
          {:status 412
@@ -1198,7 +1214,9 @@
             unsupported (sr/unsupported-filter-params nil params)]
         (if (seq unsupported)
           (unsupported-params-response (str compartment-type " compartment search") unsupported)
-          (let [entries (vec
+          (let [entries (narrative/present-entries
+                         req :compartment-search
+                         (vec
                           (mapcat
                             (fn [[rt _params]]
                               (when-let [registry (get all-registries rt)]
@@ -1210,7 +1228,7 @@
                                            :resource res
                                            :search   {:mode "match"}})
                                         results))))
-                            compartment-map))]
+                            compartment-map)))]
             {:status 200
              :body {:resourceType "Bundle"
                     :type "searchset"
@@ -1241,11 +1259,13 @@
                             (assoc params :_count limit :_skip skip) registry)
                           [])
                 base-url (str "/" tenant-id "/fhir/" compartment-type "/" compartment-id "/" target-type)
-                entries (mapv (fn [res]
-                                {:fullUrl  (str "/" tenant-id "/fhir/" target-type "/" (:id res))
-                                 :resource res
-                                 :search   {:mode "match"}})
-                              results)
+                entries (narrative/present-entries
+                         req :compartment-search
+                         (mapv (fn [res]
+                                 {:fullUrl  (str "/" tenant-id "/fhir/" target-type "/" (:id res))
+                                  :resource res
+                                  :search   {:mode "match"}})
+                               results))
                 self-link {:relation "self" :url base-url}
                 next-link (when (= (count results) limit)
                             {:relation "next"
@@ -1563,7 +1583,9 @@
         types (keys all-registries)]
     (or error
         (let [type-params (with-parsed-since params since)
-              all-entries (vec
+              all-entries (narrative/present-entries
+                           req :system-history
+                           (vec
                             (mapcat
                               (fn [resource-type]
                                 (let [results (versions-since since (db/history-type store tenant-id (keyword resource-type) type-params))]
@@ -1574,7 +1596,7 @@
                                                      :url (str (or (:resourceType res) resource-type) "/" (:id res))}
                                            :response {:status "200"}})
                                         results)))
-                              types))]
+                              types)))]
           {:status 200
            :body {:resourceType "Bundle"
                   :type "history"
@@ -1619,7 +1641,7 @@
          :body {:resourceType "Bundle"
                 :type "searchset"
                 :total (count all-entries)
-                :entry (vec all-entries)}}))))
+                :entry (narrative/present-entries req :system-search (vec all-entries))}}))))
 
 (defn build-resource-decoders
   "Builds {resource-type-string -> decoder-fn} so a resource map can be
@@ -1965,7 +1987,7 @@
                          (resolve-patch-entries store tenant-id entries))]
             (bundle-response
              (narrative/present-bundle-response
-              req
+              req :transaction
               (db/transact-transaction store tenant-id entries))
              entries))
           ;; Batch: each entry independent. Decode entries (with per-entry
@@ -1996,7 +2018,7 @@
                                     head)))
                             resolved)]
             (bundle-response
-             (narrative/present-bundle-response req (assoc res :entry woven))
+             (narrative/present-bundle-response req :batch (assoc res :entry woven))
              decoded)))
         {:status 400
          :body {:resourceType "OperationOutcome"
