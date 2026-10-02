@@ -7,9 +7,14 @@
    compartment (only `patient/` scopes, with a `patient` launch claim), the
    launch-patient filter is added to EVERY query the request issues — searches,
    instance reads, `_include`/`_revinclude` lookups and counts alike — by
-   swapping the request store for a `CompartmentFilteringStore`. Writes that
-   reference another patient are rejected, and `patient/` access to resource
-   types outside the Patient compartment is denied.
+   swapping the request store for a `CompartmentFilteringStore`. Every write
+   verb is confined the same way, the Bundle verbs entry by entry: a write
+   must leave its resource in the launch patient's compartment and may not
+   land on a resource the token cannot read, and `patient/` access to resource
+   types outside the Patient compartment is denied. A route may name resource
+   types it writes outside the compartment (`:compartment/exempt-write-types`,
+   see `wrap-patient-compartment`); such a write still may not touch another
+   patient's compartment.
 
    Compartment membership is the UNION of the search parameters the R4B
    CompartmentDefinition lists for a resource type (e.g. an Observation is in a
@@ -419,7 +424,10 @@
 (defn- write-in-compartment?
   "True when writing `resource` (logical id `id`) to `resource-type` stays within
    `patient-id`'s compartment. Patient writes must target the launch patient;
-   member writes must reference Patient/<patient-id> via a registered link param."
+   member writes must reference Patient/<patient-id> via a registered link param.
+   A type outside the compartment is never inside it: REST refuses a `patient/`
+   token those types before the store is reached, and a Bundle entry or an
+   operation must not reach further than the same request issued alone."
   [all-registries patient-id resource-type id resource]
   (let [ft (name resource-type)]
     (cond
@@ -427,17 +435,151 @@
       (= (or id (:id resource)) patient-id)
 
       (not (member? "Patient" ft))
-      true
+      false
 
       :else
       (let [desc (compartment-descriptor "Patient" ft (get all-registries ft))]
         (and desc (reference-matches? resource (:columns desc) (str "Patient/" patient-id)))))))
 
-(defn- forbidden-write! []
-  (throw (ex-info "Resource is outside the patient compartment."
-                  {:fhir/status 403 :fhir/code "forbidden"})))
+(defn- links-another-patient?
+  "True when `resource` of `resource-type` belongs to the compartment of a
+   Patient other than `patient-id`: the Patient record itself, or a member
+   holding a Patient reference in one of its link columns. A type outside the
+   compartment links no patient, and neither does a nil `resource`. A member
+   type with no registered link parameter cannot be judged, so it is assumed
+   to link one."
+  [all-registries patient-id resource-type resource]
+  (let [ft (name resource-type)
+        own (str "Patient/" patient-id)]
+    (boolean
+     (when resource
+       (cond
+         (= ft "Patient")
+         (not= (:id resource) patient-id)
 
-(defrecord CompartmentFilteringStore [base patient-id all-registries]
+         (not (member? "Patient" ft))
+         false
+
+         :else
+         (if-let [desc (compartment-descriptor "Patient" ft (get all-registries ft))]
+           (some (fn [column]
+                   (some #(let [r (:reference %)]
+                            (and (string? r) (str/starts-with? r "Patient/") (not= r own)))
+                         (column-values resource column)))
+                 (:columns desc))
+           true))))))
+
+(defn- refusal [status code diagnostics]
+  {:status status :code code :diagnostics diagnostics})
+
+(def ^:private outside-compartment
+  (refusal 403 "forbidden" "Resource is outside the patient compartment."))
+
+(defn- refuse! [{:keys [status code diagnostics]}]
+  (throw (ex-info diagnostics {:fhir/status status :fhir/code code})))
+
+(defn- write-refusal
+  "nil when `method` (:create, :update or :delete) on `resource-type`/`id`
+   with post-image `resource` may reach the base store, else the refusal.
+
+   The post-image check alone is not enough: an update addressed to a resource
+   the token cannot read would overwrite another patient's record while
+   re-pointing it at the launch patient, so the resource being replaced must
+   be readable here or absent from the base. A delete must name a readable
+   resource, as it always has.
+
+   A type the route declares exempt skips the compartment check, but neither
+   the post-image nor the resource it replaces may link another patient: an
+   exemption lets an operation write shared or server-owned records, never
+   reach into another patient's chart."
+  [{:keys [base patient-id all-registries exempt-write-types] :as store}
+   tenant-id method resource-type id resource]
+  (let [ft (name resource-type)
+        existing (when id (db/read-resource base tenant-id resource-type id))]
+    (if (contains? exempt-write-types ft)
+      (if (or (links-another-patient? all-registries patient-id ft resource)
+              (links-another-patient? all-registries patient-id ft existing))
+        outside-compartment
+        (do (t/event! :authz/patient-compartment.exempt-write
+                      {:data {:resource-type ft :method method}})
+            nil))
+      (let [readable? (fn [] (some? (db/read-resource store tenant-id resource-type id)))]
+        (case method
+          :delete (when-not (and id (readable?)) outside-compartment)
+          (when-not (and (write-in-compartment? all-registries patient-id ft id resource)
+                         (or (nil? existing) (readable?)))
+            outside-compartment))))))
+
+(defn- entry-refusal
+  "nil when a Bundle `entry` may reach the base store, else the refusal.
+
+   Entries are judged against the state before the Bundle runs. Two shapes are
+   refused outright because the base would resolve them with a search this
+   store never sees: a conditional entry (a `?` in the url, or `ifNoneExist`)
+   and an unresolved PATCH, whose post-image does not exist until the base
+   applies it. dromon's own Bundle handler resolves PATCH into a guarded PUT
+   before the store is called. A read of a resource the token cannot read
+   answers as a read does: not found."
+  [store tenant-id entry]
+  (let [request (:request entry)
+        method (some-> (:method request) str/upper-case)
+        url (str (:url request))
+        [type id] (str/split url #"/")
+        ;; Keyword, as every other verb passes it: a store may key its state
+        ;; by the keyword form, and a string would read as absent.
+        rt (when-not (str/blank? type) (keyword type))]
+    (cond
+      (or (str/includes? url "?") (:ifNoneExist request) (get request "ifNoneExist"))
+      (refusal 403 "forbidden"
+               "Conditional Bundle entries are not supported for a patient-compartment token.")
+
+      (= "PATCH" method)
+      (refusal 403 "forbidden"
+               "An unresolved PATCH entry is not supported for a patient-compartment token.")
+
+      (#{"GET" "HEAD"} method)
+      (when-not (and rt id (db/read-resource store tenant-id rt id))
+        (refusal 404 "not-found" (str url " not found")))
+
+      (nil? rt)
+      (refusal 403 "forbidden" "A Bundle entry must name a resource type.")
+
+      ;; The check is made against the url's type, so a body of another type
+      ;; must not ride under it.
+      (and (:resource entry) (not= type (:resourceType (:resource entry))))
+      (refusal 403 "forbidden"
+               (str "Bundle entry resource type does not match its url: " url))
+
+      (= "POST" method)
+      (write-refusal store tenant-id :create rt nil (:resource entry))
+
+      (= "PUT" method)
+      (write-refusal store tenant-id :update rt id (:resource entry))
+
+      (= "DELETE" method)
+      (write-refusal store tenant-id :delete rt id nil)
+
+      ;; Any other method the base refuses itself.
+      :else nil)))
+
+(defn- refused-entry
+  "A batch-response entry answering a refused input entry in place."
+  [{:keys [status code diagnostics]}]
+  {:response {:status (str status " " (if (= 404 status) "Not Found" "Forbidden"))
+              :outcome {:resourceType "OperationOutcome"
+                        :issue [{:severity "error" :code code :diagnostics diagnostics}]}}})
+
+(defn- in-compartment?
+  "Whether an already-read version of `resource-type` belongs to the launch
+   patient's compartment, for confining history. A type outside the
+   compartment is linked context and passes, as it does for reads."
+  [{:keys [patient-id all-registries]} resource-type resource]
+  (let [ft (name resource-type)]
+    (or (not (member? "Patient" ft))
+        (resource-in-any-compartment? "Patient" #{patient-id} ft resource
+                                      (get all-registries ft)))))
+
+(defrecord CompartmentFilteringStore [base patient-id all-registries exempt-write-types]
   db/IFHIRStore
   (search [_ tenant-id resource-type params search-registry]
     (let [registry (or search-registry (get all-registries (name resource-type)))
@@ -480,42 +622,81 @@
   (resource-deleted? [_ tenant-id resource-type id]
     (db/resource-deleted? base tenant-id resource-type id))
 
-  (create-resource [_ tenant-id resource-type id resource]
-    (if (write-in-compartment? all-registries patient-id resource-type id resource)
-      (db/create-resource base tenant-id resource-type id resource)
-      (forbidden-write!)))
+  (create-resource [this tenant-id resource-type id resource]
+    (db/create-resource this tenant-id resource-type id resource nil))
+
+  (create-resource [this tenant-id resource-type id resource opts]
+    (when-let [r (write-refusal this tenant-id :create resource-type id resource)]
+      (refuse! r))
+    (if opts
+      (db/create-resource base tenant-id resource-type id resource opts)
+      (db/create-resource base tenant-id resource-type id resource)))
 
   (update-resource [this tenant-id resource-type id resource]
     (db/update-resource this tenant-id resource-type id resource nil))
 
-  (update-resource [_ tenant-id resource-type id resource opts]
-    (if (write-in-compartment? all-registries patient-id resource-type id resource)
-      (if opts
-        (db/update-resource base tenant-id resource-type id resource opts)
-        (db/update-resource base tenant-id resource-type id resource))
-      (forbidden-write!)))
+  (update-resource [this tenant-id resource-type id resource opts]
+    (when-let [r (write-refusal this tenant-id :update resource-type id resource)]
+      (refuse! r))
+    (if opts
+      (db/update-resource base tenant-id resource-type id resource opts)
+      (db/update-resource base tenant-id resource-type id resource)))
 
   (delete-resource [this tenant-id resource-type id]
     (db/delete-resource this tenant-id resource-type id nil))
 
   (delete-resource [this tenant-id resource-type id opts]
-    (if (db/read-resource this tenant-id resource-type id)
-      (if opts
-        (db/delete-resource base tenant-id resource-type id opts)
-        (db/delete-resource base tenant-id resource-type id))
-      (forbidden-write!)))
+    (when-let [r (write-refusal this tenant-id :delete resource-type id nil)]
+      (refuse! r))
+    (if opts
+      (db/delete-resource base tenant-id resource-type id opts)
+      (db/delete-resource base tenant-id resource-type id)))
 
-  (history [_ tenant-id resource-type id]
-    (db/history base tenant-id resource-type id))
+  (history [this tenant-id resource-type id]
+    (filterv #(in-compartment? this resource-type %)
+             (db/history base tenant-id resource-type id)))
 
-  (history-type [_ tenant-id resource-type params]
-    (db/history-type base tenant-id resource-type params))
+  (history-type [this tenant-id resource-type params]
+    (filterv #(in-compartment? this resource-type %)
+             (db/history-type base tenant-id resource-type params)))
 
-  (transact-transaction [_ tenant-id entries]
-    (db/transact-transaction base tenant-id entries))
+  (transact-transaction [this tenant-id entries]
+    (db/transact-transaction this tenant-id entries nil))
 
-  (transact-bundle [_ tenant-id entries]
-    (db/transact-bundle base tenant-id entries))
+  ;; Atomic: every entry is judged before any reaches the base, so one refusal
+  ;; fails the whole Bundle with nothing written.
+  (transact-transaction [this tenant-id entries opts]
+    (doseq [entry entries]
+      (when-let [r (entry-refusal this tenant-id entry)]
+        (refuse! r)))
+    (if opts
+      (db/transact-transaction base tenant-id entries opts)
+      (db/transact-transaction base tenant-id entries)))
+
+  (transact-bundle [this tenant-id entries]
+    (db/transact-bundle this tenant-id entries nil))
+
+  ;; Batch: a refused entry is answered in place and the rest go to the base,
+  ;; whose responses are woven back into input order.
+  (transact-bundle [this tenant-id entries opts]
+    (let [checked (mapv (fn [entry]
+                          (if-let [r (entry-refusal this tenant-id entry)]
+                            {:refusal r}
+                            {:entry entry}))
+                        entries)
+          admitted (into [] (keep :entry) checked)
+          res (cond
+                (empty? admitted) {:resourceType "Bundle" :type "batch-response" :entry []}
+                opts (db/transact-bundle base tenant-id admitted opts)
+                :else (db/transact-bundle base tenant-id admitted))
+          from-base (volatile! (seq (:entry res)))]
+      (assoc res :entry (mapv (fn [{:keys [refusal]}]
+                                (if refusal
+                                  (refused-entry refusal)
+                                  (let [[head & tail] @from-base]
+                                    (vreset! from-base tail)
+                                    head)))
+                              checked))))
 
   (create-tenant [_ tenant-id] (db/create-tenant base tenant-id))
   (create-tenant [_ tenant-id opts] (db/create-tenant base tenant-id opts))
@@ -534,10 +715,12 @@
     (db/count-as-of base tenant-id resource-type basis)))
 
 (defn filtering-store
-  "Wraps `base` store so every query is confined to `patient-id`'s Patient
-   compartment."
-  [base {:keys [patient-id all-registries]}]
-  (->CompartmentFilteringStore base patient-id all-registries))
+  "Wraps `base` store so every query and write is confined to `patient-id`'s
+   Patient compartment. `exempt-write-types` is a collection of resource type
+   names the caller may write outside it; see `write-refusal`."
+  [base {:keys [patient-id all-registries exempt-write-types]}]
+  (->CompartmentFilteringStore base patient-id all-registries
+                               (set (map name exempt-write-types))))
 
 ;; ---------------------------------------------------------------------------
 ;; Enforcement middleware
@@ -568,7 +751,18 @@
    CompartmentFilteringStore so every query the handler issues is confined to
    the launch patient's compartment (the UNION of the R4B link parameters).
    On a compartment-search route it permits only the launch patient's own
-   Patient compartment (the handler then confines by compartment id)."
+   Patient compartment (the handler then confines by compartment id).
+
+   A system endpoint that resolves to no resource type -- a transaction or
+   batch Bundle POSTed to the base -- has no type to gate, so its store is
+   wrapped as well: the entries are the only place the patient link can be
+   judged, and the filtering store judges them one by one.
+
+   Route data may carry `:compartment/exempt-write-types`, the resource type
+   names an operation writes outside the compartment. It is the one way to
+   cross the boundary, declared where the route is built rather than decided
+   at the call site, and it never admits a write into another patient's
+   compartment (see `write-refusal`)."
   [handler _opts]
   (fn [request]
     (let [route-data (get-in request [:reitit.core/match :data])]
@@ -584,7 +778,9 @@
                                (assoc req :fhir/store
                                       (filtering-store (:fhir/store req)
                                                        {:patient-id pid
-                                                        :all-registries all-registries})))]
+                                                        :all-registries all-registries
+                                                        :exempt-write-types
+                                                        (:compartment/exempt-write-types route-data)})))]
           (cond
             ;; Unrestricted token (user/system, or no patient scope): leave the
             ;; scope/keto decisions to stand, no compartment narrowing.
@@ -607,7 +803,7 @@
 
             ;; System endpoints that resolve to no resource type.
             (nil? fhir-type)
-            (handler request)
+            (handler (wrap-store request))
 
             ;; Deny patient/ access to types outside the Patient compartment.
             (not (patient-compartment-member? fhir-type))
