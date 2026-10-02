@@ -108,11 +108,14 @@
     "Specimen"                     ["subject"]
     "SupplyDelivery"               ["patient"]
     "SupplyRequest"                ["subject"]
-    ;; Deliberate forward-port from R5: R4B's Patient CompartmentDefinition
-    ;; omits Task (added in R5). Breeze files patient-authored Tasks
-    ;; (demographic change requests), which must stay inside the patient
-    ;; compartment.
-    "Task"                         ["patient" "subject" "owner" "requester"]
+    ;; Deliberate forward-port from R5, narrowed. R4B's Patient
+    ;; CompartmentDefinition omits Task (R5 adds it with patient, subject,
+    ;; owner and requester). Breeze files patient-authored Tasks (demographic
+    ;; change requests) with Task.for = the subject and Task.requester = the
+    ;; filing patient, and no owner. Staff workflow Tasks also point Task.for
+    ;; at the patient, so `patient`, `subject` and `owner` would expose them to
+    ;; a patient token. Only `requester` marks the authored case.
+    "Task"                         ["requester"]
     "VisionPrescription"           ["patient"]}
 
    "Practitioner"

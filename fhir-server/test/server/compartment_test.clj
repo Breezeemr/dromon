@@ -83,34 +83,6 @@
     (testing "member type with no registered link param is denied"
       (is (= :deny (compartment/confine "Patient" "123" "Observation" {} {}))))))
 
-;; ---------------------------------------------------------------------------
-;; Task: a deliberate forward-port of R5's Patient/Task compartment entry, so
-;; patient-filed demographic change requests stay inside the compartment.
-;; ---------------------------------------------------------------------------
-
-(deftest task-is-a-patient-compartment-member
-  (is (compartment/patient-compartment-member? "Task"))
-  (is (= ["patient" "subject" "owner" "requester"]
-         (compartment/compartment-link-params "Patient" "Task"))))
-
-(deftest task-descriptor-unions-registered-link-params
-  (let [desc (compartment/compartment-descriptor "Patient" "Task" (get registries "Task"))]
-    (is (= "reference" (:type desc)))
-    (is (= ["Patient"] (:target desc)))
-    (testing "patient and subject collapse onto Task.for; non-link params are excluded"
-      (is (= [{:col "for"} {:col "owner"} {:col "requester"}] (:columns desc))))))
-
-(deftest confine-task-search-under-patient-token
-  (let [outcome (compartment/confine "Patient" "123" "Task" {} (get registries "Task"))]
-    (testing "a Task search is confined, never denied, once the link params resolve"
-      (is (not= :deny outcome))
-      (is (vector? outcome))
-      (let [[tag params registry] outcome]
-        (is (= :run tag))
-        (is (= "Patient/123" (get params compartment/compartment-search-param)))
-        (is (= [{:col "for"} {:col "owner"} {:col "requester"}]
-               (:columns (get registry compartment/compartment-search-param))))))))
-
 (deftest token-restriction-detection
   (testing "patient-only token is restricted"
     (is (compartment/token-patient-restricted? (scope/parse-scopes "patient/Observation.rs")))
@@ -285,6 +257,95 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the patient compartment"
           (db/update-resource store tenant :Observation "moved"
                               (obs "moved" "Patient/999"))))))
+
+;; ---------------------------------------------------------------------------
+;; Task: a deliberate, narrowed forward-port of R5's Patient/Task compartment
+;; entry. Only `requester` is a link, so patient-filed demographic change
+;; requests stay visible to their author while staff workflow Tasks (which name
+;; the patient in Task.for or Task.owner) are not readable by a patient token.
+;; ---------------------------------------------------------------------------
+
+(defn- task [id & {:keys [for requester owner]}]
+  (cond-> {:resourceType "Task" :id id :status "requested" :intent "proposal"}
+    for       (assoc :for {:reference for})
+    requester (assoc :requester {:reference requester})
+    owner     (assoc :owner {:reference owner})))
+
+(defn- seeded-task-store []
+  (let [store (mock/create-mock-store {})
+        put!  (fn [t] (db/create-resource store tenant :Task (:id t) t))]
+    ;; the shape Patient/$request-demographic-change stages
+    (put! (task "task-authored" :for "Patient/123" :requester "Patient/123"))
+    ;; staff workflow Tasks that name the patient in the other roles
+    (put! (task "task-staff-for" :for "Patient/123" :requester "Practitioner/p1"))
+    (put! (task "task-staff-owner" :for "Patient/999" :owner "Patient/123"))
+    (put! (task "task-staff-unlinked" :for "Patient/123"))
+    (put! (task "task-other" :for "Patient/999" :requester "Patient/999"))
+    store))
+
+(defn- search-tasks [store params]
+  (handlers/search-type
+    {:fhir/store store
+     :fhir/resource-type "Task"
+     :fhir/search-registry (get registries "Task")
+     :fhir/all-registries registries
+     :path-params {:tenant-id tenant}
+     :query-params params}))
+
+(defn- task-ids [resp]
+  (set (map (comp :id :resource) (get-in resp [:body :entry]))))
+
+(deftest task-is-a-patient-compartment-member
+  (is (compartment/patient-compartment-member? "Task"))
+  (is (= ["requester"] (compartment/compartment-link-params "Patient" "Task"))))
+
+(deftest task-descriptor-covers-only-the-authored-link
+  (let [desc (compartment/compartment-descriptor "Patient" "Task" (get registries "Task"))]
+    (is (= "reference" (:type desc)))
+    (is (= ["Patient"] (:target desc)))
+    (is (= [{:col "requester"}] (:columns desc))
+        "for and owner are registered but are not compartment links for Task")))
+
+(deftest confine-task-search-under-patient-token
+  (let [outcome (compartment/confine "Patient" "123" "Task" {} (get registries "Task"))]
+    (testing "a Task search is confined, never denied, once the link param resolves"
+      (is (not= :deny outcome))
+      (let [[tag params registry] outcome]
+        (is (= :run tag))
+        (is (= "Patient/123" (get params compartment/compartment-search-param)))
+        (is (= [{:col "requester"}]
+               (:columns (get registry compartment/compartment-search-param))))))))
+
+(deftest patient-token-reads-own-change-request-task-only
+  (let [store (fstore (seeded-task-store))
+        read  (fn [id] (handlers/read-resource
+                         {:fhir/store store :fhir/resource-type "Task"
+                          :path-params {:tenant-id tenant :id id}}))]
+    (testing "the Task the patient authored is readable"
+      (is (= 200 (:status (read "task-authored")))))
+    (testing "staff Tasks naming the patient as for, or as owner, are not"
+      (is (= 404 (:status (read "task-staff-for"))))
+      (is (= 404 (:status (read "task-staff-owner"))))
+      (is (= 404 (:status (read "task-staff-unlinked")))))
+    (testing "another patient's Task is not"
+      (is (= 404 (:status (read "task-other")))))))
+
+(deftest patient-token-task-search-returns-only-authored
+  (let [store (fstore (seeded-task-store))]
+    (testing "an unfiltered search"
+      (is (= #{"task-authored"} (task-ids (search-tasks store {})))))
+    (testing "the portal's Task?patient=<self> query"
+      (is (= #{"task-authored"}
+             (task-ids (search-tasks store {"patient" "Patient/123"})))))
+    (testing "a client cannot widen the search through the owner or requester filters"
+      (is (empty? (task-ids (search-tasks store {"owner" "Patient/123"}))))
+      (is (empty? (task-ids (search-tasks store {"requester" "Practitioner/p1"})))))))
+
+(deftest patient-token-cannot-write-task-outside-its-compartment
+  (let [store (fstore (seeded-task-store))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the patient compartment"
+          (db/create-resource store tenant :Task "t-x"
+                              (task "t-x" :for "Patient/123" :requester "Practitioner/p1"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; wrap-patient-compartment middleware
