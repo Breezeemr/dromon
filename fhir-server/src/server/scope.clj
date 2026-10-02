@@ -136,6 +136,37 @@
       :delete :delete
       :read)))
 
+(defn route-interaction
+  "Resolve the `:smart/interaction` route-data override for a request.
+
+   Operation routes share one route-data map across HTTP methods, so the
+   override is either a single interaction keyword or a map keyed by request
+   method (e.g. {:get :read :post :update}). Returns:
+   - nil when the route sets no override, or the method map has no entry for
+     this request's method (method-derived scoring applies);
+   - {:interaction kw} for a recognised interaction;
+   - {:invalid value} for anything else, which callers must refuse."
+  [request]
+  (let [route-data (get-in request [:reitit.core/match :data])]
+    (when (contains? route-data :smart/interaction)
+      (let [override (:smart/interaction route-data)
+            value    (if (map? override)
+                       (get override (:request-method request) ::absent)
+                       override)]
+        (cond
+          (= ::absent value)                  nil
+          (interaction->permission value)     {:interaction value}
+          :else                               {:invalid value})))))
+
+(defn effective-interaction
+  "The SMART interaction scored for a request: the route's `:smart/interaction`
+   override when present, otherwise the method-derived interaction. Returns
+   {:interaction kw :source :route|:method} or {:invalid value :source :route}."
+  [request]
+  (if-let [override (route-interaction request)]
+    (assoc override :source :route)
+    {:interaction (request->interaction request) :source :method}))
+
 (defn- forbidden [diagnostics]
   {:status 403
    :body   {:resourceType "OperationOutcome"
@@ -149,7 +180,10 @@
    Requires `:identity` to be populated by server.auth/wrap-jwt-auth and so
    must run after it. Bypasses enforcement for routes marked `:public? true`.
    System endpoints that do not resolve to a FHIR resource type are allowed
-   (resource-type access is what scopes gate)."
+   (resource-type access is what scopes gate).
+
+   A route may pin the scored interaction with `:smart/interaction` (see
+   `route-interaction`). An unrecognised override is refused with 403."
   [handler _opts]
   (fn [request]
     (let [route-data (get-in request [:reitit.core/match :data])
@@ -158,8 +192,17 @@
         (handler request)
         (let [scopes      (request-scopes request)
               fhir-type   (request->fhir-type request)
-              interaction (request->interaction request)]
+              effective   (effective-interaction request)
+              {:keys [interaction invalid source]} effective]
           (cond
+            (contains? effective :invalid)
+            (do (t/log! {:level :error
+                         :id    :authz/smart-scope.invalid-route-interaction
+                         :data  {:uri (:uri request)
+                                 :request-method (:request-method request)
+                                 :value invalid}})
+                (forbidden "Route declares an unrecognised :smart/interaction; access refused."))
+
             (nil? fhir-type)
             (handler request)
 
@@ -171,6 +214,7 @@
                              {:id :authz/smart-scope.check
                               :data {:fhir-type fhir-type
                                      :interaction interaction
+                                     :interaction-source source
                                      :scopes (mapv #(str (:compartment %) "/" (:resource %)
                                                          "." (apply str (sort (:permissions %))))
                                                    scopes)}}

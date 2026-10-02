@@ -230,3 +230,58 @@
                                :request-method :get
                                :uri "/default/fhir/metadata"})]
       (is (= 200 (:status response))))))
+
+;; ---------------------------------------------------------------------------
+;; :smart/interaction route-data override
+;; ---------------------------------------------------------------------------
+
+(defn- op-req
+  "An operation request whose matched route carries `route-data`."
+  [scope-claim method route-data]
+  (assoc (req scope-claim method "Appointment" :id "a1")
+         :uri "/default/fhir/Appointment/a1/$telehealth-signal"
+         :reitit.core/match {:data route-data}))
+
+(deftest effective-interaction-resolution
+  (testing "absent key keeps method-derived scoring (POST -> :create)"
+    (is (= {:interaction :create :source :method}
+           (scope/effective-interaction (op-req "x" :post {})))))
+  (testing "keyword override wins for POST"
+    (is (= {:interaction :update :source :route}
+           (scope/effective-interaction (op-req "x" :post {:smart/interaction :update})))))
+  (testing "per-method map picks by request method"
+    (let [route {:smart/interaction {:get :read :post :update}}]
+      (is (= :read (:interaction (scope/effective-interaction (op-req "x" :get route)))))
+      (is (= :update (:interaction (scope/effective-interaction (op-req "x" :post route)))))))
+  (testing "method missing from the map falls back to method-derived scoring"
+    (is (= {:interaction :read :source :method}
+           (scope/effective-interaction (op-req "x" :get {:smart/interaction {:post :update}})))))
+  (testing "unknown values are reported as invalid"
+    (is (= {:invalid :write :source :route}
+           (scope/effective-interaction (op-req "x" :post {:smart/interaction :write}))))
+    (is (= {:invalid "update" :source :route}
+           (scope/effective-interaction (op-req "x" :post {:smart/interaction {:post "update"}}))))
+    (is (= {:invalid nil :source :route}
+           (scope/effective-interaction (op-req "x" :post {:smart/interaction nil}))))))
+
+(deftest middleware-route-interaction-override
+  (let [route {:smart/interaction {:get :read :post :update}}]
+    (testing "patient/Appointment.u allows POST when the route says :update"
+      (is (= 200 (:status ((wrapped) (op-req "patient/Appointment.u" :post route))))))
+    (testing "patient/*.read is refused for POST when the route says :update"
+      (is (= 403 (:status ((wrapped) (op-req "patient/*.read" :post route))))))
+    (testing "patient/Appointment.c is refused for POST when the route says :update"
+      (is (= 403 (:status ((wrapped) (op-req "patient/Appointment.c" :post route))))))
+    (testing "GET stays a read under the per-method map"
+      (is (= 200 (:status ((wrapped) (op-req "patient/*.read" :get route)))))))
+  (testing "absent key keeps POST -> :create"
+    (is (= 200 (:status ((wrapped) (op-req "patient/Appointment.c" :post {})))))
+    (is (= 403 (:status ((wrapped) (op-req "patient/Appointment.u" :post {}))))))
+  (testing "an unknown override value is refused even with every permission"
+    (let [response ((wrapped) (op-req "patient/*.cruds" :post {:smart/interaction :write}))]
+      (is (= 403 (:status response)))
+      (is (= "OperationOutcome" (get-in response [:body :resourceType])))))
+  (testing "a nil override value is refused, not treated as absent"
+    (is (= 403 (:status ((wrapped) (op-req "patient/*.cruds" :post {:smart/interaction nil}))))))
+  (testing "an unknown per-method value is refused"
+    (is (= 403 (:status ((wrapped) (op-req "patient/*.cruds" :post {:smart/interaction {:post :write}})))))))
