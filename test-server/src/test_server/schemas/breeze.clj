@@ -23,6 +23,8 @@
    'breeze.capability.v1-0-0.CarePlan/capability
    'breeze.capability.v1-0-0.CareTeam/capability
    'breeze.capability.v1-0-0.Claim/capability
+   ;; CodeSystem: so the built-in CodeSystem/$lookup has a type to route under.
+   'breeze.capability.v1-0-0.CodeSystem/capability
    'breeze.capability.v1-0-0.Composition/capability
    'breeze.capability.v1-0-0.Condition/capability
    'breeze.capability.v1-0-0.Consent/capability

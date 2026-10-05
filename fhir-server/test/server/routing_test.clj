@@ -48,6 +48,27 @@
       (is (= "/:tenant-id/fhir/ValueSet/$expand"
              (match-template routes "/t/fhir/ValueSet/$expand"))))))
 
+(deftest terminology-operations-route-on-the-types-fhir-declares-them-on
+  (let [schema-of (fn [type]
+                    (sc/capability-schema->server-schema
+                     (m/schema [:map {:resourceType type
+                                      :fhir/interactions {:read {}}
+                                      :fhir/handlers {:read 'clojure.core/identity}}
+                                [:id :string]])
+                     nil nil))
+        routes (routing/build-resource-routes [(schema-of "ValueSet") (schema-of "CodeSystem")])]
+    (testing "ValueSet/$validate-code at type and instance level"
+      (is (= "/:tenant-id/fhir/ValueSet/$validate-code"
+             (match-template routes "/t/fhir/ValueSet/$validate-code")))
+      (is (= "/:tenant-id/fhir/ValueSet/:id/$validate-code"
+             (match-template routes "/t/fhir/ValueSet/vs1/$validate-code"))))
+    (testing "CodeSystem/$lookup"
+      (is (= "/:tenant-id/fhir/CodeSystem/$lookup"
+             (match-template routes "/t/fhir/CodeSystem/$lookup"))))
+    (testing "ValueSet/$lookup is no route of its own: R4B declares none"
+      (is (not= "/:tenant-id/fhir/ValueSet/$lookup"
+                (match-template routes "/t/fhir/ValueSet/$lookup"))))))
+
 (deftest operation-routes-carry-route-data
   (testing "non-method keys in an operation config surface as Reitit route
             data on both the type-level and instance-level routes"
@@ -90,7 +111,11 @@
     (let [schema (m/schema [:map {:resourceType "ValueSet"} [:id :string]])
           server-schema (sc/capability-schema->server-schema schema nil nil)
           ops (:fhir/operations (m/properties server-schema))]
-      (is (= #{"$expand" "$lookup"} (set (keys ops))))))
+      (is (= #{"$expand" "$validate-code"} (set (keys ops))))))
+  (testing "$lookup is CodeSystem's, as FHIR declares it"
+    (let [schema (m/schema [:map {:resourceType "CodeSystem"} [:id :string]])
+          server-schema (sc/capability-schema->server-schema schema nil nil)]
+      (is (= #{"$lookup"} (set (keys (:fhir/operations (m/properties server-schema))))))))
   (testing "extra operations reach types resolved through the same path"
     (let [schema (m/schema [:map {:resourceType "Appointment"} [:id :string]])
           server-schema (sc/capability-schema->server-schema
@@ -107,6 +132,7 @@
                   {"ValueSet"     {"$custom" {:get 'clojure.core/identity}}
                    "Appointment"  {"$telehealth-signal" {:get 'server.telehealth/poll-signal}}})]
       (is (contains? (get merged "ValueSet") "$expand"))
-      (is (contains? (get merged "ValueSet") "$lookup"))
+      (is (contains? (get merged "ValueSet") "$validate-code"))
+      (is (contains? (get merged "CodeSystem") "$lookup"))
       (is (contains? (get merged "ValueSet") "$custom"))
       (is (contains? (get merged "Appointment") "$telehealth-signal")))))
