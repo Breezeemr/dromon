@@ -72,11 +72,17 @@
 
    Consumers extend this per deployment by passing an `:operations` map of
    the same shape to [[resolve-schemas]] (or the `:fhir/schemas` integrant
-   component); entries merge over these defaults."
-  {"ValueSet" {"$expand" {:get  'server.handlers/valueset-expand
-                           :post 'server.handlers/valueset-expand}
-               "$lookup" {:get  'server.handlers/valueset-lookup
-                           :post 'server.handlers/valueset-lookup}}})
+   component); entries merge over these defaults.
+
+   The three terminology operations sit on the types FHIR declares them on:
+   `$expand` and `$validate-code` on ValueSet, `$lookup` on CodeSystem. An
+   entry only routes when a deployment resolves a schema for its type."
+  {"ValueSet"   {"$expand"        {:get  'server.handlers/valueset-expand
+                                   :post 'server.handlers/valueset-expand}
+                 "$validate-code" {:get  'server.handlers/valueset-validate-code
+                                   :post 'server.handlers/valueset-validate-code}}
+   "CodeSystem" {"$lookup"        {:get  'server.handlers/codesystem-lookup
+                                   :post 'server.handlers/codesystem-lookup}}})
 
 (defn- merge-operations
   "Merges an extra {resourceType {op-name config}} operations map over the

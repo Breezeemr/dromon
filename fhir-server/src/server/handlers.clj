@@ -1391,8 +1391,12 @@
                   :issue [{:severity "error" :code "not-supported"
                            :diagnostics "ValueSet $expand not supported"}]}})))))
 
-(defn valueset-lookup
-  "Handler for ValueSet $lookup operation."
+(defn codesystem-lookup
+  "Handler for CodeSystem $lookup, which FHIR declares on CodeSystem (there is
+   no ValueSet/$lookup). Reads `system` and `code` from the query.
+
+   Without a terminology service it falls back to the store's
+   `:valueset-lookup` operation, the name stores already provide it under."
   [req]
   (let [terminology (:fhir/terminology req)
         store (:fhir/store req)
@@ -1414,7 +1418,38 @@
           {:status 501
            :body {:resourceType "OperationOutcome"
                   :issue [{:severity "error" :code "not-supported"
-                           :diagnostics "ValueSet $lookup not supported"}]}})))))
+                           :diagnostics "CodeSystem $lookup not supported"}]}})))))
+
+(defn valueset-validate-code
+  "Handler for ValueSet $validate-code: whether a code (`system` + `code`, or
+   `url` naming the value set) is in a value set. Reads the query, folding in
+   the instance id the way [[valueset-expand]] does.
+
+   Without a terminology service it falls back to the store's
+   `:valueset-validate-code` operation, then answers 501."
+  [req]
+  (let [terminology (:fhir/terminology req)
+        store (:fhir/store req)
+        tenant-id (-> req :path-params :tenant-id)
+        id (-> req :path-params :id)
+        params (or (:query-params req) {})]
+    (if terminology
+      (try
+        {:status 200
+         :body (terminology/validate-code terminology
+                 (cond-> params id (assoc :id id)))}
+        (catch Exception e
+          {:status (or (:fhir/status (ex-data e)) 500)
+           :body {:resourceType "OperationOutcome"
+                  :issue [{:severity "error" :code "exception"
+                           :diagnostics (ex-message e)}]}}))
+      (let [op-fn (:valueset-validate-code (:operations store))]
+        (if op-fn
+          {:status 200 :body (op-fn store tenant-id params id)}
+          {:status 501
+           :body {:resourceType "OperationOutcome"
+                  :issue [{:severity "error" :code "not-supported"
+                           :diagnostics "ValueSet $validate-code not supported"}]}})))))
 
 (def ^:private bulk-export-resource-operations
   "Bulk Data IG per-resource $export operation declarations. Inferno's
