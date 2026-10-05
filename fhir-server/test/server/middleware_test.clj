@@ -156,6 +156,13 @@
         (is (= allowed (get-in resp [:headers "Access-Control-Allow-Origin"])))
         (is (= "true" (get-in resp [:headers "Access-Control-Allow-Credentials"])))))
 
+    (testing "a 503's Retry-After is readable cross-origin, on preflight and response"
+      (doseq [resp [(preflight allowed)
+                    ((middleware/wrap-cors (fn [_] {:status 503 :headers {"Retry-After" "15"} :body ""})
+                                           #{allowed})
+                     {:request-method :get :headers {"origin" allowed}})]]
+        (is (clojure.string/includes? (get-in resp [:headers "Access-Control-Expose-Headers"]) "Retry-After"))))
+
     (testing "the preflight admits the headers cookie mode and dev-token mode need,
               plus the trace-context headers an instrumented browser client sends"
       (let [hdrs (get-in (preflight allowed) [:headers "Access-Control-Allow-Headers"])]

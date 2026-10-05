@@ -162,7 +162,10 @@
        "X-Breeze-Client, traceparent, b3"))
 
 (def ^:private expose-headers
-  "Location, ETag, Last-Modified, X-Request-Id, Content-Location")
+  "The response headers a cross-origin script may read. `Retry-After` is not
+   CORS-safelisted, so without it here a browser client cannot honour a 503's
+   or 429's wait and has to guess one."
+  "Location, ETag, Last-Modified, X-Request-Id, Content-Location, Retry-After")
 
 (defn wrap-cors
   "Middleware that adds CORS headers for browser-based FHIR clients.
