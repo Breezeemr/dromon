@@ -14,6 +14,22 @@
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]))
 
+(defn fhir-base
+  "The FHIR base `req` was addressed to, as a path: the mount prefix a host
+   stripped before routing (Ring's `:context`), then the tenant the URL names.
+   Every URL a response carries -- Bundle links, `fullUrl`s, `Location` -- is
+   built on it, so a client can follow it back through the path it used.
+
+   The tenant comes from the router's match rather than `:path-params`, because
+   the two can differ on purpose: a host may answer a type from another
+   tenant's store by rewriting `:path-params :tenant-id` after routing, and the
+   store tenant is not an address the client can reach."
+  [req]
+  (str (:context req) "/"
+       (or (get-in req [:reitit.core/match :path-params :tenant-id])
+           (get-in req [:path-params :tenant-id]))
+       "/fhir"))
+
 (defn- gone-response [resource-type id]
   {:status 410
    :body {:resourceType "OperationOutcome"
@@ -363,7 +379,7 @@
           {:status 200
            :body (narrative/present-bundle-response
                   req :timeline
-                  (tmp/timeline-bundle (str "/" tenant-id "/fhir/" resource-type)
+                  (tmp/timeline-bundle (str (fhir-base req) "/" resource-type)
                                        (db/temporal-axes store)
                                        rows))}
           (not-found-response resource-type id))))))
@@ -416,7 +432,7 @@
           (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
             {:status 200 :body (narrative/present-response req :update resource-type res)})
           (let [res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
-                base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
+                base-url (str (fhir-base req) "/" resource-type "/" id)
                 vid (get-in res [:meta :versionId])]
             {:status 201
              :headers {"Location" (str base-url "/_history/" vid)}
@@ -491,8 +507,8 @@
 
 (defn- history-entry
   "Build a Bundle entry for a history result."
-  [tenant-id resource-type res]
-  {:fullUrl (str "/" tenant-id "/fhir/" resource-type "/" (:id res))
+  [base resource-type res]
+  {:fullUrl (str base "/" resource-type "/" (:id res))
    :resource res
    :request {:method (let [vid (get-in res [:meta :versionId])]
                        (if (= vid "1") "POST" "PUT"))
@@ -551,8 +567,8 @@
         results (->> all-results (drop skip) (take limit) vec)
         entries (narrative/present-entries
                  req :history-instance
-                 (mapv (partial history-entry tenant-id resource-type) results))
-        base-url (str "/" tenant-id "/fhir/" resource-type "/" id "/_history")
+                 (mapv (partial history-entry (fhir-base req) resource-type) results))
+        base-url (str (fhir-base req) "/" resource-type "/" id "/_history")
         ;; The Instant's own rendering is UTC and needs no URL encoding; the
         ;; raw value could carry a '+' offset, which a query string reads as a space.
         page-url (fn [skip]
@@ -584,7 +600,7 @@
                                                              (with-parsed-since params since)))
               entries (narrative/present-entries
                        req :history-type
-                       (mapv (partial history-entry tenant-id resource-type) results))]
+                       (mapv (partial history-entry (fhir-base req) resource-type) results))]
           {:status 200
            :body {:resourceType "Bundle"
                   :type "history"
@@ -639,7 +655,7 @@
   (let [resource-body (narrative/ensure-narrative (:fhir/narrative req) resource-type resource-body)
         id (str (java.util.UUID/randomUUID))
         res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
-        base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
+        base-url (str (fhir-base req) "/" resource-type "/" id)
         vid (get-in res [:meta :versionId])]
     {:status 201
      :headers {"Location" (str base-url "/_history/" vid)}
@@ -742,7 +758,7 @@
    compartment, naming _include targets as the case it exists for. So a patient
    token resolves the Practitioner and Organization names on its own appointments
    without any widening of what it may read directly."
-  [store tenant-id results include-params all-registries]
+  [store tenant-id base results include-params all-registries]
   (when (and (seq include-params) (seq results))
     (let [params (ensure-coll include-params)
           ;; First pass: collect all referenced resource IDs grouped by type
@@ -791,14 +807,14 @@
         (->> included-resources
              (distinct)
              (mapv (fn [res]
-                     {:fullUrl (str "/" tenant-id "/fhir/" (:resourceType res) "/" (:id res))
+                     {:fullUrl (str base "/" (:resourceType res) "/" (:id res))
                       :resource res
                       :search {:mode "include"}})))))))
 
 (defn- resolve-revincludes
   "For _revinclude=TargetType:searchParam, find resources of TargetType whose searchParam
    references any of the primary results. Returns Bundle entries with search.mode=include."
-  [store tenant-id results revinclude-params all-registries]
+  [store tenant-id base results revinclude-params all-registries]
   (when (and (seq revinclude-params) (seq results))
     (let [params (ensure-coll revinclude-params)
           refs (keep (fn [res]
@@ -820,7 +836,7 @@
                                    :_skip "0"}
                                   target-registry)))))
                (mapv (fn [res]
-                       {:fullUrl (str "/" tenant-id "/fhir/" (:resourceType res) "/" (:id res))
+                       {:fullUrl (str base "/" (:resourceType res) "/" (:id res))
                         :resource res
                         :search {:mode "include"}}))))))))
 
@@ -963,7 +979,7 @@
       refusal
       (let [basis (when requested-basis
                     (tmp/resolve-basis store tenant-id requested-basis))
-            base-url (str "/" tenant-id "/fhir/" resource-type)
+            base-url (str (fhir-base req) "/" resource-type)
             outcome-entry (when (seq unsupported)
                             (unsupported-params-entry base-url resource-type unsupported))]
         (if (zero? limit)
@@ -1037,8 +1053,8 @@
                 all-registries (:fhir/all-registries req)
                 ;; Includes follow references out of the STORED results;
                 ;; presentation runs afterwards, over the finished entries.
-                inc-entries (resolve-includes store tenant-id results include-param all-registries)
-                revinc-entries (resolve-revincludes store tenant-id results revinclude all-registries)
+                inc-entries (resolve-includes store tenant-id (fhir-base req) results include-param all-registries)
+                revinc-entries (resolve-revincludes store tenant-id (fhir-base req) results revinclude all-registries)
   
                 all-entries (narrative/present-entries
                              req :search-type
@@ -1076,7 +1092,7 @@
          ;; No matches: create
          (let [id (or (:id resource-body) (str (java.util.UUID/randomUUID)))
                res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
-               base-url (str "/" tenant-id "/fhir/" resource-type "/" id)
+               base-url (str (fhir-base req) "/" resource-type "/" id)
                vid (get-in res [:meta :versionId])]
            {:status 201
             :headers {"Location" (str base-url "/_history/" vid)}
@@ -1224,7 +1240,7 @@
                                                 store tenant-id compartment-type compartment-id rt
                                                 (assoc params :_count 50 :_skip 0) registry)]
                                   (mapv (fn [res]
-                                          {:fullUrl  (str "/" tenant-id "/fhir/" rt "/" (:id res))
+                                          {:fullUrl  (str (fhir-base req) "/" rt "/" (:id res))
                                            :resource res
                                            :search   {:mode "match"}})
                                         results))))
@@ -1258,11 +1274,11 @@
                             store tenant-id compartment-type compartment-id target-type
                             (assoc params :_count limit :_skip skip) registry)
                           [])
-                base-url (str "/" tenant-id "/fhir/" compartment-type "/" compartment-id "/" target-type)
+                base-url (str (fhir-base req) "/" compartment-type "/" compartment-id "/" target-type)
                 entries (narrative/present-entries
                          req :compartment-search
                          (mapv (fn [res]
-                                 {:fullUrl  (str "/" tenant-id "/fhir/" target-type "/" (:id res))
+                                 {:fullUrl  (str (fhir-base req) "/" target-type "/" (:id res))
                                   :resource res
                                   :search   {:mode "match"}})
                                results))
@@ -1625,7 +1641,7 @@
                               (fn [resource-type]
                                 (let [results (versions-since since (db/history-type store tenant-id (keyword resource-type) type-params))]
                                   (mapv (fn [res]
-                                          {:fullUrl (str "/" tenant-id "/fhir/" (or (:resourceType res) resource-type) "/" (:id res))
+                                          {:fullUrl (str (fhir-base req) "/" (or (:resourceType res) resource-type) "/" (:id res))
                                            :resource res
                                            :request {:method "PUT"
                                                      :url (str (or (:resourceType res) resource-type) "/" (:id res))}
@@ -1667,7 +1683,7 @@
                                                        (assoc params :_count 50 :_skip 0)
                                                        registry))]
                               (mapv (fn [res]
-                                      {:fullUrl (str "/" tenant-id "/fhir/" resource-type "/" (:id res))
+                                      {:fullUrl (str (fhir-base req) "/" resource-type "/" (:id res))
                                        :resource res
                                        :search {:mode "match"}})
                                     (or results []))))

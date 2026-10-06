@@ -147,13 +147,13 @@
   (str (forwarded-scheme req) "://" (forwarded-host req) path))
 
 (defn- status-url [req tenant-id job-id]
-  (absolute-url req (str "/" tenant-id "/fhir/$export-status/" job-id)))
+  (absolute-url req (str (:context req) "/" tenant-id "/fhir/$export-status/" job-id)))
 
 (defn- file-url [req tenant-id job-id file-id]
-  (absolute-url req (str "/" tenant-id "/fhir/$export-file/" job-id "/" file-id)))
+  (absolute-url req (str (:context req) "/" tenant-id "/fhir/$export-file/" job-id "/" file-id)))
 
 (defn- request-url [req]
-  (absolute-url req (str (:uri req)
+  (absolute-url req (str (:context req) (:uri req)
                          (when-let [q (not-empty (:query-string req))]
                            (str "?" q)))))
 
