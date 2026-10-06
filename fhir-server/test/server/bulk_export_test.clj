@@ -63,6 +63,16 @@
     (is (not (be/valid-output-format? "")))))
 
 ;; ---------------------------------------------------------------------------
+;; NDJSON encoding
+;; ---------------------------------------------------------------------------
+
+(deftest ndjson-decimals-encode-in-plain-notation-with-their-scale
+  (let [json-str @#'be/json-str]
+    (doseq [[value literal] [[6E+1M "60"] [60.0M "60.0"] [1.50M "1.50"] [1E-7M "0.0000001"]]]
+      (testing (pr-str value)
+        (is (= (str "{\"value\":" literal "}") (json-str {:value value})))))))
+
+;; ---------------------------------------------------------------------------
 ;; Manifest builder
 ;; ---------------------------------------------------------------------------
 

@@ -43,17 +43,21 @@
             [server.temporal :as tmp]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace])
-  (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
+  (:import [com.fasterxml.jackson.core JsonGenerator$Feature]
+           [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]
            [java.io OutputStream OutputStreamWriter BufferedWriter Writer]
            [java.nio.charset StandardCharsets]))
 
 (def ^:private json-mapper
   "Jackson mapper that renders java.time values (e.g. meta.lastUpdated
-   Instants) as ISO strings rather than epoch arrays, matching the server's
-   canonical JSON encoding."
+   Instants) as ISO strings rather than epoch arrays, and BigDecimals in plain
+   notation, matching the server's canonical JSON encoding
+   (`server.router/java-time-encode-mapper`)."
   (doto (json/object-mapper {:modules [(JavaTimeModule.)]})
-    (.disable SerializationFeature/WRITE_DATES_AS_TIMESTAMPS)))
+    (.disable SerializationFeature/WRITE_DATES_AS_TIMESTAMPS)
+    (.enable ^"[Lcom.fasterxml.jackson.core.JsonGenerator$Feature;"
+             (into-array JsonGenerator$Feature [JsonGenerator$Feature/WRITE_BIGDECIMAL_AS_PLAIN]))))
 
 (defn- json-str [x]
   (json/write-value-as-string x json-mapper))

@@ -19,6 +19,7 @@
             [reitit.ring :as ring]
             [server.auth :as auth]
             [server.core :as sc]
+            [server.middleware :as middleware]
             [server.router :as router]
             [server.routing :as routing])
   (:import [java.io ByteArrayInputStream InputStream]))
@@ -516,6 +517,41 @@
             "FHIR requires the trailing zero be preserved")
         (is (= "3.14159265358979323846" (str precise))
             "digits past a double's precision survive")))))
+
+;; ---------------------------------------------------------------------------
+;; Response body encoding
+;; ---------------------------------------------------------------------------
+
+(def ^:private decimal-literals
+  "BigDecimal -> the JSON literal FHIR expects for it. 6E+1M has scale -1 and
+   1E-7M scale 7: `BigDecimal.toString` writes both in exponent form."
+  [[6E+1M "60"]
+   [2.4E+2M "240"]
+   [60M "60"]
+   [60.0M "60.0"]
+   [1.50M "1.50"]
+   [1E-7M "0.0000001"]
+   [-1.2E+3M "-1200"]])
+
+(defn- quantity-json [value]
+  (str "{\"quantity\":{\"value\":" value "}}"))
+
+(deftest json-decimals-encode-in-plain-notation-with-their-scale
+  ;; application/fhir+json responses use the application/json format.
+  (doseq [format ["application/json" "application/json-patch+json"]
+          [value literal] decimal-literals]
+    (testing (str format " " (pr-str value))
+      (is (= (quantity-json literal)
+             (slurp (muuntaja/encode router/muuntaja-instance format
+                                     {:quantity {:value value}})))))))
+
+(deftest pretty-printed-decimals-keep-plain-notation
+  (let [app (middleware/wrap-pretty-print
+              (fn [_] {:status 200 :body {:quantity {:value 6E+1M}}})
+              router/java-time-encode-mapper)
+        body (slurp (:body (app {:query-params {"_pretty" "true"}})))]
+    (is (= {"quantity" {"value" 60}} (json/read-value body)))
+    (is (not (re-find #"\d[eE]" body)) body)))
 
 ;; ---------------------------------------------------------------------------
 ;; resolve-options
