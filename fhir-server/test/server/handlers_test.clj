@@ -175,6 +175,27 @@
     (is (= 400 (:status resp)))
     (is (= "OperationOutcome" (get-in resp [:body :resourceType])))))
 
+(deftest response-urls-follow-the-path-the-client-used
+  ;; A host that mounts the server under a prefix strips it before routing and
+  ;; leaves it in `:context`; one that answers a type from another tenant's
+  ;; store rewrites `:path-params :tenant-id` after routing. Neither is an
+  ;; address the client can reach, so neither may leak into a URL.
+  (let [store   (make-store)
+        hosted  (fn [request]
+                  (assoc request
+                         :context "/realm"
+                         :reitit.core/match {:path-params {:tenant-id "dev"}}))
+        created (handlers/create-resource
+                 (hosted (base-request store :body {:resourceType "Patient" :name [{:family "Test"}]})))]
+    (create-patient! store :body {:resourceType "Patient" :name [{:family "Other"}]})
+    (is (clojure.string/starts-with? (get-in created [:headers "Location"]) "/realm/dev/fhir/Patient/"))
+    (let [resp  (handlers/search-type (hosted (base-request store :params {"_count" "1"})))
+          links (into {} (map (juxt :relation :url)) (get-in resp [:body :link]))]
+      (is (= "/realm/dev/fhir/Patient?_count=1&_skip=0" (get links "self")))
+      (is (= "/realm/dev/fhir/Patient?_count=1&_skip=1" (get links "next")))
+      (is (every? #(clojure.string/starts-with? (:fullUrl %) "/realm/dev/fhir/Patient/")
+                  (get-in resp [:body :entry]))))))
+
 ;; ---------------------------------------------------------------------------
 ;; history-instance
 ;; ---------------------------------------------------------------------------
