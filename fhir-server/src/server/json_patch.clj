@@ -19,78 +19,106 @@
                   (keyword unescaped))))
             parts))))
 
+(defn- path-not-found [path]
+  (ex-info (str "Path not found: " path) {:path path}))
+
+(defn- element-index
+  "The array position `segment` names in `array`, or nil when it names none.
+   `limit` is the largest position allowed: the last element for an existing
+   target, one past it where `add` inserts."
+  [array segment limit]
+  (when (and (vector? array) (int? segment) (<= 0 segment limit))
+    segment))
+
+(defn- has-target?
+  "Whether `segment` names an existing member of `container`."
+  [container segment]
+  (cond
+    (vector? container) (some? (element-index container segment (dec (count container))))
+    (map? container) (contains? container segment)
+    :else false))
+
 (defn- get-at
-  "Get the value at a parsed path in a nested structure."
-  [doc path]
-  (reduce (fn [current key]
-            (cond
-              (and (vector? current) (int? key)) (nth current key)
-              (map? current) (get current key)
-              :else (throw (ex-info "Invalid path" {:path path :key key}))))
-          doc path))
+  "The value at a parsed path. Throws when the path names nothing: the
+   target of remove, replace, move, copy and test must exist (RFC 6902
+   section 4)."
+  [doc parsed-path path]
+  (reduce (fn [current segment]
+            (if (has-target? current segment)
+              (get current segment)
+              (throw (path-not-found path))))
+          doc parsed-path))
 
-(defn- set-at
-  "Set a value at a parsed path in a nested structure."
-  [doc path value]
-  (if (empty? path)
+(defn- update-container
+  "`doc` with the container holding the last segment of `parsed-path`
+   replaced by `(f container segment)`. The containers above it are rewritten
+   in place, an array element by assoc, so `f` alone decides whether the
+   operation adds, removes or replaces."
+  [doc parsed-path path f]
+  (let [[segment & more] parsed-path]
+    (cond
+      (empty? more)
+      (f doc segment)
+
+      (has-target? doc segment)
+      (assoc doc segment (update-container (get doc segment) more path f))
+
+      :else
+      (throw (path-not-found path)))))
+
+(defn- add-at
+  "RFC 6902 section 4.1: insert into an array at an index, or append at `-`;
+   set an object member, replacing one that exists."
+  [doc parsed-path path value]
+  (if (empty? parsed-path)
     value
-    (let [key (first path)
-          rest-path (rest path)]
-      (if (= 1 (count path))
+    (update-container
+      doc parsed-path path
+      (fn [container segment]
         (cond
-          (and (vector? doc) (= key :-))
-          (conj doc value)
+          (and (vector? container) (= :- segment))
+          (conj container value)
 
-          (and (vector? doc) (int? key))
-          (into (subvec doc 0 key)
-                (cons value (subvec doc key)))
+          (vector? container)
+          (if-some [i (element-index container segment (count container))]
+            (into (conj (subvec container 0 i) value) (subvec container i))
+            (throw (path-not-found path)))
 
-          (map? doc)
-          (assoc doc key value)
+          (map? container)
+          (assoc container segment value)
 
           :else
-          (throw (ex-info "Cannot set at path" {:path path})))
-        (cond
-          (and (vector? doc) (int? key))
-          (assoc doc key (set-at (nth doc key) (vec rest-path) value))
-
-          (map? doc)
-          (assoc doc key (set-at (get doc key) (vec rest-path) value))
-
-          :else
-          (throw (ex-info "Cannot traverse path" {:path path :key key})))))))
+          (throw (path-not-found path)))))))
 
 (defn- remove-at
-  "Remove the value at a parsed path."
-  [doc path]
-  (if (empty? path)
-    (throw (ex-info "Cannot remove root" {}))
-    (let [key (last path)
-          parent-path (vec (butlast path))]
-      (if (empty? parent-path)
-        ;; Removing from root
-        (cond
-          (and (vector? doc) (int? key))
-          (into (subvec doc 0 key) (subvec doc (inc key)))
+  "RFC 6902 section 4.2: drop an existing array element or object member."
+  [doc parsed-path path]
+  (when (empty? parsed-path)
+    (throw (ex-info "Cannot remove the whole document" {:path path})))
+  (update-container
+    doc parsed-path path
+    (fn [container segment]
+      (cond
+        (not (has-target? container segment))
+        (throw (path-not-found path))
 
-          (map? doc)
-          (dissoc doc key)
+        (vector? container)
+        (into (subvec container 0 segment) (subvec container (inc segment)))
 
-          :else
-          (throw (ex-info "Cannot remove at path" {:path path})))
-        ;; Removing from nested location
-        (let [parent (get-at doc parent-path)
-              new-parent (cond
-                           (and (vector? parent) (int? key))
-                           (into (subvec parent 0 key) (subvec parent (inc key)))
+        :else
+        (dissoc container segment)))))
 
-                           (map? parent)
-                           (dissoc parent key)
-
-                           :else
-                           (throw (ex-info "Cannot remove at path" {:path path})))]
-          ;; Replace the parent with the modified version
-          (set-at doc (vec (concat (butlast parent-path) [(last parent-path)])) new-parent))))))
+(defn- replace-at
+  "RFC 6902 section 4.3: the value at an existing location, swapped in place."
+  [doc parsed-path path value]
+  (if (empty? parsed-path)
+    value
+    (update-container
+      doc parsed-path path
+      (fn [container segment]
+        (if (has-target? container segment)
+          (assoc container segment value)
+          (throw (path-not-found path)))))))
 
 (defn- decimal-value
   "A number's value as a BigDecimal, or nil for a NaN or infinite double,
@@ -145,40 +173,34 @@
   (let [parsed-path (parse-path path)]
     (case op
       "add"
-      (set-at doc parsed-path value)
+      (add-at doc parsed-path path value)
 
       "remove"
-      (remove-at doc parsed-path)
+      (remove-at doc parsed-path path)
 
       "replace"
-      (let [_ (get-at doc parsed-path)] ;; verify path exists
-        (if (empty? parsed-path)
-          value
-          (let [parent-path (vec (butlast parsed-path))
-                key (last parsed-path)]
-            (if (empty? parent-path)
-              (assoc doc key value)
-              (let [parent (get-at doc parent-path)]
-                (set-at doc (vec (concat (butlast parent-path) [(last parent-path)]))
-                        (assoc parent key value)))))))
+      (replace-at doc parsed-path path value)
 
       "move"
       (let [from-path (parse-path from)
-            val (get-at doc from-path)
-            without (remove-at doc from-path)]
-        (set-at without parsed-path val))
+            moved (get-at doc from-path from)]
+        (add-at (remove-at doc from-path from) parsed-path path moved))
 
       "copy"
-      (let [from-path (parse-path from)
-            val (get-at doc from-path)]
-        (set-at doc parsed-path val))
+      (add-at doc parsed-path path (get-at doc (parse-path from) from))
 
       "test"
-      (let [actual (get-at doc parsed-path)]
-        (if (json-equal? actual value)
+      ;; A target that is gone fails the test like one that changed: either
+      ;; way the resource is not the one the client read.
+      (let [actual (try
+                     (get-at doc parsed-path path)
+                     (catch clojure.lang.ExceptionInfo _
+                       ::absent))]
+        (if (and (not= ::absent actual) (json-equal? actual value))
           doc
           (throw (ex-info "Test operation failed"
-                          {:op "test" :path path :expected value :actual actual}))))
+                          (cond-> {:op "test" :path path :expected value}
+                            (not= ::absent actual) (assoc :actual actual))))))
 
       (throw (ex-info "Unknown patch operation" {:op op})))))
 
