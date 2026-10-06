@@ -127,6 +127,119 @@
            (ex-data e)))))
 
 ;; ---------------------------------------------------------------------------
+;; Operations below an array element
+;;
+;; A path through an array element (/note/0/text) must rewrite that element
+;; in place. An earlier engine put the edited element back with `add`
+;; semantics, so the edited copy was inserted in front of the original and
+;; the resource ended up with both.
+;; ---------------------------------------------------------------------------
+
+(def ^:private condition
+  {:resourceType "Condition"
+   :id "c1"
+   :clinicalStatus {:coding [{:system "http://terminology.hl7.org/CodeSystem/condition-clinical"
+                              :code "active"}]}
+   :identifier [{:system "urn:a" :value "1"} {:system "urn:b" :value "2"}]
+   :note [{:text "Seen at Lafayette General, 3 nights"}
+          {:text "second" :authorString "Lee"}]})
+
+(defn- patched [doc & ops]
+  (json-patch/apply-patch doc (vec ops)))
+
+(defn- refusal
+  "The ex-message of the ex-info `ops` throw against `doc`, or nil."
+  [doc ops]
+  (try
+    (json-patch/apply-patch doc ops)
+    nil
+    (catch clojure.lang.ExceptionInfo e
+      (ex-message e))))
+
+(deftest replace-below-an-array-element-edits-that-element
+  (testing "the guarded note edit jib3's hospitalizations page sends"
+    (is (= [{:text "Seen at Lafayette General, 3 nights; appendectomy"}
+            {:text "second" :authorString "Lee"}]
+           (:note (patched condition
+                           {:op "test" :path "/note/0/text"
+                            :value "Seen at Lafayette General, 3 nights"}
+                           {:op "replace" :path "/note/0/text"
+                            :value "Seen at Lafayette General, 3 nights; appendectomy"})))))
+  (testing "the last element, and a path two arrays deep"
+    (is (= [{:text "Seen at Lafayette General, 3 nights"} {:text "x" :authorString "Lee"}]
+           (:note (patched condition {:op "replace" :path "/note/1/text" :value "x"}))))
+    (is (= [{:system "http://terminology.hl7.org/CodeSystem/condition-clinical"
+             :code "resolved"}]
+           (get-in (patched condition {:op "replace" :path "/clinicalStatus/coding/0/code"
+                                       :value "resolved"})
+                   [:clinicalStatus :coding]))))
+  (testing "a whole element"
+    (is (= [{:system "urn:a" :value "1"} {:system "urn:c" :value "3"}]
+           (:identifier (patched condition {:op "replace" :path "/identifier/1"
+                                            :value {:system "urn:c" :value "3"}}))))))
+
+(deftest remove-below-an-array-element-edits-that-element
+  (is (= [{:text "Seen at Lafayette General, 3 nights"} {:text "second"}]
+         (:note (patched condition {:op "remove" :path "/note/1/authorString"}))))
+  (is (= [{:text "second" :authorString "Lee"}]
+         (:note (patched condition {:op "remove" :path "/note/0"}))))
+  (is (= [{:text "Seen at Lafayette General, 3 nights"}]
+         (:note (patched condition {:op "remove" :path "/note/1"})))))
+
+(deftest add-below-an-array-element-edits-that-element
+  (testing "a member of an element"
+    (is (= [{:text "Seen at Lafayette General, 3 nights" :authorString "Kim"}
+            {:text "second" :authorString "Lee"}]
+           (:note (patched condition {:op "add" :path "/note/0/authorString" :value "Kim"})))))
+  (testing "an element inserted at an index, appended at the end and at -"
+    (is (= ["new" "Seen at Lafayette General, 3 nights" "second"]
+           (map :text (:note (patched condition {:op "add" :path "/note/0"
+                                                 :value {:text "new"}})))))
+    (is (= ["Seen at Lafayette General, 3 nights" "second" "new"]
+           (map :text (:note (patched condition {:op "add" :path "/note/2"
+                                                 :value {:text "new"}})))
+           (map :text (:note (patched condition {:op "add" :path "/note/-"
+                                                 :value {:text "new"}})))))))
+
+(deftest move-and-copy-below-an-array-element
+  (is (= [{:text "Seen at Lafayette General, 3 nights" :authorString "Lee"}
+          {:text "second"}]
+         (:note (patched condition {:op "move" :from "/note/1/authorString"
+                                    :path "/note/0/authorString"}))))
+  (is (= [{:text "Seen at Lafayette General, 3 nights" :authorString "Lee"}
+          {:text "second" :authorString "Lee"}]
+         (:note (patched condition {:op "copy" :from "/note/1/authorString"
+                                    :path "/note/0/authorString"}))))
+  (is (= ["second" "Seen at Lafayette General, 3 nights"]
+         (map :text (:note (patched condition {:op "move" :from "/note/0" :path "/note/1"}))))))
+
+(deftest a-target-that-does-not-exist-is-refused
+  ;; RFC 6902 section 4: remove, replace, move and copy need an existing
+  ;; target (or source), and add an existing parent with an index no greater
+  ;; than the array's size.
+  (doseq [op [{:op "replace" :path "/note/2/text" :value "x"}
+              {:op "replace" :path "/note/0/authorString" :value "x"}
+              {:op "replace" :path "/abatementDateTime" :value "2024"}
+              {:op "remove" :path "/note/2"}
+              {:op "remove" :path "/note/0/authorString"}
+              {:op "remove" :path "/abatementDateTime"}
+              {:op "add" :path "/note/3" :value {:text "x"}}
+              {:op "add" :path "/note/2/text" :value "x"}
+              {:op "add" :path "/stage/0/summary" :value {:text "x"}}
+              {:op "move" :from "/note/2" :path "/note/0"}
+              {:op "copy" :from "/note/0/authorString" :path "/note/1/authorString"}]]
+    (is (= (str "Path not found: " (or (:from op) (:path op)))
+           (refusal condition [op]))
+        (pr-str op))))
+
+(deftest a-test-of-a-target-that-does-not-exist-fails
+  ;; A target that is gone is the resource moving under the client, which is
+  ;; what a failed test reports.
+  (is (= "Test operation failed"
+         (refusal condition [{:op "test" :path "/note/2/text" :value "x"}])
+         (refusal condition [{:op "test" :path "/abatementDateTime" :value nil}]))))
+
+;; ---------------------------------------------------------------------------
 ;; Over HTTP
 ;;
 ;; A PATCH sent through the router, so the expected value is whatever the
@@ -198,6 +311,30 @@
   (let [[resp stored] (patch! (guarded-replace "/valueQuantity/value" "72.6"))]
     (is (= 400 (:status resp)))
     (is (= "final" (:status stored)))))
+
+(deftest a-replaced-note-text-is-stored-as-one-note
+  (let [store (mock/create-mock-store {})
+        _ (db/create-resource store "default" :Observation "o1"
+                              (assoc observation :note [{:text "Seen at Lafayette General, 3 nights"}]))
+        resp ((app store) {:request-method :patch
+                           :uri "/default/fhir/Observation/o1"
+                           :headers {"content-type" "application/json-patch+json"
+                                     "accept" "application/fhir+json"}
+                           :body (ByteArrayInputStream.
+                                   (.getBytes (str "[{\"op\":\"test\",\"path\":\"/note/0/text\","
+                                                   "\"value\":\"Seen at Lafayette General, 3 nights\"},"
+                                                   "{\"op\":\"replace\",\"path\":\"/note/0/text\","
+                                                   "\"value\":\"Seen at Lafayette General, 3 nights; appendectomy\"}]")
+                                              "UTF-8"))})]
+    (is (= 200 (:status resp)) (body-of resp))
+    (is (= [{:text "Seen at Lafayette General, 3 nights; appendectomy"}]
+           (:note (db/read-resource store "default" :Observation "o1"))))))
+
+(deftest a-replace-of-a-missing-element-is-refused-and-stores-nothing
+  (let [[resp stored] (patch! "[{\"op\":\"replace\",\"path\":\"/component/2/code\",\"value\":{}}]")]
+    (is (= 400 (:status resp)))
+    (is (re-find #"Path not found: /component/2/code" (body-of resp)))
+    (is (= (:component observation) (:component stored)))))
 
 (deftest a-replaced-decimal-reaches-the-store-with-its-scale
   ;; A PATCH result is written without request coercion, so the store gets

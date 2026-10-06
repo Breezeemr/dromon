@@ -227,7 +227,7 @@
                   [:patch
                    #(handlers/patch-resource
                      (lc-req st "Substance" lc :id "s-1"
-                             :body [{:op "replace" :path "/status" :value "active"}]))]
+                             :body [{:op "add" :path "/status" :value "active"}]))]
                   [:conditional-create
                    #(handlers/create-resource
                      (-> (lc-req st "Substance" lc :body {:resourceType "Substance"})
@@ -241,7 +241,7 @@
                      (cond-r {"_id" "s-none"} {:resourceType "Substance" :id "s-cond"}))]
                   [:patch
                    #(handlers/conditional-patch
-                     (cond-r {"_id" "s-1"} [{:op "replace" :path "/status" :value "inactive"}]))]]]
+                     (cond-r {"_id" "s-1"} [{:op "add" :path "/status" :value "inactive"}]))]]]
       (doseq [[interaction call] cases]
         (reset! calls [])
         (let [resp (call)]
@@ -339,7 +339,7 @@
           calls (atom [])
           resp  (handlers/patch-resource
                  (lc-req st "Substance" (recording-lifecycle calls) :id "s-1"
-                         :body [{:op "replace" :path "/status" :value "active"}]))]
+                         :body [{:op "add" :path "/status" :value "active"}]))]
       (is (= 200 (:status resp)))
       (is (= presented-text (get-in resp [:body :text])))
       (is (= [:patch] (mapv :interaction @calls)) "one presentation, of the result")
@@ -357,7 +357,7 @@
                       :body-params    {:resourceType "Bundle"
                                        :type "transaction"
                                        :entry [{:request  {:method "PATCH" :url "Substance/s-1"}
-                                                :resource [{:op "replace" :path "/status"
+                                                :resource [{:op "add" :path "/status"
                                                             :value "active"}]}]}})]
       (is (= 200 (:status resp)) (pr-str (:body resp)))
       (is (= [:transaction] (mapv :interaction @calls)))
