@@ -58,7 +58,8 @@
             [server.middleware :as middleware]
             [server.routing :as routing]
             [server.scope :as scope])
-  (:import [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
+  (:import [com.fasterxml.jackson.core JsonGenerator$Feature]
+           [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]))
 
 ;; ---------------------------------------------------------------------------
@@ -66,9 +67,17 @@
 ;; ---------------------------------------------------------------------------
 
 (def java-time-encode-mapper
-  "Jackson ObjectMapper that serializes java.time objects to ISO strings."
+  "Jackson ObjectMapper that serializes java.time objects to ISO strings and
+   BigDecimals in plain notation.
+
+   Jackson otherwise writes a BigDecimal with `toString`, which uses exponent
+   form for a negative scale or a small value: 60 stored as 6E+1 went out as
+   `6E+1`, and 0.0000001 as `1E-7`. Plain notation keeps every digit the value
+   has, so 60.0 still goes out as 60.0 and 1.50 as 1.50."
   (doto (json/object-mapper {:modules [(JavaTimeModule.)]})
-    (.disable SerializationFeature/WRITE_DATES_AS_TIMESTAMPS)))
+    (.disable SerializationFeature/WRITE_DATES_AS_TIMESTAMPS)
+    (.enable ^"[Lcom.fasterxml.jackson.core.JsonGenerator$Feature;"
+             (into-array JsonGenerator$Feature [JsonGenerator$Feature/WRITE_BIGDECIMAL_AS_PLAIN]))))
 
 (def java-time-decode-mapper
   "Jackson ObjectMapper that deserializes with keyword keys and reads every
