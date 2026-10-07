@@ -1,0 +1,13 @@
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}
+        fhir-store/protocol {:local/root "../fhir-store-protocol"}
+        com.breezeehr/fhir-primitives {:local/root "../fhir-primitives"}
+        metosin/malli {:mvn/version "0.20.2"}
+        metosin/jsonista {:mvn/version "0.3.14"}
+        integrant/integrant {:mvn/version "0.13.1"}
+        com.taoensso/telemere {:mvn/version "1.2.1"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {fhir-store/mock {:local/root "../fhir-store-mock"}
+                      lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+         :main-opts ["-m" "kaocha.runner"]}}}
