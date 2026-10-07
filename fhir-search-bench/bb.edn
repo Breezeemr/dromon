@@ -5,22 +5,12 @@
   {:doc "Download Synthea (once) and generate the synthetic dataset. Pass :population N to change size."
    :task (apply shell "clojure" "-X" "fhir-search-bench.synthea/generate" *command-line-args*)}
 
-  transactor
-  {:doc "Start the dockerized Datomic dev transactor on 4337 (hasch baked in; isolated from the :4334 realm). Foreground; Ctrl-C to stop and remove the container."
-   :task (shell "./transactor-docker.sh" "foreground")}
-
   bench-xtdb
   {:doc "Run the benchmark against the xtdb2 backend."
    :task (apply shell
                 "clojure" "-X:xtdb" "fhir-search-bench.bench/run" ":backend" ":xtdb2"
                 *command-line-args*)}
 
-  bench-datomic
-  {:doc "Run the benchmark against the datomic backend (transactor must be running)."
-   :task (apply shell
-                "clojure" "-X:datomic" "fhir-search-bench.bench/run" ":backend" ":datomic"
-                *command-line-args*)}
-
   report
-  {:doc "Aggregate both per-backend results into target/REPORT.md."
-   :task (shell "clojure" "-X" "fhir-search-bench.bench/report")}}}
+  {:doc "Compare target/bench-xtdb2.edn with another store's result (`bb report :b '\"<path>\"'`) into target/REPORT.md."
+   :task (apply shell "clojure" "-X" "fhir-search-bench.bench/report" *command-line-args*)}}}

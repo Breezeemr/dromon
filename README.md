@@ -118,9 +118,9 @@ conformance resources of whichever implementation guide is on the classpath.
 The served CapabilityStatement is generated from the same source as the routes,
 so the server's description of itself cannot drift from its behaviour. The
 schema package (`:malli/uscore8`, `:malli/r4b`, a private Breeze IG outside
-this repository) and the store backend (`:store/xtdb2`, `:store/datomic`,
-`:store/mock`) are both aliases chosen at startup, and `fhir-server` depends
-statically on neither. A private guide can even ship a storage registry that
+this repository) and the store backend (`:store/xtdb2`, `:store/mock`) are both
+aliases chosen at startup, and `fhir-server` depends statically on neither; a
+store outside this repository plugs in the same way. A private guide can even ship a storage registry that
 `server.core/resolve-schema` recompiles schemas under, adapting a profile to a
 backend's storage model without forking the server.
 

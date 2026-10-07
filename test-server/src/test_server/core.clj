@@ -62,40 +62,14 @@
                 :store-ref (ig/ref :fhir-store/xtdb2-store)}
    :mock  {:requires '[fhir-store.mock.sys]
            :extra    {:fhir-store/mock {}}
-           :store-ref (ig/ref :fhir-store/mock)}
-   ;; In-memory Datomic (`datomic:mem://`), no transactor required. Selected via
-   ;; TEST_SERVER_STORE=datomic with the `:store/datomic` deps alias on the
-   ;; classpath. Used by the compartment-e2e runner to verify enforcement
-   ;; against the Datomic backend.
-   :datomic {:requires '[fhir-store-datomic.core]
-             :extra    {:fhir-store/datomic-store {:resource/schemas (ig/ref :fhir/schemas)
-                                                   :storage          :mem
-                                                   :close-on-halt?   true}}
-             :store-ref (ig/ref :fhir-store/datomic-store)}
-   ;; Persistent Datomic dev storage pointed at a pre-existing database
-   ;; produced by fhir-datomic-decant. The `default` tenant is mapped to the
-   ;; decant target database instead of the usual `{prefix}-{tenant}` name.
-   ;; Requires a running transactor (default datomic:dev://localhost:4334);
-   ;; override with DATOMIC_BASE_URI / DATOMIC_DEFAULT_DB. Selected via
-   ;; TEST_SERVER_STORE=datomic-decant with the `:store/datomic` deps alias.
-   :datomic-decant
-   {:requires '[fhir-store-datomic.core]
-    :extra    {:fhir-store/datomic-store
-               {:resource/schemas (ig/ref :fhir/schemas)
-                :storage          :dev
-                :base-uri         (or (System/getenv "DATOMIC_BASE_URI")
-                                      "datomic:dev://localhost:4334")
-                :tenant-db-names  {"default" (or (System/getenv "DATOMIC_DEFAULT_DB")
-                                                 "phi-fhir-test-decanted")}
-                :close-on-halt?   false}}
-    :store-ref (ig/ref :fhir-store/datomic-store)}})
+           :store-ref (ig/ref :fhir-store/mock)}})
 
 (def ^:private schema-presets
   "Map of schema-package -> namespace whose `specs` Var lists the schema
    specs to feed into `:fhir/schemas`."
   {:uscore8 'test-server.schemas.uscore8
    ;; Breeze IG capabilities + storage overlays (USEP HumanName/Address).
-   ;; Requires the `:malli/breeze` deps alias (and typically `:store/datomic`).
+   ;; Requires the `:malli/breeze` deps alias.
    :breeze  'test-server.schemas.breeze})
 
 (def ^:private extra-operations
@@ -129,8 +103,7 @@
    - :store    -- one of (keys store-presets); default :xtdb2
    - :schemas  -- one of (keys schema-presets); default :uscore8.
                   Use :breeze with the `:malli/breeze` alias for Breeze IG
-                  capabilities and USEP card-one name/address storage on
-                  the Datomic store.
+                  capabilities and USEP card-one name/address storage.
    - :port     -- HTTP port (default 8080)
    - :ssl-port -- HTTPS port (default 8443)"
   [{:keys [store schemas port ssl-port]
