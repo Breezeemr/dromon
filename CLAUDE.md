@@ -142,6 +142,7 @@ backends or schema packages on the classpath.
 - **fhir-store-protocol** -- `IFHIRStore` protocol: create, read, update, delete, search, history, vread, transact-bundle. Every write verb also takes a trailing `opts` map carrying `:if-match` and `:tx-metadata`; `ITxMetadataStore` says whether a store actually keeps the latter
 - **fhir-store-xtdb2** -- Primary backend; maps FHIR resources to dynamic SQL tables, stores original JSON in `fhir_source` column
 - **fhir-store-mock** -- Atom-backed in-memory store for tests
+- **fhir-store-http** -- `IFHIRStore` over a remote FHIR REST API (GCP Healthcare, HAPI, another dromon); one base URL per tenant. Snapshot verbs and tenant create/delete answer 501, `:tx-metadata` is dropped, lifecycle `tx-ops` are Bundle entries sent in one transaction with the write. See its README for what differs from a local store
 - **fhir-server** -- Reitit routing, Ring handlers, JWT auth, Keto authorization, Muuntaja content negotiation, FHIR exception middleware. No static dep on any malli schema package or store impl.
 - **test-server** -- Config-driven Integrant system wiring the above together. Picks store backend and schema package via `build-config` opts (or `TEST_SERVER_STORE` / `TEST_SERVER_SCHEMAS` env vars). Dependencies for stores and malli packages are pulled in via deps.edn aliases (`:store/xtdb2`, `:store/mock`, `:malli/uscore8`, ...).
 - **fhir-defintions-to-malli** -- Downloads FHIR StructureDefinitions and generates Malli schemas + CapabilityStatement :multi schemas
