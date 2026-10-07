@@ -1,6 +1,6 @@
 {:paths ["src" "resources"]
  :deps  {org.clojure/clojure                 {:mvn/version "1.12.6"}
-         metosin/malli                       {:mvn/version "0.20.1"}
+         metosin/malli                       {:mvn/version "0.20.2"}
          com.breezeehr/malli-decimal         {:git/url "https://github.com/Breezeemr/malli-decimal.git"
                                               :git/sha "94a2d330f793964f4ee364ef200a1f47c81b2a07"}
          #_#_io.github.Breezeemr/malli-java-time {:sha "c9a03b115f7da61d483a90a882d7e0e353af15c6"}}
