@@ -3,20 +3,17 @@
    IFHIRStore protocol (no HTTP, no auth) so the numbers isolate storage and
    search performance — the layer Blaze measures.
 
-   Run once per backend (each needs its own classpath alias):
+   dromon benchmarks its own store, xtdb2:
 
-     clojure -X:xtdb    fhir-search-bench.bench/run :backend :xtdb2
-     clojure -X:datomic fhir-search-bench.bench/run :backend :datomic
+     clojure -X:xtdb fhir-search-bench.bench/run :backend :xtdb2
 
-   Each run writes target/bench-<backend>.edn. Then aggregate:
+   which writes its on-disk node under data/xtdb2/ and its result to
+   target/bench-xtdb2.edn. Any other IFHIRStore runs through the same harness
+   from its own project, passing `:store-fn`, a qualified symbol naming a
+   no-argument function that answers a fresh store (master-at-arms2's
+   dromon-datomic does this for Datomic). `report` compares two result files:
 
-     clojure -X fhir-search-bench.bench/report
-
-   The datomic run uses master-at-arms2's shared dev transactor on 4334 (`bb
-   datomic-up` at the ma2 root; run-datomic.sh and `bb transactor` start it),
-   under a random database prefix (`fhirbench-1a2b3c4d`) so it never meets
-   another project's databases; the run deletes its tenant at the end. The xtdb
-   run writes its on-disk node under data/xtdb2/."
+     clojure -X fhir-search-bench.bench/report :b '\"<other>/target/bench-datomic.edn\"'"
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
@@ -40,12 +37,14 @@
 (defn- xtdb-data-dir [] (str data-root "/xtdb2"))
 
 (defn- make-store
-  "Construct a fresh on-disk store for `backend`. For xtdb2 the on-disk node
-   directory is wiped first; for datomic the database is dropped-and-recreated by
-   `create-tenant {:if-exists :replace}` below."
-  [backend]
-  (case backend
-    :xtdb2
+  "Construct a fresh store: `(store-fn)` when given, else the built-in xtdb2
+   store, whose on-disk node directory is wiped first."
+  [backend store-fn]
+  (cond
+    store-fn
+    ((requiring-resolve store-fn))
+
+    (= :xtdb2 backend)
     (let [dir    (xtdb-data-dir)
           create (requiring-resolve 'fhir-store-xtdb2.core/create-xtdb-store)]
       (shell/sh "rm" "-rf" dir)
@@ -55,13 +54,9 @@
                :node-config      {:log     [:local {:path (str dir "/log")}]
                                   :storage [:local {:path (str dir "/storage")}]}}))
 
-    :datomic
-    (let [create (requiring-resolve 'fhir-store-datomic.core/create-datomic-store)]
-      (create {:resource/schemas @schema/schemas
-               :storage          :dev
-               :base-uri         "datomic:dev://localhost:4334"
-               :db-prefix        (str "fhirbench-" (subs (str (random-uuid)) 0 8))
-               :close-on-halt?   false}))))
+    :else
+    (throw (ex-info (str "Unknown backend " backend "; pass :store-fn for a store outside dromon")
+                    {:backend backend}))))
 
 ;; ── Load ────────────────────────────────────────────────────────────────────
 
@@ -86,60 +81,17 @@
 
 ;; Bundles larger than `max-tx` resources are split into sub-chunks of that size,
 ;; each its own transaction. This bounds the size of any single atomic transaction
-;; — Synthea occasionally emits a multi-thousand-resource mega-patient whose 20k+
-;; datom transaction overwhelms the Datomic dev transactor once cumulative state is
-;; large. Cross-sub-chunk urn:uuid references stay as strings (skipped), so
-;; splitting is safe; the only cost is a few dropped intra-patient reference links,
-;; which the search workload does not touch. Both loaders below split this way and
-;; bound in-flight transactions to `concurrency` for back pressure.
-
-(defn- load-dataset-async!
-  "Pipelined Datomic load. Splits bundles at `max-tx` like load-dataset!, but
-   submits each sub-chunk via the store's `transact-load-async` (non-blocking
-   d/transact-async) and bounds the number of in-flight transactions with a
-   semaphore of `concurrency` permits. A permit is acquired before each submit
-   and released when that transaction commits, so when the transactor falls
-   behind the submit loop blocks — that blocking is the back pressure. A chunk
-   whose async transaction fails is retried per-entry via transact-bundle so one
-   bad resource doesn't lose the whole chunk."
-  [store bundles total max-tx concurrency]
-  (let [submit (requiring-resolve 'fhir-store-datomic.core/transact-load-async)
-        sem    (java.util.concurrent.Semaphore. concurrency)
-        ok     (java.util.concurrent.atomic.AtomicLong. 0)
-        t0     (now-ns)
-        chunks (for [{:keys [entries]} bundles
-                     sub (partition-all max-tx entries)]
-                 (vec sub))
-        completions
-        (doall
-         (for [chunk chunks]
-           (do
-             (.acquire sem)
-             (let [fut (submit store tenant chunk)]
-               (future
-                 (try
-                   (when fut (deref fut))
-                   (.addAndGet ok (long (count chunk)))
-                   (catch Throwable _
-                     (.addAndGet ok (long (try (batch-oks (db/transact-bundle store tenant chunk))
-                                               (catch Throwable _ 0)))))
-                   (finally (.release sem))))))))]
-    (doseq [c completions] (deref c))
-    (let [elapsed-ns (- (now-ns) t0)
-          secs       (/ elapsed-ns 1e9)
-          okn        (.get ok)]
-      {:requested   total
-       :loaded      okn
-       :failed      (- total okn)
-       :elapsed-ms  (->ms elapsed-ns)
-       :res-per-sec (when (pos? secs) (Math/round (/ (double okn) secs)))})))
+;; -- Synthea occasionally emits a multi-thousand-resource mega-patient whose
+;; transaction is far larger than any real write. Cross-sub-chunk urn:uuid
+;; references stay as strings (skipped), so splitting is safe; the only cost is a
+;; few dropped intra-patient reference links, which the search workload does not
+;; touch. In-flight transactions are bounded by `concurrency` for back pressure.
 
 (defn- load-dataset-pooled!
-  "Concurrent load for backends without an async transact API (xtdb2). Splits
-   bundles at `max-tx` and runs up to `concurrency` synchronous
-   `transact-transaction` calls at once via a fixed thread pool. The pool size
-   bounds in-flight transactions — the database back pressure — mirroring the
-   Datomic async path so the two backends load apples-to-apples."
+  "Concurrent load. Splits bundles at `max-tx` and runs up to `concurrency`
+   synchronous `transact-transaction` calls at once via a fixed thread pool. The
+   pool size bounds in-flight transactions, the database back pressure, the same
+   for every store so their loads compare."
   [store bundles total max-tx concurrency]
   (let [pool   (java.util.concurrent.Executors/newFixedThreadPool concurrency)
         ok     (java.util.concurrent.atomic.AtomicLong. 0)
@@ -218,19 +170,20 @@
 
 (defn run
   "Benchmark one backend end-to-end. Options:
-   - :backend        :xtdb2 | :datomic (required)
+   - :backend        result label, e.g. :xtdb2 (required); names the result file
+   - :store-fn       qualified symbol of a no-arg fn answering a fresh store, for
+                     a store outside dromon (default: the built-in xtdb2 store)
    - :max-resources  dataset cap (default 10000)
    - :max-tx         max resources per transaction; larger bundles are split
                      (default 2000). Bounds atomic-transaction size so a Synthea
-                     mega-patient bundle can't overwhelm the Datomic transactor.
-   - :concurrency    max in-flight transactions during load (default 4). Datomic
-                     uses d/transact-async + a semaphore; xtdb2 uses a fixed
-                     thread pool of synchronous transactions. Same bound, so the
-                     two backends load apples-to-apples.
+                     mega-patient bundle can't dominate the load.
+   - :concurrency    max in-flight transactions during load (default 4), the
+                     same bound for every store so loads compare.
    - :synthea-dir    Synthea fhir bundle dir (default synthea-output/fhir)"
-  [{:keys [backend max-resources max-tx concurrency synthea-dir]
+  [{:keys [backend store-fn max-resources max-tx concurrency synthea-dir]
     :or   {max-resources 10000 max-tx 2000 concurrency 4 synthea-dir "synthea-output/fhir"}}]
-  (assert (#{:xtdb2 :datomic} backend) (str "Unknown backend: " backend))
+  (when-not (keyword? backend)
+    (throw (ex-info "Pass :backend, the result label (e.g. :xtdb2)" {:backend backend})))
   ;; The stores emit a `t/trace!` per operation; at trace/info level that floods
   ;; the run with millions of lines. Keep only warnings and errors.
   (tel/set-min-level! :warn)
@@ -239,16 +192,12 @@
   (let [{:keys [bundles total patients by-type]}
         (dataset/build {:dir synthea-dir :max-resources max-resources})
         _      (log "Constructing store and provisioning tenant ...")
-        store  (make-store backend)]
+        store  (make-store backend store-fn)]
     (db/create-tenant store tenant {:if-exists :replace})
     (db/warmup-tenant store tenant)
     (log "Loading" total "resources across" (count bundles) "bundle(s)"
          (str "(pooled, concurrency " concurrency ")")
          "...")
-    ;; Both backends load via the pooled (synchronous transact-transaction)
-    ;; path. The datomic async loader referenced a transact-load-async entry
-    ;; point the store no longer exposes; the load mechanism does not affect
-    ;; query latency, so pooled keeps the before/after comparison valid.
     (let [load-stats (load-dataset-pooled! store bundles total max-tx concurrency)
           _ (log "Loaded" (:loaded load-stats) "/" total
                  "in" (format "%.1f" (:elapsed-ms load-stats)) "ms"
@@ -276,8 +225,8 @@
 
 ;; ── Report ──────────────────────────────────────────────────────────────────
 
-(defn- read-result [backend]
-  (let [f (io/file (str "target/bench-" (name backend) ".edn"))]
+(defn- read-result [path]
+  (let [f (io/file path)]
     (when (.exists f) (edn/read-string (slurp f)))))
 
 (defn- fmt-ms [x] (if x (format "%.2f" (double x)) "—"))
@@ -289,30 +238,34 @@
    backends must return the same date sequence (ids are store-local POST
    assignments and intentionally not compared). Limit-only (unsorted) pages are
    an arbitrary slice, so only the hit count is asserted. Returns a short label."
-  [qx qd]
+  [qa qb]
   (cond
-    (not (and qx qd))            "—"
-    (not= (:hits qx) (:hits qd)) (format "HITS DIFFER %d/%d" (:hits qx) (:hits qd))
-    (:sorted? (or qx qd))        (if (= (:page-dates qx) (:page-dates qd))
+    (not (and qa qb))            "—"
+    (not= (:hits qa) (:hits qb)) (format "HITS DIFFER %d/%d" (:hits qa) (:hits qb))
+    (:sorted? (or qa qb))        (if (= (:page-dates qa) (:page-dates qb))
                                    "page order match" "PAGE ORDER DIFF")
-    (:limited? (or qx qd))       "page size match"
+    (:limited? (or qa qb))       "page size match"
     :else                        "hits match"))
 
 (defn report
-  "Aggregate target/bench-xtdb2.edn and target/bench-datomic.edn into a side-by-side
-   comparison, printed and written to target/REPORT.md."
-  [_]
-  (let [x (read-result :xtdb2)
-        d (read-result :datomic)]
-    (when-not (or x d)
-      (log "No bench result files found under target/. Run the per-backend bench first.")
+  "Compare two bench result files side by side, printed and written to
+   target/REPORT.md. `:a` defaults to target/bench-xtdb2.edn; `:b` is the other
+   store's result, e.g. dromon-datomic's target/bench-datomic.edn. Either may be
+   absent, and the report then covers the one present."
+  [{:keys [a b] :or {a "target/bench-xtdb2.edn"}}]
+  (let [ra (read-result a)
+        rb (when b (read-result b))]
+    (when-not (or ra rb)
+      (log "No bench result files found. Run the per-backend bench first.")
       (System/exit 1))
-    (let [lines (StringBuilder.)
+    (let [la    (some-> ra :backend name)
+          lb    (some-> rb :backend name)
+          lines (StringBuilder.)
           emit  (fn [s] (.append lines s) (.append lines "\n"))
           q-by  (fn [r] (into {} (map (juxt :id identity)) (:queries r)))
-          xq    (q-by x) dq (q-by d)
-          ids   (distinct (concat (map :id (:queries x)) (map :id (:queries d))))]
-      (emit "# FHIR Search Benchmark — xtdb2 vs datomic")
+          aq    (q-by ra) bq (q-by rb)
+          ids   (distinct (concat (map :id (:queries ra)) (map :id (:queries rb))))]
+      (emit (str "# FHIR Search Benchmark — " (str/join " vs " (remove nil? [la lb]))))
       (emit "")
       (emit "Methodology adapted from Blaze's FHIR-search performance suite")
       (emit "(https://samply.github.io/blaze/performance/fhir-search.html): synthetic")
@@ -321,11 +274,11 @@
       (emit "")
       (emit "## Dataset")
       (emit "")
-      (doseq [[label r] [["xtdb2" x] ["datomic" d]]]
+      (doseq [[label r] [[la ra] [lb rb]]]
         (when r
           (emit (format "- **%s**: %d resources from %d patient bundle(s)"
                         label (get-in r [:dataset :total]) (get-in r [:dataset :patients])))))
-      (when-let [bt (some-> (or x d) :dataset :by-type)]
+      (when-let [bt (some-> (or ra rb) :dataset :by-type)]
         (emit "")
         (emit "Resource mix:")
         (emit (str "  " (str/join ", " (map (fn [[k v]] (str k "=" v)) bt)))))
@@ -334,7 +287,7 @@
       (emit "")
       (emit "| backend | loaded | failed | time (ms) | res/s |")
       (emit "|---|---:|---:|---:|---:|")
-      (doseq [[label r] [["xtdb2" x] ["datomic" d]]]
+      (doseq [[label r] [[la ra] [lb rb]]]
         (when r
           (let [l (:load r)]
             (emit (format "| %s | %d | %d | %s | %s |"
@@ -343,47 +296,48 @@
       (emit "")
       (emit "## Search latency (median of 5 runs, ms) and hit counts")
       (emit "")
-      (emit "| query | tier | hits | xtdb2 ms | datomic ms | faster | result match |")
+      (emit (format "| query | tier | hits | %s ms | %s ms | faster | result match |"
+                    (or la "—") (or lb "—")))
       (emit "|---|---|---:|---:|---:|---|---|")
       (doseq [id ids]
-        (let [qx (get xq id) qd (get dq id)
-              desc (:desc (or qx qd))
-              hits (or (:hits qx) (:hits qd))
-              mx (:median-ms qx) md (:median-ms qd)
-              faster (cond (and mx md) (if (< mx md) "xtdb2" "datomic")
-                           mx "xtdb2" md "datomic" :else "—")]
+        (let [qa (get aq id) qb (get bq id)
+              desc (:desc (or qa qb))
+              hits (or (:hits qa) (:hits qb))
+              ma (:median-ms qa) mb (:median-ms qb)
+              faster (cond (and ma mb) (if (< ma mb) la lb)
+                           ma la mb lb :else "—")]
           (emit (format "| %s | %s | %s | %s | %s | %s | %s |"
-                        desc (name (:tier (or qx qd)))
-                        (fmt-int hits) (fmt-ms mx) (fmt-ms md) faster
-                        (result-match qx qd)))))
+                        desc (name (:tier (or qa qb)))
+                        (fmt-int hits) (fmt-ms ma) (fmt-ms mb) faster
+                        (result-match qa qb)))))
       (emit "")
       (emit "_Note: both stores return `[]` for unsupported search params, so a")
       (emit "0-hit extended query may mean \"unsupported\" rather than \"no matches\"._")
-      (when (and x d)
-        (let [core (filter #(= :core (:tier %)) (:queries x))
+      (when (and ra rb)
+        (let [core (filter #(= :core (:tier %)) (:queries ra))
               wins (fn [pick]
                      (count (filter (fn [q]
-                                      (let [mx (:median-ms (get xq (:id q)))
-                                            md (:median-ms (get dq (:id q)))]
-                                        (and mx md (pick mx md))))
+                                      (let [ma (:median-ms (get aq (:id q)))
+                                            mb (:median-ms (get bq (:id q)))]
+                                        (and ma mb (pick ma mb))))
                                     core)))
-              x-wins (wins <) d-wins (wins >)
-              lx (get-in x [:load :elapsed-ms]) ld (get-in d [:load :elapsed-ms])
-              load-winner (if (< lx ld) "xtdb2" "datomic")]
+              a-wins (wins <) b-wins (wins >)
+              lda (get-in ra [:load :elapsed-ms]) ldb (get-in rb [:load :elapsed-ms])
+              load-winner (if (< lda ldb) la lb)]
           (emit "")
           (emit "## Verdict")
           (emit "")
           (emit (format "- **Load**: %s faster (%.0f ms vs %.0f ms, %.0f%% delta)."
-                        load-winner (min lx ld) (max lx ld)
-                        (* 100.0 (/ (Math/abs (- lx ld)) (min lx ld)))))
-          (emit (format "- **Search**: xtdb2 faster on %d/%d core queries, datomic on %d/%d."
-                        x-wins (count core) d-wins (count core)))
-          (let [matches   (map #(result-match (get xq %) (get dq %)) ids)
+                        load-winner (min lda ldb) (max lda ldb)
+                        (* 100.0 (/ (Math/abs (- lda ldb)) (min lda ldb)))))
+          (emit (format "- **Search**: %s faster on %d/%d core queries, %s on %d/%d."
+                        la a-wins (count core) lb b-wins (count core)))
+          (let [matches   (map #(result-match (get aq %) (get bq %)) ids)
                 bad       (remove #{"hits match" "page size match" "page order match"} matches)
                 sorted-ok (every? #(= "page order match" %)
                                   (keep (fn [id]
-                                          (let [q (or (get xq id) (get dq id))]
-                                            (when (:sorted? q) (result-match (get xq id) (get dq id)))))
+                                          (let [q (or (get aq id) (get bq id))]
+                                            (when (:sorted? q) (result-match (get aq id) (get bq id)))))
                                         ids))]
             (emit (format "- **Conformance**: %s (%d/%d queries)%s."
                           (if (empty? bad) "hit counts agree on every query" "MISMATCHES present (see result match column)")

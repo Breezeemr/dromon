@@ -9,7 +9,9 @@
    tuples, then drives HTTP requests and asserts that a `patient/`-scoped token
    is confined to its launch patient's compartment.
 
-   Run via `bb compartment-e2e`. Exits non-zero if any assertion fails."
+   Run via `bb compartment-e2e`. Exits non-zero if any assertion fails. A
+   store outside dromon runs the same scenarios against its own server through
+   [[run-with!]] (master-at-arms2's dromon-datomic does, for Datomic)."
   (:require [babashka.process :refer [shell process]]
             [babashka.curl :as curl]
             [cheshire.core :as json]
@@ -77,15 +79,10 @@
 
 ;; ── FHIR server lifecycle ──────────────────────────────────────────────────
 
-(defn- store-alias
-  "Deps alias chain to put the chosen store backend on the classpath. `:test`
-   already bundles XTDB2; datomic needs its own (out-of-tree) alias added."
+(defn- start-test-server!
+  "Start dromon's test-server on `store` (:xtdb2 or :mock, both on the :test
+   alias), serving HTTP on :3000 with SMART scopes enforced."
   [store]
-  (case store
-    :datomic "-X:test:store/datomic"
-    "-X:test"))
-
-(defn- start-server! [store]
   (io/delete-file "e2e-server.log" true)
   (println (format "Starting FHIR server (store=%s, HTTP :3000, ENFORCE_SMART_SCOPES=1)..."
                    (name store)))
@@ -93,7 +90,7 @@
             "-J--add-opens=java.base/java.nio=ALL-UNNAMED"
             "-J--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
             "-J--enable-preview"
-            (store-alias store) "test-server.core/-main" ":port" "3000" ":ssl-port" "false"]
+            "-X:test" "test-server.core/-main" ":port" "3000" ":ssl-port" "false"]
            {:dir "test-server"
             :out (io/file "e2e-server.log")
             :err :out
@@ -293,21 +290,21 @@
   (try (zero? (:exit (shell {:continue true :out :string :err :string} "docker" "version")))
        (catch Exception _ false)))
 
-(defn run!
-  "Entry point for `bb compartment-e2e`. Runs the full scenario suite against
-   each store backend in turn (default: XTDB2 then Datomic). Skips (exit 0)
-   when Docker is absent. Optional args select stores, e.g.
-   `bb compartment-e2e datomic`."
-  [& store-args]
+(defn run-with!
+  "Run the full scenario suite against each of `stores` in turn, starting each
+   one's server with `(start-server store)`. That must answer a babashka process
+   serving FHIR over HTTP on :3000 (`base-url`) with SMART scopes enforced
+   (ENFORCE_SMART_SCOPES=1), verifying tokens against the local Hydra. Skips
+   (exit 0) when Docker is absent; exits non-zero if any assertion fails."
+  [{:keys [stores start-server]}]
   (when-not (docker-available?)
     (println "Docker/Podman not available -- skipping compartment-e2e.")
     (System/exit 0))
 
-  (let [stores (if (seq store-args) (mapv keyword store-args) [:xtdb2 :datomic])
-        ;; NOTE: System/exit is called AFTER the try/finally completes — calling
-        ;; it inside the body would begin JVM shutdown and skip the finally
-        ;; (leaving the server up and Hydra stuck in hook mode).
-        stop-webhook (atom nil)
+  ;; NOTE: System/exit is called AFTER the try/finally completes — calling it
+  ;; inside the body would begin JVM shutdown and skip the finally (leaving the
+  ;; server up and Hydra stuck in hook mode).
+  (let [stop-webhook (atom nil)
         server-proc  (atom nil)
         exit-code    (atom 1)]
     (try
@@ -321,7 +318,7 @@
 
       (doseq [store stores]
         (println (str "\n========== STORE: " (name store) " =========="))
-        (let [p (start-server! store)]
+        (let [p (start-server store)]
           (reset! server-proc p)
           (wait-for-server 90)
           (run-scenarios! store)
@@ -352,3 +349,11 @@
         (println "Restoring plain Hydra...")
         (try (run-hydra! false) (catch Exception _))))
     (System/exit @exit-code)))
+
+(defn run!
+  "Entry point for `bb compartment-e2e`: the scenarios against dromon's
+   test-server on XTDB2. Optional args select test-server stores, e.g.
+   `bb compartment-e2e xtdb2 mock`."
+  [& store-args]
+  (run-with! {:stores       (if (seq store-args) (mapv keyword store-args) [:xtdb2])
+              :start-server start-test-server!}))

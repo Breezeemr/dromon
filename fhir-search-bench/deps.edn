@@ -9,10 +9,8 @@
         metosin/jsonista {:mvn/version "0.3.14"}}
 
  :aliases
- ;; The two backends are mutually exclusive on the classpath. Run the bench once
- ;; per backend with the matching alias so a single JVM never loads both the XTDB
- ;; Arrow stack and the Datomic peer at the same time (matches how the inferno
- ;; perf comparison sequences them).
+ ;; dromon benchmarks its own store here. A store outside dromon brings its own
+ ;; classpath and runs this harness with :store-fn (see bench.clj).
  {:xtdb
   ;; Pin the netty family to 4.1.x. xtdb-core 2.2.0-beta1 pulls netty 4.2.9,
   ;; but Arrow 19's netty allocator is incompatible with netty 4.2
@@ -32,8 +30,4 @@
               "--add-opens=java.base/java.nio=ALL-UNNAMED"
               "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
               "--enable-preview"
-              "--sun-misc-unsafe-memory-access=allow"]}
-
-  :datomic
-  {:extra-deps {fhir-store/datomic {:local/root "../../fhir-store-datomic"}}
-   :jvm-opts ["-Xmx28g"]}}}
+              "--sun-misc-unsafe-memory-access=allow"]}}}

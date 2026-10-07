@@ -199,7 +199,7 @@
    :task (apply tc/-main *command-line-args*)}
 
   compartment-e2e
-  {:doc "Full-stack patient-compartment integration test against the real local Ory stack (Hydra token hook + Keto). Runs every scenario against both the XTDB2 and Datomic backends (or the stores named as args, e.g. `bb compartment-e2e datomic`). Skips if Docker is unavailable."
+  {:doc "Full-stack patient-compartment integration test against the real local Ory stack (Hydra token hook + Keto). Runs every scenario against the test-server on XTDB2 (or the test-server stores named as args, e.g. `bb compartment-e2e mock`). Skips if Docker is unavailable."
    :requires ([server.compartment-e2e-runner :as e2e])
    :task (apply e2e/run! *command-line-args*)}
 

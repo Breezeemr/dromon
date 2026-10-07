@@ -1,8 +1,9 @@
 # fhir-search-bench
 
-A FHIR-search performance harness for comparing the two dromon storage backends
-— **fhir-store-xtdb2** (XTDB v2) and **fhir-store-datomic** (Datomic) — at larger
-dataset scales.
+A FHIR-search performance harness for dromon's store, **fhir-store-xtdb2**
+(XTDB v2), at larger dataset scales. Any other `IFHIRStore` runs through the
+same harness from its own project and is compared with `bb report`;
+master-at-arms2's `dromon-datomic` does this for Datomic (`bb bench` there).
 
 The methodology is adapted from
 [Blaze's FHIR-search performance suite](https://samply.github.io/blaze/performance/fhir-search.html):
@@ -39,16 +40,13 @@ hospital/practitioner-information bundles first, then each patient bundle),
 keeping Synthea's native `urn:uuid` intra-bundle references so each store's
 `transact-transaction` resolves them atomically.
 
-The two backends are mutually exclusive on the classpath, so the bench runs
-**once per backend** (selected by deps alias) — matching how the inferno perf
-comparison sequences them.
+Another store runs this harness in its own JVM with its own classpath, passing
+`:store-fn`: a qualified symbol naming a no-argument function that answers a
+fresh store. Its result file is then compared with xtdb2's by `bb report`.
 
 ## Prerequisites
 
 - **Java 21** (XTDB v2). The bb tasks pin `/usr/lib/jvm/java-21-openjdk-amd64`.
-- **Datomic dev transactor** for the datomic run: master-at-arms2's shared one on
-  :4334 (`bb datomic-up` at the ma2 root). The run isolates itself with a random
-  database prefix (`fhirbench-1a2b3c4d`) and deletes its tenant at the end.
 
 ## Usage
 
@@ -60,31 +58,19 @@ bb synthea :population 20        # larger
 # 2a. Benchmark xtdb2 (writes an on-disk node under data/xtdb2/).
 bb bench-xtdb
 
-# 2b. Benchmark datomic. Start the shared transactor first (it stays running):
-bb transactor
-bb bench-datomic
-
-# 3. Aggregate into target/REPORT.md.
+# 3. Report into target/REPORT.md, alone or against another store's result.
 bb report
+bb report :b '"../../dromon-datomic/target/bench-datomic.edn"'
 ```
 
-`run-datomic.sh` is a one-shot convenience that starts the shared transactor if it
-is not running and runs the datomic benchmark:
-
-```bash
-./run-datomic.sh    # bb transactor + bb bench-datomic in one step
-```
-
-Each backend run writes `target/bench-<backend>.edn`; `bb report` reads both and
-emits the side-by-side `target/REPORT.md`.
+Each run writes `target/bench-<backend>.edn` in the directory it ran from;
+`bb report` compares `:a` (default `target/bench-xtdb2.edn`) with `:b`.
 
 ### Without bb
 
 ```bash
 JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
   clojure -X:xtdb    fhir-search-bench.bench/run :backend :xtdb2
-JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
-  clojure -X:datomic fhir-search-bench.bench/run :backend :datomic
 clojure -X fhir-search-bench.bench/report
 ```
 
@@ -97,10 +83,10 @@ clojure -X fhir-search-bench.bench/report
 - **Conditional references are stripped.** Synthea links cross-bundle resources
   with conditional references like
   `Organization?identifier=https://github.com/synthetichealth/synthea|<uuid>`.
-  The Datomic backend cannot resolve these to an entity (it aborts the bundle
-  load with `:db.error/not-an-entity`); xtdb2 keeps them as opaque strings.
+  Not every store can resolve these to an entity (fhir-store-datomic aborts the
+  bundle with `:db.error/not-an-entity`); xtdb2 keeps them as opaque strings.
   Since they are not part of the search workload, `dataset.clj` drops them so
-  both backends load identical data and every query returns identical hit
-  counts. (This is a real limitation of `fhir-store-datomic` on raw Synthea.)
+  every store loads identical data and every query returns identical hit
+  counts.
 - `synthea-with-dependencies.jar`, `synthea-output/`, `data/`, and `target/` are
   git-ignored (regenerable, large).
