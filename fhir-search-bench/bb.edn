@@ -6,8 +6,8 @@
    :task (apply shell "clojure" "-X" "fhir-search-bench.synthea/generate" *command-line-args*)}
 
   transactor
-  {:doc "Start the dockerized Datomic dev transactor on 4337 (hasch baked in; isolated from the :4334 realm). Foreground; Ctrl-C to stop and remove the container."
-   :task (shell "./transactor-docker.sh" "foreground")}
+  {:doc "Start master-at-arms2's shared dev Datomic transactor on 4334 (bb datomic-up at the ma2 root). It stays running; the bench isolates itself with a random database prefix."
+   :task (shell {:dir "../.."} "bb" "datomic-up")}
 
   bench-xtdb
   {:doc "Run the benchmark against the xtdb2 backend."

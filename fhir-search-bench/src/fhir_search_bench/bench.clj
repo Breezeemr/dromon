@@ -12,9 +12,11 @@
 
      clojure -X fhir-search-bench.bench/report
 
-   The datomic run needs the dockerized Datomic transactor listening on 4337
-   (started by run-datomic.sh / `bb transactor`); the xtdb run writes its on-disk
-   node under data/xtdb2/."
+   The datomic run uses master-at-arms2's shared dev transactor on 4334 (`bb
+   datomic-up` at the ma2 root; run-datomic.sh and `bb transactor` start it),
+   under a random database prefix (`fhirbench-1a2b3c4d`) so it never meets
+   another project's databases; the run deletes its tenant at the end. The xtdb
+   run writes its on-disk node under data/xtdb2/."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
@@ -57,8 +59,8 @@
     (let [create (requiring-resolve 'fhir-store-datomic.core/create-datomic-store)]
       (create {:resource/schemas @schema/schemas
                :storage          :dev
-               :base-uri         "datomic:dev://localhost:4337"
-               :db-prefix        "fhirbench"
+               :base-uri         "datomic:dev://localhost:4334"
+               :db-prefix        (str "fhirbench-" (subs (str (random-uuid)) 0 8))
                :close-on-halt?   false}))))
 
 ;; ── Load ────────────────────────────────────────────────────────────────────

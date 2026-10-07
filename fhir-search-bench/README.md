@@ -46,7 +46,9 @@ comparison sequences them.
 ## Prerequisites
 
 - **Java 21** (XTDB v2). The bb tasks pin `/usr/lib/jvm/java-21-openjdk-amd64`.
-- **Datomic dev transactor** for the datomic run — uses `../../local-datomic/datomic-pro`.
+- **Datomic dev transactor** for the datomic run: master-at-arms2's shared one on
+  :4334 (`bb datomic-up` at the ma2 root). The run isolates itself with a random
+  database prefix (`fhirbench-1a2b3c4d`) and deletes its tenant at the end.
 
 ## Usage
 
@@ -58,7 +60,7 @@ bb synthea :population 20        # larger
 # 2a. Benchmark xtdb2 (writes an on-disk node under data/xtdb2/).
 bb bench-xtdb
 
-# 2b. Benchmark datomic. Start the transactor in another terminal first:
+# 2b. Benchmark datomic. Start the shared transactor first (it stays running):
 bb transactor
 bb bench-datomic
 
@@ -66,11 +68,11 @@ bb bench-datomic
 bb report
 ```
 
-`run-datomic.sh` is a one-shot convenience that starts a fresh transactor, runs
-the datomic benchmark, and tears the transactor down again:
+`run-datomic.sh` is a one-shot convenience that starts the shared transactor if it
+is not running and runs the datomic benchmark:
 
 ```bash
-./run-datomic.sh    # transactor lifecycle + bb bench-datomic in one step
+./run-datomic.sh    # bb transactor + bb bench-datomic in one step
 ```
 
 Each backend run writes `target/bench-<backend>.edn`; `bb report` reads both and
