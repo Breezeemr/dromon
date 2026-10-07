@@ -11,12 +11,20 @@
      FHIR_STORE_HTTP_IT_OFFSET_PARAM=_skip        ; optional, else link walking
 
    Every resource it writes has a fresh id, so it can run against a shared
-   server, and it leaves those resources behind."
+   server, and it leaves those resources behind.
+
+   Unset, the tests are marked `:kaocha/pending`: kaocha would otherwise fail
+   them for making no assertions, and `clojure -M:test` must pass without a
+   server."
   (:require [clojure.test :refer [deftest is testing]]
             [fhir-store.http.core :as http]
             [fhir-store.protocol :as fp]))
 
 (def ^:private base (System/getenv "FHIR_STORE_HTTP_IT_BASE"))
+(def ^:private skipped?
+  "Evaluated into each deftest's var metadata at load time."
+  (nil? base))
+
 (def ^:private tenant (or (System/getenv "FHIR_STORE_HTTP_IT_TENANT") "default"))
 
 (defn- store []
@@ -30,7 +38,7 @@
 
 (defn- fresh [] (str "it-" (random-uuid)))
 
-(deftest remote-round-trip
+(deftest ^{:kaocha/pending skipped?} remote-round-trip
   (when base
     (let [s   (store)
           id  (fresh)
@@ -68,7 +76,7 @@
       (is (true? (fp/resource-deleted? s tenant :Patient id)))
       (is (false? (fp/resource-deleted? s tenant :Patient (fresh)))))))
 
-(deftest remote-bundles
+(deftest ^{:kaocha/pending skipped?} remote-bundles
   (when base
     (let [s  (store)
           id (fresh)]
