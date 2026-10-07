@@ -185,7 +185,8 @@
     (is (nil? @result) "never rethrown, returns nil")
     (is (= :fhir-store/lifecycle-after-commit-failed (:id signal)))
     (is (= :error (:level signal)))
-    (is (= {:tenant-id "t1" :resource-types #{"Composition" "Patient"}}
+    (is (= {:tenant-id "t1" :resource-types #{"Composition" "Patient"}
+            :lifecycle (.getName ThrowingLifecycle)}
            (:data signal)))
     (is (not (str/includes? (pr-str (dissoc signal :error)) "Testerson")))))
 
@@ -213,7 +214,9 @@
                                                          read composition)))]
         (is (identical? composition @result))
         (is (= :fhir-store/lifecycle-present-failed (:id signal)))
-        (is (= {:tenant-id "t1" :resource-type "Composition"} (:data signal)))
+        (is (= {:tenant-id "t1" :resource-type "Composition"
+                :lifecycle (.getName ThrowingLifecycle)}
+               (:data signal)))
         (is (not (str/includes? (pr-str (dissoc signal :error)) "Testerson")))))))
 
 (deftest lifecycle-schema-tx

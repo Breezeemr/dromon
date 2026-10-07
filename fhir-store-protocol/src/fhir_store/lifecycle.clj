@@ -96,13 +96,47 @@
    already succeeded; a host bug there must cost a missing side effect, never
    a failed request. The log events are meant to be monitored:
 
-     :fhir-store/lifecycle-after-commit-failed  {:tenant-id :resource-types}
-     :fhir-store/lifecycle-present-failed       {:tenant-id :resource-type}
+     :fhir-store/lifecycle-after-commit-failed  {:tenant-id :resource-types :lifecycle}
+     :fhir-store/lifecycle-present-failed       {:tenant-id :resource-type :lifecycle}
+
+   `:lifecycle` is the failing lifecycle's class name, so a monitor can tell
+   which member of a composed lifecycle failed.
 
    RESOURCE CONTENT NEVER REACHES A SIGNAL. The events above carry the tenant
-   id and resource types only -- the same rule as `fhir-store.trace` -- and a
-   lifecycle must not put resource content into an exception message either,
-   since propagated exceptions are logged by the server.
+   id, resource types and a class name only -- the same rule as
+   `fhir-store.trace` -- and a lifecycle must not put resource content into an
+   exception message either, since propagated exceptions are logged by the
+   server.
+
+   COMPOSITION. A store holds ONE lifecycle, and a host often has several
+   concerns that each want one (Composition narrative, an eRx profile's write
+   constraints, ...). `compose` joins them into one, and `:resource/lifecycle`
+   accepts a vector of specs, each resolved as above and then composed:
+
+     {:resource/lifecycle [my.host.narrative/lifecycle my.host.erx/lifecycle]}
+
+   A member listed EARLIER is OUTER, the way an interceptor chain is ordered:
+   it sees the client's body first and the response last.
+
+     prepare       in order; each member receives the body the previous
+                   member prepared. The first refusal stops the chain.
+     tx-ops        in order, every member computed from the FINAL prepared
+                   body and concatenated. The first refusal stops the chain.
+     after-commit  in order, each member contained on its own, so one
+                   member's failure costs only that member's side effect.
+     present       in REVERSE order, each member contained on its own, so the
+                   outermost member has the last word on a response -- a
+                   member that redacts must sit before one that renders.
+     schema-tx     concatenated, in order.
+
+   Every member's write map in `after-commit` carries the WHOLE write's
+   `:tx-ops`, all members' ops together, because the store records one ops
+   vector per write. A member that needs its own ops back recognizes them by
+   their shape.
+
+   A host that needs to find its own member -- to hand it the store after
+   construction, say -- looks it up through `members`, which sees through a
+   composition, rather than by testing the store's lifecycle's type directly.
 
    Stores and the server call the helpers below rather than the protocol
    methods, so a call site is one line and a nil lifecycle, or one that
@@ -165,6 +199,8 @@
       (refuse! :unresolvable (str ":resource/lifecycle " sym " does not resolve") sym))
     @v))
 
+(declare compose)
+
 (defn resolve-lifecycle
   "Turn a `:resource/lifecycle` store opt into a lifecycle, or nil.
 
@@ -174,18 +210,27 @@
                            resolve.
    - a lifecycle value  -> returned as is.
    - a function         -> called with `store-opts`; must return a lifecycle.
+   - a vector           -> each element resolved by these same rules, then
+                           `compose`d in order. Empty, or all nil, is nil.
 
    Anything else throws ex-info `{:fhir/status 500 :lifecycle/problem <kw>}`
    at construction, where a misconfiguration belongs, rather than on the first
    write."
   [spec store-opts]
-  (when (some? spec)
+  (cond
+    (nil? spec)    nil
+    (vector? spec) (compose (mapv #(resolve-lifecycle % store-opts) spec))
+    :else
     (let [value (cond
                   (symbol? spec) (resolve-symbol spec)
                   (var? spec)    @spec
                   :else          spec)]
       (cond
         (lifecycle? value) value
+
+        ;; A symbol or var may name a vector of specs, so a host can keep its
+        ;; composition in one def.
+        (vector? value) (resolve-lifecycle value store-opts)
 
         (fn? value)
         (let [built (value store-opts)]
@@ -244,7 +289,8 @@
                      :data {:tenant-id      (:tenant-id commit)
                             :resource-types (into (sorted-set)
                                                   (keep :resource-type)
-                                                  (:writes commit))}}
+                                                  (:writes commit))
+                            :lifecycle      (.getName (class lc))}}
                     t))))
   nil)
 
@@ -263,7 +309,8 @@
       (catch Throwable t
         (tel/error! {:id   :fhir-store/lifecycle-present-failed
                      :data {:tenant-id     (:tenant-id read)
-                            :resource-type (:resource-type read)}}
+                            :resource-type (:resource-type read)
+                            :lifecycle     (.getName (class lc))}}
                     t)
         resource))
     resource))
@@ -274,3 +321,64 @@
   [lc]
   (when (satisfies? IStoreSchema lc)
     (seq (schema-tx lc))))
+
+;; ---------------------------------------------------------------------------
+;; Composition. See COMPOSITION in the namespace docstring for the ordering.
+;;
+;; Each phase goes through the single-lifecycle helpers above, member by
+;; member, so a member that implements only some of the protocols, returns
+;; nil, or throws in a contained phase behaves exactly as it would alone.
+;; ---------------------------------------------------------------------------
+
+(defrecord ComposedLifecycle [members]
+  IWriteLifecycle
+  (prepare [_ write]
+    (reduce (fn [resource member]
+              (prepare-write member (assoc write :resource resource)))
+            (:resource write)
+            members))
+  (tx-ops [_ write]
+    (not-empty (into [] (mapcat #(write-tx-ops % write)) members)))
+  (after-commit [_ commit]
+    (run! #(fire-after-commit! % commit) members))
+
+  IReadLifecycle
+  (present [_ read resource]
+    (reduce (fn [resource member] (present-resource member read resource))
+            resource
+            (rseq members)))
+
+  IStoreSchema
+  (schema-tx [_]
+    (into [] (mapcat lifecycle-schema-tx) members)))
+
+(defn members
+  "The lifecycles `lc` is made of, in order: a composition's members, a single
+   lifecycle as a one-element vector, nil as an empty one.
+
+   How a host finds its own member, e.g.
+   `(some #(when (instance? MyLifecycle %) %) (members (:resource/lifecycle store)))`,
+   so the lookup keeps working once the lifecycle is composed."
+  [lc]
+  (cond
+    (nil? lc)                          []
+    (instance? ComposedLifecycle lc)   (:members lc)
+    :else                              [lc]))
+
+(defn compose
+  "One lifecycle made of `lifecycles`, in order -- see COMPOSITION in the
+   namespace docstring. nil entries are dropped and nested compositions are
+   flattened. Returns nil for none and the lifecycle itself for one, so
+   composing never changes what a single lifecycle does.
+
+   Throws ex-info `{:fhir/status 500 :lifecycle/problem :not-a-lifecycle}`
+   when an entry is not a lifecycle."
+  [lifecycles]
+  (let [flat (into [] (comp (remove nil?) (mapcat members)) lifecycles)]
+    (doseq [lc flat]
+      (when-not (lifecycle? lc)
+        (refuse! :not-a-lifecycle "compose was given something that is not a lifecycle" nil)))
+    (case (count flat)
+      0 nil
+      1 (first flat)
+      (->ComposedLifecycle flat))))

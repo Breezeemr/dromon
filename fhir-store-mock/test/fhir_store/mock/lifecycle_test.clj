@@ -89,3 +89,46 @@
     (is (nil? (:resource/lifecycle store)))
     (is (nil? (:language created)))
     (is (= true (:active (protocol/read-resource store tenant :Patient "p1"))))))
+
+(defn- constraint-lifecycle
+  "A second concern on the same store: refuses an inactive Patient and adds
+   its own op."
+  [calls]
+  (reify lc/IWriteLifecycle
+    (prepare [_ write]
+      (swap! calls conj [:constraint-prepare (:language (:resource write))])
+      (when (false? (:active (:resource write)))
+        (throw (ex-info "inactive refused" {:fhir/status 422})))
+      (:resource write))
+    (tx-ops [_ write]
+      [[:constraint (:id write)]])
+    (after-commit [_ commit]
+      (swap! calls conj [:constraint-after-commit (count (:writes commit))]))))
+
+(deftest a-vector-spec-composes-on-the-store
+  (let [calls (atom [])
+        store (mock/create-mock-store {:resource/lifecycle [(recording-lifecycle calls)
+                                                            (constraint-lifecycle calls)]})]
+    (is (= 2 (count (lc/members (:resource/lifecycle store)))))
+    (testing "the second member sees the first member's prepared body, and both members' ops land on the write"
+      (let [created (protocol/create-resource store tenant :Patient "p1" {:active true})]
+        (is (= "prepared" (:language created)))
+        (is (some #{[:constraint-prepare "prepared"]} @calls))
+        (is (= [[[:probe "p1"] [:constraint "p1"]]]
+               (last (first (after-commits calls)))))
+        (is (some #{[:constraint-after-commit 1]} @calls))))
+    (testing "either member can refuse, and a refused write fires no member"
+      (reset! calls [])
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (protocol/update-resource store tenant :Patient "p1" {:active false})))
+      (is (true? (:active (protocol/read-resource store tenant :Patient "p1"))))
+      (is (empty? (after-commits calls)))
+      (is (not-any? #(= :constraint-after-commit (first %)) @calls)))
+    (testing "a transaction fires each member once"
+      (reset! calls [])
+      (protocol/transact-transaction store tenant
+                                     [{:request {:method "PUT" :url "Patient/p2"} :resource {:active true}}
+                                      {:request {:method "PUT" :url "Patient/p3"} :resource {:active true}}])
+      (is (= 1 (count (after-commits calls))))
+      (is (= [[:constraint-after-commit 2]]
+             (filterv #(= :constraint-after-commit (first %)) @calls))))))
