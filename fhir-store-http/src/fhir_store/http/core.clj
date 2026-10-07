@@ -86,6 +86,7 @@
   (:require [clojure.string :as str]
             [com.breezeehr.fhir-json-transform :as fjt]
             [fhir-store.lifecycle :as lc]
+            [fhir-store.lifecycle-store :as lcs]
             [fhir-store.protocol :as fp]
             [fhir-store.trace :as ftrace]
             [jsonista.core :as json]
@@ -396,30 +397,16 @@
 
 (def ^:private return-representation {"Prefer" "return=representation"})
 
-(defn- lifecycle-write
-  "Run `prepare` then `tx-ops` for one create or update: the write map with
-   :resource the prepared body and :tx-ops the Bundle entries it adds."
-  [store tenant-id method resource-type id resource]
-  (let [lifecycle (:resource/lifecycle store)
-        write     {:tenant-id     (str tenant-id)
-                   :resource-type (name resource-type)
-                   :id            id
-                   :method        method
-                   :resource      resource
-                   :db            nil
-                   :entity        nil
-                   :store         store}
-        prepared  (lc/prepare-write lifecycle write)
-        ops-write (assoc write :resource prepared :submitted resource)]
-    (assoc ops-write :tx-ops (lc/write-tx-ops lifecycle ops-write))))
-
-(defn- fire-after-commit! [store tenant-id writes result]
-  (when (seq writes)
-    (lc/fire-after-commit! (:resource/lifecycle store)
-                           {:tenant-id (str tenant-id)
-                            :writes    writes
-                            :result    result
-                            :store     store})))
+(defn- write-of
+  "One create or update as this store sends it: the body, and the Bundle
+   entries `fhir-store.lifecycle-store` contributes for it through
+   `:lifecycle/tx-ops` in `opts`."
+  [opts resource-type id resource]
+  {:resource-type (name resource-type)
+   :id            id
+   :resource      resource
+   :tx-ops        (lcs/contributed-ops opts {:resource-type (name resource-type)
+                                             :id id :db nil :entity nil})})
 
 (defn- encode-entry
   "A Bundle entry with its resource encoded for the wire."
@@ -482,20 +469,19 @@
         :else                      (remote-error! interaction response nil)))))
 
 (defn- create!
-  [store tenant-id resource-type id resource]
+  [store tenant-id resource-type id resource opts]
   (let [rt      (checked "resource type" type-pattern resource-type)
         minted? (nil? id)
         id      (if minted? (str (random-uuid)) (checked "resource id" id-pattern id))]
     (when (and (not minted?)
                (get-json store "read" (str (tenant-base store tenant-id) "/" rt "/" id)))
       (refuse! 409 "duplicate" "Resource already exists"))
-    (let [write             (lifecycle-write store tenant-id :create rt id resource)
+    (let [write             (write-of opts rt id resource)
           [status created]  (put-one! store tenant-id write {"If-None-Match" "*"} "create" nil)]
       (when (and status (not= 201 status))
         (refuse! 500 "exception"
                  (str "Remote FHIR server answered " status " to a create: it ignored "
                       "If-None-Match and may have updated an existing resource")))
-      (fire-after-commit! store tenant-id [(assoc write :resource created)] created)
       created)))
 
 (defn- update!
@@ -504,11 +490,10 @@
         id       (checked "resource id" id-pattern id)
         if-match (:if-match opts)
         header   (etag-header if-match)
-        write    (lifecycle-write store tenant-id :update rt id resource)
+        write    (write-of opts rt id resource)
         [_ updated] (put-one! store tenant-id write
                               (cond-> {} header (assoc "If-Match" header))
                               "update" if-match)]
-    (fire-after-commit! store tenant-id [(assoc write :resource updated)] updated)
     updated))
 
 (defn- delete!
@@ -546,7 +531,7 @@
   "One Bundle entry as it goes to the remote, plus its lifecycle write when it
    writes a resource. A POST becomes a guarded PUT under a minted id, for the
    same reason as `create!`; its fullUrl is kept so references to it resolve."
-  [store tenant-id entry]
+  [store opts entry]
   (let [method (method-of entry)
         [rt id] (entry-target entry)]
     (case method
@@ -555,8 +540,7 @@
         (when (get-in entry [:request :ifNoneExist])
           (not-supported! "A conditional create (ifNoneExist) in a transaction"))
         (let [id     (or (when (= "PUT" method) id) (str (random-uuid)))
-              write  (lifecycle-write store tenant-id (if (= "POST" method) :create :update)
-                                      rt id (:resource entry))
+              write  (write-of opts rt id (:resource entry))
               guard  (if (= "POST" method)
                        {"If-None-Match" "*"}
                        (some->> (get-in entry [:request :ifMatch]) etag-header (hash-map "If-Match")))]
@@ -572,30 +556,26 @@
       (refuse! 405 "not-supported" (str "Bundle entry method not supported: " method)))))
 
 (defn- transact-transaction!
-  [store tenant-id entries]
-  (let [planned  (mapv #(transaction-entry store tenant-id %) entries)
-        writes   (into [] (keep :write) planned)
-        ops      (into [] (comp (mapcat :tx-ops) (map #(encode-entry store %))) writes)
+  [store tenant-id entries opts]
+  (let [planned  (mapv #(transaction-entry store opts %) entries)
+        ops      (into [] (comp (keep :write) (mapcat :tx-ops) (map #(encode-entry store %)))
+                       planned)
         bundle   (post-transaction! store tenant-id
                                     (into (mapv :entry planned) ops)
                                     "transaction" nil)
-        own      (vec (take (count planned) (:entry bundle)))
-        by-index (zipmap (keep-indexed (fn [i p] (when (:write p) i)) planned)
-                         writes)
-        landed   (into [] (keep (fn [[i w]] (assoc w :resource (get-in own [i :resource]))))
-                       (sort-by key by-index))]
-    (fire-after-commit! store tenant-id landed bundle)
+        own      (vec (take (count planned) (:entry bundle)))]
     {:resourceType "Bundle"
      :type         "transaction-response"
      :entry        own}))
 
 (defn- batch-entry-response
-  [store tenant-id entry]
+  [store tenant-id opts entry]
   (try
     (let [method   (method-of entry)
           [rt id]  (entry-target entry)
           if-match (get-in entry [:request :ifMatch])
-          opts     (when if-match {:if-match if-match})
+          entry-opts (when if-match {:if-match if-match})
+          lc-opts  (select-keys opts [:lifecycle/tx-ops])
           etagged  (fn [status res]
                      {:resource res
                       :response (cond-> {:status status}
@@ -607,9 +587,9 @@
                                   (get-in res [:meta :lastUpdated])
                                   (assoc :lastModified (str (get-in res [:meta :lastUpdated]))))})]
       (case method
-        "POST"   (etagged "201 Created" (create! store tenant-id rt nil (:resource entry)))
-        "PUT"    (etagged "200 OK" (update! store tenant-id rt id (:resource entry) opts))
-        "DELETE" (do (delete! store tenant-id rt id opts)
+        "POST"   (etagged "201 Created" (create! store tenant-id rt nil (:resource entry) lc-opts))
+        "PUT"    (etagged "200 OK" (update! store tenant-id rt id (:resource entry) (merge lc-opts entry-opts)))
+        "DELETE" (do (delete! store tenant-id rt id entry-opts)
                      {:response {:status "204 No Content"}})
         "GET"    (if-let [res (get-json store "read"
                                         (str (tenant-base store tenant-id) "/" rt "/" id))]
@@ -655,12 +635,15 @@
     resource-type (assoc :resource-type (name resource-type))))
 
 (defrecord HttpStore []
+  lcs/ITxOpsStore
+  (tx-ops-dialect [_] :fhir-bundle)
+
   fp/IFHIRStore
   (create-resource [this tenant-id resource-type id resource]
     (fp/create-resource this tenant-id resource-type id resource nil))
-  (create-resource [this tenant-id resource-type id resource _opts]
+  (create-resource [this tenant-id resource-type id resource opts]
     (traced {:id :store/create :data (traced-data tenant-id resource-type)}
-                   (create! this tenant-id resource-type id resource)))
+                   (create! this tenant-id resource-type id resource opts)))
 
   (read-resource [this tenant-id resource-type id]
     (traced {:id :store/read :data (traced-data tenant-id resource-type)}
@@ -719,19 +702,19 @@
 
   (transact-transaction [this tenant-id entries]
     (fp/transact-transaction this tenant-id entries nil))
-  (transact-transaction [this tenant-id entries _opts]
+  (transact-transaction [this tenant-id entries opts]
     (traced {:id :store/transact-transaction
                     :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
-                   (transact-transaction! this tenant-id entries)))
+                   (transact-transaction! this tenant-id entries opts)))
 
   (transact-bundle [this tenant-id entries]
     (fp/transact-bundle this tenant-id entries nil))
-  (transact-bundle [this tenant-id entries _opts]
+  (transact-bundle [this tenant-id entries opts]
     (traced {:id :store/transact-bundle
                     :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
                    {:resourceType "Bundle"
                     :type         "batch-response"
-                    :entry        (mapv #(batch-entry-response this tenant-id %) entries)}))
+                    :entry        (mapv #(batch-entry-response this tenant-id opts %) entries)}))
 
   (resource-deleted? [this tenant-id resource-type id]
     (let [base     (tenant-base this tenant-id)
@@ -780,7 +763,8 @@
    - :offset-param         the remote's offset search parameter (`_skip`,
                            `_offset`), or nil to page by walking `next` links.
    - :resource/schemas     compiled malli schemas, used to encode bodies.
-   - :resource/lifecycle   see `fhir-store.lifecycle`.
+   - :resource/lifecycle   see `fhir-store.lifecycle`; the store returned is
+                           then wrapped by `fhir-store.lifecycle-store/wrap`.
    - :http/request         transport fn replacing the default client.
    - :connect-timeout-ms / :request-timeout-ms  for the default client."
   [{:keys [base-url] :as options}]
@@ -788,7 +772,8 @@
                 (and (string? base-url) (str/includes? base-url "{tenant}")))
     (throw (ex-info ":base-url must be a fn of the tenant id or a string containing {tenant}"
                     {:fhir/status 500 :fhir/code "exception"})))
-  (-> (map->HttpStore (select-keys options [:base-url :authorization :offset-param]))
-      (assoc :encoders           (build-encoders (:resource/schemas options))
-             :http/request       (or (:http/request options) (java-http-transport options))
-             :resource/lifecycle (lc/resolve-lifecycle (:resource/lifecycle options) options))))
+  (lcs/wrap
+   (-> (map->HttpStore (select-keys options [:base-url :authorization :offset-param]))
+       (assoc :encoders     (build-encoders (:resource/schemas options))
+              :http/request (or (:http/request options) (java-http-transport options))))
+   (lc/resolve-lifecycle (:resource/lifecycle options) options)))

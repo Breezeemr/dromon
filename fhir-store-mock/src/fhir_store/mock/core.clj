@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [fhir-store.protocol :as protocol]
             [fhir-store.lifecycle :as lc]
+            [fhir-store.lifecycle-store :as lcs]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]))
 
@@ -85,75 +86,45 @@
             :else (= (str field-val) v-str)))))))
 
 ;; ---------------------------------------------------------------------------
-;; Write lifecycle (see fhir-store.lifecycle for the ordering contract).
-;;
-;; The mock has no transactions. `prepare` runs INSIDE the swap! fn, after the
-;; precondition checks, so it may run more than once under contention; the
-;; contract already requires it to be free of lasting side effects. `tx-ops`
-;; is computed (so a lifecycle can still refuse a write from it) but never
-;; applied: the ops are only handed back on the commit's write map. The
-;; commit's :result is the state value the write produced.
+;; Write lifecycle. The mock is the PROTOTYPE store for
+;; `fhir-store.lifecycle-store`: the wrapper runs prepare and after-commit,
+;; and the mock's only part is to call `:lifecycle/tx-ops` inside each write
+;; (`contributed-ops`), so a lifecycle can still refuse a write from it. The
+;; ops are computed and never applied -- the mock has no transactions.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private ^:dynamic *transaction-writes*
-  "Bound to an atom while transact-transaction runs its entries through the
-   single-write verbs. Each committed write is collected here instead of
-   firing after-commit, and the Bundle fires once after every entry landed."
-  nil)
-
-(defn- lifecycle-write
-  "Run prepare then tx-ops for one create or update; returns the write map
-   with :resource the prepared body and :tx-ops the (unapplied) ops."
-  [store tenant-id method resource-type id resource db]
-  (let [lifecycle (:resource/lifecycle store)
-        write     {:tenant-id     (str tenant-id)
-                   :resource-type (name resource-type)
-                   :id            id
-                   :method        method
-                   :resource      resource
-                   :db            db
-                   :entity        nil
-                   :store         store}
-        prepared  (lc/prepare-write lifecycle write)
-        ops-write (assoc write :resource prepared :submitted resource)]
-    (assoc ops-write :tx-ops (lc/write-tx-ops lifecycle ops-write))))
-
-(defn- committed!
-  [store tenant-id write result]
-  (if-let [pending *transaction-writes*]
-    (swap! pending conj write)
-    (lc/fire-after-commit! (:resource/lifecycle store)
-                           {:tenant-id (str tenant-id)
-                            :writes    [write]
-                            :result    result
-                            :store     store})))
+(defn- write-ops!
+  [opts resource-type id state]
+  (lcs/contributed-ops opts {:resource-type (name resource-type) :id id :db state :entity nil}))
 
 (defrecord MockStore [state options]
+  lcs/ITxOpsStore
+  (tx-ops-dialect [_] :recorded)
+
   protocol/IFHIRStore
   (create-resource [this tenant-id resource-type id resource]
+    (protocol/create-resource this tenant-id resource-type id resource nil))
+
+  (create-resource [_ tenant-id resource-type id resource opts]
     (let [id (or id (new-id))
           vid "1"
-          write (atom nil)
-          result (atom nil)
-          new-state
-          (swap! state
-                 (fn [s]
-                   (when (get-in s [tenant-id resource-type id])
-                     (throw (ex-info "Resource already exists" {:id id :type resource-type})))
-                   (let [w (lifecycle-write this tenant-id :create resource-type id resource s)
-                         meta-info {:versionId vid
-                                    :lastUpdated (java.time.Instant/now)}
-                         resource-with-meta (-> (:resource w)
-                                                (update :meta merge meta-info)
-                                                (assoc :id id))]
-                     (reset! write w)
-                     (reset! result resource-with-meta)
-                     (assoc-in s [tenant-id resource-type id]
-                               {:history {vid resource-with-meta}
-                                :current vid
-                                :resource resource-with-meta
-                                :deleted? false}))))]
-      (committed! this tenant-id @write new-state)
+          result (atom nil)]
+      (swap! state
+             (fn [s]
+               (when (get-in s [tenant-id resource-type id])
+                 (throw (ex-info "Resource already exists" {:id id :type resource-type})))
+               (write-ops! opts resource-type id s)
+               (let [meta-info {:versionId vid
+                                :lastUpdated (java.time.Instant/now)}
+                     resource-with-meta (-> resource
+                                            (update :meta merge meta-info)
+                                            (assoc :id id))]
+                 (reset! result resource-with-meta)
+                 (assoc-in s [tenant-id resource-type id]
+                           {:history {vid resource-with-meta}
+                            :current vid
+                            :resource resource-with-meta
+                            :deleted? false}))))
       @result))
 
   (read-resource [_ tenant-id resource-type id]
@@ -173,10 +144,9 @@
   (update-resource [this tenant-id resource-type id resource]
     (protocol/update-resource this tenant-id resource-type id resource nil))
 
-  (update-resource [this tenant-id resource-type id resource opts]
+  (update-resource [_ tenant-id resource-type id resource opts]
     (let [expected (protocol/normalize-if-match (:if-match opts))
           result (atom nil)
-          write (atom nil)
           swap-fn (fn [s existing]
                     (let [active? (and existing (not (:deleted? existing)))
                           current-vid (when existing (:current existing))
@@ -199,23 +169,21 @@
                       (let [vid (if current-vid
                                   (str (inc (Long/parseLong current-vid)))
                                   "1")
-                            w (lifecycle-write this tenant-id :update resource-type id resource s)
+                            _ (write-ops! opts resource-type id s)
                             meta-info {:versionId vid
                                        :lastUpdated (java.time.Instant/now)}
-                            resource-with-meta (-> (:resource w)
+                            resource-with-meta (-> resource
                                                    (update :meta merge meta-info)
                                                    (assoc :id id))
                             record {:history (assoc (or (:history existing) {}) vid resource-with-meta)
                                     :current vid
                                     :resource resource-with-meta
                                     :deleted? false}]
-                        (reset! write w)
                         (reset! result resource-with-meta)
-                        record)))
-          new-state (swap! state
-                           (fn [s]
-                             (update-in s [tenant-id resource-type id] #(swap-fn s %))))]
-      (committed! this tenant-id @write new-state)
+                        record)))]
+      (swap! state
+             (fn [s]
+               (update-in s [tenant-id resource-type id] #(swap-fn s %))))
       @result))
 
   (delete-resource [this tenant-id resource-type id]
@@ -314,6 +282,9 @@
       (mapcat (fn [record] (vals (:history record))) records)))
 
   (transact-transaction [this tenant-id entries]
+    (protocol/transact-transaction this tenant-id entries nil))
+
+  (transact-transaction [this tenant-id entries opts]
     ;; Atomic transaction: snapshot state for rollback on failure.
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
     (ftrace/trace!
@@ -321,9 +292,11 @@
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
      (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
            snapshot @state
-           writes (atom [])]
+           ;; Only the lifecycle's tx-ops fn reaches the per-entry writes; each
+           ;; entry's own If-Match is added below.
+           lc-opts (select-keys opts [:lifecycle/tx-ops])]
        (try
-         (let [results (binding [*transaction-writes* writes]
+         (let [results (do
                          (mapv (fn [entry]
                                  (let [req (:request entry)
                                        method (:method req)
@@ -345,7 +318,7 @@
                                        ;; unconditional one.
                                        entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                                    (case method
-                                     "POST" (let [res (protocol/create-resource this tenant-id rt nil resource)
+                                     "POST" (let [res (protocol/create-resource this tenant-id rt nil resource (not-empty lc-opts))
                                                   vid (get-in res [:meta :versionId])
                                                   last-mod (str (get-in res [:meta :lastUpdated]))]
                                               {:resource res
@@ -353,10 +326,9 @@
                                                           :location (str type "/" (:id res) "/_history/" vid)
                                                           :etag (str "W/\"" vid "\"")
                                                           :lastModified last-mod}})
-                                     "PUT" (let [res (if entry-if-match
-                                                       (protocol/update-resource this tenant-id rt id resource
-                                                                                 {:if-match entry-if-match})
-                                                       (protocol/update-resource this tenant-id rt id resource))
+                                     "PUT" (let [res (protocol/update-resource this tenant-id rt id resource
+                                                                         (not-empty (cond-> lc-opts
+                                                                                      entry-if-match (assoc :if-match entry-if-match))))
                                                  vid (get-in res [:meta :versionId])
                                                  last-mod (str (get-in res [:meta :lastUpdated]))]
                                              {:resource res
@@ -383,13 +355,6 @@
                                                       :method method
                                                       :url url})))))
                                ordered))]
-           ;; Once for the whole Bundle, and only once every entry landed.
-           (when (seq @writes)
-             (lc/fire-after-commit! (:resource/lifecycle this)
-                                    {:tenant-id (str tenant-id)
-                                     :writes    @writes
-                                     :result    @state
-                                     :store     this}))
            {:resourceType "Bundle"
             :type "transaction-response"
             :entry results})
@@ -398,13 +363,17 @@
            (throw e))))))
 
   (transact-bundle [this tenant-id entries]
+    (protocol/transact-bundle this tenant-id entries nil))
+
+  (transact-bundle [this tenant-id entries opts]
     ;; Batch semantics: each entry is processed independently; per-entry
     ;; failures do NOT roll back other entries. Returns a batch-response
     ;; Bundle reporting per-entry status in input order.
     (ftrace/trace!
      {:id :store/transact-bundle
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
-     (let [results
+     (let [lc-opts (select-keys opts [:lifecycle/tx-ops])
+           results
            (mapv
             (fn [entry]
               (try
@@ -423,7 +392,7 @@
                       entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                   (case method
                     "POST"
-                    (let [res (protocol/create-resource this tenant-id rt nil resource)
+                    (let [res (protocol/create-resource this tenant-id rt nil resource (not-empty lc-opts))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -433,10 +402,9 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "PUT"
-                    (let [res (if entry-if-match
-                                (protocol/update-resource this tenant-id rt id resource
-                                                          {:if-match entry-if-match})
-                                (protocol/update-resource this tenant-id rt id resource))
+                    (let [res (protocol/update-resource this tenant-id rt id resource
+                                                         (not-empty (cond-> lc-opts
+                                                                      entry-if-match (assoc :if-match entry-if-match))))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -585,17 +553,16 @@
                 :valueString "Mocked"}]})
 
 (defn create-mock-store
-  "Options may carry :resource/lifecycle (qualified symbol, value, or
-   constructor fn of `options`), resolved once here; see fhir-store.lifecycle
-   and the notes above MockStore for what a store without transactions does
-   with it."
+  "Options may carry :resource/lifecycle (qualified symbol, value, vector,
+   or constructor fn of `options`), resolved once here. With one, the store
+   returned is the mock wrapped by `fhir-store.lifecycle-store/wrap`, which
+   runs the lifecycle around its writes."
   [options]
-  (let [store (->MockStore (atom {}) options)]
-    (assoc store
-           :resource/lifecycle (lc/resolve-lifecycle (:resource/lifecycle options) options)
-           :basis-counter (atom 0)
-           :operations {:valueset-expand mock-valueset-expand
-                        :valueset-lookup mock-valueset-lookup})))
+  (lcs/wrap (assoc (->MockStore (atom {}) options)
+                   :basis-counter (atom 0)
+                   :operations {:valueset-expand mock-valueset-expand
+                                :valueset-lookup mock-valueset-lookup})
+            (lc/resolve-lifecycle (:resource/lifecycle options) options)))
 
 (defn halt-mock-store [store]
   (reset! (:state store) {})
