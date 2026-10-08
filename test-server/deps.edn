@@ -39,7 +39,10 @@
                                        com.breezeehr/fhir-malli-r4b             {:local/root "../../fhir-igs/r4b"}}}
 
   :dev {:extra-paths ["dev" "../fhir-server/dev"]}
-  :test {:extra-paths ["test" "../fhir-server/test"]
+  :test {:extra-paths ["test" "../fhir-server/test"
+                       ;; For fhir-store.mock.search-test's registries, which
+                       ;; mock-search-registry-test checks against the real ones.
+                       "../fhir-store-mock/test"]
          :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
                       lambdaisland/kaocha    {:mvn/version "1.91.1392"}
                       fhir-store/mock        {:local/root "../fhir-store-mock"}
