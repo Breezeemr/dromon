@@ -4,7 +4,8 @@
    fhir-server builds for the Breeze capability (printed from
    `server.core/resolve-schemas`), so the columns are the real ones: List
    `code` is a single CodeableConcept, Observation `date` is `effective[x]`,
-   MedicationRequest `patient` is `subject`."
+   MedicationRequest `patient` is `subject`. test-server's
+   mock-search-registry-test fails when a copy drifts from the built one."
   (:require [clojure.test :refer [deftest is testing]]
             [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as protocol]))
