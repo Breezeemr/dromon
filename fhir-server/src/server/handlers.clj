@@ -14,6 +14,53 @@
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]))
 
+(defn- write-opts
+  "The opts for a store write made for `req`: `opts` (an `:if-match`, say),
+   plus the host's `:tx-metadata` stamp when the router was given a producer
+   (`server.router/wrap-tx-metadata`) and `store` keeps a stamp. nil when there
+   is neither, so the plain arity is kept: a decorator forwards the opts arity
+   only for non-nil opts, and a store without an opts arity on a verb would
+   throw on it."
+  [req store opts]
+  (let [produce (:fhir/tx-metadata req)
+        stamp   (when (and produce (db/supports-tx-metadata? store))
+                  (produce req))]
+    (not-empty (cond-> (or opts {}) stamp (assoc :tx-metadata stamp)))))
+
+(defn- create!
+  [req store tenant-id resource-type id resource]
+  (if-let [opts (write-opts req store nil)]
+    (db/create-resource store tenant-id resource-type id resource opts)
+    (db/create-resource store tenant-id resource-type id resource)))
+
+(defn- update!
+  ([req store tenant-id resource-type id resource]
+   (update! req store tenant-id resource-type id resource nil))
+  ([req store tenant-id resource-type id resource base-opts]
+   (if-let [opts (write-opts req store base-opts)]
+     (db/update-resource store tenant-id resource-type id resource opts)
+     (db/update-resource store tenant-id resource-type id resource))))
+
+(defn- delete!
+  ([req store tenant-id resource-type id]
+   (delete! req store tenant-id resource-type id nil))
+  ([req store tenant-id resource-type id base-opts]
+   (if-let [opts (write-opts req store base-opts)]
+     (db/delete-resource store tenant-id resource-type id opts)
+     (db/delete-resource store tenant-id resource-type id))))
+
+(defn- transact-transaction!
+  [req store tenant-id entries]
+  (if-let [opts (write-opts req store nil)]
+    (db/transact-transaction store tenant-id entries opts)
+    (db/transact-transaction store tenant-id entries)))
+
+(defn- transact-bundle!
+  [req store tenant-id entries]
+  (if-let [opts (write-opts req store nil)]
+    (db/transact-bundle store tenant-id entries opts)
+    (db/transact-bundle store tenant-id entries)))
+
 (defn fhir-base
   "The FHIR base `req` was addressed to, as a path: the mount prefix a host
    stripped before routing (Ring's `:context`), then the tenant the URL names.
@@ -419,8 +466,8 @@
       ;; resource, or a version mismatch, surfaces as 412 ex-info handled
       ;; by wrap-fhir-exceptions.
       expected-version
-      (let [res (db/update-resource store tenant-id (keyword resource-type) id
-                                    resource-body {:if-match expected-version})]
+      (let [res (update! req store tenant-id (keyword resource-type) id
+                         resource-body {:if-match expected-version})]
         {:status 200 :body (narrative/present-response req :update resource-type res)})
 
       ;; Without If-Match: preserve the create-with-client-id upsert path
@@ -429,9 +476,9 @@
       :else
       (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
         (if existing
-          (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
+          (let [res (update! req store tenant-id (keyword resource-type) id resource-body)]
             {:status 200 :body (narrative/present-response req :update resource-type res)})
-          (let [res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
+          (let [res (create! req store tenant-id (keyword resource-type) id resource-body)
                 base-url (str (fhir-base req) "/" resource-type "/" id)
                 vid (get-in res [:meta :versionId])]
             {:status 201
@@ -478,9 +525,7 @@
                      resource-type
                      (json-patch/apply-patch existing patch-ops))
             opts (when expected-version {:if-match expected-version})
-            result (if opts
-                     (db/update-resource store tenant-id (keyword resource-type) id patched opts)
-                     (db/update-resource store tenant-id (keyword resource-type) id patched))]
+            result (update! req store tenant-id (keyword resource-type) id patched opts)]
         {:status 200 :body (narrative/present-response req :patch resource-type result)}))))
 
 (defn delete-resource
@@ -497,12 +542,12 @@
       (:error expected-version) (:error expected-version)
 
       expected-version
-      (do (db/delete-resource store tenant-id (keyword resource-type) id
-                              {:if-match expected-version})
+      (do (delete! req store tenant-id (keyword resource-type) id
+                   {:if-match expected-version})
           {:status 204 :body nil})
 
       :else
-      (do (db/delete-resource store tenant-id (keyword resource-type) id)
+      (do (delete! req store tenant-id (keyword resource-type) id)
           {:status 204 :body nil}))))
 
 (defn- history-entry
@@ -654,7 +699,7 @@
   ;; resource without writing and must NOT be touched.
   (let [resource-body (narrative/ensure-narrative (:fhir/narrative req) resource-type resource-body)
         id (str (java.util.UUID/randomUUID))
-        res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
+        res (create! req store tenant-id (keyword resource-type) id resource-body)
         base-url (str (fhir-base req) "/" resource-type "/" id)
         vid (get-in res [:meta :versionId])]
     {:status 201
@@ -1091,7 +1136,7 @@
          (zero? match-count)
          ;; No matches: create
          (let [id (or (:id resource-body) (str (java.util.UUID/randomUUID)))
-               res (db/create-resource store tenant-id (keyword resource-type) id resource-body)
+               res (create! req store tenant-id (keyword resource-type) id resource-body)
                base-url (str (fhir-base req) "/" resource-type "/" id)
                vid (get-in res [:meta :versionId])]
            {:status 201
@@ -1108,7 +1153,7 @@
               :body {:resourceType "OperationOutcome"
                      :issue [{:severity "error" :code "invalid"
                               :diagnostics (str "Resource id in body (" body-id ") does not match resolved id (" id ")")}]}}
-             (let [res (db/update-resource store tenant-id (keyword resource-type) id resource-body)]
+             (let [res (update! req store tenant-id (keyword resource-type) id resource-body)]
                {:status 200
                 :body (narrative/present-response req :update resource-type res)})))
 
@@ -1136,7 +1181,7 @@
          {:status 204 :body nil}
 
          (= 1 match-count)
-         (do (db/delete-resource store tenant-id (keyword resource-type) (:id (first results)))
+         (do (delete! req store tenant-id (keyword resource-type) (:id (first results)))
              {:status 204 :body nil})
 
          :else
@@ -1173,7 +1218,7 @@
                         (:fhir/narrative req)
                         resource-type
                         (json-patch/apply-patch existing patch-ops))
-               result (db/update-resource store tenant-id (keyword resource-type) id patched)]
+               result (update! req store tenant-id (keyword resource-type) id patched)]
            {:status 200
             :body (narrative/present-response req :patch resource-type result)})
 
@@ -2039,7 +2084,7 @@
             (bundle-response
              (narrative/present-bundle-response
               req :transaction
-              (db/transact-transaction store tenant-id entries))
+              (transact-transaction! req store tenant-id entries))
              entries))
           ;; Batch: each entry independent. Decode entries (with per-entry
           ;; spans), then hand off to the store's batch impl which emits
@@ -2055,7 +2100,7 @@
                                         (catch Exception e {:error (entry-error-response e)}))
                                    {:entry entry}))
                                decoded)
-                res (db/transact-bundle store tenant-id
+                res (transact-bundle! req store tenant-id
                                         (narrative/ensure-bundle-narrative
                                          (:fhir/narrative req)
                                          (into [] (keep :entry) resolved)))

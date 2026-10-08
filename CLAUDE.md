@@ -316,6 +316,14 @@ Rules that are easy to get wrong:
   transaction. Entries that fail commit nothing and are stamped nowhere.
 - **A stamp never goes into a span's `:data`** -- it carries usernames and
   practitioner ids. Log key presence only, same rule as `fhir-store.trace`.
+- **dromon's own handlers stamp only through a host producer.** The router's
+  `:tx-metadata` option is `(fn [request])` returning a stamp; it is injected
+  as `:fhir/tx-metadata` and called at write time, and only when
+  `supports-tx-metadata?` holds for the request's store.
+- **The lifecycle sees the opts.** A write map's `:opts` is the verb's opts
+  (a Bundle's, with each entry's own If-Match). A host passes its own keys
+  there, such as `:write/origin`, to tell its trusted writers apart; the
+  router never puts one there.
 - **The log is not retired by this.** A stamp exists only for a write that
   landed, so refusals and thrown writes remain the audit log's business.
 

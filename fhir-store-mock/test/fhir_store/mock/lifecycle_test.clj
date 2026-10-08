@@ -132,3 +132,40 @@
       (is (= 1 (count (after-commits calls))))
       (is (= [[:constraint-after-commit 2]]
              (filterv #(= :constraint-after-commit (first %)) @calls))))))
+
+(defn- opts-recording-lifecycle [seen]
+  (reify lc/IWriteLifecycle
+    (prepare [_ write]
+      (swap! seen conj [(:method write) (:id write) (:opts write)])
+      nil)
+    (tx-ops [_ _write] nil)
+    (after-commit [_ _commit] nil)))
+
+(deftest the-write-map-carries-the-verbs-opts
+  (let [seen (atom [])
+        store (mock/create-mock-store {:resource/lifecycle (opts-recording-lifecycle seen)})
+        origin {:write/origin :test}]
+    (protocol/create-resource store tenant :Patient "p1" {:active true})
+    (protocol/create-resource store tenant :Patient "p2" {:active true} origin)
+    (protocol/update-resource store tenant :Patient "p2" {:active false}
+                              (assoc origin :if-match "1"))
+    (is (= [[:create "p1" nil]
+            [:create "p2" origin]
+            [:update "p2" (assoc origin :if-match "1")]]
+           @seen))
+    (testing "a Bundle's opts reach each entry, with the entry's own If-Match"
+      (reset! seen [])
+      (protocol/transact-transaction
+       store tenant
+       [{:request {:method "PUT" :url "Patient/p2" :ifMatch "W/\"2\""} :resource {:active true}}
+        {:request {:method "PUT" :url "Patient/p3"} :resource {:active true}}]
+       (assoc origin :if-match "ignored"))
+      (is (= [[:update "p2" (assoc origin :if-match "W/\"2\"")]
+              [:update "p3" origin]]
+             @seen))
+      (reset! seen [])
+      (protocol/transact-bundle
+       store tenant
+       [{:request {:method "POST" :url "Patient"} :resource {:active true}}]
+       origin)
+      (is (= [origin] (mapv last @seen))))))

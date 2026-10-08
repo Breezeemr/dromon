@@ -308,3 +308,37 @@
   (is (thrown? clojure.lang.ExceptionInfo
                (http/create-http-store {:base-url "http://remote.test/fhir"})))
   (is (some? (http/create-http-store {:base-url (fn [_] "http://one.test/fhir")}))))
+
+(deftest the-write-map-carries-the-verbs-opts
+  (let [remote (fake/fake-remote)
+        seen   (atom [])
+        store  (store-over remote {:resource/lifecycle
+                                   (reify lc/IWriteLifecycle
+                                     (prepare [_ write]
+                                       (swap! seen conj [(:method write) (:id write) (:opts write)])
+                                       nil)
+                                     (tx-ops [_ _write] nil)
+                                     (after-commit [_ _commit] nil))})
+        origin {:write/origin :test}]
+    (fp/create-resource store tenant :Patient "p1" {:resourceType "Patient"})
+    (fp/create-resource store tenant :Patient "p2" {:resourceType "Patient"} origin)
+    (fp/update-resource store tenant :Patient "p2" {:resourceType "Patient"} (assoc origin :if-match "1"))
+    (is (= [[:create "p1" nil]
+            [:create "p2" origin]
+            [:update "p2" (assoc origin :if-match "1")]]
+           @seen))
+    (testing "a transaction's opts reach each entry, with the entry's own If-Match"
+      (reset! seen [])
+      (fp/transact-transaction store tenant
+                               [{:request {:method "PUT" :url "Patient/p2" :ifMatch "2"}
+                                 :resource {:resourceType "Patient"}}
+                                {:request {:method "PUT" :url "Patient/p3"}
+                                 :resource {:resourceType "Patient"}}]
+                               origin)
+      (is (= [[:update "p2" (assoc origin :if-match "2")] [:update "p3" origin]] @seen)))
+    (testing "and a batch's"
+      (reset! seen [])
+      (fp/transact-bundle store tenant
+                          [{:request {:method "POST" :url "Patient"} :resource {:resourceType "Patient"}}]
+                          origin)
+      (is (= [origin] (mapv last @seen))))))

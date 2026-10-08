@@ -104,13 +104,14 @@
 (defn- lifecycle-write
   "Run prepare then tx-ops for one create or update; returns the write map
    with :resource the prepared body and :tx-ops the (unapplied) ops."
-  [store tenant-id method resource-type id resource db]
+  [store tenant-id method resource-type id resource db opts]
   (let [lifecycle (:resource/lifecycle store)
         write     {:tenant-id     (str tenant-id)
                    :resource-type (name resource-type)
                    :id            id
                    :method        method
                    :resource      resource
+                   :opts          opts
                    :db            db
                    :entity        nil
                    :store         store}
@@ -128,9 +129,38 @@
                             :result    result
                             :store     store})))
 
+(defn- entry-opts
+  "A Bundle entry's opts: the Bundle's own, with the entry's If-Match in place
+   of any the Bundle carried. nil when there is neither, so the plain arity is
+   kept."
+  [opts if-match]
+  (not-empty (cond-> (dissoc opts :if-match)
+               if-match (assoc :if-match if-match))))
+
+(defn- create-with
+  [store tenant-id rt resource opts]
+  (if opts
+    (protocol/create-resource store tenant-id rt nil resource opts)
+    (protocol/create-resource store tenant-id rt nil resource)))
+
+(defn- update-with
+  [store tenant-id rt id resource opts]
+  (if opts
+    (protocol/update-resource store tenant-id rt id resource opts)
+    (protocol/update-resource store tenant-id rt id resource)))
+
+(defn- delete-with
+  [store tenant-id rt id opts]
+  (if opts
+    (protocol/delete-resource store tenant-id rt id opts)
+    (protocol/delete-resource store tenant-id rt id)))
+
 (defrecord MockStore [state options]
   protocol/IFHIRStore
   (create-resource [this tenant-id resource-type id resource]
+    (protocol/create-resource this tenant-id resource-type id resource nil))
+
+  (create-resource [this tenant-id resource-type id resource opts]
     (let [id (or id (new-id))
           vid "1"
           write (atom nil)
@@ -140,7 +170,7 @@
                  (fn [s]
                    (when (get-in s [tenant-id resource-type id])
                      (throw (ex-info "Resource already exists" {:id id :type resource-type})))
-                   (let [w (lifecycle-write this tenant-id :create resource-type id resource s)
+                   (let [w (lifecycle-write this tenant-id :create resource-type id resource s opts)
                          meta-info {:versionId vid
                                     :lastUpdated (java.time.Instant/now)}
                          resource-with-meta (-> (:resource w)
@@ -199,7 +229,7 @@
                       (let [vid (if current-vid
                                   (str (inc (Long/parseLong current-vid)))
                                   "1")
-                            w (lifecycle-write this tenant-id :update resource-type id resource s)
+                            w (lifecycle-write this tenant-id :update resource-type id resource s opts)
                             meta-info {:versionId vid
                                        :lastUpdated (java.time.Instant/now)}
                             resource-with-meta (-> (:resource w)
@@ -314,6 +344,9 @@
       (mapcat (fn [record] (vals (:history record))) records)))
 
   (transact-transaction [this tenant-id entries]
+    (protocol/transact-transaction this tenant-id entries nil))
+
+  (transact-transaction [this tenant-id entries opts]
     ;; Atomic transaction: snapshot state for rollback on failure.
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
     (ftrace/trace!
@@ -345,7 +378,7 @@
                                        ;; unconditional one.
                                        entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                                    (case method
-                                     "POST" (let [res (protocol/create-resource this tenant-id rt nil resource)
+                                     "POST" (let [res (create-with this tenant-id rt resource (entry-opts opts nil))
                                                   vid (get-in res [:meta :versionId])
                                                   last-mod (str (get-in res [:meta :lastUpdated]))]
                                               {:resource res
@@ -353,20 +386,16 @@
                                                           :location (str type "/" (:id res) "/_history/" vid)
                                                           :etag (str "W/\"" vid "\"")
                                                           :lastModified last-mod}})
-                                     "PUT" (let [res (if entry-if-match
-                                                       (protocol/update-resource this tenant-id rt id resource
-                                                                                 {:if-match entry-if-match})
-                                                       (protocol/update-resource this tenant-id rt id resource))
+                                     "PUT" (let [res (update-with this tenant-id rt id resource
+                                                                  (entry-opts opts entry-if-match))
                                                  vid (get-in res [:meta :versionId])
                                                  last-mod (str (get-in res [:meta :lastUpdated]))]
                                              {:resource res
                                               :response {:status "200 OK"
                                                          :etag (str "W/\"" vid "\"")
                                                          :lastModified last-mod}})
-                                     "DELETE" (do (if entry-if-match
-                                                    (protocol/delete-resource this tenant-id rt id
-                                                                              {:if-match entry-if-match})
-                                                    (protocol/delete-resource this tenant-id rt id))
+                                     "DELETE" (do (delete-with this tenant-id rt id
+                                                               (entry-opts opts entry-if-match))
                                                   {:response {:status "204 No Content"}})
                                      "GET" (let [res (protocol/read-resource this tenant-id rt id)]
                                              (if res
@@ -398,6 +427,9 @@
            (throw e))))))
 
   (transact-bundle [this tenant-id entries]
+    (protocol/transact-bundle this tenant-id entries nil))
+
+  (transact-bundle [this tenant-id entries opts]
     ;; Batch semantics: each entry is processed independently; per-entry
     ;; failures do NOT roll back other entries. Returns a batch-response
     ;; Bundle reporting per-entry status in input order.
@@ -423,7 +455,7 @@
                       entry-if-match (or (:ifMatch req) (get req "ifMatch"))]
                   (case method
                     "POST"
-                    (let [res (protocol/create-resource this tenant-id rt nil resource)
+                    (let [res (create-with this tenant-id rt resource (entry-opts opts nil))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -433,10 +465,8 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "PUT"
-                    (let [res (if entry-if-match
-                                (protocol/update-resource this tenant-id rt id resource
-                                                          {:if-match entry-if-match})
-                                (protocol/update-resource this tenant-id rt id resource))
+                    (let [res (update-with this tenant-id rt id resource
+                                           (entry-opts opts entry-if-match))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -445,10 +475,7 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "DELETE"
-                    (do (if entry-if-match
-                          (protocol/delete-resource this tenant-id rt id
-                                                    {:if-match entry-if-match})
-                          (protocol/delete-resource this tenant-id rt id))
+                    (do (delete-with this tenant-id rt id (entry-opts opts entry-if-match))
                         {:response {:status "204 No Content"}})
 
                     "GET"
