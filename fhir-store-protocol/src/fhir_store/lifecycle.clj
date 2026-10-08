@@ -56,8 +56,16 @@
                      Bundle's opts reach every entry's write map, with the
                      entry's own If-Match in place of the Bundle's.
      :db             the store's read handle for this write. Datomic: the db
-                     value the tx data is built from. xtdb2: the node or jdbc
-                     connection being written through.
+                     value the tx data is built from (inside a transaction
+                     Bundle, the one db every entry is built from). xtdb2:
+                     the node or jdbc connection being written through.
+                     mock: the tenant's immutable state value the write is
+                     computed from, before the write; inside a transaction
+                     Bundle, before the whole Bundle, as Datomic's. Where the
+                     store implements fhir-store.protocol/IBasisReadStore,
+                     `(read-in-basis store db resource-type id)` reads the
+                     version the write replaces (nil for a create) without
+                     depending on what the handle is.
      :entity         Datomic: the resource entity's eid (Long) or its tempid
                      inside this tx. xtdb2: nil.
      :store          the store itself.
@@ -164,8 +172,9 @@
      :fhir/status to refuse the write.")
   (tx-ops [this write]
     "Extra ops for the SAME transaction, in the calling store's own dialect
-     (Datomic tx-data; XTDB tx-op vectors). Seq or nil. Computed before blobs
-     are saved, like tx-metadata stamp ops.")
+     (Datomic tx-data; XTDB tx-op vectors; the mock's host-row ops, see
+     fhir-store.mock.core). Seq or nil. Computed before blobs are saved, like
+     tx-metadata stamp ops.")
   (after-commit [this commit]
     "Fired once per committed transaction. Exceptions are logged (telemere)
      and never rethrown."))

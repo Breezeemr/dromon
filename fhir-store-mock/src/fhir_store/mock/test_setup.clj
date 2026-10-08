@@ -373,8 +373,8 @@
 ;; ---------------------------------------------------------------------------
 
 (defn snapshot
-  "The store's whole test state as a value: resources of every tenant, the
-   harness (pins, strict mode, recording, log), the basis and write counters,
+  "The store's whole test state as a value: resources and host rows of every
+   tenant, the harness (pins, strict mode, recording, log), the basis and write counters,
    and the position of a `fixed-clock` and of `seeded-ids` when the store
    uses them, so a restored store mints the same ids and times again."
   [store]
