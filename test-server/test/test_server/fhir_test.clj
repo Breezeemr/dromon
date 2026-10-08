@@ -272,6 +272,48 @@
       (is (= 2 (:total body)))
       (is (= 2 (count (:entry body)))))))
 
+(deftest history-lists-deletions-test
+  (let [now (atom nil)
+        at! #(reset! now (java.time.Instant/parse (str "2026-01-0" % "T00:00:00Z")))
+        store (mock/create-mock-store {:clock #(deref now)})
+        app (test-app store)
+        _ (at! 1)
+        _ (db/create-resource store "default" :Patient "pt-1"
+                              {:resourceType "Patient" :name [{:family "Doe"}]})
+        _ (at! 2)
+        _ (db/update-resource store "default" :Patient "pt-1"
+                              {:resourceType "Patient" :name [{:family "Doe-v2"}]})
+        _ (at! 3)
+        _ (db/delete-resource store "default" :Patient "pt-1")
+        history (fn [uri] (parse-body (:body (app (request :get uri)))))
+        shape (fn [entry]
+                [(get-in entry [:request :method])
+                 (get-in entry [:response :status])
+                 (contains? entry :resource)])]
+    (doseq [uri ["/default/fhir/Patient/pt-1/_history"
+                 "/default/fhir/Patient/_history"]]
+      (testing (str uri " lists the deletion first, as a body-less DELETE")
+        (let [body (history uri)]
+          (is (= 3 (:total body)))
+          (is (= [["DELETE" "204" false] ["PUT" "200" true] ["POST" "200" true]]
+                 (mapv shape (:entry body))))
+          (is (= {:method "DELETE" :url "Patient/pt-1"} (:request (first (:entry body)))))
+          (is (= ["Doe-v2" "Doe"]
+                 (mapv #(get-in % [:resource :name 0 :family]) (rest (:entry body))))))))
+    (testing "_history at the system level renders the deletion the same way"
+      (let [body (history "/default/fhir/_history")]
+        (is (= 3 (:total body)))
+        (is (= [["DELETE" "204" false] ["PUT" "200" true] ["PUT" "200" true]]
+               (mapv shape (:entry body))))))
+    (testing "_since keeps the deletion when it falls at or after the bound"
+      (let [body (history "/default/fhir/Patient/pt-1/_history?_since=2026-01-02T00:00:00Z")]
+        (is (= 2 (:total body)))
+        (is (= ["DELETE" "PUT"] (mapv #(get-in % [:request :method]) (:entry body))))))
+    (testing "_since after the deletion leaves it out"
+      (doseq [uri ["/default/fhir/Patient/pt-1/_history?_since=2026-01-04T00:00:00Z"
+                   "/default/fhir/Patient/_history?_since=2026-01-04T00:00:00Z"]]
+        (is (= 0 (:total (history uri))) uri)))))
+
 ;; ---------------------------------------------------------------------------
 ;; JSON Patch tests (RFC 6902)
 ;; ---------------------------------------------------------------------------
