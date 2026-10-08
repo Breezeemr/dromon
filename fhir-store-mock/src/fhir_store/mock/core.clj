@@ -30,10 +30,15 @@
 ;; a write through one was invisible to a read through the other.
 ;; ---------------------------------------------------------------------------
 
-(defn- tenant-key [tenant-id]
+(defn tenant-key
+  "The state key of a tenant given as a string or a keyword."
+  [tenant-id]
   (if (keyword? tenant-id) (name tenant-id) (str tenant-id)))
 
-(defn- type-key [resource-type] (keyword (name resource-type)))
+(defn type-key
+  "The state key of a resource type given as a string or a keyword."
+  [resource-type]
+  (keyword (name resource-type)))
 
 (defn- clock-now [store]
   ((or (:clock store) #(java.time.Instant/now))))
@@ -402,6 +407,122 @@
     (if (string? raw) (parse-long raw) raw)))
 
 ;; ---------------------------------------------------------------------------
+;; Test harness state
+;;
+;; The store's :harness atom holds what fhir-store.mock.test-setup configures:
+;;
+;;   {:pins     {[tenant type-keyword pin-key] [id ...]}
+;;    :strict?  boolean
+;;    :record?  boolean
+;;    :log      [entry ...]}
+;;
+;; With no pins, :strict? false and :record? false (the defaults), every verb
+;; behaves exactly as it does without the harness. A MockStore built without
+;; create-mock-store has no :harness and never consults it.
+;; ---------------------------------------------------------------------------
+
+(def ^:private ^:dynamic *transaction-log*
+  "Bound to an atom while transact-transaction runs, so the entries its verbs
+   record reach the log only once the whole Bundle landed. A rolled-back
+   Bundle wrote nothing, and the log says so."
+  nil)
+
+(defn- record!
+  "Appends `entry` to the store's log when recording is on. Entries carry
+   operation, tenant, type, ids, version ids and the NAMES of parameters and
+   opts keys present, never resource content or an opts value: the same rule
+   fhir-store.trace keeps for spans, since a test log is printed on failure."
+  [store entry]
+  (when-let [h (:harness store)]
+    (when (:record? @h)
+      (if-let [pending *transaction-log*]
+        (swap! pending conj entry)
+        (swap! h update :log conj entry)))))
+
+(defn- opts-keys [opts]
+  (into (sorted-set) (keep (fn [[k v]] (when (some? v) k))) opts))
+
+(defn- param-value-key
+  "A parameter value as pins compare it: strings as given, keywords by name,
+   a repeated parameter (an AND) as the set of its values."
+  [v]
+  (cond (sequential? v) (into #{} (map param-value-key) v)
+        (keyword? v) (name v)
+        :else (str v)))
+
+(defn search-pin-key
+  "The key a pinned search is filed under: its filter parameters as a set of
+   [name value] pairs, names as strings, result parameters (_count, _sort,
+   ...) left out. Map order and keyword versus string keys do not matter."
+  [params]
+  (into #{}
+        (keep (fn [[k v]]
+                (let [n (name k)]
+                  (when-not (contains? result-params n)
+                    [n (param-value-key v)]))))
+        params))
+
+(defn- pinned-ids [store tid rt params]
+  (when-let [h (:harness store)]
+    (get-in @h [:pins [tid rt (search-pin-key params)]])))
+
+(def ^:private evaluable-modifiers
+  "Modifiers the matcher evaluates, by parameter type. `:missing` is
+   evaluated for every type; a reference's type modifier (`subject:Patient`)
+   is checked separately."
+  {"token"     #{nil}
+   "reference" #{nil}
+   "string"    #{nil "exact" "contains"}
+   "date"      #{nil}
+   "number"    #{nil}
+   "quantity"  #{nil}
+   "uri"       #{nil}})
+
+(def ^:private special-params
+  "Parameters the matcher evaluates without a registry descriptor."
+  #{"_id" "_lastUpdated" "_tag" "_security" "_profile"})
+
+(defn- unevaluable-reason
+  "Why the matcher cannot evaluate parameter `k` = `v`, or nil when it can.
+   Without strict mode such a parameter falls back to the resource field of
+   the same name, which may silently match nothing or the wrong thing."
+  [registry k v]
+  (let [[base modifier] (str/split (name k) #":" 2)
+        desc (get registry base)]
+    (cond
+      (contains? result-params base) nil
+      (str/includes? base ".") "chained parameter"
+      (str/starts-with? base "_has") "reverse chained parameter"
+      (contains? special-params base)
+      (when-not (nil? modifier) (str "modifier :" modifier))
+      (nil? desc) "no search registry descriptor"
+      (= "missing" modifier) nil
+      (:exists-not-false desc) (when-not (nil? modifier) (str "modifier :" modifier))
+      (not (contains? evaluable-modifiers (:type desc)))
+      (str "parameter type " (pr-str (:type desc)))
+      (and (= "reference" (:type desc)) (type-modifier modifier)) nil
+      (not (contains? (get evaluable-modifiers (:type desc)) modifier))
+      (str "modifier :" modifier)
+      (and (= "quantity" (:type desc))
+           (some #(re-find #"\|.*\S" %) (flatten (and-groups v))))
+      "quantity with a system or unit"
+      :else nil)))
+
+(defn- check-strict!
+  [store rt registry params]
+  (when-let [h (:harness store)]
+    (when (:strict? @h)
+      (doseq [[k v] params]
+        (when-let [reason (unevaluable-reason registry k v)]
+          (throw (ex-info (str "Search parameter not evaluated by the mock store: "
+                               (name rt) "?" (name k) " (" reason ")")
+                          {:fhir/status 501
+                           :fhir/code "not-supported"
+                           :resource-type (name rt)
+                           :param (name k)
+                           :reason reason})))))))
+
+;; ---------------------------------------------------------------------------
 ;; Write lifecycle (see fhir-store.lifecycle for the ordering contract).
 ;;
 ;; The mock has no transactions. `prepare` runs INSIDE the swap! fn, after the
@@ -532,6 +653,60 @@
        (sort-by :seq)
        (map :resource)))
 
+(defn- write-entry [op tid rt id version opts]
+  {:op op
+   :tenant tid
+   :type (name rt)
+   :id id
+   :version-id (get-in version [:meta :versionId])
+   :opts (opts-keys opts)})
+
+(defn- pinned-resources
+  "The live resources a pin names, in pin order. A pin naming an id that is
+   not stored is a broken fixture, not an empty result."
+  [s tid rt ids]
+  (mapv (fn [id]
+          (let [record (get-in s [tid rt id])]
+            (if (and record (not (:deleted? record)))
+              (:resource record)
+              (throw (ex-info (str "Pinned search names " (name rt) "/" id
+                                   ", which is not stored")
+                              {:fhir/status 500
+                               :fhir/code "exception"
+                               :resource-type (name rt)
+                               :id id})))))
+        ids))
+
+(defn- run-search
+  "Search without recording: {:resources [...] :pinned? boolean}."
+  [store tenant-id resource-type params search-registry]
+  (let [tid (tenant-key tenant-id)
+        rt (type-key resource-type)
+        s @(:state store)
+        registry (or search-registry (get (:registries store) rt))
+        filter-params (into {} (remove (fn [[k _]] (contains? result-params (name k)))) params)
+        pinned (pinned-ids store tid rt filter-params)
+        _ (when-not pinned (check-strict! store rt registry filter-params))
+        filtered (if pinned
+                   (pinned-resources s tid rt pinned)
+                   (filter (fn [res]
+                             (every? (fn [[k v]] (match-param res registry k v))
+                                     filter-params))
+                           (live-resources s tid rt)))
+        specs (sort-specs (or (get params "_sort") (get params :_sort)))
+        sorted (if (seq specs) (sort-results filtered registry specs) filtered)
+        limit (param-int params "_count" "50")
+        offset (or (param-int params "_skip" nil) (param-int params "_offset" "0"))]
+    {:resources (->> sorted (drop offset) (take limit) vec)
+     :pinned? (some? pinned)}))
+
+(defn- search-entry [op tenant-id resource-type params pinned?]
+  {:op op
+   :tenant (tenant-key tenant-id)
+   :type (name resource-type)
+   :params (into (sorted-set) (map (comp name key)) params)
+   :pinned? pinned?})
+
 (defrecord MockStore [state options]
   protocol/IFHIRStore
   (create-resource [this tenant-id resource-type id resource]
@@ -561,16 +736,25 @@
                        (reset! write w)
                        (reset! result version)
                        (assoc-in s [tid rt id] (put-version this existing version))))))]
+      ;; Logged before after-commit fires, so the store calls a lifecycle
+      ;; makes from after-commit follow the write that caused them.
+      (record! this (write-entry :create tid rt id @result opts))
       (committed! this tid @write new-state)
       @result))
 
-  (read-resource [_ tenant-id resource-type id]
-    (let [record (get-in @state [(tenant-key tenant-id) (type-key resource-type) id])]
-      (when (and record (not (:deleted? record)))
-        (:resource record))))
+  (read-resource [this tenant-id resource-type id]
+    (let [record (get-in @state [(tenant-key tenant-id) (type-key resource-type) id])
+          found (when (and record (not (:deleted? record)))
+                  (:resource record))]
+      (record! this {:op :read :tenant (tenant-key tenant-id) :type (name resource-type)
+                     :id id :found? (some? found)})
+      found))
 
-  (vread-resource [_ tenant-id resource-type id vid]
-    (get-in @state [(tenant-key tenant-id) (type-key resource-type) id :history (str vid)]))
+  (vread-resource [this tenant-id resource-type id vid]
+    (let [found (get-in @state [(tenant-key tenant-id) (type-key resource-type) id :history (str vid)])]
+      (record! this {:op :vread :tenant (tenant-key tenant-id) :type (name resource-type)
+                     :id id :version-id (str vid) :found? (some? found)})
+      found))
 
   (update-resource [this tenant-id resource-type id resource]
     (protocol/update-resource this tenant-id resource-type id resource nil))
@@ -592,6 +776,9 @@
                      (reset! write w)
                      (reset! result version)
                      (assoc-in s [tid rt id] (put-version this existing version)))))]
+      ;; Logged before after-commit fires, so the store calls a lifecycle
+      ;; makes from after-commit follow the write that caused them.
+      (record! this (write-entry :update tid rt id @result opts))
       (committed! this tid @write new-state)
       @result))
 
@@ -605,10 +792,12 @@
     (let [tid (tenant-key tenant-id)
           rt (type-key resource-type)
           expected (protocol/normalize-if-match (:if-match opts))
-          result (atom {})]
+          result (atom {})
+          deleted-vid (atom nil)]
       (swap! state
              (fn [s]
                (reset! result {})
+               (reset! deleted-vid nil)
                (let [existing (get-in s [tid rt id])]
                  (check-if-match! expected existing)
                  (if (and existing (not (:deleted? existing)))
@@ -623,6 +812,7 @@
                                 {:fhir-store/basis basis
                                  :fhir-store/deleted? true})]
                      (reset! result (with-basis {} basis))
+                     (reset! deleted-vid vid)
                      (assoc-in s [tid rt id]
                                (assoc existing
                                       :deletes (assoc (or (:deletes existing) {}) vid stub)
@@ -630,44 +820,49 @@
                                       :deleted? true
                                       :resource nil)))
                    s))))
+      (record! this (assoc (write-entry :delete tid rt id nil opts)
+                           :version-id @deleted-vid
+                           :written? (some? @deleted-vid)))
       @result))
 
   (resource-deleted? [_ tenant-id resource-type id]
     (let [record (get-in @state [(tenant-key tenant-id) (type-key resource-type) id])]
       (boolean (and record (:deleted? record)))))
 
-  (search [_ tenant-id resource-type params search-registry]
-    (let [candidates (live-resources @state (tenant-key tenant-id) (type-key resource-type))
-          filter-params (into {} (remove (fn [[k _]] (contains? result-params (name k)))) params)
-          filtered (filter (fn [res]
-                             (every? (fn [[k v]] (match-param res search-registry k v))
-                                     filter-params))
-                           candidates)
-          specs (sort-specs (or (get params "_sort") (get params :_sort)))
-          sorted (if (seq specs) (sort-results filtered search-registry specs) filtered)
-          limit (param-int params "_count" "50")
-          offset (or (param-int params "_skip" nil) (param-int params "_offset" "0"))]
-      (->> sorted (drop offset) (take limit) vec)))
+  (search [this tenant-id resource-type params search-registry]
+    (let [{:keys [resources pinned?]} (run-search this tenant-id resource-type params search-registry)]
+      (record! this (assoc (search-entry :search tenant-id resource-type params pinned?)
+                           :ids (mapv :id resources)))
+      resources))
 
   (count-resources [this tenant-id resource-type params search-registry]
     ;; Reuse search with a high limit to count all matching resources
     (let [count-params (-> params
                            (dissoc "_count" "_skip" "_offset" :_offset)
-                           (assoc :_count "2147483647" :_skip "0"))]
-      (count (protocol/search this tenant-id resource-type count-params search-registry))))
+                           (assoc :_count "2147483647" :_skip "0"))
+          {:keys [resources pinned?]} (run-search this tenant-id resource-type count-params search-registry)]
+      (record! this (assoc (search-entry :count tenant-id resource-type params pinned?)
+                           :count (count resources)))
+      (count resources)))
 
-  (history [_ tenant-id resource-type id]
-    (if-let [record (get-in @state [(tenant-key tenant-id) (type-key resource-type) id])]
-      (vec (versions-newest-first record))
-      []))
+  (history [this tenant-id resource-type id]
+    (let [versions (if-let [record (get-in @state [(tenant-key tenant-id) (type-key resource-type) id])]
+                     (vec (versions-newest-first record))
+                     [])]
+      (record! this {:op :history :tenant (tenant-key tenant-id) :type (name resource-type)
+                     :id id :count (count versions)})
+      versions))
 
-  (history-type [_ tenant-id resource-type _params]
-    (->> (vals (get-in @state [(tenant-key tenant-id) (type-key resource-type)]))
-         (mapcat versions-newest-first)
-         (sort-by (fn [v] [(- (get-in (meta v) [:fhir-store/basis :tx-id] 0))
-                           (:id v)
-                           (- (Long/parseLong (get-in v [:meta :versionId])))]))
-         vec))
+  (history-type [this tenant-id resource-type _params]
+    (let [versions (->> (vals (get-in @state [(tenant-key tenant-id) (type-key resource-type)]))
+                        (mapcat versions-newest-first)
+                        (sort-by (fn [v] [(- (get-in (meta v) [:fhir-store/basis :tx-id] 0))
+                                          (:id v)
+                                          (- (Long/parseLong (get-in v [:meta :versionId])))]))
+                        vec)]
+      (record! this {:op :history-type :tenant (tenant-key tenant-id) :type (name resource-type)
+                     :count (count versions)})
+      versions))
 
   (transact-transaction [this tenant-id entries]
     (protocol/transact-transaction this tenant-id entries nil))
@@ -681,10 +876,12 @@
      (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
            snapshot @state
            writes (atom [])
+           log (atom [])
            basis (next-basis this)]
        (try
          (let [results (binding [*transaction-writes* writes
-                                 *transaction-basis* basis]
+                                 *transaction-basis* basis
+                                 *transaction-log* log]
                          (mapv (fn [entry]
                                  (let [req (:request entry)
                                        method (:method req)
@@ -734,6 +931,10 @@
                                                       :method method
                                                       :url url})))))
                                ordered))]
+           ;; The Bundle's entries reach the log before after-commit fires
+           ;; (it never throws), so a lifecycle's own store calls follow them.
+           (when-let [h (and (seq @log) (:harness this))]
+             (swap! h update :log into @log))
            ;; Once for the whole Bundle, and only once every entry landed.
            (when (seq @writes)
              (lc/fire-after-commit! (:resource/lifecycle this)
@@ -937,13 +1138,30 @@
    - :clock, a (fn [] java.time.Instant): every write's meta.lastUpdated and
      basis :system-time, and current-basis's. Defaults to Instant/now.
    - :id-fn, a (fn [] string): the id of a create that names none. Defaults to
-     a random UUID."
+     a random UUID.
+   - :registries, {resource-type search-registry}: the registry a search or
+     count uses when its caller passes none (a direct store call, where the
+     router would have passed the capability's). Type keys may be keywords or
+     strings. Absent, such a search falls back to resource field names.
+   - :record?, whether the verbs append to the harness log from the start
+     (see fhir-store.mock.test-setup). Defaults to false.
+   - :strict-search?, whether a search parameter the matcher cannot evaluate
+     is refused with a 501 (see fhir-store.mock.test-setup/strict-search!).
+     Defaults to false.
+
+   The store's :harness atom holds pins, strict mode and the log; with the
+   defaults above it changes nothing."
   [options]
   (let [store (->MockStore (atom {}) options)]
     (assoc store
            :resource/lifecycle (lc/resolve-lifecycle (:resource/lifecycle options) options)
            :clock (or (:clock options) #(java.time.Instant/now))
            :id-fn (or (:id-fn options) new-id)
+           :registries (update-keys (or (:registries options) {}) type-key)
+           :harness (atom {:pins {}
+                           :strict? (boolean (:strict-search? options))
+                           :record? (boolean (:record? options))
+                           :log []})
            :basis-counter (atom 0)
            :write-counter (atom 0)
            :operations {:valueset-expand mock-valueset-expand

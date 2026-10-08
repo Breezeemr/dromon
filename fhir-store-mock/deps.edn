@@ -2,7 +2,8 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         fhir-store/protocol {:local/root "../fhir-store-protocol"}
         integrant/integrant {:mvn/version "0.13.1"}
-        com.taoensso/telemere {:mvn/version "1.2.1"}}
+        com.taoensso/telemere {:mvn/version "1.2.1"}
+        metosin/jsonista {:mvn/version "0.3.14"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
