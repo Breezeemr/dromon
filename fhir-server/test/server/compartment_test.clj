@@ -162,7 +162,7 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the patient compartment"
             (db/delete-resource store tenant :Observation "obs-other"))))
     (testing "deleting an in-compartment resource succeeds"
-      (is (true? (db/delete-resource store tenant :Observation "obs-mine"))))))
+      (is (= {} (db/delete-resource store tenant :Observation "obs-mine"))))))
 
 ;; Appointment's only Patient-compartment link param, `actor`, resolves to the
 ;; nested Appointment.participant.actor, which the registry describes as a

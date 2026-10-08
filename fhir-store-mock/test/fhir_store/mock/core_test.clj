@@ -41,7 +41,7 @@
         resource {:resourceType "Patient" :name [{:family "Smith"}]}
         created (protocol/create-resource store tenant "Patient" "pt1" resource)]
     (testing "delete removes from read but keeps history"
-      (is (true? (protocol/delete-resource store tenant "Patient" "pt1")))
+      (is (= {} (protocol/delete-resource store tenant "Patient" "pt1")))
       (is (nil? (protocol/read-resource store tenant "Patient" "pt1")))
       (is (= created (protocol/vread-resource store tenant "Patient" "pt1" "1"))))))
 
@@ -86,7 +86,7 @@
         (is (some? e))
         (is (= 412 (:fhir/status (ex-data e))))))
     (testing "delete with matching :if-match succeeds"
-      (is (true? (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "1"}))))))
+      (is (= {} (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "1"}))))))
 
 (deftest if-match-accepted-forms-test
   (testing "every spelling of the current version is accepted, not just the bare id"
@@ -141,7 +141,7 @@
         (is (nil? (protocol/read-resource store tenant "Patient" "missing"))
             "* must not create the resource it was guarding against")))
     (testing "* deletes whatever version is current, then has nothing left to match"
-      (is (true? (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "*"})))
+      (is (= {} (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "*"})))
       (let [e (try
                 (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "*"})
                 nil
@@ -367,3 +367,133 @@
       (protocol/create-resource store tenant "Patient" "p3"
                                 {:resourceType "Patient" :name [{:family "C"}]})
       (is (= #{"p1" "p3"} (set (map :id (protocol/scan-type-as-of store tenant "Patient" basis))))))))
+
+(deftest type-and-tenant-keys-are-normalised
+  (let [store (mock/create-mock-store {})]
+    (protocol/create-resource store "t" "Patient" "p1" {:resourceType "Patient"})
+    (protocol/create-resource store :t :Patient "p2" {:resourceType "Patient"})
+    (testing "a string and a keyword type name the same bucket"
+      (is (some? (protocol/read-resource store "t" :Patient "p1")))
+      (is (some? (protocol/read-resource store "t" "Patient" "p2")))
+      (is (= #{"p1" "p2"} (set (map :id (protocol/search store "t" "Patient" {} nil)))))
+      (is (= #{"p1" "p2"} (set (map :id (protocol/search store "t" :Patient {} nil))))))
+    (testing "a keyword tenant and its string are the same tenant"
+      (is (= 2 (protocol/count-resources store :t :Patient {} nil))))
+    (testing "state is keyed by the tenant string and the type keyword"
+      (is (= #{"p1" "p2"} (set (keys (get-in @(:state store) ["t" :Patient])))))
+      (is (= [:Patient] (keys (get @(:state store) "t")))))
+    (testing "every verb reaches the same bucket"
+      (protocol/update-resource store "t" "Patient" "p1" {:resourceType "Patient" :active true})
+      (is (= "2" (get-in (protocol/vread-resource store :t :Patient "p1" "2") [:meta :versionId])))
+      (protocol/delete-resource store "t" "Patient" "p2")
+      (is (true? (protocol/resource-deleted? store :t :Patient "p2")))
+      (is (= 1 (protocol/count-as-of store "t" "Patient" nil))))
+    (testing "a transaction's url lands in the same bucket"
+      (protocol/transact-transaction store "t" [{:request {:method "PUT" :url "Patient/p3"}
+                                                 :resource {:resourceType "Patient"}}])
+      (is (some? (protocol/read-resource store "t" "Patient" "p3"))))))
+
+(deftest duplicate-create-is-a-409
+  (let [store (mock/create-mock-store {})]
+    (protocol/create-resource store "t" :Patient "p1" {:resourceType "Patient"})
+    (let [e (try (protocol/create-resource store "t" "Patient" "p1" {:resourceType "Patient"})
+                 nil
+                 (catch clojure.lang.ExceptionInfo ex ex))]
+      (is (= 409 (:fhir/status (ex-data e))))
+      (is (= "conflict" (:fhir/code (ex-data e))))
+      (is (= "1" (get-in (protocol/read-resource store "t" :Patient "p1") [:meta :versionId]))
+          "the stored version is untouched"))
+    (testing "a deleted id may be created again, its versions going on"
+      (protocol/delete-resource store "t" :Patient "p1")
+      (let [again (protocol/create-resource store "t" :Patient "p1" {:resourceType "Patient"})]
+        (is (= "3" (get-in again [:meta :versionId])))))))
+
+(deftest history-is-newest-first-with-the-deletion
+  (let [store (mock/create-mock-store {})]
+    (protocol/create-resource store "t" :Patient "p1" {:resourceType "Patient"})
+    (protocol/update-resource store "t" :Patient "p1" {:resourceType "Patient" :active true})
+    (protocol/create-resource store "t" :Patient "p2" {:resourceType "Patient"})
+    (protocol/delete-resource store "t" :Patient "p1")
+    (let [versions (protocol/history store "t" :Patient "p1")]
+      (is (= ["3" "2" "1"] (mapv #(get-in % [:meta :versionId]) versions)))
+      (testing "the deletion is marked and carries no body"
+        (is (protocol/deleted-version? (first versions)))
+        (is (= {:resourceType "Patient" :id "p1"} (dissoc (first versions) :meta)))
+        (is (not-any? protocol/deleted-version? (rest versions))))
+      (testing "vread does not answer the deletion's version"
+        (is (nil? (protocol/vread-resource store "t" :Patient "p1" "3")))))
+    (testing "type history is newest first across resources"
+      (is (= [["p1" "3"] ["p2" "1"] ["p1" "2"] ["p1" "1"]]
+             (mapv (juxt :id #(get-in % [:meta :versionId]))
+                   (protocol/history-type store "t" :Patient {})))))))
+
+(deftest write-results-carry-the-basis
+  (let [store (mock/create-mock-store {})
+        basis-of (fn [ret]
+                   (let [b (:fhir-store/basis (meta ret))]
+                     (is (int? (:tx-id b)))
+                     (is (instance? java.time.Instant (:system-time b)))
+                     b))
+        created (protocol/create-resource store "t" :Patient "b1" {:resourceType "Patient"})
+        updated (protocol/update-resource store "t" :Patient "b1" {:resourceType "Patient" :active true})
+        deleted (protocol/delete-resource store "t" :Patient "b1")
+        txed (protocol/transact-transaction
+              store "t"
+              [{:request {:method "PUT" :url "Patient/b2"} :resource {:resourceType "Patient"}}
+               {:request {:method "POST" :url "Patient"} :resource {:resourceType "Patient"}}])
+        bases (mapv basis-of [created updated deleted txed])]
+    (is (= {} deleted))
+    (is (apply < (map :tx-id bases)) "tx-ids increase across writes")
+    (is (= (get-in updated [:meta :lastUpdated]) (:system-time (second bases)))
+        "lastUpdated is the basis's system time")
+    (testing "every entry of one transaction shares its basis"
+      (is (= #{(last bases)}
+             (set (map #(:fhir-store/basis (meta (:resource %))) (:entry txed))))))
+    (testing "deleting what is not live writes nothing and carries no basis"
+      (let [ret (protocol/delete-resource store "t" :Patient "never")]
+        (is (= {} ret))
+        (is (nil? (:fhir-store/basis (meta ret))))))))
+
+(deftest clock-and-id-fn-options
+  (let [now (atom (java.time.Instant/parse "2026-01-01T00:00:00Z"))
+        n (atom 0)
+        store (mock/create-mock-store {:clock (fn [] @now)
+                                       :id-fn (fn [] (str "id-" (swap! n inc)))})
+        a (protocol/create-resource store "t" :Patient nil {:resourceType "Patient"})
+        _ (reset! now (java.time.Instant/parse "2026-01-02T00:00:00Z"))
+        b (protocol/create-resource store "t" :Patient nil {:resourceType "Patient"})
+        posted (protocol/transact-transaction
+                store "t" [{:request {:method "POST" :url "Patient"} :resource {:resourceType "Patient"}}])]
+    (is (= ["id-1" "id-2"] [(:id a) (:id b)]))
+    (is (= "id-3" (get-in posted [:entry 0 :resource :id])))
+    (is (= (java.time.Instant/parse "2026-01-01T00:00:00Z") (get-in a [:meta :lastUpdated])))
+    (is (= (java.time.Instant/parse "2026-01-02T00:00:00Z") (get-in b [:meta :lastUpdated])))
+    (is (= (java.time.Instant/parse "2026-01-02T00:00:00Z")
+           (:system-time (protocol/current-basis store "t"))))
+    (testing "the defaults are unchanged: a UUID and the wall clock"
+      (let [plain (mock/create-mock-store {})
+            c (protocol/create-resource plain "t" :Patient nil {:resourceType "Patient"})]
+        (is (parse-uuid (:id c)))
+        (is (instance? java.time.Instant (get-in c [:meta :lastUpdated])))))))
+
+(deftest unsorted-search-is-creation-order-and-pages
+  (let [store (mock/create-mock-store {})]
+    (doseq [id ["c" "a" "d" "b"]]
+      (protocol/create-resource store "t" :Patient id {:resourceType "Patient"}))
+    (is (= ["c" "a" "d" "b"] (mapv :id (protocol/search store "t" :Patient {} nil))))
+    (is (= ["d" "b"] (mapv :id (protocol/search store "t" :Patient {"_count" "2" "_skip" "2"} nil))))
+    (is (= ["a" "b" "c" "d"] (mapv :id (protocol/search store "t" :Patient {"_sort" "_id"} nil))))
+    (is (= 4 (protocol/count-resources store "t" :Patient {"_count" "1"} nil)))
+    (testing "the entries of one transaction Bundle share a basis, yet keep entry order"
+      (let [ids (mapv #(format "tx-%02d" (- 20 %)) (range 20))
+            minted (atom ids)
+            tx-store (mock/create-mock-store {:id-fn #(let [[id] @minted]
+                                                        (swap! minted subvec 1)
+                                                        id)})
+            entries (mapv (fn [_] {:request {:method "POST" :url "Patient"}
+                                   :resource {:resourceType "Patient"}})
+                          ids)]
+        (protocol/transact-transaction tx-store "t" entries nil)
+        (is (= ids (mapv :id (protocol/search tx-store "t" :Patient {} nil))))
+        (is (= [(first ids)]
+               (mapv :id (protocol/search tx-store "t" :Patient {"_count" "1"} nil))))))))
