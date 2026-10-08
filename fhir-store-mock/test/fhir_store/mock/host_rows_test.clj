@@ -60,18 +60,23 @@
     (reset! seen [])
     (protocol/transact-transaction
      store tenant
-     [{:request {:method "POST" :url "Patient"} :resource {:active true}}
+     [{:request {:method "PUT" :url "Patient/watched"} :resource {:active true}}
       {:request {:method "PUT" :url "Patient/p1"} :resource {:active false}}
-      {:request {:method "PUT" :url "Patient/watched"} :resource {:active true}}])
+      {:request {:method "POST" :url "Patient"} :resource {:active true}}])
     (let [by-id (into {} (map (juxt :id identity)) @seen)
           posted (some #(when (= :create (:method %)) %) @seen)]
       (is (= 3 (count @seen)))
+      (is (= [(:id posted) "watched" "p1"] (mapv :id @seen))
+          "the POST runs first and the PUTs keep input order, so Patient/p1 runs after Patient/watched")
       (is (nil? (:stored posted)) "a POST sees nothing stored")
       (is (= "1" (get-in by-id ["p1" :stored :meta :versionId])) "a PUT sees the version it replaces")
       (is (nil? (:stored (by-id "watched"))) "a PUT that creates sees nothing stored")
-      (is (every? nil? (map :watched @seen))
-          "no entry sees another entry's write, as on Datomic")
-      (is (apply = (map :db @seen)) "every entry gets the same :db"))))
+      (is (nil? (:watched (by-id "p1")))
+          "a later entry does not see an earlier entry's write, as on Datomic")
+      (is (every? nil? (map :watched @seen)))
+      (is (apply = (map :db @seen)) "every entry gets the same :db")
+      (is (some? (protocol/read-in-basis store (mock/tenant-db store tenant) :Patient "watched"))
+          "the earlier entry's write did land"))))
 
 ;; ---------------------------------------------------------------------------
 ;; Host rows
