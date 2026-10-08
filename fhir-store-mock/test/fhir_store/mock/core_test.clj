@@ -483,4 +483,17 @@
     (is (= ["c" "a" "d" "b"] (mapv :id (protocol/search store "t" :Patient {} nil))))
     (is (= ["d" "b"] (mapv :id (protocol/search store "t" :Patient {"_count" "2" "_skip" "2"} nil))))
     (is (= ["a" "b" "c" "d"] (mapv :id (protocol/search store "t" :Patient {"_sort" "_id"} nil))))
-    (is (= 4 (protocol/count-resources store "t" :Patient {"_count" "1"} nil)))))
+    (is (= 4 (protocol/count-resources store "t" :Patient {"_count" "1"} nil)))
+    (testing "the entries of one transaction Bundle share a basis, yet keep entry order"
+      (let [ids (mapv #(format "tx-%02d" (- 20 %)) (range 20))
+            minted (atom ids)
+            tx-store (mock/create-mock-store {:id-fn #(let [[id] @minted]
+                                                        (swap! minted subvec 1)
+                                                        id)})
+            entries (mapv (fn [_] {:request {:method "POST" :url "Patient"}
+                                   :resource {:resourceType "Patient"}})
+                          ids)]
+        (protocol/transact-transaction tx-store "t" entries nil)
+        (is (= ids (mapv :id (protocol/search tx-store "t" :Patient {} nil))))
+        (is (= [(first ids)]
+               (mapv :id (protocol/search tx-store "t" :Patient {"_count" "1"} nil))))))))

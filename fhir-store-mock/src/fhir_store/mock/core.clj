@@ -54,6 +54,14 @@
                 (System/nanoTime))
        :system-time (clock-now store)}))
 
+(defn- next-write-seq
+  "A per-write sequence number. The basis cannot order creations: every entry
+   of one transaction Bundle shares it."
+  [store]
+  (if-let [counter (:write-counter store)]
+    (swap! counter inc)
+    (System/nanoTime)))
+
 (defn- with-basis [ret basis]
   (vary-meta ret assoc :fhir-store/basis basis))
 
@@ -480,7 +488,7 @@
 
 (defn- put-version
   "`record` with `version` as its new current version."
-  [record version basis]
+  [store record version]
   (let [vid (get-in version [:meta :versionId])]
     (assoc record
            :history (assoc (or (:history record) {}) vid version)
@@ -488,7 +496,7 @@
            :resource version
            :deleted? false
            ;; Creation order, the order of an unsorted search.
-           :seq (or (:seq record) (:tx-id basis)))))
+           :seq (or (:seq record) (next-write-seq store)))))
 
 (defn- check-if-match!
   [expected record]
@@ -552,7 +560,7 @@
                            version (stamp-version (:resource w) id (next-version-id existing) basis)]
                        (reset! write w)
                        (reset! result version)
-                       (assoc-in s [tid rt id] (put-version existing version basis))))))]
+                       (assoc-in s [tid rt id] (put-version this existing version))))))]
       (committed! this tid @write new-state)
       @result))
 
@@ -583,7 +591,7 @@
                          version (stamp-version (:resource w) id (next-version-id existing) basis)]
                      (reset! write w)
                      (reset! result version)
-                     (assoc-in s [tid rt id] (put-version existing version basis)))))]
+                     (assoc-in s [tid rt id] (put-version this existing version)))))]
       (committed! this tid @write new-state)
       @result))
 
@@ -937,6 +945,7 @@
            :clock (or (:clock options) #(java.time.Instant/now))
            :id-fn (or (:id-fn options) new-id)
            :basis-counter (atom 0)
+           :write-counter (atom 0)
            :operations {:valueset-expand mock-valueset-expand
                         :valueset-lookup mock-valueset-lookup})))
 
