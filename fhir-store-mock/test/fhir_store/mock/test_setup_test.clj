@@ -1,6 +1,7 @@
 (ns fhir-store.mock.test-setup-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
+            [fhir-store.lifecycle :as lc]
             [fhir-store.mock.core :as mock]
             [fhir-store.mock.test-setup :as ts]
             [fhir-store.protocol :as protocol])
@@ -315,6 +316,32 @@
       (let [plain (ts/mock-store)]
         (ts/seed! plain tenant (org "o1" "1"))
         (is (= [] (ts/log plain)))))))
+
+(defn- read-back-lifecycle
+  "A lifecycle whose after-commit reads every written resource back from the
+   store, as flotilla's eRx member does."
+  []
+  (reify lc/IWriteLifecycle
+    (prepare [_ write] (:resource write))
+    (tx-ops [_ _] [])
+    (after-commit [_ {:keys [tenant-id writes store]}]
+      (doseq [{:keys [resource-type id]} writes]
+        (protocol/read-resource store tenant-id resource-type id)))))
+
+(deftest recording-order-with-after-commit-test
+  (let [store (ts/mock-store {:record? true :resource/lifecycle (read-back-lifecycle)})]
+    (testing "a single write is logged before the reads its after-commit makes"
+      (protocol/create-resource store tenant :Organization "o1" (org "o1" "1"))
+      (protocol/update-resource store tenant :Organization "o1" (org "o1" "2"))
+      (is (= [[:create "o1"] [:read "o1"] [:update "o1"] [:read "o1"]]
+             (mapv (juxt :op :id) (ts/log store)))))
+    (testing "a Bundle's entries are logged before its after-commit's reads"
+      (ts/clear-log! store)
+      (protocol/transact-transaction store tenant
+                                     [{:resource (org "o2" "3") :request {:method "PUT" :url "Organization/o2"}}
+                                      {:resource (org "o3" "4") :request {:method "PUT" :url "Organization/o3"}}])
+      (is (= [[:update "o2"] [:update "o3"] [:read "o2"] [:read "o3"]]
+             (mapv (juxt :op :id) (ts/log store)))))))
 
 (deftest snapshot-test
   (let [store (ts/mock-store {:record? true})]

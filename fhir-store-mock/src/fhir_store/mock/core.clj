@@ -736,8 +736,10 @@
                        (reset! write w)
                        (reset! result version)
                        (assoc-in s [tid rt id] (put-version this existing version))))))]
-      (committed! this tid @write new-state)
+      ;; Logged before after-commit fires, so the store calls a lifecycle
+      ;; makes from after-commit follow the write that caused them.
       (record! this (write-entry :create tid rt id @result opts))
+      (committed! this tid @write new-state)
       @result))
 
   (read-resource [this tenant-id resource-type id]
@@ -774,8 +776,10 @@
                      (reset! write w)
                      (reset! result version)
                      (assoc-in s [tid rt id] (put-version this existing version)))))]
-      (committed! this tid @write new-state)
+      ;; Logged before after-commit fires, so the store calls a lifecycle
+      ;; makes from after-commit follow the write that caused them.
       (record! this (write-entry :update tid rt id @result opts))
+      (committed! this tid @write new-state)
       @result))
 
   (delete-resource [this tenant-id resource-type id]
@@ -927,6 +931,10 @@
                                                       :method method
                                                       :url url})))))
                                ordered))]
+           ;; The Bundle's entries reach the log before after-commit fires
+           ;; (it never throws), so a lifecycle's own store calls follow them.
+           (when-let [h (and (seq @log) (:harness this))]
+             (swap! h update :log into @log))
            ;; Once for the whole Bundle, and only once every entry landed.
            (when (seq @writes)
              (lc/fire-after-commit! (:resource/lifecycle this)
@@ -934,8 +942,6 @@
                                      :writes    @writes
                                      :result    @state
                                      :store     this}))
-           (when-let [h (and (seq @log) (:harness this))]
-             (swap! h update :log into @log))
            (with-basis {:resourceType "Bundle"
                         :type "transaction-response"
                         :entry results}
