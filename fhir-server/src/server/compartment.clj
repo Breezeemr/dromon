@@ -721,7 +721,21 @@
   (scan-type-as-of [_ tenant-id resource-type basis]
     (db/scan-type-as-of base tenant-id resource-type basis))
   (count-as-of [_ tenant-id resource-type basis]
-    (db/count-as-of base tenant-id resource-type basis)))
+    (db/count-as-of base tenant-id resource-type basis))
+
+  ;; A decorator answers both questions by delegating (fhir-store.protocol,
+  ;; rule 2): the write verbs above already forward a stamp to the base, so
+  ;; whether it is kept is the base's answer. Saying so lets a handler pass the
+  ;; host's stamp on a patient-scoped request, which the base's lifecycle sees
+  ;; on its write map; the compartment's write refusals run first either way.
+  db/ITxMetadataStore
+  (tx-metadata-supported? [_]
+    (db/supports-tx-metadata? base))
+  (tx-metadata-of [this tenant-id resource-type id vid]
+    ;; A stamp is read only for a version this store would serve.
+    (when (and (db/supports-tx-metadata? base)
+               (db/vread-resource this tenant-id resource-type id vid))
+      (db/tx-metadata-of base tenant-id resource-type id vid))))
 
 (defn filtering-store
   "Wraps `base` store so every query and write is confined to `patient-id`'s

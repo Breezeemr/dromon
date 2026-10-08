@@ -41,6 +41,15 @@
    failed transaction, and why anything that must not happen for a write that
    did not land belongs in `after-commit`.
 
+   ONE EXCEPTION: a CONTENT-ADDRESSED write. `prepare` may create an object
+   named by a digest of its own bytes, with a does-not-exist precondition --
+   the same kind of I/O step 4 does for contained blobs. If the transaction
+   then fails, the object is an orphan no resource names: harmless to every
+   read, and the very object a retry would write. Doing it in `after-commit`
+   instead would be worse, since a failed copy there leaves a committed
+   resource naming bytes that do not exist. Deleting or replacing anything
+   still belongs in `after-commit`.
+
    THE WRITE MAP handed to `prepare` and `tx-ops`:
 
      :tenant-id      string
