@@ -77,10 +77,11 @@
    (see `server.core/resource-operations`).
 
    $telehealth-signal carries WebRTC signaling between the patient portal
-   and the provider over long polling. It writes no clinical data, so it is
-   gated on the `read` Keto relation: anyone who may read the appointment
+   and the provider over long polling. A telehealth visit is a virtual
+   Encounter, so the mailbox is keyed by one. It writes no clinical data, so it
+   is gated on the `read` Keto relation: anyone who may read the encounter
    may signal on it."
-  {"Appointment"
+  {"Encounter"
    {"$telehealth-signal" {:get  'server.telehealth/poll-signal
                           :post 'server.telehealth/post-signal
                           :keto/relation "read"}}})

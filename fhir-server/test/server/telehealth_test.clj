@@ -9,7 +9,7 @@
 
 (use-fixtures :each reset-sessions!)
 
-(def k ["default" "appt-1"])
+(def k ["default" "enc-1"])
 
 (deftest post-poll-roundtrip
   (testing "a message posted by the patient lands in the provider inbox"
@@ -44,10 +44,10 @@
         "a parked poll is released by the peer's post, not the timeout")))
 
 (deftest sessions-are-isolated
-  (th/post-message! ["default" "appt-1"] "patient" {:type "offer" :payload "1"})
-  (th/post-message! ["default" "appt-2"] "patient" {:type "offer" :payload "2"})
-  (is (= ["1"] (mapv :payload (th/poll-messages! ["default" "appt-1"] "provider" 0))))
-  (is (= ["2"] (mapv :payload (th/poll-messages! ["default" "appt-2"] "provider" 0)))))
+  (th/post-message! ["default" "enc-1"] "patient" {:type "offer" :payload "1"})
+  (th/post-message! ["default" "enc-2"] "patient" {:type "offer" :payload "2"})
+  (is (= ["1"] (mapv :payload (th/poll-messages! ["default" "enc-1"] "provider" 0))))
+  (is (= ["2"] (mapv :payload (th/poll-messages! ["default" "enc-2"] "provider" 0)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Ring handlers
@@ -57,18 +57,18 @@
   {:resourceType "Parameters"
    :parameter (mapv (fn [[n k v]] {:name n k v}) name-value-pairs)})
 
-(defn- post-req [tenant appt-id body]
+(defn- post-req [tenant encounter-id body]
   {:request-method :post
-   :path-params {:tenant-id tenant :id appt-id}
+   :path-params {:tenant-id tenant :id encounter-id}
    :body-params body})
 
-(defn- get-req [tenant appt-id query]
+(defn- get-req [tenant encounter-id query]
   {:request-method :get
-   :path-params {:tenant-id tenant :id appt-id}
+   :path-params {:tenant-id tenant :id encounter-id}
    :query-params query})
 
 (deftest post-signal-validates-input
-  (testing "missing appointment id"
+  (testing "missing encounter id"
     (let [resp (th/post-signal {:path-params {:tenant-id "default"}
                                 :body-params (parameters-body ["role" :valueCode "patient"]
                                                               ["type" :valueCode "offer"]

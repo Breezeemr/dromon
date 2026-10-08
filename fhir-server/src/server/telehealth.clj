@@ -1,8 +1,11 @@
 (ns server.telehealth
-  "WebRTC signaling for telehealth visits, exposed as the Appointment
-   `$telehealth-signal` operation with long polling.
+  "WebRTC signaling for telehealth visits, exposed as the Encounter
+   `$telehealth-signal` operation with long polling. A telehealth visit is a
+   virtual Encounter, so the session is keyed by the Encounter's id; nothing
+   here reads the resource, so which type carries the operation is the host's
+   routing, not this namespace's.
 
-   Model: one signaling session per (tenant, appointment). Each session has
+   Model: one signaling session per (tenant, encounter). Each session has
    two roles -- \"patient\" and \"provider\" -- with one inbox queue per
    role. A message POSTed by one role is enqueued on the other role's inbox;
    a GET long-polls the caller's own inbox, blocking (on a virtual thread)
@@ -10,13 +13,13 @@
 
    Wire format is FHIR Parameters:
 
-   POST /:tenant/fhir/Appointment/:id/$telehealth-signal
+   POST /:tenant/fhir/Encounter/:id/$telehealth-signal
      {\"resourceType\":\"Parameters\",
       \"parameter\":[{\"name\":\"role\",\"valueCode\":\"patient\"},
                      {\"name\":\"type\",\"valueCode\":\"offer\"},
                      {\"name\":\"payload\",\"valueString\":\"<sdp/candidate json>\"}]}
 
-   GET /:tenant/fhir/Appointment/:id/$telehealth-signal?role=patient&timeout=25
+   GET /:tenant/fhir/Encounter/:id/$telehealth-signal?role=patient&timeout=25
      -> {\"resourceType\":\"Parameters\",
          \"parameter\":[{\"name\":\"message\",
                          \"part\":[{\"name\":\"type\",\"valueCode\":\"answer\"},
@@ -43,8 +46,8 @@
   (* 2 60 60 1000))
 
 (defonce ^:private sessions
-  ;; {[tenant-id appointment-id] {:inboxes {role LinkedBlockingQueue}
-  ;;                              :last-active-ms long}}
+  ;; {[tenant-id encounter-id] {:inboxes {role LinkedBlockingQueue}
+  ;;                             :last-active-ms long}}
   (atom {}))
 
 (defn- now-ms [] (System/currentTimeMillis))
@@ -143,7 +146,7 @@
 ;; ---------------------------------------------------------------------------
 
 (defn post-signal
-  "POST handler for Appointment/$telehealth-signal. Body is a Parameters
+  "POST handler for Encounter/$telehealth-signal. Body is a Parameters
    resource with role, type and (except for bye) payload parameters."
   [req]
   (let [k (session-key req)
@@ -151,7 +154,7 @@
         {:keys [role type payload]} (parameters->map body)]
     (cond
       (nil? k)
-      (bad-request "Operation requires an appointment id: Appointment/{id}/$telehealth-signal")
+      (bad-request "Operation requires an encounter id: Encounter/{id}/$telehealth-signal")
 
       (not (contains? roles role))
       (bad-request (str "role parameter must be one of " roles))
@@ -174,7 +177,7 @@
     (max 0 (min t max-timeout-seconds))))
 
 (defn poll-signal
-  "GET handler for Appointment/$telehealth-signal. Long-polls the caller's
+  "GET handler for Encounter/$telehealth-signal. Long-polls the caller's
    inbox; `role` selects the inbox, `timeout` (seconds) bounds the wait.
    Returns immediately with any queued messages, otherwise blocks until a
    message arrives or the timeout elapses (then returns an empty Parameters)."
@@ -185,7 +188,7 @@
         timeout-s (parse-timeout (get query "timeout"))]
     (cond
       (nil? k)
-      (bad-request "Operation requires an appointment id: Appointment/{id}/$telehealth-signal")
+      (bad-request "Operation requires an encounter id: Encounter/{id}/$telehealth-signal")
 
       (not (contains? roles role))
       (bad-request (str "role query parameter must be one of " roles))
