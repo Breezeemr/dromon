@@ -525,12 +525,20 @@
 ;; ---------------------------------------------------------------------------
 ;; Write lifecycle (see fhir-store.lifecycle for the ordering contract).
 ;;
-;; The mock has no transactions. `prepare` runs INSIDE the swap! fn, after the
-;; precondition checks, so it may run more than once under contention; the
-;; contract already requires it to be free of lasting side effects. `tx-ops`
-;; is computed (so a lifecycle can still refuse a write from it) but never
-;; applied: the ops are only handed back on the commit's write map. The
-;; commit's :result is the state value the write produced.
+;; One write is one swap! of the state atom. `prepare` and `tx-ops` run INSIDE
+;; the swap! fn, after the precondition checks, so they may run more than once
+;; under contention; the contract already requires them to be free of lasting
+;; side effects.
+;;
+;; The write map's :db is the tenant's state value the write is computed from,
+;; immutable and taken before the write (before the whole Bundle inside a
+;; transaction Bundle, as Datomic builds every entry from one db). Read it
+;; through protocol/read-in-basis and `rows-in-basis`, not by its shape.
+;;
+;; `tx-ops` may carry host-row ops (see "Host rows" below); they are applied
+;; in the same swap! as the resource, so a failed CAS refuses the whole write.
+;; Ops of any other shape are not applied, only handed back on the commit's
+;; write map. The commit's :result is the state value the write produced.
 ;; ---------------------------------------------------------------------------
 
 (def ^:private ^:dynamic *transaction-writes*
@@ -539,9 +547,82 @@
    firing after-commit, and the Bundle fires once after every entry landed."
   nil)
 
+(def ^:private ^:dynamic *transaction-state*
+  "Bound to the state before the Bundle while transact-transaction runs, so
+   every entry's write map carries the same pre-transaction :db."
+  nil)
+
+;; ---------------------------------------------------------------------------
+;; Host rows
+;;
+;; A host lifecycle may keep rows of its own beside the resources (flotilla's
+;; eRx outbox and inbox, for example), written in the same transaction as the
+;; resource on Datomic. On the mock they live in the tenant's state under
+;; ::rows, {table {key row}}, so a write, its rows, a Bundle rollback, and
+;; test-setup's snapshot/restore! all move them together. Two op forms, in a
+;; lifecycle's tx-ops or in `transact-rows!`:
+;;
+;;   [:mock.row/put table key row]   row a map; nil removes the row
+;;   [:mock.row/cas table key attr expected new]
+;;                                   sets the row's `attr` to `new` when it
+;;                                   holds `expected` (nil: absent, the row
+;;                                   included, which then gets created), and
+;;                                   otherwise throws a 409 that refuses the
+;;                                   whole write, as Datomic's :db/cas does
+;;
+;; Ops apply in order. A row op of another arity or verb is a 500.
+;; ---------------------------------------------------------------------------
+
+(defn- row-op? [op]
+  (and (sequential? op)
+       (keyword? (first op))
+       (= "mock.row" (namespace (first op)))))
+
+(defn- bad-row-op! [op]
+  (throw (ex-info (str "Malformed mock host-row op " (first op))
+                  {:fhir/status 500
+                   :fhir/code "exception"
+                   :op (first op)})))
+
+(defn- apply-row-op
+  [tenant-state op]
+  (let [[verb table k & args] op]
+    (case verb
+      :mock.row/put
+      (let [_ (when-not (= 1 (count args)) (bad-row-op! op))
+            row (first args)]
+        (cond
+          (nil? row) (update-in tenant-state [::rows table] dissoc k)
+          (map? row) (assoc-in tenant-state [::rows table k] row)
+          :else (bad-row-op! op)))
+
+      :mock.row/cas
+      (let [_ (when-not (= 3 (count args)) (bad-row-op! op))
+            [attr expected new-value] args]
+        (if (= expected (get-in tenant-state [::rows table k attr]))
+          (assoc-in tenant-state [::rows table k attr] new-value)
+          ;; Row content stays out of the exception, as resource content does.
+          (throw (ex-info "Host row compare-and-set failed"
+                          {:fhir/status 409
+                           :fhir/code "conflict"
+                           :table table
+                           :key k
+                           :attr attr}))))
+
+      (bad-row-op! op))))
+
+(defn- apply-row-ops
+  "`tenant-state` with the row ops among `ops` applied in order; ops of any
+   other shape are skipped."
+  [tenant-state ops]
+  (reduce (fn [ts op] (if (row-op? op) (apply-row-op ts op) ts))
+          tenant-state
+          ops))
+
 (defn- lifecycle-write
   "Run prepare then tx-ops for one create or update; returns the write map
-   with :resource the prepared body and :tx-ops the (unapplied) ops."
+   with :resource the prepared body and :tx-ops the ops, whose host-row ops
+   the caller applies in the same swap!."
   [store tenant-id method resource-type id resource db opts]
   (let [lifecycle (:resource/lifecycle store)
         write     {:tenant-id     (tenant-key tenant-id)
@@ -556,6 +637,12 @@
         prepared  (lc/prepare-write lifecycle write)
         ops-write (assoc write :resource prepared :submitted resource)]
     (assoc ops-write :tx-ops (lc/write-tx-ops lifecycle ops-write))))
+
+(defn- write-db
+  "The :db of a write computed from state `s`: the tenant's state before the
+   write, or before the Bundle inside a transaction Bundle."
+  [s tid]
+  (get (or *transaction-state* s) tid))
 
 (defn- committed!
   [store tenant-id write result]
@@ -731,11 +818,13 @@
                                         :id id
                                         :resource-type (name rt)})))
                      (let [basis (next-basis this)
-                           w (lifecycle-write this tid :create rt id resource s opts)
+                           w (lifecycle-write this tid :create rt id resource (write-db s tid) opts)
                            version (stamp-version (:resource w) id (next-version-id existing) basis)]
                        (reset! write w)
                        (reset! result version)
-                       (assoc-in s [tid rt id] (put-version this existing version))))))]
+                       (-> s
+                           (assoc-in [tid rt id] (put-version this existing version))
+                           (update tid apply-row-ops (:tx-ops w)))))))]
       ;; Logged before after-commit fires, so the store calls a lifecycle
       ;; makes from after-commit follow the write that caused them.
       (record! this (write-entry :create tid rt id @result opts))
@@ -771,11 +860,13 @@
                    (let [existing (get-in s [tid rt id])
                          _ (check-if-match! expected existing)
                          basis (next-basis this)
-                         w (lifecycle-write this tid :update rt id resource s opts)
+                         w (lifecycle-write this tid :update rt id resource (write-db s tid) opts)
                          version (stamp-version (:resource w) id (next-version-id existing) basis)]
                      (reset! write w)
                      (reset! result version)
-                     (assoc-in s [tid rt id] (put-version this existing version)))))]
+                     (-> s
+                         (assoc-in [tid rt id] (put-version this existing version))
+                         (update tid apply-row-ops (:tx-ops w))))))]
       ;; Logged before after-commit fires, so the store calls a lifecycle
       ;; makes from after-commit follow the write that caused them.
       (record! this (write-entry :update tid rt id @result opts))
@@ -880,6 +971,7 @@
            basis (next-basis this)]
        (try
          (let [results (binding [*transaction-writes* writes
+                                 *transaction-state* snapshot
                                  *transaction-basis* basis
                                  *transaction-log* log]
                          (mapv (fn [entry]
@@ -1100,7 +1192,51 @@
     (->> (get-in @state [(tenant-key tenant-id) (type-key resource-type)])
          vals
          (remove :deleted?)
-         count)))
+         count))
+
+  protocol/IBasisReadStore
+  (read-in-basis [_ db resource-type id]
+    ;; Not logged: a lifecycle reads here inside the write's swap!, which may
+    ;; run more than once.
+    (let [record (get-in db [(type-key resource-type) id])]
+      (when (and record (not (:deleted? record)))
+        (:resource record)))))
+
+(defn tenant-db
+  "The tenant's current state as an immutable basis, the same kind of value a
+   write lifecycle gets as :db: for protocol/read-in-basis and
+   `rows-in-basis` outside a write."
+  [store tenant-id]
+  (get @(:state store) (tenant-key tenant-id)))
+
+(defn rows-in-basis
+  "The host rows of `table` in `db` (a write map's :db, or `tenant-db`), as
+   {key row}; {} when there are none."
+  [_store db table]
+  (get-in db [::rows table] {}))
+
+(defn rows
+  "The tenant's current host rows of `table`, as {key row}."
+  [store tenant-id table]
+  (rows-in-basis store (tenant-db store tenant-id) table))
+
+(defn transact-rows!
+  "Applies host-row `ops` (see \"Host rows\" above) to the tenant atomically,
+   outside any resource write: how a worker claims and finishes rows. A
+   failed CAS throws a 409 and applies none of `ops`. Every op must be a row
+   op. Fires no lifecycle. Returns {:db-before :db-after}, tenant bases."
+  [store tenant-id ops]
+  (let [tid (tenant-key tenant-id)]
+    (doseq [op ops]
+      (when-not (row-op? op)
+        (throw (ex-info "transact-rows! takes host-row ops only"
+                        {:fhir/status 500
+                         :fhir/code "exception"}))))
+    (if (seq ops)
+      (let [[before after] (swap-vals! (:state store) update tid apply-row-ops ops)]
+        {:db-before (get before tid) :db-after (get after tid)})
+      (let [db (tenant-db store tid)]
+        {:db-before db :db-after db}))))
 
 (defn- mock-valueset-expand [store tenant-id _params id]
   ;; Mock an expansion logic

@@ -619,6 +619,35 @@
      write-only claim: without it no test and no operator can tell a store
      that keeps stamps from one that accepts and discards them."))
 
+;; ---------------------------------------------------------------------------
+;; Basis-read extension protocol.
+;;
+;; A write lifecycle is handed the store's read handle as the write map's
+;; `:db` (see fhir-store.lifecycle). What that handle IS differs per store,
+;; so a host that wants to read the stored version of the resource being
+;; written -- to compare the submitted body with it, say -- would otherwise
+;; need one code path per store. This protocol is that read, store-agnostic.
+;; Separate from IFHIRStore, as above, because only a store whose `:db` is an
+;; immutable pre-write value can answer it truthfully.
+;;
+;;   fhir-store-mock    implemented: `:db` is the tenant's state value before
+;;                      the write (before the Bundle, inside a transaction
+;;                      Bundle)
+;;   fhir-store-datomic planned: `:db` is the db value the tx data is built
+;;                      from
+;;   fhir-store-xtdb2   not implemented: its `:db` is the node or connection
+;;                      being written through, a live handle, not a basis
+;;   fhir-store-http    not implemented: it has no `:db`
+;; ---------------------------------------------------------------------------
+
+(defprotocol IBasisReadStore
+  "Reads against an immutable basis: the `:db` a write lifecycle is handed,
+   or a value the store documents as one."
+  (read-in-basis [this db resource-type id]
+    "The resource `id` of `resource-type` (a keyword or a string) as `db`
+     holds it, or nil when `db` holds no live version of it. Inside a write's
+     lifecycle that is the version the write replaces, nil for a create."))
+
 (defn supports-tx-metadata?
   "Whether `store` will keep a `:tx-metadata` stamp -- the check a caller
    makes BEFORE deciding to pass one.
