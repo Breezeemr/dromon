@@ -294,6 +294,13 @@
 
     (= "_lastUpdated" base) (date-matches? (get-in res [:meta :lastUpdated]) value)
 
+    (#{"_tag" "_security"} base)
+    (let [token (parse-token value)]
+      (boolean (some #(token-matches? % token)
+                     (as-seq (get-in res [:meta (keyword (subs base 1))])))))
+
+    (= "_profile" base) (boolean (some #(= value %) (as-seq (get-in res [:meta :profile]))))
+
     (and param-desc (:exists-not-false param-desc))
     (= (= "true" value)
        (boolean (some (fn [col] (some #(not (false? %)) (column-values res col)))

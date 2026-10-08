@@ -254,3 +254,13 @@
                       {:resourceType "MedicationRequest" :id "b" :subject {:reference "Patient/p2"}}
                       {:resourceType "MedicationRequest" :id "c" :subject {:reference "Patient/p3"}})]
     (is (= ["a" "c"] (ids store :MedicationRequest {"patient" "Patient/p1,Patient/p3"})))))
+
+(deftest meta-parameters
+  (let [erx "http://breezeehr.com/fhir/StructureDefinition/breeze-erx-medicationrequest"
+        store (seeded {:resourceType "MedicationRequest" :id "a"
+                       :meta {:profile [erx]
+                              :tag [{:system "http://breezeehr.com/tags" :code "erx"}]}}
+                      {:resourceType "MedicationRequest" :id "b"})]
+    (is (= ["a"] (ids store :MedicationRequest {"_tag" "http://breezeehr.com/tags|erx"})))
+    (is (= ["a"] (ids store :MedicationRequest {"_profile" erx})))
+    (is (= ["a" "b"] (ids store :MedicationRequest {"_lastUpdated" "gt2000-01-01"})))))
