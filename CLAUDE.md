@@ -326,6 +326,10 @@ Rules that are easy to get wrong:
   router never puts one there.
 - **The log is not retired by this.** A stamp exists only for a write that
   landed, so refusals and thrown writes remain the audit log's business.
+- **`CompartmentFilteringStore` answers `ITxMetadataStore` by delegating
+  to its base**, so a patient-scoped request is stamped exactly when the base
+  keeps stamps, and the base's lifecycle sees the stamp in the write map's
+  `:opts`.
 
 The protocol lives here and its implementations live in the consuming
 repository, which advances its submodule pointer only later, so every change
