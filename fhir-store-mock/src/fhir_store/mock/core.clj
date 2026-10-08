@@ -30,7 +30,8 @@
 ;; a write through one was invisible to a read through the other.
 ;; ---------------------------------------------------------------------------
 
-(defn- tenant-key [tenant-id] (str tenant-id))
+(defn- tenant-key [tenant-id]
+  (if (keyword? tenant-id) (name tenant-id) (str tenant-id)))
 
 (defn- type-key [resource-type] (keyword (name resource-type)))
 
@@ -280,7 +281,8 @@
   "Whether `res` holds any value for the parameter (the `:missing` modifier)."
   [res param-desc base]
   (if param-desc
-    (boolean (some #(seq (column-values res %))
+    (boolean (some (fn [col-desc]
+                     (some #(fixed-satisfied? col-desc %) (column-values res col-desc)))
                    (concat (:columns param-desc) (:exists-not-false param-desc))))
     (some? (get res (keyword base)))))
 
@@ -406,7 +408,7 @@
    with :resource the prepared body and :tx-ops the (unapplied) ops."
   [store tenant-id method resource-type id resource db opts]
   (let [lifecycle (:resource/lifecycle store)
-        write     {:tenant-id     (str tenant-id)
+        write     {:tenant-id     (tenant-key tenant-id)
                    :resource-type (name resource-type)
                    :id            id
                    :method        method
@@ -424,7 +426,7 @@
   (if-let [pending *transaction-writes*]
     (swap! pending conj write)
     (lc/fire-after-commit! (:resource/lifecycle store)
-                           {:tenant-id (str tenant-id)
+                           {:tenant-id (tenant-key tenant-id)
                             :writes    [write]
                             :result    result
                             :store     store})))
@@ -660,7 +662,7 @@
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
     (ftrace/trace!
      {:id :store/transact-transaction
-      :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
+      :data {:tenant-id (tenant-key tenant-id) :entry-count (count entries)}}
      (let [ordered (sort-by #(method-order (get-in % [:request :method])) entries)
            snapshot @state
            writes (atom [])
@@ -720,7 +722,7 @@
            ;; Once for the whole Bundle, and only once every entry landed.
            (when (seq @writes)
              (lc/fire-after-commit! (:resource/lifecycle this)
-                                    {:tenant-id (str tenant-id)
+                                    {:tenant-id (tenant-key tenant-id)
                                      :writes    @writes
                                      :result    @state
                                      :store     this}))
@@ -741,7 +743,7 @@
     ;; Bundle reporting per-entry status in input order.
     (ftrace/trace!
      {:id :store/transact-bundle
-      :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
+      :data {:tenant-id (tenant-key tenant-id) :entry-count (count entries)}}
      (let [results
            (mapv
             (fn [entry]
@@ -816,7 +818,7 @@
     (protocol/create-tenant this tenant-id nil))
 
   (create-tenant [_ tenant-id opts]
-    (let [tid       (str tenant-id)
+    (let [tid       (tenant-key tenant-id)
           if-exists (get opts :if-exists :error)]
       (swap! state
              (fn [s]
@@ -841,7 +843,7 @@
     (protocol/delete-tenant this tenant-id nil))
 
   (delete-tenant [_ tenant-id opts]
-    (let [tid       (str tenant-id)
+    (let [tid       (tenant-key tenant-id)
           if-absent (get opts :if-absent :error)]
       (swap! state
              (fn [s]
@@ -859,7 +861,7 @@
   (warmup-tenant [_ tenant-id _opts]
     ;; Mock has no cold state worth warming. Ensure the tenant key
     ;; exists so subsequent searches do not 404, then return.
-    (swap! state update (str tenant-id) (fnil identity {}))
+    (swap! state update (tenant-key tenant-id) (fnil identity {}))
     nil)
 
   (current-basis [this _tenant-id]
