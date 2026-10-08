@@ -267,9 +267,13 @@
      is the write whose provenance is least recoverable from the data, since
      it leaves none.")
   (search [this tenant-id resource-type params search-registry])
-  (history [this tenant-id resource-type id])
+  (history [this tenant-id resource-type id]
+    "The versions of one resource. A store may also list its deletions, each
+     as an entry `deleted-version?` holds for (no body, only resourceType, id
+     and meta); callers that want stored versions only drop those.")
   (history-type [this tenant-id resource-type params]
-    "Returns all versions of all resources of a given type.")
+    "Returns all versions of all resources of a given type. Deletions as in
+     `history`.")
   (count-resources [this tenant-id resource-type params search-registry]
     "Returns the total count of resources matching the search params.")
   (transact-transaction
@@ -391,6 +395,13 @@
      from `current-basis`). Unfiltered snapshot count, intended for manifest
      `output[].count` entries. Cheaper than realizing `scan-type-as-of`; a
      backend that cannot count cheaply may return 0."))
+
+(defn deleted-version?
+  "True when a `history` or `history-type` entry stands for a deletion rather
+   than a stored version. Stores that list deletions mark them with
+   `:fhir-store/deleted?` metadata."
+  [version]
+  (boolean (:fhir-store/deleted? (meta version))))
 
 (defn create-store
   "Creates an IFHIRStore implementation. `impl-fn` is a function that takes

@@ -553,12 +553,17 @@
 (defn- history-entry
   "Build a Bundle entry for a history result."
   [base resource-type res]
-  {:fullUrl (str base "/" resource-type "/" (:id res))
-   :resource res
-   :request {:method (let [vid (get-in res [:meta :versionId])]
-                       (if (= vid "1") "POST" "PUT"))
-             :url (str resource-type "/" (:id res))}
-   :response {:status "200"}})
+  (if (db/deleted-version? res)
+    {:fullUrl (str base "/" resource-type "/" (:id res))
+     :request {:method "DELETE"
+               :url (str resource-type "/" (:id res))}
+     :response {:status "204"}}
+    {:fullUrl (str base "/" resource-type "/" (:id res))
+     :resource res
+     :request {:method (let [vid (get-in res [:meta :versionId])]
+                         (if (= vid "1") "POST" "PUT"))
+               :url (str resource-type "/" (:id res))}
+     :response {:status "200"}}))
 
 (defn- parse-since
   "`_since` of a history request: {:since <Instant or nil>}, or {:error <400>}
@@ -1686,11 +1691,14 @@
                               (fn [resource-type]
                                 (let [results (versions-since since (db/history-type store tenant-id (keyword resource-type) type-params))]
                                   (mapv (fn [res]
-                                          {:fullUrl (str (fhir-base req) "/" (or (:resourceType res) resource-type) "/" (:id res))
-                                           :resource res
-                                           :request {:method "PUT"
-                                                     :url (str (or (:resourceType res) resource-type) "/" (:id res))}
-                                           :response {:status "200"}})
+                                          (let [rt (or (:resourceType res) resource-type)]
+                                            (if (db/deleted-version? res)
+                                              (history-entry (fhir-base req) rt res)
+                                              {:fullUrl (str (fhir-base req) "/" rt "/" (:id res))
+                                               :resource res
+                                               :request {:method "PUT"
+                                                         :url (str rt "/" (:id res))}
+                                               :response {:status "200"}})))
                                         results)))
                               types)))]
           {:status 200

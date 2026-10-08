@@ -51,7 +51,10 @@
     {:resourceType "Bundle"
      :type type
      :total (count resources)
-     :entry (mapv #(merge {:resource %} mode) rows)
+     :entry (mapv #(if (fp/deleted-version? %)
+                     {:request {:method "DELETE" :url (str (:resourceType %) "/" (:id %))}}
+                     (merge {:resource %} mode))
+                  rows)
      :link (cond-> []
              more (conj {:relation "next"
                          :url (str base "/" path "?"

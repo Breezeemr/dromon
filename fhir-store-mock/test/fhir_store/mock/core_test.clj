@@ -41,7 +41,7 @@
         resource {:resourceType "Patient" :name [{:family "Smith"}]}
         created (protocol/create-resource store tenant "Patient" "pt1" resource)]
     (testing "delete removes from read but keeps history"
-      (is (true? (protocol/delete-resource store tenant "Patient" "pt1")))
+      (is (= {} (protocol/delete-resource store tenant "Patient" "pt1")))
       (is (nil? (protocol/read-resource store tenant "Patient" "pt1")))
       (is (= created (protocol/vread-resource store tenant "Patient" "pt1" "1"))))))
 
@@ -86,7 +86,7 @@
         (is (some? e))
         (is (= 412 (:fhir/status (ex-data e))))))
     (testing "delete with matching :if-match succeeds"
-      (is (true? (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "1"}))))))
+      (is (= {} (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "1"}))))))
 
 (deftest if-match-accepted-forms-test
   (testing "every spelling of the current version is accepted, not just the bare id"
@@ -141,7 +141,7 @@
         (is (nil? (protocol/read-resource store tenant "Patient" "missing"))
             "* must not create the resource it was guarding against")))
     (testing "* deletes whatever version is current, then has nothing left to match"
-      (is (true? (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "*"})))
+      (is (= {} (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "*"})))
       (let [e (try
                 (protocol/delete-resource store tenant "Patient" "pt1" {:if-match "*"})
                 nil
