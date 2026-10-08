@@ -345,15 +345,17 @@
 ;; ---------------------------------------------------------------------------
 ;; Write lifecycle (see fhir-store.lifecycle for the ordering contract).
 ;;
-;; A write path receives an lc-ctx, {:lifecycle :tenant-id :store}, built once
-;; per store call. With no lifecycle configured every helper below is a
+;; A write path receives an lc-ctx, {:lifecycle :tenant-id :store :opts},
+;; built once per store call; :opts is the verb's opts, handed to the lifecycle
+;; on the write map. With no lifecycle configured every helper below is a
 ;; pass-through, so the write behaves exactly as it did before the seam.
 ;; ---------------------------------------------------------------------------
 
-(defn- lifecycle-ctx [store tenant-id]
+(defn- lifecycle-ctx [store tenant-id opts]
   {:lifecycle (:resource/lifecycle store)
    :tenant-id (str tenant-id)
-   :store     store})
+   :store     store
+   :opts      opts})
 
 (defn ^:no-doc lifecycle-write
   "Run the lifecycle's prepare, then its tx-ops, for one create or update
@@ -362,12 +364,13 @@
    :resource the PREPARED body (the one to encode), :submitted the body as
    sent, and :tx-ops the ops to append to the same execute-tx (nil for none).
    Exceptions propagate: they refuse the write before anything is sent."
-  [{:keys [lifecycle tenant-id store]} db method resource-type id resource]
+  [{:keys [lifecycle tenant-id store opts]} db method resource-type id resource]
   (let [write     {:tenant-id     tenant-id
                    :resource-type (name resource-type)
                    :id            id
                    :method        method
                    :resource      resource
+                   :opts          opts
                    :db            db
                    :entity        nil
                    :store         store}
@@ -2353,10 +2356,21 @@
                     {:fhir/status 400 :fhir/code "not-supported"
                      :query-mode query-mode}))))
 
+(defn- entry-opts
+  "A batch entry's opts: the Bundle's own, with the entry's If-Match in place
+   of any the Bundle carried. nil when there is neither, so the plain arity is
+   kept."
+  [opts if-match]
+  (not-empty (cond-> (dissoc opts :if-match)
+               if-match (assoc :if-match if-match))))
+
 (defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode pool-opts]
   IFHIRStore
 
   (create-resource [this tenant-id resource-type id resource]
+    (fp/create-resource this tenant-id resource-type id resource nil))
+
+  (create-resource [this tenant-id resource-type id resource opts]
     (refuse-unencodable-input! {:resource-type resource-type :id id})
     (ftrace/trace!
      {:id :store/create
@@ -2364,10 +2378,10 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (create-xtql node resource-type id resource storage-encoders
-                            (lifecycle-ctx this tenant-id))
+                            (lifecycle-ctx this tenant-id opts))
          (with-open [conn (jdbc/get-connection pool)]
            (create-sql conn resource-type id resource storage-encoders
-                       (lifecycle-ctx this tenant-id)))))))
+                       (lifecycle-ctx this tenant-id opts)))))))
 
   (read-resource [this tenant-id resource-type id]
     (refuse-unencodable-input! {:resource-type resource-type :id id})
@@ -2402,10 +2416,10 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (update-xtql node resource-type id resource opts storage-encoders
-                            (lifecycle-ctx this tenant-id))
+                            (lifecycle-ctx this tenant-id opts))
          (with-open [conn (jdbc/get-connection pool)]
            (update-sql conn resource-type id resource opts storage-encoders
-                       (lifecycle-ctx this tenant-id)))))))
+                       (lifecycle-ctx this tenant-id opts)))))))
 
   (delete-resource [this tenant-id resource-type id]
     (fp/delete-resource this tenant-id resource-type id nil))
@@ -2505,6 +2519,9 @@
            (history-type-sql conn resource-type params read-decoders))))))
 
   (transact-transaction [this tenant-id entries]
+    (fp/transact-transaction this tenant-id entries nil))
+
+  (transact-transaction [this tenant-id entries opts]
     ;; Pre-compute entry metadata (method, resource-type, id) for use in both
     ;; building tx-ops and constructing the response afterward.
     ;; Entries are reordered per FHIR §3.1.0.11.2: DELETE -> POST -> PUT/PATCH -> GET/HEAD
@@ -2573,7 +2590,7 @@
           ;; bypassing the INSERT planner entirely. execute-tx accepts both
           ;; shapes (and a mix with [:sql ASSERT ...]) in one atomic call.
           xtql-mode? (= query-mode :xtql)
-          lc-ctx (lifecycle-ctx this tenant-id)
+          lc-ctx (lifecycle-ctx this tenant-id opts)
           ;; `resource` is the lifecycle-PREPARED body for POST/PUT, never
           ;; the entry's submitted one.
           emit-write-op
@@ -2610,7 +2627,8 @@
                              vid (if (= "POST" method)
                                    "1"
                                    (next-version current))
-                             write (lifecycle-write lc-ctx node
+                             write (lifecycle-write (assoc lc-ctx :opts (entry-opts opts if-match))
+                                                    node
                                                     (if (= "POST" method) :create :update)
                                                     resource-type id (:resource em))
                              prepared (:resource write)
@@ -2704,6 +2722,9 @@
           tx-key)))))))))
 
   (transact-bundle [this tenant-id entries]
+    (fp/transact-bundle this tenant-id entries nil))
+
+  (transact-bundle [this tenant-id entries opts]
     ;; Batch semantics: each entry is processed independently via the
     ;; single-resource CRUD methods on this store. Per-entry failures
     ;; are captured as OperationOutcome responses and do NOT affect
@@ -2729,7 +2750,9 @@
                   (case method
                     "POST"
                     (let [new-id (str (java.util.UUID/randomUUID))
-                          res (fp/create-resource this tenant-id (keyword resource-type) new-id resource)
+                          res (if-let [o (entry-opts opts nil)]
+                                (fp/create-resource this tenant-id (keyword resource-type) new-id resource o)
+                                (fp/create-resource this tenant-id (keyword resource-type) new-id resource))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
@@ -2739,9 +2762,8 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "PUT"
-                    (let [res (if entry-if-match
-                                (fp/update-resource this tenant-id (keyword resource-type) id resource
-                                                    {:if-match entry-if-match})
+                    (let [res (if-let [o (entry-opts opts entry-if-match)]
+                                (fp/update-resource this tenant-id (keyword resource-type) id resource o)
                                 (fp/update-resource this tenant-id (keyword resource-type) id resource))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
@@ -2751,9 +2773,8 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "DELETE"
-                    (do (if entry-if-match
-                          (fp/delete-resource this tenant-id (keyword resource-type) id
-                                              {:if-match entry-if-match})
+                    (do (if-let [o (entry-opts opts entry-if-match)]
+                          (fp/delete-resource this tenant-id (keyword resource-type) id o)
                           (fp/delete-resource this tenant-id (keyword resource-type) id))
                         {:response {:status "204 No Content"}})
 

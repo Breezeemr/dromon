@@ -50,12 +50,25 @@
      :resource       for `prepare`: the submitted body.
                      for `tx-ops`: the PREPARED body.
      :submitted      for `tx-ops`: the original submitted body.
+     :opts           the opts the write verb was called with, nil for the
+                     plain arity: `:if-match`, `:tx-metadata`, and any key a
+                     host passes for its own lifecycle. A transaction or batch
+                     Bundle's opts reach every entry's write map, with the
+                     entry's own If-Match in place of the Bundle's.
      :db             the store's read handle for this write. Datomic: the db
                      value the tx data is built from. xtdb2: the node or jdbc
                      connection being written through.
      :entity         Datomic: the resource entity's eid (Long) or its tempid
                      inside this tx. xtdb2: nil.
      :store          the store itself.
+
+   WHO IS WRITING. dromon never puts a host key into `:opts`, and its router
+   builds opts only from the If-Match header and the host's `:tx-metadata`
+   producer. So a host that needs to tell its own trusted writers apart (an
+   operation, a background worker) passes a key of its own beside them, such
+   as `:write/origin`, on the writes it makes, and a write through the FHIR
+   surface arrives without one. A store forwards the map and never reads a
+   host key.
 
    THE COMMIT MAP handed to `after-commit`:
 

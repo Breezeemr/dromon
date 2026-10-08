@@ -125,6 +125,16 @@
   (fn [req]
     (handler (assoc req :fhir/narrative narrative-fn))))
 
+(defn wrap-tx-metadata
+  "Inject the host's `:tx-metadata` producer, a function from a request to the
+   stamp a write made for that request carries (see
+   `fhir-store.protocol/check-tx-metadata`), or nil for none. The write
+   handlers call it at write time, after authentication has put the identity
+   on the request."
+  [handler produce]
+  (fn [req]
+    (handler (assoc req :fhir/tx-metadata produce))))
+
 (defn wrap-lifecycle
   "Inject the host's `fhir-store.lifecycle` object, mirroring wrap-narrative.
    The handlers read it from :fhir/lifecycle via `server.narrative` to present
@@ -182,9 +192,11 @@
    consumed by [[default-middleware]].
 
    Accepts `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
-   `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle` and
-   `:legacy-realm-blind-fallback?`; unknown keys are ignored. `:lifecycle` is
-   carried through as given; [[default-middleware]] resolves it.
+   `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle`,
+   `:tx-metadata` and `:legacy-realm-blind-fallback?`; unknown keys are
+   ignored. `:lifecycle` is carried through as given; [[default-middleware]]
+   resolves it. `:tx-metadata` is the host's stamp producer, `(fn [request])`
+   returning a stamp or nil; with none, writes carry no stamp.
 
    This is the ONLY place the environment is consulted, so tests and hosts can
    bypass it entirely by hand-building the resolved map (for example passing a
@@ -205,7 +217,7 @@
                                only when `DROMON_DEV_TRACE_TAP=1`, so the OTel
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url terminology cors-allowed-origins
-           enforce-smart-scopes? bulk-job-store login-url lifecycle
+           enforce-smart-scopes? bulk-job-store login-url lifecycle tx-metadata
            legacy-realm-blind-fallback?]}]
   {:jwks-url              (or jwks-url
                               (System/getenv "JWKS_URL")
@@ -232,6 +244,7 @@
                                     deref))
    :terminology           terminology
    :lifecycle             lifecycle
+   :tx-metadata           tx-metadata
    :bulk-job-store        bulk-job-store})
 
 ;; ---------------------------------------------------------------------------
@@ -247,7 +260,8 @@
    splice relative to names rather than indices (see [[insert-before]],
    [[insert-after]], [[replace-middleware]]).
 
-   Three entry groups are conditional: `::trace-tap` appears only when `opts`
+   Four entry groups are conditional: `::tx-metadata` appears only when `opts`
+   carries a `:tx-metadata` producer, `::trace-tap` only when it
    carries a `:trace-tap` function, `::lifecycle` only when it carries a
    `:lifecycle` (a lifecycle value, a qualified symbol naming one, or a
    constructor fn, resolved here by `fhir-store.lifecycle/resolve-lifecycle`
@@ -333,7 +347,7 @@
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
-                 jwks-url enforce-smart-scopes? login-url narrative lifecycle
+                 jwks-url enforce-smart-scopes? login-url narrative lifecycle tx-metadata
                  legacy-realm-blind-fallback?]
           :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}
           :as opts}]
@@ -371,6 +385,9 @@
     lifecycle
     (conj (let [lc (lifecycle/resolve-lifecycle lifecycle opts)]
             {:name ::lifecycle :wrap (fn [handler] (wrap-lifecycle handler lc))}))
+
+    tx-metadata
+    (conj {:name ::tx-metadata :wrap (fn [handler] (wrap-tx-metadata handler tx-metadata))})
 
     :always
     (into [{:name ::bulk-job-store

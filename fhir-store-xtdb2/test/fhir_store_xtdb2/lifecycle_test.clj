@@ -359,3 +359,37 @@
       (is (= true (get-in resp [:entry 0 :resource :active])))
       (is (nil? (get-in resp [:entry 0 :resource :language])))
       (is (= false (:active (db/read-resource store tenant :Patient "p1")))))))
+
+(deftest the-write-map-carries-the-verbs-opts
+  (each-mode [store {}]
+    (let [seen (atom [])
+          store (assoc store :resource/lifecycle
+                       (reify lc/IWriteLifecycle
+                         (prepare [_ write]
+                           (swap! seen conj [(:method write) (:id write) (:opts write)])
+                           nil)
+                         (tx-ops [_ _write] nil)
+                         (after-commit [_ _commit] nil)))
+          origin {:write/origin :test}]
+      (db/create-resource store tenant :Patient "p1" {:active true})
+      (db/create-resource store tenant :Patient "p2" {:active true} origin)
+      (db/update-resource store tenant :Patient "p2" {:active false} (assoc origin :if-match "1"))
+      (is (= [[:create "p1" nil]
+              [:create "p2" origin]
+              [:update "p2" (assoc origin :if-match "1")]]
+             @seen))
+      (testing "a transaction's opts reach each entry, with the entry's own If-Match"
+        (reset! seen [])
+        (db/transact-transaction
+         store tenant
+         [{:request {:method "PUT" :url "Patient/p2" :ifMatch "W/\"2\""} :resource {:active true}}
+          {:request {:method "PUT" :url "Patient/p3"} :resource {:active true}}]
+         origin)
+        (is (= #{["p2" (assoc origin :if-match "2")] ["p3" origin]}
+               (into #{} (map (fn [[_ id opts]] [id opts])) @seen))))
+      (testing "and a batch's"
+        (reset! seen [])
+        (db/transact-bundle store tenant
+                            [{:request {:method "POST" :url "Patient"} :resource {:active true}}]
+                            origin)
+        (is (= [origin] (mapv last @seen)))))))

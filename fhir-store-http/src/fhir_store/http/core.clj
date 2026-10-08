@@ -399,13 +399,14 @@
 (defn- lifecycle-write
   "Run `prepare` then `tx-ops` for one create or update: the write map with
    :resource the prepared body and :tx-ops the Bundle entries it adds."
-  [store tenant-id method resource-type id resource]
+  [store tenant-id method resource-type id resource opts]
   (let [lifecycle (:resource/lifecycle store)
         write     {:tenant-id     (str tenant-id)
                    :resource-type (name resource-type)
                    :id            id
                    :method        method
                    :resource      resource
+                   :opts          opts
                    :db            nil
                    :entity        nil
                    :store         store}
@@ -482,14 +483,14 @@
         :else                      (remote-error! interaction response nil)))))
 
 (defn- create!
-  [store tenant-id resource-type id resource]
+  [store tenant-id resource-type id resource opts]
   (let [rt      (checked "resource type" type-pattern resource-type)
         minted? (nil? id)
         id      (if minted? (str (random-uuid)) (checked "resource id" id-pattern id))]
     (when (and (not minted?)
                (get-json store "read" (str (tenant-base store tenant-id) "/" rt "/" id)))
       (refuse! 409 "duplicate" "Resource already exists"))
-    (let [write             (lifecycle-write store tenant-id :create rt id resource)
+    (let [write             (lifecycle-write store tenant-id :create rt id resource opts)
           [status created]  (put-one! store tenant-id write {"If-None-Match" "*"} "create" nil)]
       (when (and status (not= 201 status))
         (refuse! 500 "exception"
@@ -504,7 +505,7 @@
         id       (checked "resource id" id-pattern id)
         if-match (:if-match opts)
         header   (etag-header if-match)
-        write    (lifecycle-write store tenant-id :update rt id resource)
+        write    (lifecycle-write store tenant-id :update rt id resource opts)
         [_ updated] (put-one! store tenant-id write
                               (cond-> {} header (assoc "If-Match" header))
                               "update" if-match)]
@@ -546,7 +547,7 @@
   "One Bundle entry as it goes to the remote, plus its lifecycle write when it
    writes a resource. A POST becomes a guarded PUT under a minted id, for the
    same reason as `create!`; its fullUrl is kept so references to it resolve."
-  [store tenant-id entry]
+  [store tenant-id opts entry]
   (let [method (method-of entry)
         [rt id] (entry-target entry)]
     (case method
@@ -555,8 +556,11 @@
         (when (get-in entry [:request :ifNoneExist])
           (not-supported! "A conditional create (ifNoneExist) in a transaction"))
         (let [id     (or (when (= "PUT" method) id) (str (random-uuid)))
+              if-match (when (= "PUT" method) (get-in entry [:request :ifMatch]))
               write  (lifecycle-write store tenant-id (if (= "POST" method) :create :update)
-                                      rt id (:resource entry))
+                                      rt id (:resource entry)
+                                      (not-empty (cond-> (dissoc opts :if-match)
+                                                   if-match (assoc :if-match if-match))))
               guard  (if (= "POST" method)
                        {"If-None-Match" "*"}
                        (some->> (get-in entry [:request :ifMatch]) etag-header (hash-map "If-Match")))]
@@ -572,8 +576,8 @@
       (refuse! 405 "not-supported" (str "Bundle entry method not supported: " method)))))
 
 (defn- transact-transaction!
-  [store tenant-id entries]
-  (let [planned  (mapv #(transaction-entry store tenant-id %) entries)
+  [store tenant-id entries opts]
+  (let [planned  (mapv #(transaction-entry store tenant-id opts %) entries)
         writes   (into [] (keep :write) planned)
         ops      (into [] (comp (mapcat :tx-ops) (map #(encode-entry store %))) writes)
         bundle   (post-transaction! store tenant-id
@@ -590,12 +594,13 @@
      :entry        own}))
 
 (defn- batch-entry-response
-  [store tenant-id entry]
+  [store tenant-id bundle-opts entry]
   (try
     (let [method   (method-of entry)
           [rt id]  (entry-target entry)
           if-match (get-in entry [:request :ifMatch])
-          opts     (when if-match {:if-match if-match})
+          opts     (not-empty (cond-> (dissoc bundle-opts :if-match)
+                                if-match (assoc :if-match if-match)))
           etagged  (fn [status res]
                      {:resource res
                       :response (cond-> {:status status}
@@ -607,7 +612,8 @@
                                   (get-in res [:meta :lastUpdated])
                                   (assoc :lastModified (str (get-in res [:meta :lastUpdated]))))})]
       (case method
-        "POST"   (etagged "201 Created" (create! store tenant-id rt nil (:resource entry)))
+        "POST"   (etagged "201 Created" (create! store tenant-id rt nil (:resource entry)
+                                                 (dissoc bundle-opts :if-match)))
         "PUT"    (etagged "200 OK" (update! store tenant-id rt id (:resource entry) opts))
         "DELETE" (do (delete! store tenant-id rt id opts)
                      {:response {:status "204 No Content"}})
@@ -658,9 +664,9 @@
   fp/IFHIRStore
   (create-resource [this tenant-id resource-type id resource]
     (fp/create-resource this tenant-id resource-type id resource nil))
-  (create-resource [this tenant-id resource-type id resource _opts]
+  (create-resource [this tenant-id resource-type id resource opts]
     (traced {:id :store/create :data (traced-data tenant-id resource-type)}
-                   (create! this tenant-id resource-type id resource)))
+                   (create! this tenant-id resource-type id resource opts)))
 
   (read-resource [this tenant-id resource-type id]
     (traced {:id :store/read :data (traced-data tenant-id resource-type)}
@@ -719,19 +725,19 @@
 
   (transact-transaction [this tenant-id entries]
     (fp/transact-transaction this tenant-id entries nil))
-  (transact-transaction [this tenant-id entries _opts]
+  (transact-transaction [this tenant-id entries opts]
     (traced {:id :store/transact-transaction
                     :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
-                   (transact-transaction! this tenant-id entries)))
+                   (transact-transaction! this tenant-id entries opts)))
 
   (transact-bundle [this tenant-id entries]
     (fp/transact-bundle this tenant-id entries nil))
-  (transact-bundle [this tenant-id entries _opts]
+  (transact-bundle [this tenant-id entries opts]
     (traced {:id :store/transact-bundle
                     :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
                    {:resourceType "Bundle"
                     :type         "batch-response"
-                    :entry        (mapv #(batch-entry-response this tenant-id %) entries)}))
+                    :entry        (mapv #(batch-entry-response this tenant-id opts %) entries)}))
 
   (resource-deleted? [this tenant-id resource-type id]
     (let [base     (tenant-base this tenant-id)
