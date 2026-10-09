@@ -118,6 +118,9 @@ tree, and prints it to stderr; the body flows through to stdout.
 `bb setup` / `bb teardown` -- Ory auth infrastructure
 `bb inferno-check` -- smoke test (containers + server health)
 `bb inferno-run` -- Inferno web UI for interactive testing
+`bb check-domains` -- fails when a tracked file names a production domain or a
+consuming host's development hostnames; fixtures, docs and defaults here read
+localhost (`bb check-domains-test` tests the check)
 
 ## Architecture
 
