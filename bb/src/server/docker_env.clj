@@ -281,6 +281,69 @@
     (spit kratos-rendered rendered)
     kratos-rendered))
 
+;; ── Hydra JWT access-token signing key ─────────────────────────────────────
+;; docker/hydra.yml sets `strategies.access_token: jwt`, so every access token
+;; is signed with the `hydra.jwt.access-token` key set. Hydra creates that set
+;; LAZILY, inside the first token request that needs it. On one local stack
+;; that first mint failed with 500 `Could not ensure that signing keys for
+;; "hydra.jwt.access-token" exists` -- after login and consent had succeeded,
+;; so the portal reported "Sign-in failed" -- and creating the set by hand
+;; through the admin API was the fix. The cause was NOT reproduced: one and
+;; eight concurrent first mints against a fresh in-memory and a fresh
+;; Postgres-backed Hydra (v2.2.0, the stack's literal system secret) all
+;; succeeded. Creating the set up front takes the first mint out of the
+;; picture whatever the cause was.
+
+(def hydra-access-token-key-set "hydra.jwt.access-token")
+
+(defn key-set-action
+  "What to do about a Hydra JWK set given the HTTP status of GET
+   /admin/keys/{set}: :none when it exists (a second POST would ADD a key to it,
+   rotating, so this must stay a no-op), :create when Hydra says 404, :unknown
+   for anything else (Hydra not answering, an error)."
+  [status]
+  (case status
+    200 :none
+    404 :create
+    :unknown))
+
+(defn- mkcert-ca-file []
+  (str (str/trim (:out @(process ["mkcert" "-CAROOT"] {:out :string}))) "/rootCA.pem"))
+
+(defn- admin-status
+  "HTTP status of a request to the Hydra admin API, verifying its certificate
+   against the mkcert CA, or 0 when nothing answers."
+  [ca method url & [body]]
+  (let [{:keys [out]} @(process (concat ["curl" "-s" "-o" "/dev/null" "-w" "%{http_code}" "--cacert" ca
+                                         "-X" method url]
+                                        (when body ["-H" "content-type: application/json" "-d" body]))
+                                {:out :string :err :string})]
+    (or (parse-long (str/trim out)) 0)))
+
+(defn ensure-hydra-key-set!
+  "Creates the RS256 signing key set `set-id` on the Hydra admin API at
+   `hydra-admin-url` unless it already exists. Waits up to ~30s for the admin
+   API to answer. Never throws: a stack that cannot do this still starts, and
+   Hydra's own lazy creation remains the fallback. Returns :present, :created
+   or :unknown."
+  [hydra-admin-url set-id]
+  (let [ca  (mkcert-ca-file)
+        url (str hydra-admin-url "/admin/keys/" set-id)
+        status (loop [n 0]
+                 (let [st (admin-status ca "GET" url)]
+                   (if (and (zero? st) (< n 30))
+                     (do (Thread/sleep 1000) (recur (inc n)))
+                     st)))]
+    (case (key-set-action status)
+      :none   (do (println "Hydra key set" set-id "already exists.") :present)
+      :create (let [created (admin-status ca "POST" url
+                                          (str "{\"alg\":\"RS256\",\"use\":\"sig\",\"kid\":\"" (random-uuid) "\"}"))]
+                (if (= 201 created)
+                  (do (println "Created Hydra key set" set-id ".") :created)
+                  (do (println "WARNING: could not create Hydra key set" set-id "(HTTP" created ").") :unknown)))
+      (do (println "WARNING: Hydra key set" set-id "not checked (admin API answered HTTP" status ").")
+          :unknown))))
+
 ;; ── Hydra TLS terminator ──────────────────────────────────────────────────────
 ;; SMART Backend Services requires the token endpoint over TLS. Hydra keeps
 ;; serving plain HTTP on 4444; this nginx terminator presents HTTPS on
@@ -466,6 +529,7 @@
                               ["-e" (str "OAUTH2_TOKEN_HOOK_URL=" token-hook-url)
                                "-e" "OAUTH2_ALLOWED_TOP_LEVEL_CLAIMS=patient"]))))
      (assert-container-up! "hydra")
+     (ensure-hydra-key-set! (:hydra-admin urls) hydra-access-token-key-set)
      (println "Auth stack started successfully!")
      (println "  Hydra   " (:hydra-public urls) " (admin" (str (:hydra-admin urls) ")"))
      (println "  Kratos  " (:kratos-public urls) "(admin" (str (:kratos-admin urls) ")"))
