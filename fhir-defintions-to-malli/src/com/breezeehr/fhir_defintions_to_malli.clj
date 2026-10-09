@@ -1911,10 +1911,13 @@
           (let [element-kw (lookup-schema-kw "Element" version)
                 value-form (first new-sub-form)
                 ;; A repeating primitive needs a positionally-parallel companion:
-                ;; _given[i] carries the id/extensions of given[i].
+                ;; _given[i] carries the id/extensions of given[i]. An occurrence
+                ;; with a value and no id/extensions holds its place in the
+                ;; companion with a null, so the companion admits nil exactly as
+                ;; the value array does.
                 repeating? (and (vector? value-form) (= :sequential (first value-form)))
                 under-form (if repeating?
-                             [:sequential [:ref element-kw]]
+                             [:sequential [:maybe [:ref element-kw]]]
                              [:ref element-kw])
                 entry-props (entry-props-to-merge props fixed-enum?)]
             (swap! *references-atom* conj element-kw)

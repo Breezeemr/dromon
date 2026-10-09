@@ -799,3 +799,35 @@
                              (:form acc))]
       (is (= [:valueString :valueBoolean] (filterv #{:valueString :valueBoolean} keys-assoced))
           "one key per type, named after it"))))
+
+(defn- primitive-scenario
+  "The form emitted for a code element `TP.f` of cardinality `max`."
+  [max]
+  (binding [fdm/*schema-atom* (atom {})
+            fdm/*references-atom* (atom #{})
+            fdm/*recursive-references* #{}
+            fdm/*base-refs* (atom {})]
+    (:form (fdm/element-definition->attribute
+            {:sch (m/schema [:map {:closed true}] fp/fhir-registry-options) :shape {} :form []}
+            ["TP"] "1.0"
+            [{:path ["TP" "f"] :min 0 :max max :id "TP.f" :type [{:code "code"}]}]))))
+
+(defn- assoced-form [form k]
+  (some (fn [f] (when (and (seq? f) (= 'mu/assoc (first f)) (= k (second f)))
+                  (nth f 2)))
+        form))
+
+(deftest repeating-primitive-companion-admits-nil-test
+  (testing "a repeating primitive's value array and its _ companion are parallel:
+            each admits nil, so [\"MORN\" nil \"HS\"] can travel with
+            [nil {:extension [...]} nil]"
+    (let [form (primitive-scenario "*")
+          value (assoced-form form :f)
+          companion (assoced-form form :_f)]
+      (is (= :sequential (first value)))
+      (is (= :maybe (first (second value))))
+      (is (= :sequential (first companion)))
+      (is (= :maybe (first (second companion))) "the companion admits a null slot")
+      (is (= :ref (first (second (second companion)))))))
+  (testing "a single-valued primitive's companion stays a bare Element ref"
+    (is (= :ref (first (assoced-form (primitive-scenario "1") :_f))))))
