@@ -10,7 +10,11 @@
             [fhir-store.lifecycle :as lifecycle]
             [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as db]
+            [integrant.core :as ig]
+            [ring.adapter.jetty9 :as jetty]
+            [server.core :as core]
             [server.handlers :as handlers]
+            [server.router :as router]
             [server.temporal :as tmp]))
 
 (def ^:private tenant "default")
@@ -256,3 +260,121 @@
         "the temporal-bound extensions sit on the entry, untouched")
     (is (= [[:timeline "Coverage"]]
            (mapv (fn [[read _]] [(:interaction read) (:resource-type read)]) @calls)))))
+
+;; ---------------------------------------------------------------------------
+;; Canonicals: dromon names no deployment, the host supplies its own
+;; ---------------------------------------------------------------------------
+
+(def ^:private host-canonicals
+  {:basis-tag-system "https://host.example/fhir/CodeSystem/basis"
+   :extension-base   "https://host.example/fhir/StructureDefinition/host-"})
+
+(def ^:private default-tag-system "http://localhost/fhir/CodeSystem/temporal-basis")
+(def ^:private default-extension-base "http://localhost/fhir/StructureDefinition/temporal-")
+
+(defn- tag-systems [body]
+  (set (map :system (get-in body [:meta :tag]))))
+
+(defn- extension-urls [body]
+  (set (map :url (:extension (first (:entry body))))))
+
+(defn- every-temporal-answer
+  "The four places a temporal response states a canonical, each answered by the
+   real handler for `request-fn` (a function from a request to a request): the
+   search Bundle on both of its branches (`_count=0` and the paged one),
+   `$as-of`, and `$timeline`. Returns {:search-page .. :search-count .. :as-of ..
+   :timeline ..} of response bodies."
+  [request-fn]
+  (let [store #(->BitemporalStore (atom []))
+        sel {"_asOf" "2026-10-01T06:00:00Z" "_validAt" "2026-09-30"}]
+    {:search-page  (:body (handlers/search-type (request-fn (req (store) sel))))
+     :search-count (:body (handlers/search-type (request-fn (req (store) (assoc sel "_count" "0")))))
+     :as-of        (:body (handlers/resource-as-of (request-fn (req (store) sel :id "x"))))
+     :timeline     (:body (handlers/resource-timeline (request-fn (req (store) {} :id "x"))))}))
+
+(deftest without-host-canonicals-responses-state-neutral-localhost-ones
+  (let [{:keys [search-page search-count as-of timeline]} (every-temporal-answer identity)]
+    (testing "every meta.tag names the default CodeSystem"
+      (doseq [body [search-page search-count as-of]]
+        (is (= #{default-tag-system} (tag-systems body)))
+        (is (= #{"system-time" "valid-time"} (set (map :code (get-in body [:meta :tag])))))))
+    (testing "the timeline extensions sit under the default base"
+      (is (= #{(str default-extension-base "system-from")
+               (str default-extension-base "valid-from")
+               (str default-extension-base "valid-to")}
+             (extension-urls timeline))))))
+
+(deftest host-canonicals-reach-every-temporal-response
+  (let [{:keys [search-page search-count as-of timeline]}
+        (every-temporal-answer #(assoc % :fhir/temporal-canonicals host-canonicals))]
+    (testing "search, on the paged branch and on the _count=0 branch, and $as-of"
+      (doseq [[label body] {:search-page search-page :search-count search-count :as-of as-of}]
+        (is (= #{(:basis-tag-system host-canonicals)} (tag-systems body)) (name label))
+        (is (= #{"system-time" "valid-time"} (set (map :code (get-in body [:meta :tag]))))
+            (name label))))
+    (testing "$timeline"
+      (is (= #{"https://host.example/fhir/StructureDefinition/host-system-from"
+               "https://host.example/fhir/StructureDefinition/host-valid-from"
+               "https://host.example/fhir/StructureDefinition/host-valid-to"}
+             (extension-urls timeline))))))
+
+(deftest a-host-may-supply-one-canonical-and-keep-the-other-default
+  (testing "only the CodeSystem"
+    (let [{:keys [search-page timeline]}
+          (every-temporal-answer
+           #(assoc % :fhir/temporal-canonicals
+                   (select-keys host-canonicals [:basis-tag-system])))]
+      (is (= #{(:basis-tag-system host-canonicals)} (tag-systems search-page)))
+      (is (contains? (extension-urls timeline) (str default-extension-base "system-from")))))
+  (testing "only the extension base"
+    (let [{:keys [search-page timeline]}
+          (every-temporal-answer
+           #(assoc % :fhir/temporal-canonicals
+                   (select-keys host-canonicals [:extension-base])))]
+      (is (= #{default-tag-system} (tag-systems search-page)))
+      (is (contains? (extension-urls timeline)
+                     (str (:extension-base host-canonicals) "system-from"))))))
+
+(deftest check-canonicals-refuses-what-would-silently-fall-back
+  (is (nil? (tmp/check-canonicals nil)))
+  (is (= host-canonicals (tmp/check-canonicals host-canonicals)))
+  (testing "a misspelled key would otherwise serve the default with no error"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #":basis-tag-sytem"
+                          (tmp/check-canonicals {:basis-tag-sytem "https://host.example/x"}))))
+  (testing "a value that is not a usable string"
+    (doseq [bad [nil "" "  " :kw 5]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (tmp/check-canonicals {:basis-tag-system bad}))
+          (pr-str bad))))
+  (testing "not a map"
+    (is (thrown? clojure.lang.ExceptionInfo (tmp/check-canonicals "https://host.example/x")))))
+
+(deftest the-router-injects-the-canonicals
+  (let [resolved (router/resolve-options {:temporal-canonicals host-canonicals})
+        entry (some #(when (= ::router/temporal-canonicals (:name %)) %)
+                    (router/default-middleware (mock/create-mock-store {}) resolved))
+        seen (atom nil)]
+    (is (= host-canonicals (:temporal-canonicals resolved)))
+    (is (some? entry))
+    (((:wrap entry) (fn [request] (reset! seen (:fhir/temporal-canonicals request)))) {})
+    (is (= host-canonicals @seen))
+    (is (nil? (some #(when (= ::router/temporal-canonicals (:name %)) %)
+                    (router/default-middleware (mock/create-mock-store {})
+                                               (router/resolve-options {}))))
+        "absent without the option: the default stack is unchanged")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (router/resolve-options {:temporal-canonicals {:extension-bas "https://host.example/x"}}))
+        "a malformed option fails at startup, not on the first response")))
+
+(deftest the-jetty-component-forwards-the-canonicals-to-the-app
+  (let [seen (atom nil)]
+    (with-redefs [core/fhir-app (fn [store schemas & kvs]
+                                  (reset! seen {:store store :schemas schemas :opts (apply hash-map kvs)})
+                                  ::app)
+                  jetty/run-jetty (fn [app _] {:app app})]
+      (ig/init-key :server/jetty {:port 0
+                                  :store ::store
+                                  :schemas []
+                                  :temporal-canonicals host-canonicals}))
+    (is (= host-canonicals (get-in @seen [:opts :temporal-canonicals])))
+    (is (= ::store (:store @seen)))))

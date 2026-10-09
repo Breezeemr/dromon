@@ -394,7 +394,8 @@
               ;; statement, which presentation cannot remove.
               {:status 200
                :body (tmp/stamp-basis (narrative/present-response req :as-of resource-type res)
-                                      basis)}
+                                      basis
+                                      (tmp/request-canonicals req))}
               (not-found-response resource-type
                                   (str id " at the requested point in time"))))))))
 
@@ -428,6 +429,7 @@
                   req :timeline
                   (tmp/timeline-bundle (str (fhir-base req) "/" resource-type)
                                        (db/temporal-axes store)
+                                       (tmp/request-canonicals req)
                                        rows))}
           (not-found-response resource-type id))))))
 
@@ -1030,6 +1032,7 @@
       (let [basis (when requested-basis
                     (tmp/resolve-basis store tenant-id requested-basis))
             base-url (str (fhir-base req) "/" resource-type)
+            canonicals (tmp/request-canonicals req)
             outcome-entry (when (seq unsupported)
                             (unsupported-params-entry base-url resource-type unsupported))]
         (if (zero? limit)
@@ -1052,7 +1055,7 @@
                             :total total
                             :link [self-link]}
                      outcome-entry (assoc :entry [outcome-entry])
-                     basis (tmp/stamp-basis basis))})
+                     basis (tmp/stamp-basis basis canonicals))})
           ;; Normal search with pagination
           (let [search-params (assoc params :_count limit :_skip skip)
                 results (if basis
@@ -1118,7 +1121,7 @@
                             :link links
                             :entry all-entries}
                      total (assoc :total total)
-                     basis (tmp/stamp-basis basis))}))))))
+                     basis (tmp/stamp-basis basis canonicals))}))))))
 
 (defn conditional-update
   "Handler for PUT /[type]?[search params] — conditional update."

@@ -193,6 +193,16 @@ Rules that are easy to get wrong, all enforced in `server.temporal`:
 - **Temporal responses state their resolved basis** in `meta.tag`. An omitted
   `_asOf` means "latest indexed transaction", a different instant per request,
   so the response names the concrete one.
+- **The canonicals a temporal response states are the host's, not dromon's.**
+  The `meta.tag` system and the timeline extension URLs are a wire contract of
+  whichever deployment serves them, so a host passes
+  `:temporal-canonicals {:basis-tag-system .. :extension-base ..}` through
+  `:server/jetty`, `fhir-app` or `resolve-options`. A key it omits takes the
+  neutral localhost default (`server.temporal/default-canonicals`); a
+  misspelled key or a non-string value throws at startup, because falling back
+  silently would serve the wrong canonical with no error anywhere. The
+  handlers read the injected `:fhir/temporal-canonicals` on every path that
+  stamps a basis: both `search-type` branches, `$as-of` and `$timeline`.
 - **A timeline omits valid-time bounds on a single-axis store** rather than
   emitting null ones: null reads as end-of-time, absent means no such axis.
 

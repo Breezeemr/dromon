@@ -57,7 +57,8 @@
             [server.keto :as keto]
             [server.middleware :as middleware]
             [server.routing :as routing]
-            [server.scope :as scope])
+            [server.scope :as scope]
+            [server.temporal :as temporal])
   (:import [com.fasterxml.jackson.core JsonGenerator$Feature]
            [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]))
@@ -135,6 +136,16 @@
   (fn [req]
     (handler (assoc req :fhir/tx-metadata produce))))
 
+(defn wrap-temporal-canonicals
+  "Inject the host's `:temporal-canonicals`, the canonical URLs temporal
+   responses state (`{:basis-tag-system .. :extension-base ..}`, see
+   `server.temporal/default-canonicals`). The temporal handlers read it from
+   :fhir/temporal-canonicals through `server.temporal/request-canonicals`,
+   which fills in whatever the host leaves out."
+  [handler canonicals]
+  (fn [req]
+    (handler (assoc req :fhir/temporal-canonicals canonicals))))
+
 (defn wrap-lifecycle
   "Inject the host's `fhir-store.lifecycle` object, mirroring wrap-narrative.
    The handlers read it from :fhir/lifecycle via `server.narrative` to present
@@ -193,10 +204,15 @@
 
    Accepts `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle`,
-   `:tx-metadata` and `:legacy-realm-blind-fallback?`; unknown keys are
-   ignored. `:lifecycle` is carried through as given; [[default-middleware]]
-   resolves it. `:tx-metadata` is the host's stamp producer, `(fn [request])`
-   returning a stamp or nil; with none, writes carry no stamp.
+   `:tx-metadata`, `:temporal-canonicals` and `:legacy-realm-blind-fallback?`;
+   unknown keys are ignored. `:lifecycle` is carried through as given;
+   [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
+   producer, `(fn [request])` returning a stamp or nil; with none, writes carry
+   no stamp. `:temporal-canonicals` is `{:basis-tag-system .. :extension-base
+   ..}`, the URLs a temporal response states (`meta.tag` system, timeline
+   extension base); each key it omits takes the neutral default of
+   `server.temporal/default-canonicals`, and a malformed value or a misspelled
+   key throws here, at startup, rather than serving a wrong canonical.
 
    This is the ONLY place the environment is consulted, so tests and hosts can
    bypass it entirely by hand-building the resolved map (for example passing a
@@ -218,7 +234,7 @@
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url terminology cors-allowed-origins
            enforce-smart-scopes? bulk-job-store login-url lifecycle tx-metadata
-           legacy-realm-blind-fallback?]}]
+           temporal-canonicals legacy-realm-blind-fallback?]}]
   {:jwks-url              (or jwks-url
                               (System/getenv "JWKS_URL")
                               (when-not (System/getenv "JWT_DEV_SECRET")
@@ -245,6 +261,7 @@
    :terminology           terminology
    :lifecycle             lifecycle
    :tx-metadata           tx-metadata
+   :temporal-canonicals   (temporal/check-canonicals temporal-canonicals)
    :bulk-job-store        bulk-job-store})
 
 ;; ---------------------------------------------------------------------------
@@ -260,8 +277,9 @@
    splice relative to names rather than indices (see [[insert-before]],
    [[insert-after]], [[replace-middleware]]).
 
-   Four entry groups are conditional: `::tx-metadata` appears only when `opts`
-   carries a `:tx-metadata` producer, `::trace-tap` only when it
+   Five entry groups are conditional: `::tx-metadata` appears only when `opts`
+   carries a `:tx-metadata` producer, `::temporal-canonicals` only when it
+   carries `:temporal-canonicals`, `::trace-tap` only when it
    carries a `:trace-tap` function, `::lifecycle` only when it carries a
    `:lifecycle` (a lifecycle value, a qualified symbol naming one, or a
    constructor fn, resolved here by `fhir-store.lifecycle/resolve-lifecycle`
@@ -302,7 +320,8 @@
       Coercion errors are in practice caught by `::fhir-exceptions` (422/500
       OperationOutcomes); `::coerce-exceptions` is retained for compatibility.
    7. The injection middleware (`::fhir-store`, `::terminology`,
-      `::narrative`, `::lifecycle`, `::bulk-job-store`, `::keto-url`) must sit
+      `::narrative`, `::lifecycle`, `::tx-metadata`, `::temporal-canonicals`,
+      `::bulk-job-store`, `::keto-url`) must sit
       outside `::patient-compartment`, which reads and REPLACES `:fhir/store`
       with a compartment-filtering store, and outside the handlers that
       consume the injected values.
@@ -348,7 +367,7 @@
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
                  jwks-url enforce-smart-scopes? login-url narrative lifecycle tx-metadata
-                 legacy-realm-blind-fallback?]
+                 temporal-canonicals legacy-realm-blind-fallback?]
           :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}
           :as opts}]
   (cond-> []
@@ -388,6 +407,10 @@
 
     tx-metadata
     (conj {:name ::tx-metadata :wrap (fn [handler] (wrap-tx-metadata handler tx-metadata))})
+
+    temporal-canonicals
+    (conj {:name ::temporal-canonicals
+           :wrap (fn [handler] (wrap-temporal-canonicals handler temporal-canonicals))})
 
     :always
     (into [{:name ::bulk-job-store

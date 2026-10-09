@@ -22,21 +22,51 @@
   (:import [java.time Instant LocalDate OffsetDateTime ZoneOffset]))
 
 (def basis-tag-system
-  "CodeSystem for the resolved-basis tags stamped on temporal responses.
-   Moves to the rcm-ig canonical when that IG exists."
-  "https://breezeehr.com/fhir/CodeSystem/temporal-basis")
-
-(def operation-definition-base
-  "Canonical base for the temporal operations. `$as-of` and `$timeline` are not
-   HL7 operations, so a deployment mounting them advertises these rather than an
-   hl7.org canonical, which would assert conformance to a definition that does
-   not exist. Moves to the rcm-ig canonical when that IG exists."
-  "https://breezeehr.com/fhir/OperationDefinition/purser-")
+  "Default CodeSystem for the resolved-basis tags stamped on temporal
+   responses. A host that serves under its own canonical passes it as
+   `:basis-tag-system` of the router's `:temporal-canonicals` option, which
+   [[request-canonicals]] reads."
+  "http://localhost/fhir/CodeSystem/temporal-basis")
 
 (def extension-base
-  "Base URL for the timeline's temporal-bound extensions. Moves to the rcm-ig
-   canonical when that IG exists."
-  "https://breezeehr.com/fhir/StructureDefinition/purser-")
+  "Default base URL for the timeline's temporal-bound extensions, overridden
+   the same way through `:extension-base`."
+  "http://localhost/fhir/StructureDefinition/temporal-")
+
+(def default-canonicals
+  "The canonicals a response states when the host supplies none. dromon names
+   no deployment: the strings are a wire contract of whichever host serves
+   them, so they are that host's to choose."
+  {:basis-tag-system basis-tag-system
+   :extension-base   extension-base})
+
+(defn check-canonicals
+  "Validates a host's `:temporal-canonicals` option: nil, or a map holding only
+   the keys of [[default-canonicals]], each a non-blank string. Returns it
+   unchanged and throws ex-info otherwise. A misspelled key would otherwise
+   fall back to the default silently, and every temporal response would state
+   a canonical the host never chose."
+  [canonicals]
+  (when (some? canonicals)
+    (when-not (map? canonicals)
+      (throw (ex-info ":temporal-canonicals must be a map" {:value canonicals})))
+    (when-let [unknown (seq (remove (set (keys default-canonicals)) (keys canonicals)))]
+      (throw (ex-info (str ":temporal-canonicals has no key " (pr-str (first unknown))
+                           "; accepted: " (pr-str (sort (keys default-canonicals))))
+                      {:unknown (vec unknown)})))
+    (doseq [[k v] canonicals]
+      (when-not (and (string? v) (not (str/blank? v)))
+        (throw (ex-info (str ":temporal-canonicals " (pr-str k) " must be a non-blank string")
+                        {:key k :value v}))))
+    canonicals))
+
+(defn request-canonicals
+  "The canonicals the response to `req` states: the host's
+   `:fhir/temporal-canonicals` (injected by `server.router`'s
+   `::temporal-canonicals` middleware), with each key it leaves out filled from
+   [[default-canonicals]]. Always a complete map."
+  [req]
+  (merge default-canonicals (:fhir/temporal-canonicals req)))
 
 (defn parse-temporal-value
   "Coerce a FHIR instant / dateTime / date string to an Instant, or nil when it
@@ -172,20 +202,21 @@
     (assoc :system-time (:system-time (db/current-basis store tenant-id)))))
 
 (defn basis-tags
-  "`meta.tag` entries recording the resolved basis of a temporal response."
-  [basis]
+  "`meta.tag` entries recording the resolved basis of a temporal response, in
+   the CodeSystem `canonicals` names (see [[request-canonicals]])."
+  [basis {tag-system :basis-tag-system}]
   (into []
         (keep (fn [[axis t]]
                 (when t
-                  {:system basis-tag-system
+                  {:system tag-system
                    :code (name axis)
                    :display (str t)})))
         (select-keys basis [:system-time :valid-time])))
 
 (defn stamp-basis
   "Attach the resolved basis to a response body's `meta.tag`."
-  [body basis]
-  (let [tags (basis-tags basis)]
+  [body basis canonicals]
+  (let [tags (basis-tags basis canonicals)]
     (cond-> body
       (seq tags) (update-in [:meta :tag] (fnil into []) tags))))
 
@@ -194,24 +225,29 @@
 
    Valid-time extensions are emitted only when the store has that axis. A
    single-axis store must not produce a null valid period: absent means \"no
-   such axis\", whereas a null bound would read as end-of-time."
-  [base-url axes {:keys [resource valid-from valid-to system-from system-to]}]
+   such axis\", whereas a null bound would read as end-of-time.
+
+   The extension URLs are built on the `:extension-base` of `canonicals` (see
+   [[request-canonicals]])."
+  [base-url axes {ext-base :extension-base}
+   {:keys [resource valid-from valid-to system-from system-to]}]
   (let [ext (cond-> []
-              system-from (conj {:url (str extension-base "system-from")
+              system-from (conj {:url (str ext-base "system-from")
                                  :valueInstant (str system-from)})
-              system-to   (conj {:url (str extension-base "system-to")
+              system-to   (conj {:url (str ext-base "system-to")
                                  :valueInstant (str system-to)})
               (and (contains? axes :valid-time) valid-from)
-              (conj {:url (str extension-base "valid-from") :valueInstant (str valid-from)})
+              (conj {:url (str ext-base "valid-from") :valueInstant (str valid-from)})
               (and (contains? axes :valid-time) valid-to)
-              (conj {:url (str extension-base "valid-to") :valueInstant (str valid-to)}))]
+              (conj {:url (str ext-base "valid-to") :valueInstant (str valid-to)}))]
     (cond-> {:fullUrl (str base-url "/" (:id resource))
              :resource resource}
       (seq ext) (assoc :extension ext))))
 
 (defn timeline-bundle
-  [base-url axes rows]
+  "A history Bundle of [[timeline-entry]] entries, one per row."
+  [base-url axes canonicals rows]
   {:resourceType "Bundle"
    :type "history"
    :total (count rows)
-   :entry (mapv #(timeline-entry base-url axes %) rows)})
+   :entry (mapv #(timeline-entry base-url axes canonicals %) rows)})

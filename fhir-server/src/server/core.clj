@@ -311,7 +311,9 @@
    Options: `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
    `:enforce-smart-scopes?`, `:bulk-job-store`; each falls back to an
    environment variable as documented on `server.router/resolve-options`.
-   `:lifecycle` (see `server.router/default-middleware`) has no fallback.
+   `:lifecycle` (see `server.router/default-middleware`) and
+   `:temporal-canonicals` (the canonical URLs temporal responses state, see
+   `server.temporal/default-canonicals`) have no environment fallback.
 
    This is a thin composition of `server.router/resolve-options`,
    `default-middleware`, `router` and `default-handler`. Hosts that need to
@@ -324,7 +326,7 @@
 
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
                                                 jwks-url keto-url terminology cors-allowed-origins bulk-job-store
-                                                lifecycle]}]
+                                                lifecycle temporal-canonicals]}]
   ;; A nil :port means TLS only. The adapter's default is a cleartext
   ;; connector beside the TLS one, so it has to be told (:http? false) rather
   ;; than merely not given a port.
@@ -344,7 +346,8 @@
                                         :key-password key-password))]
     (jetty/run-jetty (fhir-app store schemas :jwks-url jwks-url :keto-url keto-url :terminology terminology
                                :cors-allowed-origins cors-allowed-origins :bulk-job-store bulk-job-store
-                               :lifecycle lifecycle) jetty-opts)))
+                               :lifecycle lifecycle :temporal-canonicals temporal-canonicals)
+                     jetty-opts)))
 
 (defmethod ig/halt-key! :server/jetty [_ server]
   (println "Stopping Jetty Server")
