@@ -67,6 +67,11 @@ selfservice:
     verification:
       enabled: false
 
+# Cookie scope, filled by server.docker-env/render-kratos-config. Empty when
+# Kratos and the login app share a host (the default localhost stack); a
+# parent-domain `cookies:` and `session:` block when they do not, because the
+# login app reads the Kratos session from the browser's Cookie header.
+{{COOKIES_BLOCK}}
 log:
   level: info
   format: text

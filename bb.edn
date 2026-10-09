@@ -166,6 +166,14 @@
    :requires ([server.keto-realm-backfill :as backfill])
    :task (apply backfill/-main *command-line-args*)}
 
+  docker-env-test
+  {:doc "Unit tests for the auth stack's pure config rendering (Kratos cookie domain). Needs no containers."
+   :requires ([babashka.classpath :as cp] [clojure.test :as test])
+   :task (do (cp/add-classpath "bb/test")
+             (require 'server.docker-env-test)
+             (let [{:keys [fail error]} (test/run-tests 'server.docker-env-test)]
+               (System/exit (if (pos? (+ fail error)) 1 0))))}
+
   keto-realm-backfill-test
   {:doc "Unit tests for the realm backfill planner. Needs no running Keto."
    :requires ([babashka.classpath :as cp] [clojure.test :as test])

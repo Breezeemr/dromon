@@ -267,19 +267,97 @@
 (def ^:private kratos-rendered-dir (str pwd "/docker/generated"))
 (def ^:private kratos-rendered (str kratos-rendered-dir "/kratos.yml"))
 
-(defn render-kratos-config!
-  "Writes docker/generated/kratos.yml from the template with the Kratos public
-   and admin URLs and the login app's base URL filled in. Returns the path."
-  [{:keys [kratos-public kratos-admin]} login-app-base-url]
-  (let [rendered (-> (slurp kratos-template)
+(defn- url-host [url]
+  (some-> url java.net.URI. .getHost str/lower-case))
+
+(defn shared-cookie-domain
+  "The cookie Domain Kratos needs so the login app can see its session, or nil.
+
+   Kratos sets its session cookie host-only by default, so it reaches only the
+   host Kratos answers on. The login app calls Kratos /sessions/whoami with the
+   browser's own Cookie header, so when it lives on a DIFFERENT host (this
+   stack run under local*.breezeehr.com: localkratos vs localauth) it never
+   receives the session, every sign-in bounces back through the Kratos flow, and
+   login-consent's circuit breaker ends it with `login_loop`. The login itself
+   succeeded; the session just never arrived.
+
+   Answers the longest label suffix the two hosts share, provided it has at
+   least two labels (so never a bare TLD). nil when the hosts are the same
+   (the default `localhost` stack, which needs nothing), when either is
+   `localhost` or an IP (browsers reject Domain=localhost and IP domains), or
+   when they share nothing."
+  [kratos-public-url login-app-base-url]
+  (let [labels  #(str/split % #"\.")
+        ip?     #(re-matches #"[\d.]+|\[?[\da-f:]+\]?" %)
+        a       (url-host kratos-public-url)
+        b       (url-host login-app-base-url)]
+    (when (and a b (not= a b)
+               (not-any? #{"localhost"} [a b])
+               (not-any? ip? [a b]))
+      (let [common (->> (map vector (reverse (labels a)) (reverse (labels b)))
+                        (take-while (fn [[x y]] (= x y)))
+                        (map first)
+                        reverse)]
+        (when (>= (count common) 2)
+          (str/join "." common))))))
+
+(defn cookies-block
+  "The `cookies:` and `session:` config that makes Kratos cookies visible across
+   `domain`, or \"\" when domain is nil (leave Kratos's defaults alone).
+
+   The session cookie gets its own name, `cookie-name`. A parent-domain cookie
+   called ory_kratos_session would sit in the same browser as real
+   *.breezeehr.com sessions: it would overwrite one that is also domain-scoped
+   or ride along beside one that is host-only, and either way production would
+   read the wrong value. Whatever reads the cookie BY NAME (flotilla's
+   :ory-session-cookie-name, breeze.operations.impl.bundle) must be told this
+   name to work against this stack; login-consent forwards the raw Cookie
+   header and is name-agnostic."
+  [domain cookie-name]
+  (if domain
+    (str "# Rendered because the login app and Kratos are on different hosts: a\n"
+         "# host-only session cookie never reaches the login app (see\n"
+         "# server.docker-env/shared-cookie-domain).\n"
+         "cookies:\n"
+         "  domain: " domain "\n"
+         "  path: /\n"
+         "  same_site: Lax\n"
+         "session:\n"
+         "  cookie:\n"
+         "    name: " cookie-name "\n"
+         "    domain: " domain "\n"
+         "    path: /\n"
+         "    same_site: Lax\n")
+    ""))
+
+(def default-session-cookie-name "ory_kratos_session_local")
+
+(defn render-kratos-config
+  "The rendered Kratos config text: the template with the Kratos public and
+   admin URLs, the login app's base URL and the cookie block filled in."
+  [template {:keys [kratos-public kratos-admin]} login-app-base-url session-cookie-name]
+  (let [rendered (-> template
                      (str/replace "{{KRATOS_PUBLIC_URL}}" kratos-public)
                      (str/replace "{{KRATOS_ADMIN_URL}}" kratos-admin)
-                     (str/replace "{{LOGIN_APP_BASE_URL}}" login-app-base-url))]
+                     (str/replace "{{LOGIN_APP_BASE_URL}}" login-app-base-url)
+                     (str/replace "{{COOKIES_BLOCK}}"
+                                  (cookies-block (shared-cookie-domain kratos-public login-app-base-url)
+                                                 session-cookie-name)))]
     (when-let [left (re-find #"\{\{[A-Z_]+\}\}" rendered)]
       (throw (ex-info (str "docker/kratos.yml has a placeholder this renderer does not fill: " left) {})))
-    (.mkdirs (java.io.File. kratos-rendered-dir))
-    (spit kratos-rendered rendered)
-    kratos-rendered))
+    rendered))
+
+(defn render-kratos-config!
+  "Writes docker/generated/kratos.yml from the template ([[render-kratos-config]]).
+   KRATOS_SESSION_COOKIE_NAME overrides the session cookie name used when a
+   shared cookie domain is needed. Returns the path."
+  [urls login-app-base-url]
+  (.mkdirs (java.io.File. kratos-rendered-dir))
+  (spit kratos-rendered
+        (render-kratos-config (slurp kratos-template) urls login-app-base-url
+                              (or (System/getenv "KRATOS_SESSION_COOKIE_NAME")
+                                  default-session-cookie-name)))
+  kratos-rendered)
 
 ;; ── Hydra TLS terminator ──────────────────────────────────────────────────────
 ;; SMART Backend Services requires the token endpoint over TLS. Hydra keeps
