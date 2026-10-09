@@ -124,6 +124,12 @@
       (#{:schema :malli.core/schema} t)
       (compile-node (m/deref s) ctx)
 
+      ;; A repeating primitive's element and its `_` companion's element are
+      ;; [:maybe ...]: a null holds the place of the other array's occurrence.
+      ;; XML has no null; the node is the wrapped schema's.
+      (= :maybe t)
+      (compile-node (first (m/children s)) ctx)
+
       (any-resource-map? s)
       (delay {:kind :any-resource})
 
