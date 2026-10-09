@@ -38,11 +38,11 @@
     store))
 
 (deftest list-encounter-bare-id-and-code
-  (let [allergies {:coding [{:system "http://breezeehr.com/list" :code "allergies"}]}
+  (let [allergies {:coding [{:system "http://localhost/list" :code "allergies"}]}
         store (seeded {:resourceType "List" :id "l1" :status "current" :mode "working"
                        :code allergies :encounter {:reference "Encounter/e1"}}
                       {:resourceType "List" :id "l2" :status "current" :mode "working"
-                       :code {:coding [{:system "http://breezeehr.com/list" :code "medications"}]}
+                       :code {:coding [{:system "http://localhost/list" :code "medications"}]}
                        :encounter {:reference "Encounter/e1"}}
                       {:resourceType "List" :id "l3" :status "current" :mode "working"
                        :code allergies :encounter {:reference "Encounter/e2"}})]

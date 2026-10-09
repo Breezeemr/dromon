@@ -100,16 +100,14 @@
 ;; ── Ory TLS for the auth stack ───────────────────────────────────────────────
 ;; `start-auth-stack!` serves Hydra and Kratos over TLS natively and Keto
 ;; behind a TLS terminator, from one mkcert certificate. The HOSTNAMES are a
-;; parameter: this repo's own default is `localhost` (TLS on localhost, no
-;; /etc/hosts dependency), and master-at-arms2 starts the same stack under its
-;; local*.breezeehr.com names through its root `bb auth-stack-up`, which sets
-;; HYDRA_HOST, KRATOS_HOST, KETO_HOST and LOGIN_APP_BASE_URL.
+;; function option (`:hosts`); this repo's default is `localhost` (TLS on
+;; localhost, no /etc/hosts dependency).
 ;;
 ;; Two things ride on the names and are why they are printed at the end:
 ;; Hydra's issuer is compared VERBATIM by every relying party, and Kratos
 ;; bakes its base URL into every URL it hands the browser. A relying party
 ;; configured for one set of names cannot log in against a stack started with
-;; the other.
+;; another.
 ;;
 ;; The main pool (`start!`, `bb setup`) is untouched: it is the Inferno
 ;; harness's stack, whose containers reach Hydra as http://hydra:4444 through
@@ -119,19 +117,9 @@
   "This repo's own names for the three services: TLS on localhost."
   {:hydra "localhost" :kratos "localhost" :keto "localhost"})
 
-(defn ory-hosts-from-env
-  "The hostnames to serve under. ORY_HOST names all three at once;
-   HYDRA_HOST, KRATOS_HOST and KETO_HOST name one each and win over it."
-  []
-  (let [all (System/getenv "ORY_HOST")]
-    {:hydra  (or (System/getenv "HYDRA_HOST") all (:hydra default-ory-hosts))
-     :kratos (or (System/getenv "KRATOS_HOST") all (:kratos default-ory-hosts))
-     :keto   (or (System/getenv "KETO_HOST") all (:keto default-ory-hosts))}))
-
 (defn hydra-issuer
   "Hydra's issuer for a given Hydra host: compared VERBATIM against the id_token
-   `iss` by every relying party (flotilla's `hydra-issuer`, the BFF harness's
-   `:issuer`), trailing slash included."
+   `iss` by every relying party, trailing slash included."
   [hydra-host]
   (str "https://" hydra-host ":4444/"))
 
@@ -156,8 +144,8 @@
 
 (def ^:private ory-cert-baseline-sans
   "Names every minted pair carries whatever the configured hosts are, so a
-   pair minted for one set of names still serves the other."
-  ["*.breezeehr.com" "localhost" "127.0.0.1" "::1"])
+   pair minted for another set of names still serves localhost."
+  ["localhost" "127.0.0.1" "::1"])
 
 (defn- cert-sans
   "DNS names in the certificate's subjectAltName, or nil when openssl is not
@@ -177,10 +165,8 @@
 
 (defn ensure-ory-tls-cert!
   "Mints docker/tls/ory.pem and ory-key.pem with mkcert for the configured
-   hosts plus the baseline names. These are the same files the repo-root
-   `bb cert:setup ory` in master-at-arms2 writes, so either path yields a pair
-   both sets of names verify against. The key is made world-readable because
-   the Ory images run as a non-root user and read it through the bind mount.
+   hosts plus the baseline names. The key is made world-readable because the
+   Ory images run as a non-root user and read it through the bind mount.
 
    A pair that is present but does not cover a configured host (checked
    through openssl when available) is re-minted."
@@ -216,8 +202,7 @@
 
 (defn- warn-missing-hosts!
   "Says which configured names /etc/hosts does not resolve yet. Writing the
-   file needs sudo, which this task does not take; in master-at-arms2 the
-   repo-root `bb cert:setup ory` (or `bb hosts:setup`) does."
+   file needs sudo, which this task does not take."
   [hosts]
   (let [contents (let [f (java.io.File. "/etc/hosts")] (if (.isFile f) (slurp f) ""))
         missing  (->> (vals hosts) distinct
@@ -225,7 +210,7 @@
                       (remove #(hosts-entry-present? contents %)))]
     (when (seq missing)
       (println "WARNING: not in /etc/hosts:" (str/join ", " missing))
-      (println "         add these (master-at-arms2: `bb cert:setup ory` or `bb hosts:setup` at the repo root):")
+      (println "         add these:")
       (doseq [h missing]
         (println (str "           127.0.0.1 " h))
         (println (str "           ::1 " h))))))
@@ -382,8 +367,7 @@
    and Keto serving TLS under the configured names -- by default
    https://localhost:4444 (admin :4445), https://localhost:4433 (admin :4434)
    and https://localhost:4466 (write :4467) -- with Hydra's login/consent URLs
-   pointed at the login-consent app on the host. master-at-arms2's root
-   `bb auth-stack-up` passes its local*.breezeehr.com names instead.
+   pointed at the login/consent app on the host.
 
    The certificate is minted here if missing or not covering the names
    (`ensure-ory-tls-cert!`); a non-loopback name missing from /etc/hosts is
@@ -391,8 +375,7 @@
 
    opts:
    - :hosts               {:hydra :kratos :keto} hostnames (default
-                          `default-ory-hosts`; `ory-hosts-from-env` reads
-                          ORY_HOST / HYDRA_HOST / KRATOS_HOST / KETO_HOST)
+                          `default-ory-hosts`)
    - :login-app-base-url  base URL Hydra redirects login/consent/logout
                           challenges to, and Kratos returns to. These
                           redirects are followed by the BROWSER, so the URL

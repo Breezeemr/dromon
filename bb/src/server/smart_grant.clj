@@ -12,12 +12,14 @@
      bb smart-grant --subject <id> --patients pa --revoke
 
    The Ory URLs default to the main pool's plain-HTTP listeners. Against
-   `bb auth-stack-up`, which serves TLS under its own names, override them:
+   `bb auth-stack-up`, which serves TLS on localhost, override them. The FHIR
+   server is the test-server's HTTPS port, whose dev certificate names
+   `fhir.local` (see `bb tls-setup`):
 
-     HYDRA_ADMIN_URL=https://localhydra.breezeehr.com:4445
-     HYDRA_PUBLIC_URL=https://localhydra.breezeehr.com:4444
-     KETO_ADMIN_URL=https://localketo.breezeehr.com:4467
-     FHIR_SERVER_URL=https://localdromon.breezeehr.com:8443
+     HYDRA_ADMIN_URL=https://localhost:4445
+     HYDRA_PUBLIC_URL=https://localhost:4444
+     KETO_ADMIN_URL=https://localhost:4467
+     FHIR_SERVER_URL=https://fhir.local:8443
      bb smart-grant ...            ; with the four exported
 
    Requests go through curl, which trusts mkcert's CA once `mkcert -install`
@@ -63,10 +65,10 @@
    and the waiting room updates Encounter.reasonCode. Without it the GET
    long-poll passes on `patient/*.read` while every publish 403s.
 
-   This list must agree with `com.breezeehr.cabotage.oauth/scopes` and the
-   `:scopes` in cabotage2's `bb/src/com/breezeehr/cabotage/dev.clj`: Hydra
-   refuses a scope the client is not registered for, so a scope added on one
-   side alone breaks the authorize redirect rather than degrading."
+   This list must agree with the scopes a consuming app requests at its own
+   authorize redirect: Hydra refuses a scope the client is not registered for,
+   so a scope added on one side alone breaks the authorize redirect rather
+   than degrading."
   "openid offline_access launch/patient launch/patient.* patient/*.read patient/Patient.c patient/Encounter.cu")
 
 ;; ── helpers ────────────────────────────────────────────────────────────────

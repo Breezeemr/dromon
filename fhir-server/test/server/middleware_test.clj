@@ -139,7 +139,7 @@
 
 (deftest wrap-cors-credentials-test
   (let [handler (fn [_] {:status 200 :headers {} :body "OK"})
-        allowed "https://localjib3.breezeehr.com:5173"
+        allowed "https://localhost:5173"
         wrapped (middleware/wrap-cors handler #{allowed "http://localhost:5173"})
         preflight (fn [origin]
                     (wrapped {:request-method :options

@@ -67,14 +67,15 @@
       (protocol/create-resource store tenant (keyword (:resourceType r)) (:id r) r))
     store))
 
-(def ^:private spi "http://breezeehr.com/Surescripts/SPI")
-(def ^:private message-id "http://breezeehr.com/Surescripts/MessageID")
+(def ^:private spi "http://localhost/Surescripts/SPI")
+(def ^:private message-id "http://localhost/Surescripts/MessageID")
+(def ^:private cancel-message-id "http://localhost/Surescripts/CancelMessageID")
 
 (deftest identifier-system-value
   (let [store (seeded {:resourceType "MedicationRequest" :id "mr1"
                        :identifier [{:system message-id :value "M1"}]}
                       {:resourceType "MedicationRequest" :id "mr2"
-                       :identifier [{:system "http://breezeehr.com/Surescripts/CancelMessageID"
+                       :identifier [{:system cancel-message-id
                                      :value "M1"}]}
                       {:resourceType "MedicationRequest" :id "mr3"
                        :identifier [{:value "M1"}]})]
@@ -89,19 +90,18 @@
     (testing "a comma ORs two system|value tokens"
       (is (= ["mr1" "mr2"]
              (ids store :MedicationRequest
-                  {"identifier" (str message-id "|M1,"
-                                     "http://breezeehr.com/Surescripts/CancelMessageID|M1")}))))
+                  {"identifier" (str message-id "|M1," cancel-message-id "|M1")}))))
     (testing "the fallback (no registry) evaluates the same token"
       (is (= ["mr1"] (ids store :MedicationRequest {"identifier" (str message-id "|M1")} false))))
     (testing "a value no identifier holds finds nothing"
       (is (= [] (ids store :MedicationRequest {"identifier" (str message-id "|M2")}))))))
 
 (deftest list-encounter-bare-id-and-single-codeable-concept
-  (let [allergies {:coding [{:system "http://breezeehr.com/list" :code "allergies"}]}
+  (let [allergies {:coding [{:system "http://localhost/list" :code "allergies"}]}
         store (seeded {:resourceType "List" :id "l1" :code allergies
                        :encounter {:reference "Encounter/e1"}}
                       {:resourceType "List" :id "l2"
-                       :code {:coding [{:system "http://breezeehr.com/list" :code "medications"}]}
+                       :code {:coding [{:system "http://localhost/list" :code "medications"}]}
                        :encounter {:reference "Encounter/e1"}}
                       {:resourceType "List" :id "l3" :code allergies
                        :encounter {:reference "Encounter/e2"}})]
@@ -114,7 +114,7 @@
     (testing "a reference to another type with the same id does not match"
       (is (= [] (ids store :List {"encounter" "Patient/e1"}))))
     (testing "system|code on the single CodeableConcept"
-      (is (= ["l1" "l3"] (ids store :List {"code" "http://breezeehr.com/list|allergies"}))))
+      (is (= ["l1" "l3"] (ids store :List {"code" "http://localhost/list|allergies"}))))
     (testing "the fallback matches the single CodeableConcept too"
       (is (= ["l1"] (ids store :List {"encounter" "e1" "code" "allergies"} false))))))
 
@@ -212,7 +212,7 @@
     (testing "status=attested&target=<absolute url>, with no registry for the type"
       (is (= ["v1"] (ids store :VerificationResult
                          {"status" "attested"
-                          "target" "https://api.breezeehr.com/fhir/realm/fhir/Practitioner/pr1"}
+                          "target" "https://localhost/fhir/realm/fhir/Practitioner/pr1"}
                          false))))
     (testing "the same with an R4 registry"
       (let [registry {"status" {:type "token" :columns [{:col "status" :fhir-type "code"}]}
@@ -257,11 +257,11 @@
     (is (= ["a" "c"] (ids store :MedicationRequest {"patient" "Patient/p1,Patient/p3"})))))
 
 (deftest meta-parameters
-  (let [erx "http://breezeehr.com/fhir/StructureDefinition/breeze-erx-medicationrequest"
+  (let [erx "http://localhost/fhir/StructureDefinition/test-medicationrequest"
         store (seeded {:resourceType "MedicationRequest" :id "a"
                        :meta {:profile [erx]
-                              :tag [{:system "http://breezeehr.com/tags" :code "erx"}]}}
+                              :tag [{:system "http://localhost/tags" :code "erx"}]}}
                       {:resourceType "MedicationRequest" :id "b"})]
-    (is (= ["a"] (ids store :MedicationRequest {"_tag" "http://breezeehr.com/tags|erx"})))
+    (is (= ["a"] (ids store :MedicationRequest {"_tag" "http://localhost/tags|erx"})))
     (is (= ["a"] (ids store :MedicationRequest {"_profile" erx})))
     (is (= ["a" "b"] (ids store :MedicationRequest {"_lastUpdated" "gt2000-01-01"})))))
