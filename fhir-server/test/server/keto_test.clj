@@ -129,7 +129,7 @@
             so the client learns where authentication starts instead of
             guessing at a built-in path"
     (let [handler (fn [_] {:status 200 :body "OK"})
-          login-url "https://localflotilla.breezeehr.com:8444/auth/hydra/login"
+          login-url "https://localhost:8444/auth/hydra/login"
           wrapped (keto/wrap-keto-authorization handler {:keto-url "http://mock-keto"
                                                          :login-url login-url})
           response (wrapped {:request-method :get :fhir/resource-type "Person"})]

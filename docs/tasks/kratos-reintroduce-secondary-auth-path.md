@@ -9,11 +9,11 @@ in-file), and `server.docker-env/start-auth-stack!` / `stop-auth-stack!`
 (`bb auth-stack-up` / `bb auth-stack-down`) boot Kratos on top of the main
 pool with `assert-container-up!` loud failure, create the kratos database
 idempotently (init-db.sql only runs on first ory-pg creation), and recreate
-Hydra with its login/consent URLs pointed at the login-consent app
-(`master-at-arms2/login-consent`, default http://host.docker.internal:3001).
-The main pool and `bb setup` / `bb inferno-test` are untouched. Steps 3-4
-(login/consent provider, e2e runner) are being built as the login-consent
-app in the master-at-arms2 repo; step 5 (docs flip) lands with them.
+Hydra with its login/consent URLs pointed at the login/consent app of the
+consuming host (default https://localhost:3001). The main pool and `bb setup` /
+`bb inferno-test` are untouched. Steps 3-4 (login/consent provider, e2e runner)
+are being built as a login/consent app in the consuming host's repository;
+step 5 (docs flip) lands with them.
 
 ## Context
 

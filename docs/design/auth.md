@@ -10,7 +10,7 @@ interactive **`authorization_code`** flow is served by an opt-in **secondary aut
 v1.3.0 backs credentials/identity (recreated after its removal over the cipher-secret config
 bug, `docs/tasks/kratos-cipher-secret-config.md` — secrets now arrive via the SECRETS_* env-var
 mapping, never `$VAR` literals in YAML), and Hydra's login/consent challenges redirect to the
-login-consent app (`master-at-arms2/login-consent`, in development). Kratos failing to start
+login/consent app of the consuming host (default `https://localhost:3001`). Kratos failing to start
 can never affect `bb inferno-test`.
 
 ## Authentication (`server.auth/wrap-jwt-auth`)
