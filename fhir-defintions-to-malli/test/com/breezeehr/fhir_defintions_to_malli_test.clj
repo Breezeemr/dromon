@@ -331,17 +331,7 @@
                :kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1}]
              (get index "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden"))))
 
-    (testing "version ordering infers the scheme when no versionAlgorithm is declared"
-      (is (neg? (fdm/compare-canonical-versions "4.3.0" "5.3.0-ballot-tc1")))
-      (is (neg? (fdm/compare-canonical-versions "5.3.0-ballot-tc1" "5.3.0"))
-          "a pre-release orders below the release it qualifies")
-      (is (pos? (fdm/compare-canonical-versions "2.10.0" "2.9.0"))
-          "numeric segments compare numerically, not lexically")
-      (is (zero? (fdm/compare-canonical-versions "4.3.0" "4.3.0"))))
-
-    (binding [fdm/*canonical-index* index
-              fdm/*schema-atom* (atom {:org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0 {}
-                                       :org.hl7.fhir.StructureDefinition.Patient/v4-3-0 {}})]
+    (binding [fdm/*canonical-index* index]
       (testing "a pin a package publishes outright wins"
         (binding [fdm/*current-package* xver]
           (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1
@@ -356,21 +346,6 @@
                  (fdm/resolve-canonical-kw
                   "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden|5.2.0")))))
 
-      (testing "an uninterpretable pin falls back to the latest already generated"
-        ;; No resource publishes 9.9.9 and no declared dependency names it, so the
-        ;; pin carries no information; preferring something already generated keeps
-        ;; the reference inside packages the referrer has seen.
-        (binding [fdm/*current-package* {:id "x" :version "1" :dependencies {}}]
-          (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0
-                 (fdm/resolve-canonical-kw
-                  "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden|9.9.9")))))
-
-      (testing "an unpinned canonical takes the latest already generated, per R4B"
-        (binding [fdm/*current-package* xver]
-          (is (= :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0
-                 (fdm/resolve-canonical-kw
-                  "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden")))))
-
       (testing "a forward reference resolves to the package that will define it"
         (binding [fdm/*current-package* xver]
           (is (= :org.hl7.fhir.StructureDefinition.alternate-reference/v5-3-0-ballot-tc1
@@ -379,12 +354,92 @@
 
       (testing "a canonical no package defines does not resolve"
         (is (nil? (fdm/resolve-canonical-kw
-                   "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-timeout")))))
+                   "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-timeout"))))
+
+      (testing "with no closure, two definitions of one canonical are ambiguous, never newest-wins"
+        (binding [fdm/*current-package* {:id "x" :version "1" :dependencies {}}]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot resolve canonical"
+                                (fdm/resolve-canonical-kw
+                                 "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden|9.9.9"))
+              "a pin nothing publishes and no dependency names carries no information"))))
 
     (testing "without an index bound, resolution is inert"
-      (binding [fdm/*canonical-index* nil
-                fdm/*schema-atom* (atom {})]
+      (binding [fdm/*canonical-index* nil]
         (is (nil? (fdm/resolve-canonical-kw "http://hl7.org/fhir/StructureDefinition/Patient")))))))
+
+(deftest resolve-in-package-closure-test
+  (let [hidden "http://hl7.org/fhir/StructureDefinition/questionnaire-hidden"
+        alt    "http://hl7.org/fhir/StructureDefinition/alternate-reference"
+        packages (gen/prepare-packages
+                  [{:id "hl7.fhir.r4b.core" :version "4.3.0" :dependencies {}
+                    :substitutes ["hl7.fhir.r4.core"]
+                    :plan [{:url hidden :version "4.3.0"}]}
+                   {:id "hl7.fhir.uv.extensions.r4" :version "5.3.0-ballot-tc1"
+                    :dependencies {"hl7.fhir.r4.core" "4.0.1" "hl7.terminology.r4" "6.5.0"}
+                    :plan [{:url hidden :version "5.3.0-ballot-tc1"}
+                           {:url alt :version "5.3.0-ballot-tc1"}]}
+                   {:id "hl7.fhir.us.core" :version "8.0.1"
+                    :dependencies {"hl7.fhir.r4.core" "4.0.1"
+                                   "hl7.fhir.uv.extensions.r4" "5.2.0"}
+                    :plan []}
+                   {:id "r4-only.ig" :version "1.0.0"
+                    :dependencies {"hl7.fhir.r4.core" "4.0.1"}
+                    :plan []}])
+        [r4b fx uscore r4-only] packages
+        index    (gen/canonical-index packages)
+        resolve  #(fdm/resolve-in-package index %1 %2)]
+
+    (testing "closures follow declared dependencies through substitutes, ignoring ones the run lacks"
+      (is (= #{"hl7.fhir.r4b.core"} (:closure r4b)))
+      (is (= #{"hl7.fhir.r4b.core" "hl7.fhir.uv.extensions.r4"} (:closure fx)))
+      (is (= #{"hl7.fhir.r4b.core" "hl7.fhir.uv.extensions.r4" "hl7.fhir.us.core"}
+             (:closure uscore)))
+      (is (= {"hl7.fhir.r4.core" "hl7.fhir.r4b.core"} (:dependency-run-ids fx))))
+
+    (testing "a package that does not depend on the other definer sees only its own copy"
+      (is (= {:kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0 :by :closure}
+             (resolve r4b hidden)))
+      (is (= {:kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0 :by :closure}
+             (resolve r4-only hidden))))
+
+    (testing "two definers in the closure are ambiguous without an override"
+      (is (= {:ambiguous [{:pkg-id "hl7.fhir.r4b.core" :version "4.3.0"}
+                          {:pkg-id "hl7.fhir.uv.extensions.r4" :version "5.3.0-ballot-tc1"}]}
+             (resolve uscore hidden))))
+
+    (testing "an override settles the ambiguity, and must name a candidate the referrer sees"
+      (is (= {:kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v5-3-0-ballot-tc1
+              :by :override}
+             (resolve (assoc-in uscore [:overrides hidden] "5.3.0-ballot-tc1") hidden)))
+      (is (= "9.9.9"
+             (:bad-override (resolve (assoc-in uscore [:overrides hidden] "9.9.9") hidden)))))
+
+    (testing "a pin naming a declared dependency resolves to the run's substitute"
+      (is (= {:kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0 :by :pin-dependency}
+             (resolve uscore (str hidden "|4.0.1")))
+          "hl7.fhir.r4.core 4.0.1 is what R4B stands in for"))
+
+    (testing "a canonical only packages outside the closure define is not borrowed"
+      (is (= {:outside-closure [{:pkg-id "hl7.fhir.uv.extensions.r4" :version "5.3.0-ballot-tc1"}]}
+             (resolve r4-only alt))))
+
+    (testing "check-references reports by class, and the literal Element is always resolved"
+      (let [sd     {:url "http://example.org/StructureDefinition/p" :version "1.0.0"
+                    :baseDefinition "http://hl7.org/fhir/StructureDefinition/Element"
+                    :differential {:element [{:id "p.a" :type [{:code "string"}
+                                                               {:code "Extension" :profile [hidden]}]}
+                                             {:id "p.b" :type [{:code "Missing"}]}]}}
+            report (gen/check-references [(assoc uscore :plan [sd])] index)]
+        (is (= [hidden] (map :canonical (:ambiguous report))))
+        (is (= #{"http://example.org/StructureDefinition/p"} (:from (first (:ambiguous report)))))
+        (is (= ["http://hl7.org/fhir/StructureDefinition/Element"
+                "http://hl7.org/fhir/StructureDefinition/Extension"
+                "http://hl7.org/fhir/StructureDefinition/Missing"]
+               (map :canonical (:missing report)))
+            "nothing in this toy run defines Element or Extension; string is a primitive")
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"1 ambiguous"
+                              (with-out-str
+                                (gen/check-references! [(assoc uscore :plan [sd])] index))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Slicing dispatch: the emitted :multi dispatch fn must agree with the arm keys

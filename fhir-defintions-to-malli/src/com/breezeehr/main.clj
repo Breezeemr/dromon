@@ -188,8 +188,11 @@
     (download-fhir/download lower-version)
     (println "Download complete. Generating schemas...")
     (let [plan  (gen/plan (version-sources prefix) #{nil})
-          desc  {:id (str "hl7.fhir." lower-version ".core") :version "4.3.0" :dependencies {}}
-          index (gen/canonical-index [(assoc desc :plan plan)])
+          [desc] (gen/prepare-packages
+                  [{:id (str "hl7.fhir." lower-version ".core") :version "4.3.0" :dependencies {}
+                    :plan plan}])
+          index (gen/canonical-index [desc])
+          _     (gen/check-references! [desc] index)
           sa    (atom {})
           unresolved (atom [])
           result (binding [fdm/*canonical-index*     index
@@ -199,6 +202,15 @@
       (report-unresolved-profiles! @unresolved)
       (println "Generation complete:" result)
       (assoc result :unresolved-profiles @unresolved))))
+
+(def ^:private uscore-overrides
+  "References US Core 8.0.1 makes that its dependency closure leaves ambiguous:
+   R4B core 4.3.0 and FHIR Extensions 5.3.0-ballot-tc1 both define each one, and
+   US Core depends on both. Settled by hand to the Extensions definition, which
+   is where HL7 maintains these extensions now and what the run resolved to
+   before overrides existed (newest wins)."
+  {"http://hl7.org/fhir/StructureDefinition/condition-assertedDate"  "5.3.0-ballot-tc1"
+   "http://hl7.org/fhir/StructureDefinition/workflow-supportingInfo" "5.3.0-ballot-tc1"})
 
 (defn generate-uscore!
   "Generate schemas for US Core STU8, including all intermediate dependencies.
@@ -273,11 +285,22 @@
         ;; 3.1.1 and gets 8.0.1. Those pins can never match a resource version in
         ;; what we build, so resolution has to go through the declared dependency
         ;; to find which package was meant.
-        r4b-desc     {:id "hl7.fhir.r4b.core" :version "4.3.0" :dependencies {}}
-        sdc-desc     {:id "hl7.fhir.uv.sdc" :version "4.0.0" :dependencies {}}
+        ;;
+        ;; Every IG declares hl7.fhir.r4.core; R4B stands in for it. SDC's
+        ;; dependencies are its ImplementationGuide's dependsOn, since the site
+        ;; tree's package manifest lists none.
+        r4b-desc     {:id "hl7.fhir.r4b.core" :version "4.3.0" :dependencies {}
+                      :substitutes ["hl7.fhir.r4.core"]}
+        sdc-desc     {:id "hl7.fhir.uv.sdc" :version "4.0.0"
+                      :dependencies {"hl7.terminology.r4"        "7.1.0"
+                                     "hl7.fhir.uv.xver-r5.r4"    "0.1.0"
+                                     "hl7.fhir.uv.tools.r4"      "1.1.2"
+                                     "hl7.fhir.r4.examples"      "4.0.1"
+                                     "hl7.fhir.uv.extensions.r4" "5.3.0-ballot-tc1"}}
         fhirext-desc (gen/read-package-descriptor "scratch/fhir-extensions/5.3.0-ballot-tc1/package")
         xver-desc    (gen/read-package-descriptor "scratch/xver/0.1.0/package")
-        uscore-desc  (gen/read-package-descriptor "scratch/us-core/STU8.0.1/package")
+        uscore-desc  (assoc (gen/read-package-descriptor "scratch/us-core/STU8.0.1/package")
+                            :overrides uscore-overrides)
         davinci-desc (gen/read-package-descriptor "scratch/davinci-crd/2.0.1/package")
         r4b-plan     (gen/plan (version-sources "scratch/definitions.json/") #{nil})
         r4b-urls     (into #{nil} (map :url) r4b-plan)
@@ -297,17 +320,21 @@
                                         uscore-urls :skip-missing true))
         ;; Pipeline order; a canonical defined by two packages keeps both, and the
         ;; reference decides which is meant.
-        index        (gen/canonical-index
-                      [(assoc r4b-desc     :plan r4b-plan)
-                       (assoc fhirext-desc :plan fhirext-plan)
-                       (assoc xver-desc    :plan xver-plan)
-                       (assoc sdc-desc     :plan sdc-plan)
-                       (assoc uscore-desc  :plan uscore-plan)
-                       (assoc davinci-desc :plan davinci-plan)])
+        [r4b-desc fhirext-desc xver-desc sdc-desc uscore-desc davinci-desc
+         :as packages]
+        (gen/prepare-packages
+         [(assoc r4b-desc     :plan r4b-plan)
+          (assoc fhirext-desc :plan fhirext-plan)
+          (assoc xver-desc    :plan xver-plan)
+          (assoc sdc-desc     :plan sdc-plan)
+          (assoc uscore-desc  :plan uscore-plan)
+          (assoc davinci-desc :plan davinci-plan)])
+        index        (gen/canonical-index packages)
         unresolved   (atom [])]
     (println "  planned" (+ (count r4b-plan) (count fhirext-plan) (count xver-plan)
                             (count sdc-plan) (count uscore-plan) (count davinci-plan))
              "definitions;" (count index) "distinct canonicals indexed")
+    (gen/check-references! packages index)
 
     (binding [fdm/*canonical-index*    index
               fdm/*known-canonical-kws* (gen/index-kws index)

@@ -115,7 +115,14 @@
   (let [idx (.indexOf u "|")]
     (when (pos? idx) (.substring u (inc idx)))))
 
-(defn uri->kw2 [^String x version]
+(defn uri->kw2
+  "The schema keyword of the definition at canonical `x` published at `version`.
+
+   This is a definition's identity -- call it with a StructureDefinition's own
+   :url and :version. A *reference* names a canonical and leaves the version to
+   resolution against the referencing package (`resolve-canonical-kw`); stamping
+   the referrer's version onto it names a schema that need not exist."
+  [^String x version]
   (let [;; Strip |version suffix (e.g. "...artifact-versionAlgorithm|5.3.0-ballot-tc1")
         ;; The pipe is illegal in a URL path and the version is passed separately.
         x     (let [idx (.indexOf x "|")]
@@ -210,14 +217,24 @@
    pre-scan of every plan in the run.
 
    Nil when no driver supplies one; resolution then falls back to the by-name
-   scan of the schema atom."
+   scan of the schema atom and to keywords built from the referencing
+   definition's own version (`legacy-type-code-kw`, `legacy-profile-kw`)."
   nil)
 
 (def ^:dynamic *current-package*
   "The package whose definitions are being generated, as
-   {:id :version :dependencies}. FHIR resolves a canonical against the
-   *referencing* package's declared dependencies, so this is what makes a
-   `|version` pin interpretable."
+   {:id :version :dependencies}, plus what `gen/prepare-packages` adds:
+
+     :closure            the run's package ids this package can see -- itself and
+                         its transitive declared dependencies;
+     :dependency-run-ids declared dependency id -> the run package standing in
+                         for it (hl7.fhir.r4.core -> hl7.fhir.r4b.core);
+     :overrides          canonical (no pin) -> the version to use, settling a
+                         reference the closure leaves ambiguous.
+
+   FHIR resolves a canonical against the *referencing* package's declared
+   dependencies, so this is what makes a reference interpretable. Nil, or a
+   package with no :closure, lets a reference see every package in the run."
   nil)
 
 (def ^:dynamic *known-canonical-kws*
@@ -340,26 +357,6 @@
 ;; authors should pin instead -- which is what the index does, at plan time.
 ;; ---------------------------------------------------------------------------
 
-(defn- version-segments
-  "Split a version string for comparison, inferring the scheme the way the FHIR
-   tooling does when a resource declares no versionAlgorithm (all R4 content):
-   numeric segments compare numerically, everything else lexically.
-
-   A pre-release suffix orders below the release it qualifies, so 5.3.0 beats
-   5.3.0-ballot-tc1, matching semver."
-  [^String v]
-  (let [[core pre] (str/split (or v "") #"-" 2)]
-    [(mapv (fn [seg] (if (re-matches #"\d+" seg) [0 (parse-long seg)] [1 seg]))
-           (str/split core #"[.]"))
-     ;; absent pre-release sorts after any present one
-     (if pre [0 pre] [1 ""])]))
-
-(defn compare-canonical-versions
-  "Order two resource versions, newest last. Used only to break a tie the
-   reference itself does not resolve, where R4B's guidance is to take the latest."
-  [a b]
-  (compare (version-segments a) (version-segments b)))
-
 (defn- pin-target-package
   "Which package does a `|version` pin name, when no candidate publishes that
    version outright?
@@ -371,41 +368,119 @@
    the pipeline builds 5.3.0-ballot-tc1 -- and resolving to the substitute is the
    whole point: no resource anywhere publishes 5.2.0, so an exact match can never
    succeed."
-  [pin]
-  (when (and pin *current-package*)
-    (some (fn [[dep-id dep-version]] (when (= pin dep-version) dep-id))
-          (:dependencies *current-package*))))
+  [package pin]
+  (when (and pin package)
+    (some (fn [[dep-id dep-version]]
+            (when (= pin dep-version)
+              (get (:dependency-run-ids package) dep-id dep-id)))
+          (:dependencies package))))
+
+(defn- sole-kw
+  "The one keyword `entries` agree on, or nil when they name none or several."
+  [entries]
+  (let [kws (into #{} (map :kw) entries)]
+    (when (= 1 (count kws))
+      (first kws))))
+
+(defn resolve-in-package
+  "Resolve a canonical referenced from `package` against `index`.
+
+   In order:
+     1. the package's override for the canonical -- a decision made by hand for
+        a reference the rules below leave ambiguous;
+     2. a candidate publishing exactly the pinned version;
+     3. the candidate from the package that pin names, found through the
+        referencing package's declared dependencies, which covers a pin the run
+        cannot satisfy verbatim because it substituted a different version
+        (xver pins hl7.fhir.uv.extensions.r4 at 5.2.0; the run builds
+        5.3.0-ballot-tc1);
+     4. the only candidate in the package's dependency closure.
+
+   Returns {:kw k :by <rule>} on success, otherwise a map saying why not:
+   {:missing true} when no package in the run defines the canonical,
+   {:ambiguous candidates} when several packages in the closure do,
+   {:outside-closure candidates} when only packages the referrer does not depend
+   on do, and {:bad-override version :candidates candidates} when the override
+   names no single visible candidate.
+
+   Pure, so the plan-time check (`gen/check-references`) and the walk answer
+   every reference the same way."
+  [index package ^String canonical]
+  (let [base     (strip-canonical-version canonical)
+        pin      (canonical-version canonical)
+        entries  (get index base)
+        closure  (:closure package)
+        visible  (if closure
+                   (filterv #(contains? closure (:pkg-id %)) entries)
+                   entries)
+        override (get (:overrides package) base)
+        summary  #(mapv (fn [e] (select-keys e [:pkg-id :version])) %)]
+    (cond
+      (empty? entries)
+      {:missing true}
+
+      override
+      (if-let [k (sole-kw (filter #(= override (:version %)) visible))]
+        {:kw k :by :override}
+        {:bad-override override :candidates (summary visible)})
+
+      :else
+      (let [pinned  (when pin (sole-kw (filter #(= pin (:version %)) entries)))
+            pin-pkg (pin-target-package package pin)
+            via-pin (when pin-pkg (sole-kw (filter #(= pin-pkg (:pkg-id %)) entries)))
+            in-cl   (sole-kw visible)]
+        (cond
+          pinned          {:kw pinned :by :pin}
+          via-pin         {:kw via-pin :by :pin-dependency}
+          in-cl           {:kw in-cl :by :closure}
+          (seq visible)   {:ambiguous (summary visible)}
+          :else           {:outside-closure (summary entries)})))))
 
 (defn resolve-canonical-kw
   "Resolve a canonical URL to the schema keyword of the StructureDefinition that
-   defines it.
+   defines it, for the package being generated (`resolve-in-package`).
 
-   In order:
-     1. a candidate publishing exactly the pinned version -- the reference says
-        which one it means and the run has it;
-     2. the candidate from the package that pin names, found through the
-        referencing package's declared dependencies, which covers a pin the run
-        cannot satisfy verbatim because it substituted a different version;
-     3. the newest candidate already generated, keeping the reference inside
-        packages the referencing one has actually seen;
-     4. the newest candidate in the run, covering a forward reference.
-
-   Steps 3 and 4 replace a first-match over hash-map key order, which returned an
-   arbitrary version and changed answer as the schema atom grew."
+   nil when no index is bound or no package in the run defines the canonical;
+   throws ::unresolvable-canonical when the run defines it but the rules cannot
+   choose one definition. Never guesses: a guessed keyword is valid-looking
+   output that names the wrong schema."
   [^String canonical]
-  (when (and *canonical-index* *schema-atom*)
-    (let [base    (strip-canonical-version canonical)
-          pin     (canonical-version canonical)
-          entries (get *canonical-index* base)]
-      (when (seq entries)
-        (let [newest    #(last (sort-by :version compare-canonical-versions %))
-              generated (filterv #(contains? @*schema-atom* (:kw %)) entries)
-              from-pkg  (when-let [pkg (pin-target-package pin)]
-                          (seq (filterv #(= pkg (:pkg-id %)) entries)))]
-          (:kw (or (when pin (first (filter #(= pin (:version %)) entries)))
-                   (when from-pkg (newest from-pkg))
-                   (when (seq generated) (newest generated))
-                   (newest entries))))))))
+  (when *canonical-index*
+    (let [r (resolve-in-package *canonical-index* *current-package* canonical)]
+      (cond
+        (:kw r)      (:kw r)
+        (:missing r) nil
+        :else        (throw (ex-info (str "cannot resolve canonical " canonical
+                                          " from " (or (:id *current-package*) "the run")
+                                          ": " (pr-str (dissoc r :missing)))
+                                     (assoc r
+                                            :type ::unresolvable-canonical
+                                            :canonical canonical
+                                            :package (:id *current-package*)
+                                            :definition *current-definition*)))))))
+
+(declare resolve-malli-sch)
+
+(defn- unindexed-kw
+  "The keyword for a canonical no package in the run defines, which the walk can
+   still meet when a driver seeds schemas outside the index -- the CDA driver
+   seeds FHIR Base, string and Element at each CDA version.
+
+   Tries the keyword at each of `versions` in order and takes the first schema
+   that actually exists; throws ::unresolvable-canonical when none does, since a
+   keyword nothing defines makes the generated file fail to load."
+  [^String canonical versions]
+  (let [kws (into [] (comp (remove nil?) (distinct) (map #(uri->kw2 canonical %))) versions)]
+    (or (first (filter #(or (contains? @*schema-atom* %)
+                            (some? (resolve-malli-sch %)))
+                       kws))
+        (throw (ex-info (str "no schema for canonical " canonical
+                             ": the run defines it nowhere and no seeded schema matches")
+                        {:type       ::unresolvable-canonical
+                         :canonical  canonical
+                         :tried      kws
+                         :package    (:id *current-package*)
+                         :definition *current-definition*})))))
 
 (defn kw->base-fn-name
   "Derive a base function name from a schema keyword.
@@ -429,12 +504,19 @@
        (or (str/starts-with? code "http://")
            (str/starts-with? code "https://"))))
 
-(defn- lookup-schema-kw
-  "Look up a type code in the schema atom, returning the keyword.
+(def ^:private core-sd-prefix "http://hl7.org/fhir/StructureDefinition/")
 
-  Short FHIR codes (e.g. \"CodeableConcept\") resolve via type-name match under
-  the FHIR StructureDefinition prefix. Full URLs (CDA / external SDs) resolve
-  via uri->kw2 so registry keys match StructureDefinition :url conversion."
+(defn- type-code->canonical
+  "The canonical a type code names: a URL as is, a short FHIR code (\"Element\",
+   \"CodeableConcept\") under the core StructureDefinition prefix."
+  [code]
+  (if (url-type-code? code) code (str core-sd-prefix code)))
+
+(defn- legacy-type-code-kw
+  "How a type code resolved before the canonical index existed, kept for drivers
+   that bind no index: the keyword at the referencing definition's version when
+   the atom has it, else the first atom entry sharing the type name, else that
+   keyword anyway."
   [code version]
   (if (url-type-code? code)
     (let [kw (uri->kw2 code version)]
@@ -442,6 +524,20 @@
           (first (filter #(= (kw->type-name %) (kw->type-name kw)) (keys @*schema-atom*)))
           kw))
     (lookup-kw @*schema-atom* (munge-ns (str/replace code "." "-")) base-ns-prefix version)))
+
+(defn- lookup-schema-kw
+  "The schema keyword for a declared type code.
+
+   With an index bound the code resolves as a canonical (`resolve-canonical-kw`);
+   one the run defines nowhere must name a schema the driver seeded at the
+   referencing definition's version (`unindexed-kw`). Without one it resolves the
+   pre-index way (`legacy-type-code-kw`)."
+  [code version]
+  (if *canonical-index*
+    (let [canonical (type-code->canonical code)]
+      (or (resolve-canonical-kw canonical)
+          (unindexed-kw canonical [version])))
+    (legacy-type-code-kw code version)))
 
 (def ^:private xml-choice-group-url
   "http://hl7.org/fhir/tools/StructureDefinition/xml-choice-group")
@@ -678,6 +774,32 @@
       (not (contains? *profiles-raising-child-requirement*
                       (strip-canonical-version canonical)))))
 
+(defn- legacy-profile-kw
+  "How a profile canonical resolved before the canonical index existed, kept for
+   drivers that bind no index: the first atom entry sharing the profile's name,
+   else the keyword at the referencing definition's version."
+  [canonical version]
+  (let [profile-name (munge-ns (str/replace (last (str/split (strip-canonical-version canonical) #"/"))
+                                            "." "-"))]
+    (or (first (filter #(= (kw->type-name %) profile-name) (keys @*schema-atom*)))
+        (uri->kw2 canonical version))))
+
+(defn- profile-canonical-kw
+  "The schema keyword a `type.profile` canonical names, or nil when no schema
+   will exist for it: the run defines it nowhere (planned with :skip-missing),
+   or, without an index, the guessed keyword names nothing.
+
+   A forward reference counts as existing when the index promises it
+   (`*known-canonical-kws*`)."
+  [canonical version]
+  (let [kw (if *canonical-index*
+             (resolve-canonical-kw canonical)
+             (legacy-profile-kw canonical version))]
+    (when (and kw (or (contains? @*schema-atom* kw)
+                      (contains? *known-canonical-kws* kw)
+                      (some? (resolve-malli-sch kw))))
+      kw)))
+
 (defn- narrowed-child-profile-kw
   "The schema keyword a non-slice child's single `type.profile` names, or nil to
    keep the declared base type.
@@ -714,23 +836,38 @@
                       :at (:path use-site)
                       :degraded-to base-kw}))
             nil)
-        (let [profile-kw (or (resolve-canonical-kw canonical)
-                             (let [profile-clean (strip-canonical-version canonical)
-                                   profile-name (munge-ns (str/replace (last (str/split profile-clean #"/")) "." "-"))]
-                               (or (first (filter #(= (kw->type-name %) profile-name)
-                                                  (keys @*schema-atom*)))
-                                   (uri->kw2 canonical version))))]
-          (when profile-kw
-            (if (or (contains? @*schema-atom* profile-kw)
-                    (contains? *known-canonical-kws* profile-kw)
-                    (some? (resolve-malli-sch profile-kw)))
-              profile-kw
-              (do (when *unresolved-profiles*
-                    (swap! *unresolved-profiles* conj
-                           {:profile canonical
-                            :from *current-definition*
-                            :degraded-to base-kw}))
-                  nil))))))))
+        (or (profile-canonical-kw canonical version)
+            (do (when *unresolved-profiles*
+                  (swap! *unresolved-profiles* conj
+                         {:profile canonical
+                          :from *current-definition*
+                          :degraded-to base-kw}))
+                nil))))))
+
+(defn reference-canonicals
+  "Every canonical the walk will resolve for StructureDefinition `sd`, as
+   [kind canonical] with kind :base, :type-code or :profile.
+
+   Mirrors what the walk looks up: the baseDefinition, and each differential
+   element's type codes and type profiles, skipping the codes `prim-or-ref`
+   answers without a lookup (FHIR primitives, Resource, FHIRPath System types).
+   The literal Element the walk also resolves is added by the caller, once per
+   package. `gen/check-references` resolves these at plan time so an ambiguity
+   stops the run before anything is generated."
+  [sd]
+  (concat
+   (when-let [b (:baseDefinition sd)] [[:base b]])
+   (for [el (get-in sd [:differential :element])
+         t  (:type el)
+         r  (concat
+             (let [c (:code t)]
+               (when (and c
+                          (not (fhir-primitives c))
+                          (not= "Resource" c)
+                          (not (str/starts-with? c "http://hl7.org/fhirpath/System.")))
+                 [[:type-code (type-code->canonical c)]]))
+             (map (fn [p] [:profile p]) (:profile t)))]
+     r)))
 
 (defn prim-or-ref
   "The value schema for a declared type: a primitive inline, anything else a
@@ -1555,10 +1692,11 @@
         rt (when add-rt? (str/join "." main-path))
         base-primitive (when raw-code (fhir-primitives raw-code))
         base-kw (when-not base-primitive
-                  (if raw-code
-                    (lookup-schema-kw raw-code version)
-                    (keyword (str base-ns-prefix ".Element")
-                             (str "v" (str/replace version "." "-")))))]
+                  (cond
+                    raw-code          (lookup-schema-kw raw-code version)
+                    *canonical-index* (lookup-schema-kw "Element" version)
+                    :else             (keyword (str base-ns-prefix ".Element")
+                                               (str "v" (str/replace version "." "-")))))]
     (when (and (not base-primitive) (not old-sch) (nil? (resolve-malli-sch base-kw)))
       (println "NO BASE-SCH FOUND FOR:" base-kw "raw-code:" raw-code))
     (let [field-info (:field-info acc)
@@ -2079,37 +2217,20 @@
             result))
         new-sch (or new-sub-sch [:any])
         ;; Resolve profile keyword for override-form and primitive extension detection
+        ;; A profile no schema will exist for degrades the slice to the element's
+        ;; own type: it keeps its :url discriminator but loses the profile's
+        ;; narrowing. Emitting the unresolvable keyword would make the file fail
+        ;; to load.
         profile-kw (when-let [profile (first (:profile attr-type))]
-                     ;; The canonical index resolves by URL identity, so it picks the
-                     ;; package that actually defines the profile and the version that
-                     ;; package publishes. The by-name scan below matches on the last
-                     ;; namespace segment only and picks an arbitrary hash-order entry
-                     ;; when several versions are in the atom; it stays as the fallback
-                     ;; for drivers that supply no index (e.g. the CDA generator).
-                     (or (resolve-canonical-kw profile)
-                         (let [profile-clean (strip-canonical-version profile)
-                               profile-name (munge-ns (str/replace (last (str/split profile-clean #"/")) "." "-"))]
-                           (or (first (filter #(= (kw->type-name %) profile-name)
-                                              (keys @*schema-atom*)))
-                               (uri->kw2 profile version)))))
-        ;; Last resort. With an index bound this only fires for a canonical no
-        ;; package in the run defines (the run was planned with :skip-missing).
-        ;; Emitting the unresolvable keyword would make the file fail to load, so
-        ;; the slice degrades to the element's own type: it keeps its :url
-        ;; discriminator but loses the profile's narrowing.
-        profile-kw (when profile-kw
-                     (if (or (contains? @*schema-atom* profile-kw)
-                             (contains? *known-canonical-kws* profile-kw)
-                             (some? (resolve-malli-sch profile-kw)))
-                       profile-kw
-                       (let [degraded (when-let [code (:code attr-type)]
-                                        (lookup-schema-kw code version))]
-                         (when *unresolved-profiles*
-                           (swap! *unresolved-profiles* conj
-                                  {:profile (first (:profile attr-type))
-                                   :from *current-definition*
-                                   :degraded-to degraded}))
-                         degraded)))
+                     (or (profile-canonical-kw profile version)
+                         (let [degraded (when-let [code (:code attr-type)]
+                                          (lookup-schema-kw code version))]
+                           (when *unresolved-profiles*
+                             (swap! *unresolved-profiles* conj
+                                    {:profile profile
+                                     :from *current-definition*
+                                     :degraded-to degraded}))
+                           degraded)))
         ;; For profile-based extension slices (no value[x] in sub-elements), read the
         ;; value key off the resolved extension schema so the transformer can fold the
         ;; entry down to its bare value.
@@ -2731,13 +2852,15 @@
         :as x}]
     (let [kw (uri->kw2 url version)
           basekw (when baseDefinition
-                   (let [base-def (strip-canonical-version baseDefinition)
-                         base-url ^URL (io/as-url base-def)
-                         path (into [] (remove empty?) (str/split (.getPath base-url) #"\/"))
-                         m-name (munge-ns (str/replace (last path) "." "-"))]
-                     (or (first (filter #(= (kw->type-name %) m-name) (keys @schema-atom)))
-                         (resolve-canonical-kw baseDefinition)
-                         (uri->kw2 base-def (or fhirVersion version)))))
+                   (if *canonical-index*
+                     (or (resolve-canonical-kw baseDefinition)
+                         (unindexed-kw baseDefinition [fhirVersion version]))
+                     (let [base-def (strip-canonical-version baseDefinition)
+                           base-url ^URL (io/as-url base-def)
+                           path (into [] (remove empty?) (str/split (.getPath base-url) #"\/"))
+                           m-name (munge-ns (str/replace (last path) "." "-"))]
+                       (or (first (filter #(= (kw->type-name %) m-name) (keys @schema-atom)))
+                           (uri->kw2 base-def (or fhirVersion version))))))
           ;; Complex extensions should derive from Element (id + extension only)
           ;; instead of Extension (which carries all value[x] variants)
           basekw (if (and basekw
