@@ -231,6 +231,105 @@
   [index]
   (into #{} (comp (mapcat val) (map :kw)) index))
 
+(defn prepare-packages
+  "Assoc onto each package the :closure and :dependency-run-ids that
+   `fdm/resolve-in-package` reads (see `fdm/*current-package*`).
+
+   A package answers for its own id and for each id in its optional
+   :substitutes -- the run builds R4B, hl7.fhir.r4b.core, where every IG
+   declares hl7.fhir.r4.core. A declared dependency no package in the run
+   answers for (terminology, VSAC) adds nothing to the closure."
+  [packages]
+  (let [run-id      (into {}
+                          (mapcat (fn [{:keys [id substitutes]}]
+                                    (map (fn [declared] [declared id]) (cons id substitutes))))
+                          packages)
+        dep-run-ids (fn [pkg]
+                      (into {}
+                            (keep (fn [[dep _]] (when-let [r (run-id dep)] [dep r])))
+                            (:dependencies pkg)))
+        direct      (into {} (map (fn [pkg] [(:id pkg) (set (vals (dep-run-ids pkg)))])) packages)
+        closure     (fn [id]
+                      (loop [seen #{id} todo [id]]
+                        (if-let [x (peek todo)]
+                          (let [nxt (remove seen (direct x))]
+                            (recur (into seen nxt) (into (pop todo) nxt)))
+                          seen)))]
+    (mapv (fn [pkg]
+            (assoc pkg
+                   :closure (closure (:id pkg))
+                   :dependency-run-ids (dep-run-ids pkg)))
+          packages)))
+
+(def ^:private element-canonical "http://hl7.org/fhir/StructureDefinition/Element")
+
+(defn check-references
+  "Resolve every reference each package's plan makes, exactly as the walk will
+   (`fdm/reference-canonicals`, `fdm/resolve-in-package`), before anything is
+   generated.
+
+   `packages` are prepared (`prepare-packages`), each carrying its :plan.
+   Returns the references that do not resolve, grouped by why:
+
+     :ambiguous        several packages in the referrer's closure define it;
+                       settle each with an :overrides entry on that package
+     :outside-closure  only packages the referrer does not depend on define it
+     :bad-override     the override names no single candidate the referrer sees
+     :missing          no package in the run defines it
+
+   Each entry is {:package :canonical :kinds :from :result}. The first three stop
+   the walk (`fdm/resolve-canonical-kw` throws on them); :missing is for the
+   driver to judge -- a missing profile degrades and is reported, while a missing
+   base or type code must be one the driver seeds."
+  [packages index]
+  (let [rows (for [pkg packages
+                   :let [refs (into [[:type-code element-canonical nil]]
+                                    (for [sd (:plan pkg)
+                                          [kind canonical] (fdm/reference-canonicals sd)]
+                                      [kind canonical (:url sd)]))]
+                   [canonical occurrences] (group-by second refs)
+                   :let [r (fdm/resolve-in-package index pkg canonical)]
+                   :when (not (:kw r))]
+               {:package   (:id pkg)
+                :canonical canonical
+                :kinds     (into (sorted-set) (map first) occurrences)
+                :from      (into (sorted-set) (keep #(nth % 2)) occurrences)
+                :result    r})
+        class-of (fn [{r :result}]
+                   (cond (:ambiguous r)       :ambiguous
+                         (:outside-closure r) :outside-closure
+                         (:bad-override r)    :bad-override
+                         :else                :missing))]
+    (merge {:ambiguous [] :outside-closure [] :bad-override [] :missing []}
+           (group-by class-of (sort-by (juxt :package :canonical) rows)))))
+
+(defn check-references!
+  "`check-references`, printed, throwing ::unresolved-references when any
+   reference is ambiguous, outside its referrer's closure, or overridden to
+   nothing. Returns the report otherwise."
+  [packages index]
+  (let [report  (check-references packages index)
+        fatal   (select-keys report [:ambiguous :outside-closure :bad-override])
+        missing (:missing report)]
+    (doseq [[cls entries] fatal
+            :when (seq entries)]
+      (println (str "\n" (count entries) " " (name cls) " reference(s):"))
+      (doseq [{:keys [package canonical kinds from result]} entries]
+        (println "  " package canonical kinds)
+        (println "       candidates" (or (:ambiguous result) (:outside-closure result)
+                                         (:candidates result)))
+        (println "       referenced by" (str/join ", " from))))
+    (when (seq missing)
+      (println (str "\n" (count missing) " reference(s) to canonicals no package in this run defines:"))
+      (doseq [[[package kinds] entries] (group-by (juxt :package :kinds) missing)]
+        (println "  " package kinds (count entries) "e.g." (:canonical (first entries)))))
+    (when (some seq (vals fatal))
+      (throw (ex-info (str "unresolved canonical references: "
+                           (str/join ", " (for [[cls entries] fatal :when (seq entries)]
+                                            (str (count entries) " " (name cls)))))
+                      (assoc fatal :type ::unresolved-references))))
+    report))
+
 ;; ---------------------------------------------------------------------------
 ;; File writing
 ;; ---------------------------------------------------------------------------
