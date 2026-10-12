@@ -17,7 +17,8 @@
 ;; Patient-compartment link params: `subject`/`performer` for Observation, and
 ;; for Task the four link params plus a non-link param the capability pack also
 ;; registers. Task's `patient` and `subject` both resolve to Task.for, so the
-;; union must dedupe them.
+;; union must dedupe them. CommunicationRequest registers the R4B link params
+;; its compartment entry narrows away.
 (def ^:private registries
   {"Observation" {"subject"   {:type "reference" :columns [{:col "subject"}]}
                   "performer" {:type "reference" :columns [{:col "performer" :array? true}]}}
@@ -25,7 +26,18 @@
                   "subject"   {:type "reference" :columns [{:col "for"}]}
                   "owner"     {:type "reference" :columns [{:col "owner"}]}
                   "requester" {:type "reference" :columns [{:col "requester"}]}
-                  "status"    {:type "token" :columns [{:col "status"}]}}})
+                  "status"    {:type "token" :columns [{:col "status"}]}}
+   "CommunicationRequest"
+   {"patient"   {:type "reference" :columns [{:col "subject"}]}
+    "subject"   {:type "reference" :columns [{:col "subject"}]}
+    "requester" {:type "reference" :columns [{:col "requester"}]}
+    "sender"    {:type "reference" :columns [{:col "sender"}]}
+    "recipient" {:type "reference" :columns [{:col "recipient" :array? true}]}}
+   "Communication"
+   {"patient"   {:type "reference" :columns [{:col "subject"}]}
+    "subject"   {:type "reference" :columns [{:col "subject"}]}
+    "sender"    {:type "reference" :columns [{:col "sender"}]}
+    "recipient" {:type "reference" :columns [{:col "recipient" :array? true}]}}})
 
 (defn- obs [id patient-ref]
   {:resourceType "Observation" :id id :subject {:reference patient-ref}})
@@ -292,7 +304,7 @@
      :path-params {:tenant-id tenant}
      :query-params params}))
 
-(defn- task-ids [resp]
+(defn- entry-ids [resp]
   (set (map (comp :id :resource) (get-in resp [:body :entry]))))
 
 (deftest task-is-a-patient-compartment-member
@@ -333,19 +345,121 @@
 (deftest patient-token-task-search-returns-only-authored
   (let [store (fstore (seeded-task-store))]
     (testing "an unfiltered search"
-      (is (= #{"task-authored"} (task-ids (search-tasks store {})))))
+      (is (= #{"task-authored"} (entry-ids (search-tasks store {})))))
     (testing "the portal's Task?patient=<self> query"
       (is (= #{"task-authored"}
-             (task-ids (search-tasks store {"patient" "Patient/123"})))))
+             (entry-ids (search-tasks store {"patient" "Patient/123"})))))
     (testing "a client cannot widen the search through the owner or requester filters"
-      (is (empty? (task-ids (search-tasks store {"owner" "Patient/123"}))))
-      (is (empty? (task-ids (search-tasks store {"requester" "Practitioner/p1"})))))))
+      (is (empty? (entry-ids (search-tasks store {"owner" "Patient/123"}))))
+      (is (empty? (entry-ids (search-tasks store {"requester" "Practitioner/p1"})))))))
 
 (deftest patient-token-cannot-write-task-outside-its-compartment
   (let [store (fstore (seeded-task-store))]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the patient compartment"
           (db/create-resource store tenant :Task "t-x"
                               (task "t-x" :for "Patient/123" :requester "Practitioner/p1"))))))
+
+;; ---------------------------------------------------------------------------
+;; CommunicationRequest: narrowed from R4B like Task. Staff call-back requests
+;; name the patient as subject and recipient, so only `requester` is a link.
+;; Communication keeps R4B's links: a staff-started message thread names the
+;; patient only as subject and must stay patient-readable.
+;; ---------------------------------------------------------------------------
+
+(defn- comm [resource-type id & {:keys [subject requester sender recipient]}]
+  (cond-> {:resourceType resource-type :id id :status "active"
+           :note [{:text "staff note"}]}
+    subject   (assoc :subject {:reference subject})
+    requester (assoc :requester {:reference requester})
+    sender    (assoc :sender {:reference sender})
+    recipient (assoc :recipient [{:reference recipient}])))
+
+(defn- seeded-comm-store []
+  (let [store (mock/create-mock-store {})
+        put!  (fn [r] (db/create-resource store tenant (keyword (:resourceType r)) (:id r) r))]
+    ;; CommunicationRequest
+    (put! (comm "CommunicationRequest" "cr-filed" :subject "Patient/123" :requester "Patient/123"))
+    (put! (comm "CommunicationRequest" "cr-callback" :subject "Patient/123"
+                :requester "Practitioner/p1" :sender "Practitioner/p1"
+                :recipient "Patient/123"))
+    (put! (comm "CommunicationRequest" "cr-review" :subject "Patient/123"
+                :requester "Practitioner/p1"))
+    (put! (comm "CommunicationRequest" "cr-sender" :subject "Patient/999" :sender "Patient/123"))
+    (put! (comm "CommunicationRequest" "cr-other" :subject "Patient/999" :requester "Patient/999"))
+    ;; Communication
+    (put! (comm "Communication" "c-sent" :subject "Patient/123" :sender "Patient/123"
+                :recipient "Practitioner/p1"))
+    (put! (comm "Communication" "c-received" :sender "Practitioner/p1" :recipient "Patient/123"))
+    (put! (comm "Communication" "c-staff-thread" :subject "Patient/123"
+                :sender "Practitioner/p1" :recipient "Organization/o1"))
+    (put! (comm "Communication" "c-other" :subject "Patient/999" :recipient "Patient/999"))
+    store))
+
+(defn- search-comm [store resource-type params]
+  (handlers/search-type
+    {:fhir/store store
+     :fhir/resource-type resource-type
+     :fhir/search-registry (get registries resource-type)
+     :fhir/all-registries registries
+     :path-params {:tenant-id tenant}
+     :query-params params}))
+
+(defn- read-comm [store resource-type id]
+  (:status (handlers/read-resource
+             {:fhir/store store :fhir/resource-type resource-type
+              :path-params {:tenant-id tenant :id id}})))
+
+(deftest communication-types-stay-patient-compartment-members
+  (is (compartment/patient-compartment-member? "CommunicationRequest"))
+  (is (compartment/patient-compartment-member? "Communication"))
+  (is (= ["requester"] (compartment/compartment-link-params "Patient" "CommunicationRequest")))
+  (is (= ["subject" "sender" "recipient"]
+         (compartment/compartment-link-params "Patient" "Communication"))))
+
+(deftest communication-descriptors-cover-only-the-narrowed-links
+  (is (= [{:col "requester"}]
+         (:columns (compartment/compartment-descriptor
+                     "Patient" "CommunicationRequest" (get registries "CommunicationRequest"))))
+      "subject, sender and recipient are registered but are not links"))
+
+(deftest patient-token-reads-only-the-communication-request-it-filed
+  (let [store (fstore (seeded-comm-store))]
+    (is (= 200 (read-comm store "CommunicationRequest" "cr-filed")))
+    (testing "staff requests naming the patient as subject, recipient or sender are not"
+      (doseq [id ["cr-callback" "cr-review" "cr-sender"]]
+        (is (= 404 (read-comm store "CommunicationRequest" id)) id)))
+    (testing "another patient's request is not"
+      (is (= 404 (read-comm store "CommunicationRequest" "cr-other"))))))
+
+(deftest patient-token-communication-request-search-returns-only-filed
+  (let [store (fstore (seeded-comm-store))
+        ids   #(entry-ids (search-comm store "CommunicationRequest" %))]
+    (is (= #{"cr-filed"} (ids {})))
+    (is (= #{"cr-filed"} (ids {"subject" "Patient/123"})))
+    (is (= #{"cr-filed"} (ids {"patient" "Patient/123"})))
+    (testing "a client cannot widen the search through the narrowed-away params"
+      (is (empty? (ids {"recipient" "Patient/123"})))
+      (is (empty? (ids {"sender" "Patient/123"})))
+      (is (empty? (ids {"requester" "Practitioner/p1"}))))))
+
+(deftest patient-token-reads-its-communications-including-staff-started-threads
+  (let [store (fstore (seeded-comm-store))]
+    (doseq [id ["c-sent" "c-received" "c-staff-thread"]]
+      (is (= 200 (read-comm store "Communication" id)) id))
+    (testing "another patient's Communication is not"
+      (is (= 404 (read-comm store "Communication" "c-other"))))
+    (is (= #{"c-sent" "c-received" "c-staff-thread"}
+           (entry-ids (search-comm store "Communication" {}))))
+    (testing "the portal's thread list query finds the staff-started thread"
+      (is (= #{"c-sent" "c-staff-thread"}
+             (entry-ids (search-comm store "Communication" {"subject" "Patient/123"})))))))
+
+(deftest patient-token-cannot-file-a-communication-request-for-staff
+  (let [store (fstore (seeded-comm-store))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the patient compartment"
+          (db/create-resource store tenant :CommunicationRequest "cr-x"
+                              (comm "CommunicationRequest" "cr-x" :subject "Patient/123"
+                                    :requester "Practitioner/p1"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; wrap-patient-compartment middleware
