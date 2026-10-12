@@ -411,7 +411,11 @@
               :by :override}
              (resolve (assoc-in uscore [:overrides hidden] "5.3.0-ballot-tc1") hidden)))
       (is (= "9.9.9"
-             (:bad-override (resolve (assoc-in uscore [:overrides hidden] "9.9.9") hidden)))))
+             (:bad-override (resolve (assoc-in uscore [:overrides hidden] "9.9.9") hidden))))
+      (is (= {:kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0 :by :pin}
+             (resolve (assoc-in uscore [:overrides hidden] "5.3.0-ballot-tc1")
+                      (str hidden "|4.3.0")))
+          "a pin outranks the override; the override only settles what the closure cannot"))
 
     (testing "a pin naming a declared dependency resolves to the run's substitute"
       (is (= {:kw :org.hl7.fhir.StructureDefinition.questionnaire-hidden/v4-3-0 :by :pin-dependency}

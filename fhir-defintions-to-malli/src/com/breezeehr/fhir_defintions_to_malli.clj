@@ -397,14 +397,14 @@
   "Resolve a canonical referenced from `package` against `index`.
 
    In order:
-     1. the package's override for the canonical -- a decision made by hand for
-        a reference the rules below leave ambiguous;
-     2. a candidate publishing exactly the pinned version;
-     3. the candidate from the package that pin names, found through the
+     1. a candidate publishing exactly the pinned version;
+     2. the candidate from the package that pin names, found through the
         referencing package's declared dependencies, which covers a pin the run
         cannot satisfy verbatim because it substituted a different version
         (xver pins hl7.fhir.uv.extensions.r4 at 5.2.0; the run builds
         5.3.0-ballot-tc1);
+     3. the package's override for the canonical -- a decision made by hand for
+        a reference the closure leaves ambiguous, so it never outranks a pin;
      4. the only candidate in the package's dependency closure.
 
    Returns {:kw k :by <rule>} on success, otherwise a map saying why not:
@@ -426,26 +426,21 @@
                    entries)
         override (get (:overrides package) base)
         summary  #(mapv (fn [e] (select-keys e [:pkg-id :version])) %)]
-    (cond
-      (empty? entries)
+    (if (empty? entries)
       {:missing true}
-
-      override
-      (if-let [k (sole-kw (filter #(= override (:version %)) visible))]
-        {:kw k :by :override}
-        {:bad-override override :candidates (summary visible)})
-
-      :else
       (let [pinned  (when pin (sole-kw (filter #(= pin (:version %)) entries)))
             pin-pkg (pin-target-package package pin)
             via-pin (when pin-pkg (sole-kw (filter #(= pin-pkg (:pkg-id %)) entries)))
             in-cl   (sole-kw visible)]
         (cond
-          pinned          {:kw pinned :by :pin}
-          via-pin         {:kw via-pin :by :pin-dependency}
-          in-cl           {:kw in-cl :by :closure}
-          (seq visible)   {:ambiguous (summary visible)}
-          :else           {:outside-closure (summary entries)})))))
+          pinned        {:kw pinned :by :pin}
+          via-pin       {:kw via-pin :by :pin-dependency}
+          override      (if-let [k (sole-kw (filter #(= override (:version %)) visible))]
+                          {:kw k :by :override}
+                          {:bad-override override :candidates (summary visible)})
+          in-cl         {:kw in-cl :by :closure}
+          (seq visible) {:ambiguous (summary visible)}
+          :else         {:outside-closure (summary entries)})))))
 
 (defn resolve-canonical-kw
   "Resolve a canonical URL to the schema keyword of the StructureDefinition that
