@@ -129,18 +129,17 @@
         run (fn [f]
               (let [refs (atom #{})]
                 (binding [fdm/*schema-atom* (atom atom-entries)
+                          fdm/*referencing-definition* {:version declared-version}
                           fdm/*references-atom* refs
                           fdm/*recursive-references* #{}
                           fdm/*base-refs* (atom {})]
                   {:result (f) :references @refs})))
         outer (run #(update-existing {:sch nil :form []} :f attr-type main-attr {}
-                                     sub-elements ["TP" "f"] declared-version
-                                     sub-sch field-info))
+                                     sub-elements ["TP" "f"] sub-sch field-info))
         inner (run #(fdm/attr->value-schema-patch
                      {:sch (fdm/unwrap-sequential sub-sch) :form []
                       :field-info field-info :new-field? false}
-                     "TP.f" attr-type main-attr sub-elements ["TP" "f"]
-                     declared-version))]
+                     "TP.f" attr-type main-attr sub-elements ["TP" "f"]))]
     {:patch-form (first (:form (:result outer)))
      :references (:references outer)
      :sub-acc (:result inner)
@@ -617,8 +616,9 @@
         ;; constrained children -- exactly the population this narrows.
         run   (fn [attr-type]
                 (let [refs (atom #{})]
-                  (binding [fdm/*references-atom* refs]
-                    [(:form (fdm/prim-or-ref {} attr-type "4.3.0")) @refs])))]
+                  (binding [fdm/*references-atom* refs
+                            fdm/*referencing-definition* {:version "4.3.0"}]
+                    [(:form (fdm/prim-or-ref {} attr-type)) @refs])))]
     (binding [fdm/*canonical-index*   index
               fdm/*current-package*   pkg
               fdm/*known-canonical-kws* #{narrowed-kw}
@@ -714,12 +714,13 @@
     (let [main-attr {:id "TP.classCode" :min 0 :max "1"
                      :representation ["xmlAttr"] :fixedCode "DOCSECT"}
           acc (binding [fdm/*schema-atom* (atom {})
+                        fdm/*referencing-definition* {:version "1.0"}
                         fdm/*references-atom* (atom #{})
                         fdm/*recursive-references* #{}
                         fdm/*base-refs* (atom {})]
                 (fdm/apply-element-patch
                  {:sch (m/schema [:map {:closed true}] fp/fhir-registry-options) :shape {} :form []}
-                 "TP.classCode" :classCode {:code "code"} main-attr {} ["TP" "classCode"] "1.0"))]
+                 "TP.classCode" :classCode {:code "code"} main-attr {} ["TP" "classCode"]))]
       (is (tree-contains? (:form acc) [:enum {} "DOCSECT"])
           "the fixed value still pins the content")
       (is (tree-contains? (:form acc) {:xml/attr true
@@ -751,12 +752,13 @@
                 :id "TP.f"
                 :type (mapv (fn [u] {:code u}) type-urls)}]
         acc (binding [fdm/*schema-atom* (atom {})
+                      fdm/*referencing-definition* {:version "1.0"}
                       fdm/*references-atom* refs
                       fdm/*recursive-references* #{}
                       fdm/*base-refs* (atom {})]
               (fdm/element-definition->attribute
                {:sch (m/schema [:map {:closed true}] opts) :shape {} :form []}
-               ["TP"] "1.0" items))]
+               ["TP"] items))]
     {:form (:form acc) :references @refs :shape (:shape acc)}))
 
 (defn- union-value-form
@@ -843,12 +845,13 @@
           items [{:path ["TP" "value[x]"] :min 0 :max "1" :id "TP.value[x]"
                   :type [{:code "string"} {:code "boolean"}]}]
           acc (binding [fdm/*schema-atom* (atom {})
+                        fdm/*referencing-definition* {:version "1.0"}
                         fdm/*references-atom* refs
                         fdm/*recursive-references* #{}
                         fdm/*base-refs* (atom {})]
                 (fdm/element-definition->attribute
                  {:sch (m/schema [:map {:closed true}] opts) :shape {} :form []}
-                 ["TP"] "1.0" items))
+                 ["TP"] items))
           keys-assoced (into [] (comp (filter #(and (seq? %) (= 'mu/assoc (first %))))
                                       (map second))
                              (:form acc))]
@@ -859,12 +862,13 @@
   "The form emitted for a code element `TP.f` of cardinality `max`."
   [max]
   (binding [fdm/*schema-atom* (atom {})
+            fdm/*referencing-definition* {:version "1.0"}
             fdm/*references-atom* (atom #{})
             fdm/*recursive-references* #{}
             fdm/*base-refs* (atom {})]
     (:form (fdm/element-definition->attribute
             {:sch (m/schema [:map {:closed true}] fp/fhir-registry-options) :shape {} :form []}
-            ["TP"] "1.0"
+            ["TP"]
             [{:path ["TP" "f"] :min 0 :max max :id "TP.f" :type [{:code "code"}]}]))))
 
 (defn- assoced-form [form k]
