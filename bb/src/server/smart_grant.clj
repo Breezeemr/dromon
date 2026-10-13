@@ -65,11 +65,16 @@
    and the waiting room updates Encounter.reasonCode. Without it the GET
    long-poll passes on `patient/*.read` while every publish 403s.
 
-   This list must agree with the scopes a consuming app requests at its own
-   authorize redirect: Hydra refuses a scope the client is not registered for,
-   so a scope added on one side alone breaks the authorize redirect rather
-   than degrading."
-  "openid offline_access launch/patient launch/patient.* patient/*.read patient/Patient.c patient/Encounter.cu")
+   `patient/Communication.cru` is for patient messaging. Its thread routes are
+   host (flotilla) routes outside wrap-smart-scope, so they call
+   `scope/permitted?` themselves: GETs score Communication `:read`, which
+   `patient/*.read` already covers, and POSTs score `:create` or `:update`, so
+   they need `c`/`u`.
+
+   This list must be a SUPERSET of the scopes a consuming app requests at its
+   own authorize redirect: Hydra refuses a requested scope the client is not
+   registered for, while an extra registered scope is harmless."
+  "openid offline_access launch/patient launch/patient.* patient/*.read patient/Patient.c patient/Encounter.cu patient/Communication.cru")
 
 ;; ── helpers ────────────────────────────────────────────────────────────────
 
@@ -207,4 +212,4 @@
             (println (str "    curl -u <client_id>:<client_secret> " hydra-public
                           "/oauth2/token -d grant_type=client_credentials"
                           " -d 'scope=launch/patient." (first patients)
-                          " patient/*.read patient/Patient.c patient/Encounter.cu'")))))))
+                          " patient/*.read patient/Patient.c patient/Encounter.cu patient/Communication.cru'")))))))
