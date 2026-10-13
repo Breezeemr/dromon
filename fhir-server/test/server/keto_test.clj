@@ -272,3 +272,54 @@
   (testing "a subject with no id is never allowed, whatever Keto would say"
     (with-redefs [hc/get (fn [_ _] {:status 200 :body {:allowed true}})]
       (is (not (keto/system-read-allowed? "http://mock-keto" "r1" nil false))))))
+
+(defn- recording-keto
+  "A hc/get stand-in that records [object relation] per call and allows when
+   `allow?` answers true for that pair."
+  [calls allow?]
+  (fn [url opts]
+    (let [qp (:query-params opts)]
+      (swap! calls conj {:url url :object (get qp "object") :relation (get qp "relation")})
+      {:status 200 :body {:allowed (boolean (allow? (get qp "object") (get qp "relation")))}})))
+
+(deftest relation-allowed-asks-each-object-until-one-allows
+  (let [calls (atom [])]
+    (with-redefs [hc/get (recording-keto calls (fn [object _] (= "obj2" object)))]
+      (is (true? (keto/relation-allowed? "http://mock-keto" ["obj1" "obj2"] "read" "user123")))
+      (is (= ["obj1" "obj2"] (mapv :object @calls))))))
+
+(deftest relation-allowed-stops-at-the-first-allowed-object
+  (let [calls (atom [])]
+    (with-redefs [hc/get (recording-keto calls (fn [_ _] true))]
+      (is (true? (keto/relation-allowed? "http://mock-keto" ["obj1" "obj2"] "read" "user123")))
+      (is (= 1 (count @calls))))))
+
+(deftest relation-allowed-asks-the-relation-it-was-given
+  (with-redefs [hc/get (recording-keto (atom []) (fn [_ relation] (= "message" relation)))]
+    (is (true? (keto/relation-allowed? "http://mock-keto" ["r1/Patient/p1"] "message" "user123")))
+    (is (false? (keto/relation-allowed? "http://mock-keto" ["r1/Patient/p1"] "read" "user123")))))
+
+(deftest relation-allowed-never-allows-degenerate-input
+  (let [calls (atom [])]
+    (with-redefs [hc/get (recording-keto calls (fn [_ _] true))]
+      (is (false? (keto/relation-allowed? "http://mock-keto" ["obj1"] "read" nil)))
+      (is (false? (keto/relation-allowed? "http://mock-keto" ["obj1"] "" "user123")))
+      (is (false? (keto/relation-allowed? "http://mock-keto" ["obj1"] nil "user123")))
+      (is (false? (keto/relation-allowed? "http://mock-keto" [] "read" "user123")))
+      (is (false? (keto/relation-allowed? "http://mock-keto" nil "read" "user123")))
+      (is (empty? @calls) "Keto is not asked for input that can never be allowed"))))
+
+(deftest relation-allowed-with-request-objects-matches-the-middleware
+  (let [calls (atom [])]
+    (with-redefs [hc/get (recording-keto calls (fn [_ _] false))]
+      (is (false? (keto/relation-allowed?
+                   "http://mock-keto"
+                   (keto/request-objects "r1" "Communication" "c1" false)
+                   "write" "user123")))
+      (is (= ["r1/Communication" "r1/Communication/c1"] (mapv :object @calls))))))
+
+(deftest relation-allowed-falls-back-to-the-default-url
+  (let [calls (atom [])]
+    (with-redefs [hc/get (recording-keto calls (fn [_ _] true))]
+      (keto/relation-allowed? nil ["obj1"] "read" "user123")
+      (is (= "http://localhost:4466/relation-tuples/check" (:url (first @calls)))))))
