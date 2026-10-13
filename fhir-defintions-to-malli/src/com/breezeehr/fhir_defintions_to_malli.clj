@@ -2596,7 +2596,10 @@
         props (cond-> (merge (select-keys main-attr [:isSummary :short :definition :comment :binding])
                              (representation-props main-attr))
                 choice-type? (assoc :optional true)
-                (and (not choice-type?) min-val (or field-info (zero? min-val))) (assoc :optional (zero? min-val)))]
+                ;; The shape records only the definition's own top-level fields,
+                ;; so below that level an existing child is known by sub-sch.
+                ;; Without it a nested min 1 (AssignedEntity.addr 1..*) was dropped.
+                (and (not choice-type?) min-val (or field-info sub-sch (zero? min-val))) (assoc :optional (zero? min-val)))]
     (if slice-name
       (let [ctx (prepare-slice-context old-acc k attr-type main-attr sub-elements main-path base-sch min-val props slice-name)]
         (if (:is-extension? ctx)
