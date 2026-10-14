@@ -15,6 +15,9 @@
    - {:object \"<realm>/Patient/<id>\" :relation \"request-change\"} --
      instance-level authorization for the
      Patient/$request-demographic-change operation.
+   - {:object \"<realm>/Patient/<id>\" :relation \"message\"} --
+     instance-level authorization for patient messaging. Minted on the
+     patient instance only, never on a member type.
    - {:object \"<realm>/<MemberType>\" :relation \"read\"|...} -- type-level
      access to the Patient-compartment member types. Safe in combination with
      a patient/ scoped token because server.compartment confines every query
@@ -52,10 +55,19 @@
   "Relation recording that a subject may launch with a patient context."
   "launch")
 
-;; "request-change" authorizes Patient/$request-demographic-change. It is only
-;; consulted on the instance tuple Patient/<id>; the type-level tuples it also
-;; mints on member types are inert.
-(def ^:private default-relations ["read" "request-change"])
+;; "request-change" authorizes Patient/$request-demographic-change and
+;; "message" the host's patient messaging (Patient/$start-message-thread and
+;; the thread routes). Both are only consulted on the instance tuple
+;; Patient/<id>. "request-change" is also minted on the member types, where
+;; it is inert; "message" is not (see `instance-only-relations`).
+(def ^:private default-relations ["read" "request-change" "message"])
+
+(def ^:private instance-only-relations
+  "Relations minted on the patient instance only, never on member types.
+   Each names an act on one chart, so a type-level copy would be inert, and
+   it would be rows that a host's revoke (which sweeps the instance object)
+   does not remove."
+  #{"message"})
 
 ;; ---------------------------------------------------------------------------
 ;; Realm scoping
@@ -160,7 +172,9 @@
               [(str "Patient/" pid) launch-relation]))
       (into (for [pid patient-ids, rel relations]
               [(str "Patient/" pid) rel]))
-      (into (for [t (patient-member-types), rel relations]
+      (into (for [t (patient-member-types)
+                  rel relations
+                  :when (not (instance-only-relations rel))]
               [t rel]))))
 
 (defn grant-tuples
@@ -279,8 +293,8 @@
         ;;
         ;; Every instance tuple is scanned, not just the launch ones, because
         ;; a realm whose launch tuple has already been revoked can still hold
-        ;; read and request-change tuples. Missing such a realm would leave
-        ;; exactly the access this call exists to remove.
+        ;; read, request-change and message tuples. Missing such a realm would
+        ;; leave exactly the access this call exists to remove.
         realms (into #{}
                      (comp (map :object)
                            (keep #(first (launch-object->patient %))))

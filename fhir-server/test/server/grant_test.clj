@@ -91,6 +91,42 @@
                        :relation "read" :subject_id "client-1"}) tuples))
       (is (not-any? #(= (:relation %) "request-change") tuples)))))
 
+(deftest default-relations-authorize-message
+  (testing "a minted grant carries message on the patient instance"
+    (let [tuples (captured-tuples #(grant/grant-patient-set! nil "client-1" ["pa"]))]
+      (is (some #(= % {:namespace "fhir" :object "Patient/pa"
+                       :relation "message" :subject_id "client-1"}) tuples))
+      (testing "and on no member type"
+        (is (= #{"Patient/pa"}
+               (into #{} (comp (filter #(= "message" (:relation %))) (map :object))
+                     tuples))))
+      (testing "while read and request-change still reach the member types"
+        (is (some #(= % {:namespace "fhir" :object "Observation"
+                         :relation "read" :subject_id "client-1"}) tuples))
+        (is (some #(= % {:namespace "fhir" :object "Observation"
+                         :relation "request-change" :subject_id "client-1"}) tuples)))))
+  (testing "explicit relations without message mint no message tuple"
+    (let [tuples (captured-tuples
+                  #(grant/grant-patient-set! nil "client-1" ["pa"] :relations ["read"]))]
+      (is (not-any? #(= (:relation %) "message") tuples))))
+  (testing "an explicit message relation is still confined to the instance"
+    (let [tuples (captured-tuples
+                  #(grant/grant-patient-set! nil "client-1" ["pa"]
+                                             :relations ["read" "message"]))]
+      (is (= #{"Patient/pa"}
+             (into #{} (comp (filter #(= "message" (:relation %))) (map :object))
+                   tuples)))
+      (is (some #(= % {:namespace "fhir" :object "Condition"
+                       :relation "read" :subject_id "client-1"}) tuples)))))
+
+(deftest message-is-instance-only-in-every-shape
+  (testing "realm-scoped and dual-written legacy objects, instance only"
+    (let [tuples (grant/grant-tuples "r1" "client-1" ["pa" "pb"]
+                                     ["read" "message"] true)]
+      (is (= #{"r1/Patient/pa" "Patient/pa" "r1/Patient/pb" "Patient/pb"}
+             (into #{} (comp (filter #(= "message" (:relation %))) (map :object))
+                   tuples))))))
+
 (defn- hook-payload [& {:keys [client-id scopes patient]}]
   (cond-> {:request (cond-> {:client_id client-id
                              :granted_scopes (or scopes [])}
