@@ -939,3 +939,33 @@
       (is (= :ref (first (second (second companion)))))))
   (testing "a single-valued primitive's companion stays a bare Element ref"
     (is (= :ref (first (assoced-form (primitive-scenario "1") :_f))))))
+
+(defn- nested-min-scenario
+  "The form emitted for a profile element `TP.f` of minimum `min` against a
+  schema whose `:f` already exists but which the shape does not list, as every
+  element below a definition's top level is."
+  [min]
+  (binding [fdm/*schema-atom* (atom {})
+            fdm/*referencing-definition* {:version "1.0"}
+            fdm/*references-atom* (atom #{})
+            fdm/*recursive-references* #{}
+            fdm/*base-refs* (atom {})]
+    (:form (fdm/element-definition->attribute
+            {:sch (m/schema [:map {:closed true} [:f {:optional true} :string]] fp/fhir-registry-options)
+             :shape {}
+             :form []}
+            ["TP"]
+            [{:path ["TP" "f"] :min min :id "TP.f"}]))))
+
+(deftest nested-min-makes-an-existing-child-required-test
+  (testing "min 1 on a child the shape does not list (AssignedEntity.addr 1..* under a
+            profile's performer) makes the key required"
+    (let [form (nested-min-scenario 1)
+          patch (binding [*ns* (the-ns 'com.breezeehr.fhir-defintions-to-malli)]
+                  (eval (list 'fn '[sch] (list* '-> 'sch form))))
+          sch (patch (m/schema [:map {:closed true} [:f {:optional true} :string]] fp/fhir-registry-options))]
+      (is (tree-contains? form {:optional false}))
+      (is (not (m/validate sch {})) "a map without :f fails")
+      (is (m/validate sch {:f "x"}))))
+  (testing "min 0 leaves it optional"
+    (is (not (tree-contains? (nested-min-scenario 0) {:optional false})))))
