@@ -126,6 +126,27 @@
                       (request-objects realm nil nil legacy-realm-blind?)
                       "read" subject-id)))))
 
+(defn relation-allowed?
+  "Whether `subject-id` holds `relation` on any of `objects` in the `fhir`
+   namespace, asked exactly the way wrap-keto-authorization asks.
+
+   Public entry point for a host's own routes, which sit outside
+   wrap-keto-authorization. `objects` is usually (request-objects realm type id
+   legacy?); a host may pass a narrower list, such as one realm-scoped instance
+   object. A nil subject, a blank relation or an empty object list is never
+   allowed, and Keto is not asked. `keto-url` falls back to the default when
+   nil."
+  [keto-url objects relation subject-id]
+  (boolean
+   (and subject-id
+        (not (str/blank? (str relation)))
+        (seq objects)
+        (ftrace/trace!
+         {:id   :authz/keto.check
+          :data {:subject-id subject-id :namespace "fhir" :relation relation
+                 :object (peek (vec objects)) :objects (vec objects)}}
+         (authorized? (or keto-url default-keto-url) "fhir" (vec objects) relation subject-id)))))
+
 (defn unauthenticated-response
   "The answer to a request that carries no subject at all.
 
