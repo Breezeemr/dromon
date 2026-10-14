@@ -543,6 +543,51 @@
         (is (dispatches-to-an-arm? multi {:assignedEntity {:id "x"}}))
         (is (dispatches-to-an-arm? multi {:relatedEntity {:id "x"}}))))))
 
+(deftest wildcard-exists-dispatch-test
+  (let [extract (ns-resolve 'com.breezeehr.fhir-defintions-to-malli
+                            'extract-dispatch-value)
+        discs [{:type "exists" :path "*"}]
+        slice (fn [slice-name & children]
+                (let [slice-path ["Section" (str "entry:" slice-name)]
+                      subs (into [{:path slice-path :sliceName slice-name}]
+                                 (map (fn [c] {:path (conj slice-path c) :min 1}))
+                                 children)]
+                  (merge (extract discs subs slice-path slice-name)
+                         {:slice-name slice-name
+                          :sub-elements subs
+                          :slice-path slice-path
+                          :form [(list 'mu/assoc (keyword slice-name) :string)]})))
+        entry-sch [:map
+                   [:typeCode {:optional true} :string]
+                   [:act {:optional true} [:map]]
+                   [:observation {:optional true} [:map]]]
+        compile (fn [slices]
+                  (compiled-multi
+                   {:entry {:discriminators discs
+                            :rules "open" :field-is-sequential? true
+                            :base-form nil
+                            :base-sch (m/schema entry-sch fp/fhir-registry-options)
+                            :slices slices}}
+                   :entry
+                   (m/schema [:map [:entry [:sequential entry-sch]]] fp/fhir-registry-options)))]
+    (testing "C-CDA R2.1 ProblemSection Section.entry: the slice is the child present"
+      (let [multi (compile [(slice "act" "act") (slice "observation" "observation")])]
+        (is (some? multi) "a :multi is emitted for exists on *")
+        (is (= [[true false] [false true] :malli.core/default] (multi-arm-keys multi))
+            "arm keys are [act? observation?]")
+        (is (= [true false] ((multi-dispatch multi) {:typeCode "DRIV" :act {}}))
+            "an entry holding an act dispatches to the act slice")
+        (is (= [false true] ((multi-dispatch multi) {:observation {}}))
+            "an entry holding an observation dispatches to the observation slice")
+        (is (not (dispatches-to-an-arm? multi {:typeCode "DRIV"}))
+            "an entry holding neither falls to the open default")))
+    (testing "a child every slice requires distinguishes none and is left out"
+      (let [multi (compile [(slice "act" "typeCode" "act")
+                            (slice "observation" "typeCode" "observation")])]
+        (is (= [[true false] [false true] :malli.core/default] (multi-arm-keys multi)))
+        (is (dispatches-to-an-arm? multi {:act {}})
+            "an act entry missing the shared typeCode still reaches the act arm")))))
+
 (deftest profile-dispatch-requires-a-driver-hook-test
   (testing "unbound hook declines: no :multi rather than one that cannot match"
     ;; FHIR defines profile discrimination as validating against each candidate

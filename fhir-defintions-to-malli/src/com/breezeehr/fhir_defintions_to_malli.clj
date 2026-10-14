@@ -1515,11 +1515,60 @@
                         (apply distinct? ks))))
       ks)))
 
+(defn- wildcard-exists? [{:keys [type path]}]
+  (and (= "exists" type) (= "*" path)))
+
+(defn- expand-wildcard-exists
+  "Replace an `exists` discriminator on path `*` with one `exists` per direct
+  child that some slice requires, then re-derive every slice's arm key.
+
+  `*` is not FHIRPath. C-CDA R2.1 uses it (ProblemSection,
+  AdvanceDirectivesSection Section.entry) for \"the slice is the entry whose
+  act / observation / organizer is present\", which FHIR cannot state as one
+  discriminator; HL7 later rewrote both as per-child discriminators. Read
+  literally, every slice keys it the same and the group loses its :multi.
+
+  A child every slice requires distinguishes none of them and is left out, so
+  an instance missing it still reaches its arm and fails there. The expansion
+  needs every slice, so it runs at flush rather than when the slicing is
+  first seen."
+  [{:keys [discriminators slices] :as group}]
+  (if-not (some wildcard-exists? discriminators)
+    group
+    (let [required (fn [{:keys [sub-elements slice-path]}]
+                     (into []
+                           (comp (filter #(= (inc (count slice-path)) (count (:path %))))
+                                 (map #(clean-path-segment (peek (:path %))))
+                                 (filter #(true? (derive-exists-arm-key sub-elements slice-path %)))
+                                 (distinct))
+                           sub-elements))
+          per-slice (mapv required slices)
+          children (into []
+                         (comp cat
+                               (distinct)
+                               (remove (fn [c] (every? #(some #{c} %) per-slice))))
+                         per-slice)
+          expanded (normalize-discriminators
+                    (into []
+                          (mapcat #(if (wildcard-exists? %)
+                                     (map (fn [c] {:type "exists" :path c}) children)
+                                     [%]))
+                          discriminators))]
+      (assoc group
+             :discriminators expanded
+             :slices (mapv (fn [{:keys [sub-elements slice-path slice-name] :as slice}]
+                             (merge slice
+                                    (select-keys (extract-dispatch-value expanded sub-elements slice-path slice-name)
+                                                 [:dispatch-value :this-path :exists-underivable? :profile-candidates])))
+                           slices)))))
+
 (defn- flush-pending-slicing
   [acc]
   (if-let [pending (:pending-slicing acc)]
     (reduce-kv
-     (fn [acc base-k {:keys [discriminators rules base-form base-sch field-is-sequential? slices]}]
+     (fn [acc base-k group]
+      (let [{:keys [discriminators rules base-form base-sch field-is-sequential? slices]}
+            (expand-wildcard-exists group)]
        (if (empty? slices)
          acc
          ;; The dispatch fn and the arm keys are built from one shared list of
@@ -1646,7 +1695,7 @@
                             [:multi {:dispatch ~dispatch-form}
                              ~@all-entries]]
                update-form `(~'mu/update ~base-k (~'fn [~'sch] ~multi-form))]
-           (-> acc (update :form conj update-form)))))))
+           (-> acc (update :form conj update-form))))))))
      (dissoc acc :pending-slicing)
      pending)
     acc))
@@ -2430,6 +2479,10 @@
                     :this-path this-path
                     :exists-underivable? exists-underivable?
                     :profile-candidates profile-candidates
+                    ;; Kept so flush can re-derive the arm key once every
+                    ;; slice is known (expand-wildcard-exists).
+                    :sub-elements sub-elements
+                    :slice-path main-path
                     :sch new-sub-sch
                     :form new-sub-form}))
       ;; No pending-slicing: if the base field is already a multi (or parent shape
