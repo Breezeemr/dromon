@@ -375,6 +375,28 @@
         (is (= ["search-type"]
                (mapv #(get-in % ["resource" "language"]) (get (json-body resp) "entry"))))))))
 
+(deftest jwt-issuer-and-audiences-reach-the-jwt-middleware
+  (let [store  (mock/create-mock-store {})
+        _      (db/create-resource store tenant :Patient "p-1"
+                                   {:resourceType "Patient" :id "p-1"})
+        issuer "https://oauth.example/"
+        app    (sc/fhir-app store test-schemas
+                            (assoc app-opts
+                                   :jwt-issuer issuer
+                                   :jwt-audiences ["https://fhir.example"]))
+        token  (fn [claims]
+                 (str "Bearer " (jwt/sign (merge {:sub "user-1"} claims) (.getPrivate keypair)
+                                          {:alg :rs256 :header {:kid "kid-1"}})))
+        read   (fn [claims]
+                 (:status (app (GET (str "/" tenant "/fhir/Patient/p-1")
+                                    :headers {"authorization" (token claims)}))))]
+    (with-auth
+      (is (= 200 (read {:iss issuer :aud ["https://fhir.example"]})))
+      (is (= 401 (read {:iss "https://other.example/" :aud ["https://fhir.example"]}))
+          "a token from another issuer attaches no subject, so Keto answers 401")
+      (is (= 401 (read {:iss issuer :aud ["https://rcm.example"]})))
+      (is (= 401 (read {:iss issuer}))))))
+
 (def ^:private marker-middleware
   "Short-circuits on X-Marker so its position in the chain is observable."
   {:name ::marker
@@ -565,8 +587,12 @@
                 :cors-allowed-origins "https://a.example, https://b.example"
                 :terminology :term
                 :lifecycle `presenting-lifecycle
-                :bulk-job-store :jobs})]
+                :bulk-job-store :jobs
+                :jwt-issuer "https://oauth.example/"
+                :jwt-audiences ["https://flotilla.example/fhir"]})]
     (is (= jwks-url (:jwks-url opts)))
+    (is (= "https://oauth.example/" (:jwt-issuer opts)))
+    (is (= ["https://flotilla.example/fhir"] (:jwt-audiences opts)))
     (is (= keto-url (:keto-url opts)))
     (is (false? (:enforce-smart-scopes? opts)))
     (is (= #{"https://a.example" "https://b.example"} (:cors-origins opts))

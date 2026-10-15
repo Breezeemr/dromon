@@ -103,3 +103,109 @@
           token (jwt/sign {:sub "token-user"} "test-secret" {:alg :hs256})]
       (wrapped {:headers {"authorization" (str "Token " token)}})
       (is (= {:sub "token-user"} @seen)))))
+
+;; ---------------------------------------------------------------------------
+;; Issuer and audience checks
+;; ---------------------------------------------------------------------------
+
+(def ^:private hydra-issuer "https://oauth.example/")
+
+(defn- hydra-token
+  "A token correctly signed by the mock JWKS key, carrying `claims`."
+  [claims]
+  (jwt/sign (merge {:sub "user123"} claims) mock-private-key
+            {:alg :rs256 :header {:kid "mock-key-1"}}))
+
+(defn- authenticate
+  "Run `claims` through wrap-jwt-auth with `opts` (merged over a JWKS URL) and
+   return the :identity the inner handler saw, or ::rejected when it saw none."
+  [opts claims]
+  (with-redefs [auth/fetch-jwks (fn [_] {"mock-key-1" mock-public-key})]
+    (let [seen    (atom ::unset)
+          wrapped (auth/wrap-jwt-auth (fn [req] (reset! seen (:identity req)) {:status 200})
+                                      (merge {:jwks-url "http://mock-hydra"} opts))]
+      (wrapped {:headers {"authorization" (str "Bearer " (hydra-token claims))}})
+      (or @seen ::rejected))))
+
+(deftest claims-rejection-test
+  (testing "no options checks nothing"
+    (is (nil? (auth/claims-rejection {} {})))
+    (is (nil? (auth/claims-rejection {:iss "anyone"} {:audiences []}))
+        "an empty audience list is the same as none"))
+  (testing "issuer must match verbatim, trailing slash included"
+    (is (nil? (auth/claims-rejection {:iss hydra-issuer} {:issuer hydra-issuer})))
+    (is (= :iss (auth/claims-rejection {:iss "https://oauth.example"} {:issuer hydra-issuer})))
+    (is (= :iss (auth/claims-rejection {} {:issuer hydra-issuer}))))
+  (testing "aud may be a string or an array and must intersect the accepted list"
+    (is (nil? (auth/claims-rejection {:aud "flotilla"} {:audiences ["flotilla"]})))
+    (is (nil? (auth/claims-rejection {:aud ["other" "flotilla"]} {:audiences ["mcp" "flotilla"]})))
+    (is (= :aud (auth/claims-rejection {:aud ["other"]} {:audiences ["flotilla"]})))
+    (is (= :aud (auth/claims-rejection {:aud []} {:audiences ["flotilla"]})))
+    (is (= :aud (auth/claims-rejection {} {:audiences ["flotilla"]})))))
+
+(deftest wrap-jwt-auth-issuer-check
+  (testing "a token from the configured issuer is accepted"
+    (is (= "user123" (:sub (authenticate {:issuer hydra-issuer} {:iss hydra-issuer})))))
+
+  (testing "a correctly signed token from another issuer gets no identity"
+    (is (= ::rejected (authenticate {:issuer hydra-issuer} {:iss "https://other.example/"}))))
+
+  (testing "a token with no iss claim gets no identity"
+    (is (= ::rejected (authenticate {:issuer hydra-issuer} {}))))
+
+  (testing "a rejected token is refused downstream with the 401 OperationOutcome"
+    (with-redefs [auth/fetch-jwks (fn [_] {"mock-key-1" mock-public-key})]
+      (let [wrapped  (-> (fn [_] {:status 200})
+                         auth/wrap-require-auth
+                         (auth/wrap-jwt-auth {:jwks-url "http://mock-hydra" :issuer hydra-issuer}))
+            response (wrapped {:headers {"authorization"
+                                         (str "Bearer " (hydra-token {:iss "https://other.example/"}))}})]
+        (is (= 401 (:status response)))
+        (is (= "OperationOutcome" (get-in response [:body :resourceType]))))))
+
+  (testing "without :issuer any issuer is accepted, as before"
+    (is (= "user123" (:sub (authenticate {} {:iss "https://other.example/"}))))))
+
+(deftest wrap-jwt-auth-audience-check
+  (let [opts {:issuer hydra-issuer :audiences ["https://flotilla.example/fhir"]}]
+    (testing "a token whose aud includes an accepted audience is accepted"
+      (is (= "user123" (:sub (authenticate opts {:iss hydra-issuer
+                                                 :aud ["https://flotilla.example/fhir"]})))))
+
+    (testing "a token for another audience gets no identity"
+      (is (= ::rejected (authenticate opts {:iss hydra-issuer :aud ["https://rcm.example"]}))))
+
+    (testing "a token with an empty or missing aud gets no identity"
+      (is (= ::rejected (authenticate opts {:iss hydra-issuer :aud []})))
+      (is (= ::rejected (authenticate opts {:iss hydra-issuer}))))
+
+    (testing "the issuer is still checked when the audience matches"
+      (is (= ::rejected (authenticate opts {:iss "https://other.example/"
+                                            :aud ["https://flotilla.example/fhir"]})))))
+
+  (testing "with no :audiences, a missing or foreign aud is accepted (issuer-only mode)"
+    (is (= "user123" (:sub (authenticate {:issuer hydra-issuer} {:iss hydra-issuer}))))
+    (is (= "user123" (:sub (authenticate {:issuer hydra-issuer} {:iss hydra-issuer :aud []}))))
+    (is (= "user123" (:sub (authenticate {:issuer hydra-issuer :audiences []}
+                                         {:iss hydra-issuer :aud ["anything"]}))))))
+
+(deftest wrap-jwt-auth-claim-checks-leave-other-paths-alone
+  (testing "an injected identity passes through untouched under both checks (BFF seam)"
+    (with-redefs [auth/fetch-jwks (fn [_] (throw (Exception. "the backend must not run")))]
+      (let [seen    (atom nil)
+            wrapped (auth/wrap-jwt-auth (fn [req] (reset! seen (:identity req)) {:status 200})
+                                        {:jwks-url  "http://mock-hydra"
+                                         :issuer    hydra-issuer
+                                         :audiences ["https://flotilla.example/fhir"]})]
+        (is (= 200 (:status (wrapped {:headers {} :identity {:sub "kratos-id-1"}}))))
+        (is (= {:sub "kratos-id-1"} @seen)))))
+
+  (testing "the HS256 dev path ignores :issuer and :audiences"
+    (let [seen    (atom nil)
+          wrapped (auth/wrap-jwt-auth (fn [req] (reset! seen (:identity req)) {:status 200})
+                                      {:secret    "test-secret"
+                                       :issuer    hydra-issuer
+                                       :audiences ["https://flotilla.example/fhir"]})
+          token   (jwt/sign {:sub "token-user"} "test-secret" {:alg :hs256})]
+      (wrapped {:headers {"authorization" (str "Token " token)}})
+      (is (= {:sub "token-user"} @seen)))))

@@ -204,9 +204,9 @@
 
    Accepts `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle`,
-   `:tx-metadata`, `:temporal-canonicals` and `:legacy-realm-blind-fallback?`;
-   unknown keys are ignored. `:lifecycle` is carried through as given;
-   [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
+   `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
+   `:jwt-issuer` and `:jwt-audiences`; unknown keys are ignored. `:lifecycle`
+   is carried through as given; [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
    producer, `(fn [request])` returning a stamp or nil; with none, writes carry
    no stamp. `:temporal-canonicals` is `{:basis-tag-system .. :extension-base
    ..}`, the URLs a temporal response states (`meta.tag` system, timeline
@@ -227,6 +227,9 @@
                                `KETO_LEGACY_REALM_BLIND_FALLBACK=0` to disable,
                                else `server.keto/default-legacy-realm-blind-fallback?`.
    - :enforce-smart-scopes? -- argument when non-nil, else `ENFORCE_SMART_SCOPES=1`.
+   - :jwt-issuer, :jwt-audiences -- argument only, no environment fallback;
+                               nil leaves the corresponding claim unchecked
+                               (see `server.auth/wrap-jwt-auth`).
    - :cors-origins          -- [[parse-cors-origins]] of the argument, else of
                                `CORS_ALLOWED_ORIGINS`.
    - :trace-tap             -- `server.dev.trace-tap/wrap-trace-tap`, resolved
@@ -234,11 +237,13 @@
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url terminology cors-allowed-origins
            enforce-smart-scopes? bulk-job-store login-url lifecycle tx-metadata
-           temporal-canonicals legacy-realm-blind-fallback?]}]
+           temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences]}]
   {:jwks-url              (or jwks-url
                               (System/getenv "JWKS_URL")
                               (when-not (System/getenv "JWT_DEV_SECRET")
                                 "http://localhost:4444/.well-known/jwks.json"))
+   :jwt-issuer            jwt-issuer
+   :jwt-audiences         jwt-audiences
    :keto-url              (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
    :legacy-realm-blind-fallback? (cond
                                    (some? legacy-realm-blind-fallback?)
@@ -366,8 +371,9 @@
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
-                 jwks-url enforce-smart-scopes? login-url narrative lifecycle tx-metadata
-                 temporal-canonicals legacy-realm-blind-fallback?]
+                 jwks-url jwt-issuer jwt-audiences enforce-smart-scopes? login-url
+                 narrative lifecycle tx-metadata temporal-canonicals
+                 legacy-realm-blind-fallback?]
           :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}
           :as opts}]
   (cond-> []
@@ -419,7 +425,9 @@
             :wrap (fn [handler]
                     (wrap-keto-url handler keto-url legacy-realm-blind-fallback?))}
            {:name ::jwt-auth
-            :wrap (fn [handler] (auth/wrap-jwt-auth handler {:jwks-url jwks-url}))}])
+            :wrap (fn [handler] (auth/wrap-jwt-auth handler {:jwks-url  jwks-url
+                                                             :issuer    jwt-issuer
+                                                             :audiences jwt-audiences}))}])
 
     enforce-smart-scopes?
     (conj {:name ::smart-scope :wrap (fn [handler] (scope/wrap-smart-scope handler {}))}
