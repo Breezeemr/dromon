@@ -392,6 +392,8 @@
     (put! (comm "Communication" "c-received" :sender "Practitioner/p1" :recipient "Patient/123"))
     (put! (comm "Communication" "c-staff-thread" :subject "Patient/123"
                 :sender "Practitioner/p1" :recipient "Organization/o1"))
+    (put! (comm "Communication" "c-staff-internal" :subject "Patient/123"
+                :sender "Practitioner/p1" :recipient "Practitioner/p2"))
     (put! (comm "Communication" "c-other" :subject "Patient/999" :recipient "Patient/999"))
     store))
 
@@ -448,11 +450,24 @@
       (is (= 200 (read-comm store "Communication" id)) id))
     (testing "another patient's Communication is not"
       (is (= 404 (read-comm store "Communication" "c-other"))))
-    (is (= #{"c-sent" "c-received" "c-staff-thread"}
+    (is (= #{"c-sent" "c-received" "c-staff-thread" "c-staff-internal"}
            (entry-ids (search-comm store "Communication" {}))))
     (testing "the portal's thread list query finds the staff-started thread"
-      (is (= #{"c-sent" "c-staff-thread"}
+      (is (= #{"c-sent" "c-staff-thread" "c-staff-internal"}
              (entry-ids (search-comm store "Communication" {"subject" "Patient/123"})))))))
+
+;; The residual of keeping `subject` as a Communication link. Any
+;; Communication naming the patient as subject is patient-readable, whatever
+;; its category and whoever sent or received it. Nothing writes staff-internal
+;; Communications today; whoever starts to must narrow this compartment entry
+;; first (and add the patient to `recipient` on staff-started threads) rather
+;; than change these expectations.
+(deftest patient-token-reads-a-staff-only-communication-about-them
+  (let [store (fstore (seeded-comm-store))]
+    (is (= 200 (read-comm store "Communication" "c-staff-internal"))
+        "subject alone makes a staff-to-staff Communication patient-readable")
+    (is (contains? (entry-ids (search-comm store "Communication" {}))
+                   "c-staff-internal"))))
 
 (deftest patient-token-cannot-file-a-communication-request-for-staff
   (let [store (fstore (seeded-comm-store))]
