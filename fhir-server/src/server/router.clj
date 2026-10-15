@@ -205,8 +205,8 @@
    Accepts `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
-   `:jwt-issuer` and `:jwt-audiences`; unknown keys are ignored. `:lifecycle` is carried through as given;
-   [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
+   `:jwt-issuer` and `:jwt-audiences`; unknown keys are ignored. `:lifecycle`
+   is carried through as given; [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
    producer, `(fn [request])` returning a stamp or nil; with none, writes carry
    no stamp. `:temporal-canonicals` is `{:basis-tag-system .. :extension-base
    ..}`, the URLs a temporal response states (`meta.tag` system, timeline
