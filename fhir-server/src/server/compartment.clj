@@ -58,11 +58,12 @@
     "Claim"                        ["patient" "payee"]
     "ClaimResponse"                ["patient"]
     "ClinicalImpression"           ["subject"]
-    ;; Communication keeps R4B's links: every Communication Breeze writes is a
-    ;; patient-message thread or one of its messages, and a staff-started
-    ;; thread names the patient only as subject. Staff-internal records about
-    ;; a patient must never be Communications (docs/patient-messaging.md).
-    "Communication"                ["subject" "sender" "recipient"]
+    ;; Narrowed from R4B: `subject` is not a link, so a Communication about a
+    ;; patient between staff stays out of patient reach. A patient-message
+    ;; thread names its patient as `sender` (patient-started) or in
+    ;; `recipient` after the owner (staff-started), and each message as
+    ;; `sender` or `recipient` (docs/patient-messaging.md in master-at-arms2).
+    "Communication"                ["sender" "recipient"]
     ;; Narrowed from R4B, as Task is below. Breeze's CommunicationRequests are
     ;; staff call-back work (refill requests, phone consults, report reviews)
     ;; with staff notes: they name the patient as subject and often as

@@ -17,8 +17,8 @@
 ;; Patient-compartment link params: `subject`/`performer` for Observation, and
 ;; for Task the four link params plus a non-link param the capability pack also
 ;; registers. Task's `patient` and `subject` both resolve to Task.for, so the
-;; union must dedupe them. CommunicationRequest registers the R4B link params
-;; its compartment entry narrows away.
+;; union must dedupe them. CommunicationRequest and Communication register the
+;; R4B link params their compartment entries narrow away.
 (def ^:private registries
   {"Observation" {"subject"   {:type "reference" :columns [{:col "subject"}]}
                   "performer" {:type "reference" :columns [{:col "performer" :array? true}]}}
@@ -362,8 +362,8 @@
 ;; ---------------------------------------------------------------------------
 ;; CommunicationRequest: narrowed from R4B like Task. Staff call-back requests
 ;; name the patient as subject and recipient, so only `requester` is a link.
-;; Communication keeps R4B's links: a staff-started message thread names the
-;; patient only as subject and must stay patient-readable.
+;; Communication: narrowed to `sender` and `recipient`. A staff-started message
+;; thread lists the patient in `recipient` after its owner.
 ;; ---------------------------------------------------------------------------
 
 (defn- comm [resource-type id & {:keys [subject requester sender recipient]}]
@@ -372,7 +372,8 @@
     subject   (assoc :subject {:reference subject})
     requester (assoc :requester {:reference requester})
     sender    (assoc :sender {:reference sender})
-    recipient (assoc :recipient [{:reference recipient}])))
+    recipient (assoc :recipient (mapv (fn [r] {:reference r})
+                                      (if (string? recipient) [recipient] recipient)))))
 
 (defn- seeded-comm-store []
   (let [store (mock/create-mock-store {})
@@ -391,7 +392,7 @@
                 :recipient "Practitioner/p1"))
     (put! (comm "Communication" "c-received" :sender "Practitioner/p1" :recipient "Patient/123"))
     (put! (comm "Communication" "c-staff-thread" :subject "Patient/123"
-                :sender "Practitioner/p1" :recipient "Organization/o1"))
+                :sender "Practitioner/p1" :recipient ["Organization/o1" "Patient/123"]))
     (put! (comm "Communication" "c-staff-internal" :subject "Patient/123"
                 :sender "Practitioner/p1" :recipient "Practitioner/p2"))
     (put! (comm "Communication" "c-other" :subject "Patient/999" :recipient "Patient/999"))
@@ -415,14 +416,18 @@
   (is (compartment/patient-compartment-member? "CommunicationRequest"))
   (is (compartment/patient-compartment-member? "Communication"))
   (is (= ["requester"] (compartment/compartment-link-params "Patient" "CommunicationRequest")))
-  (is (= ["subject" "sender" "recipient"]
+  (is (= ["sender" "recipient"]
          (compartment/compartment-link-params "Patient" "Communication"))))
 
 (deftest communication-descriptors-cover-only-the-narrowed-links
   (is (= [{:col "requester"}]
          (:columns (compartment/compartment-descriptor
                      "Patient" "CommunicationRequest" (get registries "CommunicationRequest"))))
-      "subject, sender and recipient are registered but are not links"))
+      "subject, sender and recipient are registered but are not links")
+  (is (= [{:col "sender"} {:col "recipient" :array? true}]
+         (:columns (compartment/compartment-descriptor
+                     "Patient" "Communication" (get registries "Communication"))))
+      "subject is registered but is not a link"))
 
 (deftest patient-token-reads-only-the-communication-request-it-filed
   (let [store (fstore (seeded-comm-store))]
@@ -450,24 +455,23 @@
       (is (= 200 (read-comm store "Communication" id)) id))
     (testing "another patient's Communication is not"
       (is (= 404 (read-comm store "Communication" "c-other"))))
-    (is (= #{"c-sent" "c-received" "c-staff-thread" "c-staff-internal"}
+    (is (= #{"c-sent" "c-received" "c-staff-thread"}
            (entry-ids (search-comm store "Communication" {}))))
     (testing "the portal's thread list query finds the staff-started thread"
-      (is (= #{"c-sent" "c-staff-thread" "c-staff-internal"}
+      (is (= #{"c-sent" "c-staff-thread"}
              (entry-ids (search-comm store "Communication" {"subject" "Patient/123"})))))))
 
-;; The residual of keeping `subject` as a Communication link. Any
-;; Communication naming the patient as subject is patient-readable, whatever
-;; its category and whoever sent or received it. Nothing writes staff-internal
-;; Communications today; whoever starts to must narrow this compartment entry
-;; first (and add the patient to `recipient` on staff-started threads) rather
-;; than change these expectations.
-(deftest patient-token-reads-a-staff-only-communication-about-them
+(deftest patient-token-cannot-read-a-staff-only-communication-about-them
   (let [store (fstore (seeded-comm-store))]
-    (is (= 200 (read-comm store "Communication" "c-staff-internal"))
-        "subject alone makes a staff-to-staff Communication patient-readable")
-    (is (contains? (entry-ids (search-comm store "Communication" {}))
-                   "c-staff-internal"))))
+    (is (= 404 (read-comm store "Communication" "c-staff-internal"))
+        "subject alone does not make a staff-to-staff Communication patient-readable")
+    (is (not (contains? (entry-ids (search-comm store "Communication" {}))
+                        "c-staff-internal")))
+    (testing "a client cannot widen the search through subject"
+      (is (not (contains? (entry-ids (search-comm store "Communication" {"subject" "Patient/123"}))
+                          "c-staff-internal")))
+      (is (not (contains? (entry-ids (search-comm store "Communication" {"patient" "Patient/123"}))
+                          "c-staff-internal"))))))
 
 (deftest patient-token-cannot-file-a-communication-request-for-staff
   (let [store (fstore (seeded-comm-store))]
