@@ -72,18 +72,53 @@
              (log/error "Failed to extract kid from JWT header map")
              nil)))))))
 
+(defn- audience-claim-set
+  "The `aud` claim as a set. RFC 7519 allows a single string or an array;
+   Hydra always emits an array, empty when no audience was granted."
+  [aud]
+  (cond
+    (nil? aud)        #{}
+    (string? aud)     #{aud}
+    (sequential? aud) (set aud)
+    :else             #{}))
+
+(defn claims-rejection
+  "Why verified `claims` were not issued for this server, or nil when they were.
+
+   `issuer` (a string) must equal the `iss` claim exactly; `audiences` (a
+   collection of strings) must intersect the `aud` claim. Either check is
+   skipped when its option is nil, and `audiences` is also skipped when empty,
+   so a host that configures neither sees no change. Returns `:iss` or `:aud`."
+  [claims {:keys [issuer audiences]}]
+  (cond
+    (and issuer (not= issuer (:iss claims)))
+    :iss
+
+    (and (seq audiences)
+         (not-any? (audience-claim-set (:aud claims)) audiences))
+    :aud))
+
 (defn wrap-jwt-auth
   "Middleware that validates JWTs from the Authorization header using buddy-auth.
    Adds the :identity key to the request map if a valid token is provided.
    Supports either a static :secret (e.g. for testing/dev HS256) or a :jwks-url
    (e.g. for Ory Hydra OIDC RS256).
 
+   With a :jwks-url, the optional :issuer and :audiences restrict which
+   correctly signed tokens are accepted (see [[claims-rejection]]). A JWKS
+   proves only that the authorization server signed a token, not that it was
+   issued for this server: without these options a token minted for any client
+   of the same Hydra is accepted. A token that fails either check is treated
+   exactly like one with a bad signature -- no :identity is attached, and the
+   downstream authorization middleware answers 401. The HS256 :secret path
+   ignores both options.
+
    A request that already carries :identity is passed through untouched. That is
    the BFF seam: flotilla authenticates the opaque session cookie itself and
    injects {:identity {:sub subject}} before delegating here, and buddy's
    authentication-request would overwrite it with nil (no Authorization header
    accompanies a cookie-mode request)."
-  [handler {:keys [secret jwks-url] :or {secret dev-secret}}]
+  [handler {:keys [secret jwks-url issuer audiences] :or {secret dev-secret}}]
   (when (and (nil? jwks-url) (nil? secret))
     (throw (ex-info "JWT auth requires either :jwks-url or :secret (set JWT_DEV_SECRET env var for dev)" {})))
   (let [backend (if jwks-url
@@ -97,7 +132,8 @@
                                                                                :code "login"
                                                                                :diagnostics "Invalid or missing token"}]}})})
                   (token/jws-backend {:secret secret
-                                      :options {:alg :hs256}}))]
+                                      :options {:alg :hs256}}))
+        claim-checks (when jwks-url {:issuer issuer :audiences audiences})]
     (fn [request]
       (if (:identity request)
         (handler request)
@@ -113,12 +149,20 @@
               ;; both of which can OOM the pr-str fallback serializer.
               ;; Capture the real result via a volatile and return ::ok.
               authed (volatile! nil)
+              rejected (volatile! nil)
               _ (ftrace/trace!
                   {:id :auth/jwt.verify
                    :data {:kid kid
                           :has-token (some? token)}}
-                  (do (vreset! authed (auth-mw/authentication-request request backend))
-                      ::ok))]
+                  (let [req (auth-mw/authentication-request request backend)
+                        reason (when-let [claims (and claim-checks (:identity req))]
+                                 (claims-rejection claims claim-checks))]
+                    (vreset! rejected reason)
+                    (vreset! authed (cond-> req reason (assoc :identity nil)))
+                    ::ok))]
+          (when-let [reason @rejected]
+            (log/info "Rejected a correctly signed JWT not issued for this server; claim:"
+                      (name reason)))
           (handler @authed))))))
 
 (defn- extract-identity [request]
