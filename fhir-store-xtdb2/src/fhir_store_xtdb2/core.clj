@@ -527,11 +527,18 @@
         sub-col (:sub-col col)
         sub-fhir-type (:sub-fhir-type col)
         sub-array? (:sub-array? col false)
-        ;; Helper to build a coding WHERE clause with optional system
+        ;; Coding WHERE clause; `|code` (a blank system) requires the system
+        ;; to be absent
         coding-where (fn [alias]
-                       (if system-val
-                         [(format "(%s.val).\"system\" = ? AND (%s.val).\"code\" = ?" alias alias) [system-val v-val]]
-                         [(format "(%s.val).\"code\" = ?" alias) [v-val]]))]
+                       (cond
+                         (nil? system-val)
+                         [(format "(%s.val).\"code\" = ?" alias) [v-val]]
+
+                         (str/blank? system-val)
+                         [(format "(%s.val).\"system\" IS NULL AND (%s.val).\"code\" = ?" alias alias) [v-val]]
+
+                         :else
+                         [(format "(%s.val).\"system\" = ? AND (%s.val).\"code\" = ?" alias alias) [system-val v-val]]))]
     (cond
       ;; Nested path (e.g., participant.role, hospitalization.dischargeDisposition)
       sub-col
@@ -581,9 +588,15 @@
         (let [[cw-sql cw-params] (coding-where "c")]
           [(format "(EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS c(val) WHERE %s))" col-name cw-sql)
            cw-params])
-        (if system-val
-          [(format "(\"%s\").\"system\" = ? AND (\"%s\").\"code\" = ?" col-name col-name) [system-val v-val]]
-          [(format "(\"%s\").\"code\" = ?" col-name) [v-val]]))
+        (cond
+          (nil? system-val)
+          [(format "(\"%s\").\"code\" = ?" col-name) [v-val]]
+
+          (str/blank? system-val)
+          [(format "(\"%s\").\"system\" IS NULL AND (\"%s\").\"code\" = ?" col-name col-name) [v-val]]
+
+          :else
+          [(format "(\"%s\").\"system\" = ? AND (\"%s\").\"code\" = ?" col-name col-name) [system-val v-val]]))
 
       ;; Default: simple equality (code, string, enum, etc.)
       :else
@@ -953,17 +966,12 @@
 
 (defn- token->needle
   "Maps one FHIR token value to its flat-array needle (a bare code). The
-   denormalized array stores only bare codes, so any system-qualified value
-   (`system|code` or `system|`) returns nil and the caller falls back to the
-   struct path, which matches system + code precisely."
+   denormalized array stores only bare codes, so any value that constrains the
+   system (`system|code`, `system|`, or `|code`, which requires the system to
+   be absent) returns nil and the caller falls back to the struct path."
   [v]
-  (let [parts (str/split v #"\|" -1)]
-    (if (= 1 (count parts))
-      (first parts)                       ; bare code
-      (let [sys (first parts) code (second parts)]
-        (if (and (str/blank? sys) (seq code))
-          code                            ; |code -> bare
-          nil)))))                        ; system|code / system| -> struct fallback
+  (when-not (str/includes? v "|")
+    v))
 
 (def ^:private token-slots
   "Leading `<col>_tokens` elements a flat token search compares by index.
