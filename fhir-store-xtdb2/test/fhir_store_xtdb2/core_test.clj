@@ -464,6 +464,76 @@
         (finally
           (close-store-nodes! store))))))
 
+(deftest test-search-token-beyond-indexed-slots
+  (testing "A flat token search compares the first token-slots elements of
+            <field>_tokens by index and finds the rest through a fallback
+            subquery, which reads the same versions as the outer query."
+    (let [coding-seq [:sequential [:map [:system {:optional true} :string] [:code :string]]]
+          obs-schema (m/schema [:map {:resourceType "Observation"}
+                                [:resourceType :string]
+                                [:status :string]
+                                [:category [:sequential [:map [:coding coding-seq]]]]
+                                [:code [:map [:coding coding-seq]]]])
+          store (core-db/create-xtdb-store {:resource/schemas [obs-schema]})
+          tenant "flat-tok-slots"
+          reg {"code" {:type "token" :target nil
+                       :columns [{:col "code" :fhir-type "CodeableConcept" :array? false}]}
+               "category" {:type "token" :target nil
+                           :columns [{:col "category" :fhir-type "CodeableConcept" :array? true}]}}
+          codings (fn [& codes] (mapv (fn [c] {:system "http://example.org/cs" :code c}) codes))
+          obs (fn [category codes]
+                {:resourceType "Observation" :status "final"
+                 :category category
+                 :code {:coding (apply codings codes)}})
+          one-cat [{:coding (codings "vital-signs")}]
+          ids (fn [params] (set (map :id (db/search store tenant :Observation params reg))))]
+      (try
+        (db/create-resource store tenant :Observation "short" (obs one-cat ["c1"]))
+        (db/create-resource store tenant :Observation "long"
+                            (obs one-cat ["c1" "c2" "c3" "c4" "c5" "c6"]))
+        (db/create-resource store tenant :Observation "multi-cat"
+                            (obs [{:coding (codings "a1" "a2")}
+                                  {:coding (codings "b1" "b2")}
+                                  {:coding (codings "z1" "laboratory")}]
+                                 ["c1"]))
+        (db/create-resource store tenant :Observation "no-system"
+                            {:resourceType "Observation" :status "final"
+                             :category [{:coding [{:code "laboratory"}]}]
+                             :code {:coding [{:code "c1"}]}})
+        (testing "a code in a leading slot"
+          (is (= #{"short" "long" "multi-cat" "no-system"} (ids {"code" "c1"}))))
+        (testing "codes past the indexed slots"
+          (is (= #{"long"} (ids {"code" "c5"})))
+          (is (= #{"long"} (ids {"code" "c6"}))))
+        (testing "comma-OR across slot and fallback codes"
+          (is (= #{"long"} (ids {"code" "c4,c6"})))
+          (is (= #{"long"} (ids {"code" "nope,c6"}))))
+        (testing "category spread over several CodeableConcepts"
+          (is (= #{"multi-cat" "no-system"} (ids {"category" "laboratory"})))
+          (is (= #{"multi-cat"} (ids {"category" "b2"}))))
+        (testing "|code requires the coding to have no system"
+          (is (= #{"no-system"} (ids {"code" "|c1"})))
+          (is (= #{"no-system"} (ids {"category" "|laboratory"})))
+          (is (= #{"short" "long" "multi-cat"} (ids {"code" "http://example.org/cs|c1"}))))
+        (testing "an absent code matches nothing"
+          (is (= #{} (ids {"code" "c7"}))))
+        (testing "count answers the same set"
+          (is (= 1 (db/count-as-of-basis store tenant :Observation {"code" "c6"} reg nil))))
+
+        (testing "an as-of search reads the fallback at the same basis"
+          (let [basis (db/current-basis store tenant)]
+            (db/update-resource store tenant :Observation "long"
+                                (obs one-cat ["c1" "c2" "c3" "c4" "c5" "c6-new"]))
+            (is (= #{} (ids {"code" "c6"})) "the current version no longer carries c6")
+            (is (= #{"long"} (ids {"code" "c6-new"})))
+            (is (= #{"long"} (set (map :id (db/search-as-of store tenant :Observation
+                                                            {"code" "c6"} reg basis)))))
+            (is (= #{} (set (map :id (db/search-as-of store tenant :Observation
+                                                      {"code" "c6-new"} reg basis)))))
+            (is (= 1 (db/count-as-of-basis store tenant :Observation {"code" "c6"} reg basis)))))
+        (finally
+          (close-store-nodes! store))))))
+
 (deftest test-search-string-prefix-case-insensitive
   (testing "String search implements FHIR semantics -- case-insensitive prefix
             match -- across HumanName, sub-col, sub-array, and Address columns,

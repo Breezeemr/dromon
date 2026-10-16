@@ -527,11 +527,18 @@
         sub-col (:sub-col col)
         sub-fhir-type (:sub-fhir-type col)
         sub-array? (:sub-array? col false)
-        ;; Helper to build a coding WHERE clause with optional system
+        ;; Coding WHERE clause; `|code` (a blank system) requires the system
+        ;; to be absent
         coding-where (fn [alias]
-                       (if system-val
-                         [(format "(%s.val).\"system\" = ? AND (%s.val).\"code\" = ?" alias alias) [system-val v-val]]
-                         [(format "(%s.val).\"code\" = ?" alias) [v-val]]))]
+                       (cond
+                         (nil? system-val)
+                         [(format "(%s.val).\"code\" = ?" alias) [v-val]]
+
+                         (str/blank? system-val)
+                         [(format "(%s.val).\"system\" IS NULL AND (%s.val).\"code\" = ?" alias alias) [v-val]]
+
+                         :else
+                         [(format "(%s.val).\"system\" = ? AND (%s.val).\"code\" = ?" alias alias) [system-val v-val]]))]
     (cond
       ;; Nested path (e.g., participant.role, hospitalization.dischargeDisposition)
       sub-col
@@ -581,9 +588,15 @@
         (let [[cw-sql cw-params] (coding-where "c")]
           [(format "(EXISTS (SELECT 1 FROM UNNEST(\"%s\") AS c(val) WHERE %s))" col-name cw-sql)
            cw-params])
-        (if system-val
-          [(format "(\"%s\").\"system\" = ? AND (\"%s\").\"code\" = ?" col-name col-name) [system-val v-val]]
-          [(format "(\"%s\").\"code\" = ?" col-name) [v-val]]))
+        (cond
+          (nil? system-val)
+          [(format "(\"%s\").\"code\" = ?" col-name) [v-val]]
+
+          (str/blank? system-val)
+          [(format "(\"%s\").\"system\" IS NULL AND (\"%s\").\"code\" = ?" col-name col-name) [v-val]]
+
+          :else
+          [(format "(\"%s\").\"system\" = ? AND (\"%s\").\"code\" = ?" col-name col-name) [system-val v-val]]))
 
       ;; Default: simple equality (code, string, enum, etc.)
       :else
@@ -953,37 +966,61 @@
 
 (defn- token->needle
   "Maps one FHIR token value to its flat-array needle (a bare code). The
-   denormalized array stores only bare codes, so any system-qualified value
-   (`system|code` or `system|`) returns nil and the caller falls back to the
-   struct path, which matches system + code precisely."
+   denormalized array stores only bare codes, so any value that constrains the
+   system (`system|code`, `system|`, or `|code`, which requires the system to
+   be absent) returns nil and the caller falls back to the struct path."
   [v]
-  (let [parts (str/split v #"\|" -1)]
-    (if (= 1 (count parts))
-      (first parts)                       ; bare code
-      (let [sys (first parts) code (second parts)]
-        (if (and (str/blank? sys) (seq code))
-          code                            ; |code -> bare
-          nil)))))                        ; system|code / system| -> struct fallback
+  (when-not (str/includes? v "|")
+    v))
+
+(def ^:private token-slots
+  "Leading `<col>_tokens` elements a flat token search compares by index.
+   Real Coding/CodeableConcept fields rarely carry more codes than this, and
+   each slot is one more scalar comparison in the scan."
+  4)
+
+(defn- flat-token-column-condition
+  "Token match on one `<col>_tokens` array as
+   `(\"t\"[1] IN (?..) OR .. OR \"t\"[K] IN (?..) OR _id IN (<fallback>))`.
+
+   A correlated `EXISTS (SELECT 1 FROM UNNEST(\"t\") ...)` (or `? = ANY(\"t\")`)
+   is planned as a mark-join applied to every row of the table, 10-30x the cost
+   of a scalar predicate, and it defeats the scan's early filtering under ORDER
+   BY and COUNT. Indexed access stays a scalar predicate XTDB evaluates in the
+   scan. Arrays longer than token-slots are found by the fallback, an
+   uncorrelated subquery XTDB runs once: its scalar CARDINALITY filter is
+   applied in the scan, so the UNNEST only touches the long arrays.
+
+   `table-ref` is [sql params] for the table being searched, temporal qualifier
+   included, so the fallback reads the same versions as the outer query."
+  [col needles [table-sql table-params]]
+  (let [tokens (format "\"%s_tokens\"" col)
+        [match match-params] (if (= 1 (count needles))
+                               ["= ?" needles]
+                               [(format "IN (%s)" (str/join "," (repeat (count needles) "?"))) needles])
+        slots (for [i (range 1 (inc token-slots))]
+                (format "%s[%d] %s" tokens i match))
+        fallback (format "_id IN (SELECT _id FROM %s WHERE CARDINALITY(%s) > %d AND EXISTS (SELECT 1 FROM UNNEST(%s) AS t(v) WHERE t.v %s))"
+                         table-sql tokens token-slots tokens match)]
+    [(str "(" (str/join " OR " (concat slots [fallback])) ")")
+     (-> []
+         (into (mapcat (constantly match-params)) slots)
+         (into table-params)
+         (into match-params))]))
 
 (defn- build-flat-token-condition
-  "Flat-array token condition: one
-   `EXISTS (SELECT 1 FROM UNNEST(\"<col>_tokens\") AS t(v) WHERE t.v IN (?...))`
-   per column, OR'd across columns; comma-separated values become the IN list.
-   Returns [sql params] or nil if any value is system-only (so the caller falls
+  "Flat-array token condition: flat-token-column-condition per column, OR'd
+   across columns; comma-separated values become one IN list. Returns
+   [sql params] or nil if any value is system-qualified (so the caller falls
    back to the struct path)."
-  [cols value-str]
+  [cols value-str table-ref]
   (let [needles (mapv token->needle (str/split value-str #","))]
     (when (every? some? needles)
-      (let [ph (str/join "," (repeat (count needles) "?"))
-            per-col (map (fn [c]
-                           [(format "EXISTS (SELECT 1 FROM UNNEST(\"%s_tokens\") AS t(v) WHERE t.v IN (%s))"
-                                    (:col c) ph)
-                            needles])
-                         cols)]
+      (let [per-col (map #(flat-token-column-condition (:col %) needles table-ref) cols)]
         (if (= 1 (count per-col))
           (first per-col)
           [(str "(" (str/join " OR " (map first per-col)) ")")
-           (vec (mapcat second per-col))])))))
+           (into [] (mapcat second) per-col)])))))
 
 ;; ---------------------------------------------------------------------------
 ;; Resource-level search parameters
@@ -1320,26 +1357,22 @@
 (defn- build-condition
   "Builds a parameterized SQL WHERE condition for a search parameter.
    Resource-level parameters (see resource-level-param?) are answered from
-   resource-level storage whatever the registry says. For token searches on
-   top-level Coding/CodeableConcept fields, uses the denormalized
-   `<col>_tokens` array (a single scalar UNNEST ... IN) which is far cheaper than
-   UNNEST-ing an array of structs under ORDER BY; everything else falls through
-   to the struct path."
-  [param-name param-value search-param]
+   resource-level storage whatever the registry says. Bare-code token searches
+   on top-level Coding/CodeableConcept fields read the denormalized
+   `<col>_tokens` array by index (see flat-token-column-condition), which XTDB
+   filters in the scan instead of UNNEST-ing structs row by row; everything
+   else falls through to the struct path.
+
+   `table-ref` is [sql params] naming the searched table with its temporal
+   qualifier, for conditions that query the table again."
+  [param-name param-value search-param table-ref]
   (let [pname (name param-name)
         param-str (if (keyword? param-value) (name param-value) (str param-value))]
     (if (resource-level-param? pname)
       (build-resource-level-condition pname param-value)
       (or (when search-param
             (when-let [cols (flat-token-columns search-param)]
-              ;; The flat array only beats the struct UNNEST when the struct would
-              ;; do extra work: a comma-OR (one mark-join per value) or an array-of
-              ;; -CodeableConcept column (a nested UNNEST). For a single value on a
-              ;; single CodeableConcept the struct equality is already optimal and
-              ;; slightly faster, so keep it.
-              (when (or (str/includes? param-str ",")
-                        (some :array? cols))
-                (build-flat-token-condition cols param-str))))
+              (build-flat-token-condition cols param-str table-ref)))
           (build-condition-struct param-name param-value search-param)))))
 (defn- drop-empty-sequentials
   "Recursively removes map entries whose value is an empty sequential collection
@@ -1907,13 +1940,16 @@
 
 (defn- where+params
   "Builds the WHERE fragment (without the leading WHERE) and its params for a
-   set of filter params, or [nil []] when there are none."
-  [filter-params search-registry]
+   set of filter params, or [nil []] when there are none. `table-ref` is the
+   searched table as [sql params], temporal qualifier included (see
+   build-condition)."
+  [filter-params search-registry table-ref]
   (if (empty? filter-params)
     [nil []]
     (let [conditions (map (fn [k]
                             (build-condition k (get filter-params k)
-                                             (get search-registry (name k))))
+                                             (get search-registry (name k))
+                                             table-ref))
                           (keys filter-params))]
       [(str/join " AND " (map first conditions))
        (into [] (mapcat second) conditions)])))
@@ -1945,12 +1981,12 @@
   ;; LIMIT/OFFSET are bound as params (not inlined) so the SQL text is stable
   ;; across pages — repeated searches of a given shape hit XTDB's plan cache.
   (let [order-by (build-order-by-clause sort-specs search-registry)
-        [where where-params] (where+params filter-params search-registry)
         [for-sql for-params] (basis->for-clause basis)
+        rt (str (table-name resource-type) for-sql)
+        [where where-params] (where+params filter-params search-registry [rt for-params])
         ;; Temporal params bind before WHERE params (see basis->for-clause).
         params (into for-params where-params)
-        where-sql (if where (str " WHERE " where) "")
-        rt (str (table-name resource-type) for-sql)]
+        where-sql (if where (str " WHERE " where) "")]
     (if (seq sort-specs)
       ;; Two-phase: an ORDER BY defeats LIMIT early-termination, so a single
       ;; SELECT * would materialize every matched row's full column set just to
@@ -1970,18 +2006,9 @@
   ([node resource-type {:keys [filter-params search-registry]} basis]
    (let [[for-sql for-params] (basis->for-clause basis)
          rt (str (table-name resource-type) for-sql)
-         [query-str all-params]
-         (if (empty? filter-params)
-           [(format "SELECT COUNT(*) AS cnt FROM %s" rt) for-params]
-           (let [cols (keys filter-params)
-                 conditions (map (fn [k]
-                                   (build-condition k (get filter-params k)
-                                                    (get search-registry (name k))))
-                                 cols)
-                 where-clause (str/join " AND " (map first conditions))
-                 p (into for-params (mapcat second) conditions)]
-             [(format "SELECT COUNT(*) AS cnt FROM %s WHERE %s" rt where-clause) p]))
-         result (first (run-query node (into [query-str] all-params)))]
+         [where where-params] (where+params filter-params search-registry [rt for-params])
+         query-str (format "SELECT COUNT(*) AS cnt FROM %s%s" rt (if where (str " WHERE " where) ""))
+         result (first (run-query node (into [query-str] (into for-params where-params))))]
      (or (:cnt result) 0))))
 
 ;; ---------------------------------------------------------------------------
