@@ -175,12 +175,29 @@
    realm-scoping migration window the same way the middleware does. Injecting
    it rather than letting them read the env keeps one source of truth for a
    flag whose whole purpose is to be flipped once, everywhere, at the same
-   time."
-  [handler keto-url legacy-realm-blind-fallback?]
+   time.
+
+   `keto-admin-url` (the 4-arity) is the Keto write API, injected as
+   `:fhir/keto-admin-url` for `server.grant`'s tuple writes. The grant
+   handlers read both URLs from the request, so a host's configured Keto is
+   the one they talk to; the 3-arity injects no admin URL, and a grant write
+   then fails rather than guessing one."
+  ([handler keto-url legacy-realm-blind-fallback?]
+   (wrap-keto-url handler keto-url legacy-realm-blind-fallback? nil))
+  ([handler keto-url legacy-realm-blind-fallback? keto-admin-url]
+   (fn [req]
+     (handler (cond-> (assoc req
+                             :fhir/keto-url keto-url
+                             :fhir/keto-legacy-realm-blind-fallback? legacy-realm-blind-fallback?)
+                keto-admin-url (assoc :fhir/keto-admin-url keto-admin-url))))))
+
+(defn wrap-oauth-base-url
+  "Inject the authorization server's base URL as `:fhir/oauth-base-url`, which
+   SMART discovery (`server.handlers/smart-configuration`) publishes as
+   `issuer` and builds its endpoint URLs from."
+  [handler oauth-base-url]
   (fn [req]
-    (handler (assoc req
-                    :fhir/keto-url keto-url
-                    :fhir/keto-legacy-realm-blind-fallback? legacy-realm-blind-fallback?))))
+    (handler (assoc req :fhir/oauth-base-url oauth-base-url))))
 
 ;; ---------------------------------------------------------------------------
 ;; Options
@@ -202,7 +219,8 @@
   "Resolve [[server.core/fhir-app]]'s options map into the fully resolved map
    consumed by [[default-middleware]].
 
-   Accepts `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
+   Accepts `:jwks-url`, `:keto-url`, `:keto-admin-url`, `:oauth-base-url`,
+   `:terminology`, `:cors-allowed-origins`,
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
    `:jwt-issuer` and `:jwt-audiences`; unknown keys are ignored. `:lifecycle`
@@ -223,6 +241,19 @@
                                unless `JWT_DEV_SECRET` is set (dev HS256 mode).
    - :keto-url              -- argument, else `KETO_URL`, else
                                `http://localhost:4466`.
+   - :keto-admin-url        -- argument, else `KETO_ADMIN_URL`, else
+                               `http://localhost:4467`. The Keto write API
+                               `server.grant` writes and deletes tuples on.
+   - :oauth-base-url        -- argument, else `OAUTH_BASE_URL`, else
+                               `http://localhost:4444`. Published verbatim as
+                               SMART discovery's `issuer`, so it must be the
+                               authorization server's issuer exactly (Hydra's
+                               carries a trailing slash).
+
+   The localhost fallbacks serve a standalone dromon next to a local Ory
+   stack. A host that embeds dromon should pass every URL here from its own
+   configuration: an unset one does not fail at startup, it reaches localhost
+   on the first request that needs it.
    - :legacy-realm-blind-fallback? -- argument when non-nil, else
                                `KETO_LEGACY_REALM_BLIND_FALLBACK=0` to disable,
                                else `server.keto/default-legacy-realm-blind-fallback?`.
@@ -235,7 +266,7 @@
    - :trace-tap             -- `server.dev.trace-tap/wrap-trace-tap`, resolved
                                only when `DROMON_DEV_TRACE_TAP=1`, so the OTel
                                SDK is not required on the default classpath."
-  [{:keys [jwks-url keto-url terminology cors-allowed-origins
+  [{:keys [jwks-url keto-url keto-admin-url oauth-base-url terminology cors-allowed-origins
            enforce-smart-scopes? bulk-job-store login-url lifecycle tx-metadata
            temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences]}]
   {:jwks-url              (or jwks-url
@@ -245,6 +276,8 @@
    :jwt-issuer            jwt-issuer
    :jwt-audiences         jwt-audiences
    :keto-url              (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
+   :keto-admin-url        (or keto-admin-url (System/getenv "KETO_ADMIN_URL") "http://localhost:4467")
+   :oauth-base-url        (or oauth-base-url (System/getenv "OAUTH_BASE_URL") "http://localhost:4444")
    :legacy-realm-blind-fallback? (cond
                                    (some? legacy-realm-blind-fallback?)
                                    legacy-realm-blind-fallback?
@@ -326,7 +359,7 @@
       OperationOutcomes); `::coerce-exceptions` is retained for compatibility.
    7. The injection middleware (`::fhir-store`, `::terminology`,
       `::narrative`, `::lifecycle`, `::tx-metadata`, `::temporal-canonicals`,
-      `::bulk-job-store`, `::keto-url`) must sit
+      `::bulk-job-store`, `::keto-url`, `::oauth-base-url`) must sit
       outside `::patient-compartment`, which reads and REPLACES `:fhir/store`
       with a compartment-filtering store, and outside the handlers that
       consume the injected values.
@@ -371,7 +404,7 @@
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
-                 jwks-url jwt-issuer jwt-audiences enforce-smart-scopes? login-url
+                 keto-admin-url oauth-base-url jwks-url jwt-issuer jwt-audiences enforce-smart-scopes? login-url
                  narrative lifecycle tx-metadata temporal-canonicals
                  legacy-realm-blind-fallback?]
           :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}
@@ -421,9 +454,12 @@
     :always
     (into [{:name ::bulk-job-store
             :wrap (fn [handler] (wrap-bulk-job-store handler bulk-job-store))}
+           {:name ::oauth-base-url
+            :wrap (fn [handler] (wrap-oauth-base-url handler oauth-base-url))}
            {:name ::keto-url
             :wrap (fn [handler]
-                    (wrap-keto-url handler keto-url legacy-realm-blind-fallback?))}
+                    (wrap-keto-url handler keto-url legacy-realm-blind-fallback?
+                                   keto-admin-url))}
            {:name ::jwt-auth
             :wrap (fn [handler] (auth/wrap-jwt-auth handler {:jwks-url  jwks-url
                                                              :issuer    jwt-issuer

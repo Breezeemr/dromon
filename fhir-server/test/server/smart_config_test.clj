@@ -17,6 +17,29 @@
     (is (= "http://oauth.example/oauth2/auth"  (:authorization_endpoint smart-config-body)))
     (is (= "http://oauth.example/oauth2/token" (:token_endpoint smart-config-body)))))
 
+(deftest smart-configuration-keeps-the-issuer-verbatim
+  (testing "an issuer with a trailing slash (Hydra's) is published as given,
+            and its endpoints carry exactly one slash"
+    (let [body (:body ((handlers/smart-configuration "https://oauth.example/") {}))]
+      (is (= "https://oauth.example/" (:issuer body)))
+      (is (= "https://oauth.example/oauth2/auth" (:authorization_endpoint body)))
+      (is (= "https://oauth.example/oauth2/token" (:token_endpoint body)))
+      (is (= "https://oauth.example/.well-known/jwks.json" (:jwks_uri body)))))
+  (testing "an issuer without one is published as given too"
+    (is (= "http://oauth.example" (:issuer smart-config-body)))
+    (is (= "http://oauth.example/.well-known/jwks.json" (:jwks_uri smart-config-body)))))
+
+(deftest smart-configuration-reads-the-injected-base-url
+  (testing "the 0-arity handler takes the request's :fhir/oauth-base-url"
+    (let [body (:body ((handlers/smart-configuration)
+                       {:fhir/oauth-base-url "https://oauth.example/"}))]
+      (is (= "https://oauth.example/" (:issuer body)))
+      (is (= "https://oauth.example/oauth2/auth" (:authorization_endpoint body)))))
+  (testing "an explicit base URL wins over the injected one"
+    (is (= "http://explicit.example"
+           (:issuer (:body ((handlers/smart-configuration "http://explicit.example")
+                            {:fhir/oauth-base-url "https://oauth.example/"})))))))
+
 (deftest smart-configuration-advertises-all-scopes
   (testing "every expected SMART scope is advertised"
     (let [advertised (set (:scopes_supported smart-config-body))]
