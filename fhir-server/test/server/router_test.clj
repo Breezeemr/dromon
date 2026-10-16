@@ -282,6 +282,7 @@
    ::router/terminology
    ::router/narrative
    ::router/bulk-job-store
+   ::router/oauth-base-url
    ::router/keto-url
    ::router/jwt-auth
    ::router/keto-authorization])
@@ -583,6 +584,8 @@
   (let [opts (router/resolve-options
                {:jwks-url jwks-url
                 :keto-url keto-url
+                :keto-admin-url "http://keto-write.test"
+                :oauth-base-url "https://oauth.example/"
                 :enforce-smart-scopes? false
                 :cors-allowed-origins "https://a.example, https://b.example"
                 :terminology :term
@@ -594,6 +597,8 @@
     (is (= "https://oauth.example/" (:jwt-issuer opts)))
     (is (= ["https://flotilla.example/fhir"] (:jwt-audiences opts)))
     (is (= keto-url (:keto-url opts)))
+    (is (= "http://keto-write.test" (:keto-admin-url opts)))
+    (is (= "https://oauth.example/" (:oauth-base-url opts)))
     (is (false? (:enforce-smart-scopes? opts)))
     (is (= #{"https://a.example" "https://b.example"} (:cors-origins opts))
         "a comma-separated string is split and trimmed into a set")
@@ -601,6 +606,64 @@
     (is (= :jobs (:bulk-job-store opts)))
     (is (= `presenting-lifecycle (:lifecycle opts))
         ":lifecycle is carried through unresolved; default-middleware resolves it")))
+
+(deftest resolve-options-service-url-defaults
+  (testing "each service URL falls back to its environment variable, then to
+            the standalone dev stack on localhost"
+    (let [opts (router/resolve-options {})]
+      (doseq [[k env default] [[:jwks-url "JWKS_URL" "http://localhost:4444/.well-known/jwks.json"]
+                               [:keto-url "KETO_URL" "http://localhost:4466"]
+                               [:keto-admin-url "KETO_ADMIN_URL" "http://localhost:4467"]
+                               [:oauth-base-url "OAUTH_BASE_URL" "http://localhost:4444"]]
+              :when (not (and (= :jwks-url k) (System/getenv "JWT_DEV_SECRET")))]
+        (is (= (or (System/getenv env) default) (get opts k)) (str k))))))
+
+(deftest service-urls-reach-the-handlers-that-use-them
+  (let [app (ring/ring-handler
+              (router/router test-schemas
+                             (router/default-middleware
+                               (mock/create-mock-store {})
+                               (router/resolve-options
+                                 (assoc app-opts
+                                        :keto-admin-url "http://keto-write.test"
+                                        :oauth-base-url "https://oauth.example/"))))
+              router/default-handler)]
+    (testing "SMART discovery, at the root and under a tenant, publishes the
+              configured issuer verbatim and joins its endpoints with one slash"
+      (doseq [uri ["/.well-known/smart-configuration"
+                   (str "/" tenant "/fhir/.well-known/smart-configuration")]]
+        (let [body (json-body (app (GET uri :headers {"accept" "application/json"})))]
+          (is (= "https://oauth.example/" (get body "issuer")) uri)
+          (is (= "https://oauth.example/oauth2/auth" (get body "authorization_endpoint")) uri)
+          (is (= "https://oauth.example/oauth2/token" (get body "token_endpoint")) uri))))
+
+    (testing "/auth/my-patients reads grants from the configured Keto read URL"
+      (let [urls (atom [])]
+        (with-redefs [auth/fetch-jwks (fn [_] {"kid-1" (.getPublic keypair)})
+                      hc/get (fn [url _]
+                               (swap! urls conj url)
+                               {:status 200 :body {:relation_tuples [{:object "r1/Patient/pa"}]}})]
+          (let [resp (app (GET "/auth/my-patients"
+                               :headers {"accept" "application/json"
+                                         "authorization" (bearer-token)}))]
+            (is (= 200 (:status resp)))
+            (is (= ["pa"] (get (json-body resp) "patients")))
+            (is (= [(str keto-url "/relation-tuples")] @urls))))))
+
+    (testing "POST /auth/grants writes tuples to the configured Keto admin URL"
+      (let [puts (atom [])]
+        (with-redefs [auth/fetch-jwks (fn [_] {"kid-1" (.getPublic keypair)})
+                      hc/get (fn [_ _] {:status 200 :body {:allowed true}})
+                      hc/put (fn [url _] (swap! puts conj url) {:status 201})]
+          (let [resp (app {:request-method :post
+                           :uri "/auth/grants"
+                           :headers {"accept" "application/json"
+                                     "content-type" "application/json"
+                                     "authorization" (bearer-token)}
+                           :body (json-stream {:subject "c1" :patients ["pa"] :realm "r1"})})]
+            (is (= 201 (:status resp)))
+            (is (seq @puts))
+            (is (every? #{"http://keto-write.test/admin/relation-tuples"} @puts))))))))
 
 (deftest parse-cors-origins-normalizes-every-accepted-shape
   (is (nil? (router/parse-cors-origins nil)))

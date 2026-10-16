@@ -1,5 +1,6 @@
 (ns server.grant-test
   (:require [clojure.test :refer [deftest is testing]]
+            [hato.client :as hc]
             [server.grant :as grant]))
 
 (deftest grant-tuples-shape
@@ -68,32 +69,35 @@
     (testing "Patient is still instance-confined, with no type-level tuple"
       (is (not-any? #(= (:object %) "Patient") tuples)))))
 
+(def ^:private test-keto
+  {:read-url "http://keto-read.test" :admin-url "http://keto-write.test"})
+
 (defn- captured-tuples
   "Runs `f` with the Keto write stubbed out, returning the tuples it would
    have written."
   [f]
   (let [tuples (atom [])]
-    (with-redefs-fn {#'grant/put-tuple! (fn [t] (swap! tuples conj t))}
+    (with-redefs-fn {#'grant/put-tuple! (fn [_keto t] (swap! tuples conj t))}
       (fn [] (f)))
     @tuples))
 
 (deftest default-relations-authorize-request-change
   (testing "a minted grant carries read and request-change on the patient instance"
-    (let [tuples (captured-tuples #(grant/grant-patient-set! nil "client-1" ["pa"]))]
+    (let [tuples (captured-tuples #(grant/grant-patient-set! test-keto nil "client-1" ["pa"]))]
       (is (some #(= % {:namespace "fhir" :object "Patient/pa"
                        :relation "read" :subject_id "client-1"}) tuples))
       (is (some #(= % {:namespace "fhir" :object "Patient/pa"
                        :relation "request-change" :subject_id "client-1"}) tuples))))
   (testing "explicit relations override the default"
     (let [tuples (captured-tuples
-                  #(grant/grant-patient-set! nil "client-1" ["pa"] :relations ["read"]))]
+                  #(grant/grant-patient-set! test-keto nil "client-1" ["pa"] :relations ["read"]))]
       (is (some #(= % {:namespace "fhir" :object "Patient/pa"
                        :relation "read" :subject_id "client-1"}) tuples))
       (is (not-any? #(= (:relation %) "request-change") tuples)))))
 
 (deftest default-relations-authorize-message
   (testing "a minted grant carries message on the patient instance"
-    (let [tuples (captured-tuples #(grant/grant-patient-set! nil "client-1" ["pa"]))]
+    (let [tuples (captured-tuples #(grant/grant-patient-set! test-keto nil "client-1" ["pa"]))]
       (is (some #(= % {:namespace "fhir" :object "Patient/pa"
                        :relation "message" :subject_id "client-1"}) tuples))
       (testing "and on no member type"
@@ -107,11 +111,11 @@
                          :relation "request-change" :subject_id "client-1"}) tuples)))))
   (testing "explicit relations without message mint no message tuple"
     (let [tuples (captured-tuples
-                  #(grant/grant-patient-set! nil "client-1" ["pa"] :relations ["read"]))]
+                  #(grant/grant-patient-set! test-keto nil "client-1" ["pa"] :relations ["read"]))]
       (is (not-any? #(= (:relation %) "message") tuples))))
   (testing "an explicit message relation is still confined to the instance"
     (let [tuples (captured-tuples
-                  #(grant/grant-patient-set! nil "client-1" ["pa"]
+                  #(grant/grant-patient-set! test-keto nil "client-1" ["pa"]
                                              :relations ["read" "message"]))]
       (is (= #{"Patient/pa"}
              (into #{} (comp (filter #(= "message" (:relation %))) (map :object))
@@ -275,3 +279,84 @@
   (testing "blank subjects everywhere is no end user"
     (is (nil? (grant/end-user-subject
                {:session {:subject "" :id_token {:subject ""}}})))))
+
+;; ---------------------------------------------------------------------------
+;; Keto endpoints
+;; ---------------------------------------------------------------------------
+
+(defmacro ^:private with-recorded-keto
+  "Runs `body` with every Keto call answered locally, binding `calls` to an
+   atom of [method url] in call order. Reads answer `tuples`."
+  [[calls tuples] & body]
+  `(let [~calls (atom [])]
+     (with-redefs [hc/get    (fn [url# _#]
+                               (swap! ~calls conj [:get url#])
+                               {:status 200 :body {:relation_tuples ~tuples}})
+                   hc/put    (fn [url# _#]
+                               (swap! ~calls conj [:put url#])
+                               {:status 201})
+                   hc/delete (fn [url# _#]
+                               (swap! ~calls conj [:delete url#])
+                               {:status 204})]
+       ~@body)))
+
+(def ^:private keto-request
+  "A request as `server.router/wrap-keto-url` leaves it."
+  {:fhir/keto-url       "http://keto-read.test"
+   :fhir/keto-admin-url "http://keto-write.test"})
+
+(deftest keto-endpoints-come-from-the-request
+  (is (= {:read-url "http://keto-read.test" :admin-url "http://keto-write.test"}
+         (grant/keto-endpoints keto-request))))
+
+(deftest handlers-talk-to-the-keto-the-request-names
+  (testing "a grant writes to the admin URL and never to localhost"
+    (with-recorded-keto [calls []]
+      (is (= 201 (:status (grant/create-grant
+                           (assoc keto-request
+                                  :body-params {:subject "c1" :patients ["pa"]
+                                                :realm "r1"})))))
+      (is (seq @calls))
+      (is (every? #(= [:put "http://keto-write.test/admin/relation-tuples"] %)
+                  @calls))))
+
+  (testing "a listing reads the read URL"
+    (with-recorded-keto [calls [{:object "r1/Patient/pa"}]]
+      (is (= {:status 200 :body {:subject "u1" :patients ["pa"]}}
+             (grant/my-patients (assoc keto-request :identity {:sub "u1"}))))
+      (is (= [[:get "http://keto-read.test/relation-tuples"]] @calls))))
+
+  (testing "a revoke reads the read URL and deletes on the admin URL"
+    (with-recorded-keto [calls [{:object "r1/Patient/pa"}]]
+      (grant/delete-grant (assoc keto-request
+                                 :body-params {:subject "c1" :patients ["pa"]}))
+      (is (= #{"http://keto-read.test/relation-tuples"
+               "http://keto-write.test/admin/relation-tuples"}
+             (set (map second @calls))))))
+
+  (testing "the token hook resolves the launch patient on the read URL"
+    (with-recorded-keto [calls [{:object "r1/Patient/pa"}]]
+      (is (= {:status 200 :body {:session {:access_token {:patient "pa"}}}}
+             (grant/token-hook
+              (assoc keto-request
+                     :body-params {:request {:client_id "c1"
+                                             :granted_scopes ["patient/*.read"]}}))))
+      (is (= #{"http://keto-read.test/relation-tuples"}
+             (set (map second @calls)))))))
+
+(deftest an-unconfigured-keto-fails-instead-of-reaching-localhost
+  (testing "no admin URL: the grant throws naming the key, and nothing is sent"
+    (with-recorded-keto [calls []]
+      (let [e (try (grant/create-grant {:fhir/keto-url "http://keto-read.test"
+                                        :body-params {:subject "c1" :patients ["pa"]}})
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= {:keto-url-key :admin-url} (ex-data e)))
+        (is (empty? @calls)))))
+  (testing "no read URL: a listing throws naming the key"
+    (with-recorded-keto [calls []]
+      (let [e (try (grant/my-patients {:identity {:sub "u1"}})
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= {:keto-url-key :read-url} (ex-data e)))
+        (is (empty? @calls))))))

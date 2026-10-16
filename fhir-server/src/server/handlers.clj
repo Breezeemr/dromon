@@ -1636,24 +1636,43 @@
 ;;   3. Grant that client subject a Keto "system" read tuple so the resulting
 ;;      RS256 access token passes dromon's Keto authorization.
 ;; dromon's own token validation (Hydra RS256 access tokens) is unchanged.
+(defn oauth-endpoint
+  "`path` (starting with a slash) under the authorization server `base`, with
+   exactly one slash between them. An issuer is published verbatim and may end
+   in a slash (Hydra's does); concatenating would then yield `//oauth2/auth`."
+  [base path]
+  (str (str/replace base #"/+$" "") path))
+
 (defn smart-configuration
-  "Returns SMART configuration. When called as a 0-arg handler, uses env vars
-   or localhost defaults. When called with an oauth-base-url, uses that."
+  "Returns the SMART configuration handler.
+
+   The authorization server's base URL is, in order: `oauth-base-url` when
+   given; else the request's `:fhir/oauth-base-url`, which
+   `server.router/default-middleware` injects from `resolve-options` (the
+   host's `:oauth-base-url`, else `OAUTH_BASE_URL`, else
+   `http://localhost:4444`); else `OAUTH_BASE_URL`, else
+   `http://localhost:4444`, for a handler mounted outside that chain.
+
+   The base is published verbatim as `issuer`, which a client compares with
+   the `iss` of the tokens it receives, so it must be the issuer exactly,
+   trailing slash included. The endpoint URLs are joined to it with
+   [[oauth-endpoint]]."
   ([] (smart-configuration nil))
   ([oauth-base-url]
-   (let [base (or oauth-base-url
-                  (System/getenv "OAUTH_BASE_URL")
-                  "http://localhost:4444")]
-     (fn [_req]
+   (fn [req]
+     (let [base (or oauth-base-url
+                    (:fhir/oauth-base-url req)
+                    (System/getenv "OAUTH_BASE_URL")
+                    "http://localhost:4444")]
        ;; Return a plain map body (no explicit Content-Type) so the muuntaja
        ;; response middleware serializes it, exactly like the /metadata
        ;; handler. Setting Content-Type here suppresses that encoding and Ring
        ;; then fails to stream the raw map (HTTP 500).
        {:status 200
         :body {:issuer                 base
-               :jwks_uri               (str base "/.well-known/jwks.json")
-               :authorization_endpoint (str base "/oauth2/auth")
-               :token_endpoint         (str base "/oauth2/token")
+               :jwks_uri               (oauth-endpoint base "/.well-known/jwks.json")
+               :authorization_endpoint (oauth-endpoint base "/oauth2/auth")
+               :token_endpoint         (oauth-endpoint base "/oauth2/token")
                :token_endpoint_auth_methods_supported ["client_secret_basic" "private_key_jwt"]
                ;; SMART Backend Services (SMART App Launch v2.2.0) requires the
                ;; asymmetric client-assertion signing algorithms the server's

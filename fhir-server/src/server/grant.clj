@@ -34,7 +34,13 @@
    `launch` tuple in Keto, and injects the `patient` claim into the access
    token. Patient-scoped token requests that cannot be resolved to a granted
    patient are rejected, so a token can never carry a patient context that
-   Keto does not back."
+   Keto does not back.
+
+   Keto endpoints: every function that reads or writes tuples takes a `keto`
+   map, `{:read-url .. :admin-url ..}`; the HTTP handlers build it from the
+   request with [[keto-endpoints]]. Neither URL has a default here: one the
+   host did not configure fails the call naming the missing key, rather than
+   reaching a Keto on localhost."
   (:require [clojure.string :as str]
             [hato.client :as hc]
             [jsonista.core :as json]
@@ -45,11 +51,22 @@
 ;; Keto endpoints
 ;; ---------------------------------------------------------------------------
 
-(defn- keto-read-url []
-  (or (System/getenv "KETO_URL") "http://localhost:4466"))
+(defn keto-endpoints
+  "The `keto` map the grant functions take, from the request: the read API URL
+   `server.router/wrap-keto-url` injects as `:fhir/keto-url`, and the write
+   API URL it injects as `:fhir/keto-admin-url`. Both come from the host's
+   `server.router/resolve-options`, the same place the Keto authorization
+   middleware gets its URL."
+  [req]
+  {:read-url  (:fhir/keto-url req)
+   :admin-url (:fhir/keto-admin-url req)})
 
-(defn- keto-admin-url []
-  (or (System/getenv "KETO_ADMIN_URL") "http://localhost:4467"))
+(defn- keto-url
+  "The `k` URL of `keto`, or a throw naming it when the host configured none."
+  [keto k]
+  (or (not-empty (get keto k))
+      (throw (ex-info (str "No Keto " (name k) " configured for server.grant")
+                      {:keto-url-key k}))))
 
 (def ^:const launch-relation
   "Relation recording that a subject may launch with a patient context."
@@ -127,8 +144,8 @@
   (when-let [[_ realm pid] (re-matches launch-object-re (str object))]
     [realm pid]))
 
-(defn- put-tuple! [tuple]
-  (let [resp (hc/put (str (keto-admin-url) "/admin/relation-tuples")
+(defn- put-tuple! [keto tuple]
+  (let [resp (hc/put (str (keto-url keto :admin-url) "/admin/relation-tuples")
                      {:headers {"content-type" "application/json"}
                       :body (json/write-value-as-string tuple)
                       :throw-exceptions false})]
@@ -139,12 +156,12 @@
 (defn- delete-tuples!
   "Deletes all tuples matching the query params (namespace/object/relation/
    subject_id subset)."
-  [query]
-  (hc/delete (str (keto-admin-url) "/admin/relation-tuples")
+  [keto query]
+  (hc/delete (str (keto-url keto :admin-url) "/admin/relation-tuples")
              {:query-params query :throw-exceptions false}))
 
-(defn- list-tuples [query]
-  (let [resp (hc/get (str (keto-read-url) "/relation-tuples")
+(defn- list-tuples [keto query]
+  (let [resp (hc/get (str (keto-url keto :read-url) "/relation-tuples")
                      {:query-params (assoc query "page_size" 500)
                       :as :json
                       :throw-exceptions false})]
@@ -212,9 +229,9 @@
    realm the deployment hosts. It stays callable so pre-existing callers keep
    working during the migration, and it is recorded on the event so such a
    grant is findable afterwards."
-  [realm subject patient-ids & {:keys [relations] :or {relations default-relations}}]
-  (run! put-tuple! (grant-tuples realm subject patient-ids relations
-                                 (dual-write-legacy?)))
+  [keto realm subject patient-ids & {:keys [relations] :or {relations default-relations}}]
+  (run! #(put-tuple! keto %) (grant-tuples realm subject patient-ids relations
+                                           (dual-write-legacy?)))
   (t/event! :grant/patient-set-granted
             {:data {:realm realm :realm-blind? (str/blank? (str realm))
                     :subject subject :patients (vec patient-ids)
@@ -229,10 +246,10 @@
    The listing is the one Keto call that sees both shapes at once: there is no
    prefix filter on `getRelationships`, so a realm cannot be queried for
    directly and the narrowing is client-side anyway."
-  [subject]
-  (->> (list-tuples {"namespace" "fhir"
-                     "relation" launch-relation
-                     "subject_id" subject})
+  [keto subject]
+  (->> (list-tuples keto {"namespace" "fhir"
+                          "relation" launch-relation
+                          "subject_id" subject})
        (keep (fn [{:keys [object]}]
                (when-let [[realm pid] (launch-object->patient object)]
                  {:realm realm :patient-id pid})))
@@ -252,8 +269,8 @@
    Pre-existing limitation, unchanged here: `list-tuples` fetches one page of
    500 and does not follow `next_page_token`, so a subject granted more than
    500 launch tuples has the excess silently invisible."
-  [subject]
-  (->> (granted-patient-grants subject)
+  [keto subject]
+  (->> (granted-patient-grants keto subject)
        (map :patient-id)
        distinct
        sort
@@ -274,8 +291,8 @@
    `subject_id` -- and the userset refactor is blocked on the subject-spelling
    split (docs/keto-realm-scoping.md), so nothing is lost today. It has to be
    revisited the day launch grants move to usersets."
-  [subject patient-id]
-  (contains? (set (granted-patients subject)) (str patient-id)))
+  [keto subject patient-id]
+  (contains? (set (granted-patients keto subject)) (str patient-id)))
 
 (defn revoke-patient-set!
   "Removes the subject's tuples for the given patient ids (all relations, all
@@ -287,7 +304,7 @@
    the subject holds a launch tuple for. Over-deleting is the only acceptable
    direction here -- a revoke that leaves one shape behind leaves the access it
    was called to remove, and reports success."
-  [subject patient-ids]
+  [keto subject patient-ids]
   (let [;; Read before deleting: this is what tells us which realms the
         ;; subject's tuples live in, and they are deleted below.
         ;;
@@ -298,17 +315,17 @@
         realms (into #{}
                      (comp (map :object)
                            (keep #(first (launch-object->patient %))))
-                     (list-tuples {"namespace" "fhir" "subject_id" subject}))]
+                     (list-tuples keto {"namespace" "fhir" "subject_id" subject}))]
     (doseq [pid patient-ids
             object (cons (str "Patient/" pid)
                          (map #(scoped-object % (str "Patient/" pid)) realms))]
-      (delete-tuples! {"namespace" "fhir"
-                       "object" object
-                       "subject_id" subject}))
-    (when (empty? (granted-patients subject))
+      (delete-tuples! keto {"namespace" "fhir"
+                            "object" object
+                            "subject_id" subject}))
+    (when (empty? (granted-patients keto subject))
       (doseq [t (patient-member-types)
               object (cons t (map #(scoped-object % t) realms))]
-        (delete-tuples! {"namespace" "fhir" "object" object "subject_id" subject})))
+        (delete-tuples! keto {"namespace" "fhir" "object" object "subject_id" subject})))
     (t/event! :grant/patient-set-revoked
               {:data {:subject subject :patients (vec patient-ids)
                       :realms (vec (sort realms))}})
@@ -341,7 +358,7 @@
       (str/blank? (str subject)) (bad-request "subject is required")
       (empty? patients) (bad-request "patients must be a non-empty list")
       :else {:status 201
-             :body (assoc (grant-patient-set! realm subject patients
+             :body (assoc (grant-patient-set! (keto-endpoints req) realm subject patients
                                               :relations (or (not-empty relations)
                                                              default-relations))
                           :realm-blind? (str/blank? (str realm)))})))
@@ -354,8 +371,8 @@
       (bad-request "subject query parameter is required")
       {:status 200
        :body {:subject subject
-              :patients (granted-patients subject)
-              :grants (granted-patient-grants subject)}})))
+              :patients (granted-patients (keto-endpoints req) subject)
+              :grants (granted-patient-grants (keto-endpoints req) subject)}})))
 
 (defn delete-grant
   "DELETE /auth/grants {subject, patients [...]}"
@@ -364,7 +381,7 @@
     (cond
       (str/blank? (str subject)) (bad-request "subject is required")
       (empty? patients) (bad-request "patients must be a non-empty list")
-      :else {:status 200 :body (revoke-patient-set! subject patients)})))
+      :else {:status 200 :body (revoke-patient-set! (keto-endpoints req) subject patients)})))
 
 (defn my-patients
   "GET /auth/my-patients -- the authenticated subject's granted patient set.
@@ -373,7 +390,7 @@
   [req]
   (if-let [subject (get-in req [:identity :sub])]
     {:status 200
-     :body {:subject subject :patients (granted-patients subject)}}
+     :body {:subject subject :patients (granted-patients (keto-endpoints req) subject)}}
     {:status 401
      :body {:resourceType "OperationOutcome"
             :issue [{:severity "error" :code "login"
@@ -522,15 +539,15 @@
 (defn- breeze-claims-for
   "Fetches and shapes the first-party claims for a Kratos subject. Keto
    subject ids carry the user:/ prefix, as mast writes them."
-  [subject]
+  [keto subject]
   (let [keto-subject (str "user:/" subject)]
     (resolve-first-party-claims
-      (list-tuples {"namespace" "breezeehr-role"
-                    "relation" "has-role"
-                    "subject_id" keto-subject})
-      (list-tuples {"namespace" "practitioner-id"
-                    "relation" "isa"
-                    "subject_id" keto-subject}))))
+      (list-tuples keto {"namespace" "breezeehr-role"
+                         "relation" "has-role"
+                         "subject_id" keto-subject})
+      (list-tuples keto {"namespace" "practitioner-id"
+                         "relation" "isa"
+                         "subject_id" keto-subject}))))
 
 (defn token-hook
   "POST /auth/token-hook -- Ory Hydra token webhook (OAUTH2_TOKEN_HOOK_URL).
@@ -542,14 +559,17 @@
   (let [secret (System/getenv "TOKEN_HOOK_SECRET")]
     (if (and secret (not= secret (get-in req [:headers "x-token-hook-secret"])))
       {:status 401 :body {:error "invalid token hook secret"}}
-      (let [payload (:body-params req)
+      (let [keto (keto-endpoints req)
+            payload (:body-params req)
             client-id (or (get-in payload [:request :client_id])
                           (get-in payload [:session :client_id]))
             subject (end-user-subject payload)
             first-party? (and subject (contains? (first-party-client-ids) client-id))
-            decision (resolve-launch-patient payload granted-patients launch-authorized?)
+            decision (resolve-launch-patient payload
+                                             #(granted-patients keto %)
+                                             #(launch-authorized? keto %1 %2))
             breeze (when (and first-party? (not (:deny decision)))
-                     (breeze-claims-for subject))]
+                     (breeze-claims-for keto subject))]
         (t/event! :grant/token-hook
                   {:data {:client-id client-id
                           :decision decision

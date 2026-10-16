@@ -308,8 +308,9 @@
   "Builds the complete dromon FHIR ring handler for `store` and the
    server-ready `schemas` vector (see [[resolve-schemas]]).
 
-   Options: `:jwks-url`, `:keto-url`, `:terminology`, `:cors-allowed-origins`,
-   `:enforce-smart-scopes?`, `:bulk-job-store`; each falls back to an
+   Options: `:jwks-url`, `:keto-url`, `:keto-admin-url`, `:oauth-base-url`,
+   `:terminology`, `:cors-allowed-origins`, `:enforce-smart-scopes?`,
+   `:bulk-job-store`; each falls back to an
    environment variable as documented on `server.router/resolve-options`.
    `:lifecycle` (see `server.router/default-middleware`) and
    `:temporal-canonicals` (the canonical URLs temporal responses state, see
@@ -325,8 +326,8 @@
 
 
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
-                                                jwks-url keto-url terminology cors-allowed-origins bulk-job-store
-                                                lifecycle temporal-canonicals]}]
+                                                jwks-url keto-url keto-admin-url oauth-base-url terminology
+                                                cors-allowed-origins bulk-job-store lifecycle temporal-canonicals]}]
   ;; A nil :port means TLS only. The adapter's default is a cleartext
   ;; connector beside the TLS one, so it has to be told (:http? false) rather
   ;; than merely not given a port.
@@ -344,7 +345,9 @@
                                         :keystore keystore
                                         :keystore-type keystore-type
                                         :key-password key-password))]
-    (jetty/run-jetty (fhir-app store schemas :jwks-url jwks-url :keto-url keto-url :terminology terminology
+    (jetty/run-jetty (fhir-app store schemas :jwks-url jwks-url :keto-url keto-url
+                               :keto-admin-url keto-admin-url :oauth-base-url oauth-base-url
+                               :terminology terminology
                                :cors-allowed-origins cors-allowed-origins :bulk-job-store bulk-job-store
                                :lifecycle lifecycle :temporal-canonicals temporal-canonicals)
                      jetty-opts)))
