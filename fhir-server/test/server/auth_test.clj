@@ -209,3 +209,56 @@
           token   (jwt/sign {:sub "token-user"} "test-secret" {:alg :hs256})]
       (wrapped {:headers {"authorization" (str "Token " token)}})
       (is (= {:sub "token-user"} @seen)))))
+
+;; ---------------------------------------------------------------------------
+;; Access tokens only
+;; ---------------------------------------------------------------------------
+
+(def ^:private hydra-access-token-claims
+  "The claim shape of a Hydra `jwt`-strategy access token."
+  {:iss hydra-issuer :aud [] :client_id "jib3" :scp ["openid" "user/*.read"]
+   :jti "at-1" :ext {}})
+
+(def ^:private hydra-id-token-claims
+  "The claim shape of a Hydra ID token for the same sign-in: the client is named
+   in `aud`, there is no `client_id`, and the login and consent app's claims
+   (here a self-asserted `fhirUser`) sit at the top level."
+  {:iss hydra-issuer :aud ["jib3"] :at_hash "h" :auth_time 1 :rat 1 :sid "s"
+   :amr ["pwd"] :fhirUser "Practitioner/forged"})
+
+(deftest claims-rejection-access-tokens-only
+  (let [opts {:issuer hydra-issuer :access-tokens-only? true}]
+    (testing "an access token is accepted"
+      (is (nil? (auth/claims-rejection hydra-access-token-claims opts))))
+    (testing "an ID token, a blank client_id and a non-string one are refused"
+      (is (= :client_id (auth/claims-rejection hydra-id-token-claims opts)))
+      (is (= :client_id (auth/claims-rejection (assoc hydra-access-token-claims :client_id "") opts)))
+      (is (= :client_id (auth/claims-rejection (assoc hydra-access-token-claims :client_id ["jib3"]) opts))))
+    (testing "the issuer is checked first"
+      (is (= :iss (auth/claims-rejection (assoc hydra-access-token-claims :iss "https://other.example/")
+                                         opts)))))
+  (testing "off unless asked for"
+    (is (nil? (auth/claims-rejection hydra-id-token-claims {:issuer hydra-issuer})))))
+
+(deftest wrap-jwt-auth-access-tokens-only
+  (let [opts {:issuer hydra-issuer :access-tokens-only? true}]
+    (testing "a Hydra access token authenticates"
+      (is (= "user123" (:sub (authenticate opts hydra-access-token-claims)))))
+    (testing "a Hydra ID token, correctly signed by the same key, gets no identity"
+      (is (= ::rejected (authenticate opts hydra-id-token-claims))))
+    (testing "and is refused downstream with the 401 OperationOutcome"
+      (with-redefs [auth/fetch-jwks (fn [_] {"mock-key-1" mock-public-key})]
+        (let [wrapped  (-> (fn [_] {:status 200})
+                           auth/wrap-require-auth
+                           (auth/wrap-jwt-auth (assoc opts :jwks-url "http://mock-hydra")))
+              response (wrapped {:headers {"authorization"
+                                           (str "Bearer " (hydra-token hydra-id-token-claims))}})]
+          (is (= 401 (:status response)))))))
+
+  (testing "the HS256 dev path is unaffected"
+    (let [seen    (atom nil)
+          wrapped (auth/wrap-jwt-auth (fn [req] (reset! seen (:identity req)) {:status 200})
+                                      {:secret "test-secret" :access-tokens-only? true})
+          token   (jwt/sign {:sub "token-user"} "test-secret" {:alg :hs256})]
+      (wrapped {:headers {"authorization" (str "Token " token)}})
+      (is (= {:sub "token-user"} @seen)))))

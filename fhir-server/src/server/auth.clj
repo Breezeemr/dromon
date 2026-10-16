@@ -4,6 +4,7 @@
             [buddy.sign.jwt :as jwt]
             [buddy.core.keys :as bkeys]
             [hato.client :as hc]
+            [clojure.string :as str]
             [clojure.tools.logging :as log]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]))
@@ -82,21 +83,45 @@
     (sequential? aud) (set aud)
     :else             #{}))
 
+(defn access-token-claims?
+  "Whether `claims` are an OAuth access token's rather than an OpenID Connect
+   ID token's, judged by the `client_id` claim.
+
+   RFC 9068 (section 2.2) requires `client_id` in a JWT access token, and Hydra's
+   `jwt` access-token strategy always writes it. An ID token never carries it:
+   it names its client in `aud`, which a bearer check cannot tell apart from a
+   resource audience when no audience is configured. Both are signed by the same
+   JWKS key, so the signature says nothing about which one was presented."
+  [claims]
+  (let [client-id (:client_id claims)]
+    (and (string? client-id) (not (str/blank? client-id)))))
+
 (defn claims-rejection
   "Why verified `claims` were not issued for this server, or nil when they were.
 
    `issuer` (a string) must equal the `iss` claim exactly; `audiences` (a
    collection of strings) must intersect the `aud` claim. Either check is
    skipped when its option is nil, and `audiences` is also skipped when empty,
-   so a host that configures neither sees no change. Returns `:iss` or `:aud`."
-  [claims {:keys [issuer audiences]}]
+   so a host that configures neither sees no change.
+
+   `access-tokens-only?` refuses any token that is not an access token
+   ([[access-token-claims?]]). An ID token is a statement to its client about
+   who signed in, and its claims are whatever the login and consent app chose to
+   put there, so accepting one as a bearer credential lets those claims stand in
+   for an authorization decision nobody made.
+
+   Returns `:iss`, `:aud` or `:client_id`."
+  [claims {:keys [issuer audiences access-tokens-only?]}]
   (cond
     (and issuer (not= issuer (:iss claims)))
     :iss
 
     (and (seq audiences)
          (not-any? (audience-claim-set (:aud claims)) audiences))
-    :aud))
+    :aud
+
+    (and access-tokens-only? (not (access-token-claims? claims)))
+    :client_id))
 
 (defn wrap-jwt-auth
   "Middleware that validates JWTs from the Authorization header using buddy-auth.
@@ -104,21 +129,23 @@
    Supports either a static :secret (e.g. for testing/dev HS256) or a :jwks-url
    (e.g. for Ory Hydra OIDC RS256).
 
-   With a :jwks-url, the optional :issuer and :audiences restrict which
-   correctly signed tokens are accepted (see [[claims-rejection]]). A JWKS
+   With a :jwks-url, the optional :issuer, :audiences and :access-tokens-only?
+   restrict which correctly signed tokens are accepted (see
+   [[claims-rejection]]). A JWKS
    proves only that the authorization server signed a token, not that it was
    issued for this server: without these options a token minted for any client
    of the same Hydra is accepted. A token that fails either check is treated
    exactly like one with a bad signature -- no :identity is attached, and the
    downstream authorization middleware answers 401. The HS256 :secret path
-   ignores both options.
+   ignores all three options.
 
    A request that already carries :identity is passed through untouched. That is
    the BFF seam: flotilla authenticates the opaque session cookie itself and
    injects {:identity {:sub subject}} before delegating here, and buddy's
    authentication-request would overwrite it with nil (no Authorization header
    accompanies a cookie-mode request)."
-  [handler {:keys [secret jwks-url issuer audiences] :or {secret dev-secret}}]
+  [handler {:keys [secret jwks-url issuer audiences access-tokens-only?]
+            :or {secret dev-secret}}]
   (when (and (nil? jwks-url) (nil? secret))
     (throw (ex-info "JWT auth requires either :jwks-url or :secret (set JWT_DEV_SECRET env var for dev)" {})))
   (let [backend (if jwks-url
@@ -133,7 +160,9 @@
                                                                                :diagnostics "Invalid or missing token"}]}})})
                   (token/jws-backend {:secret secret
                                       :options {:alg :hs256}}))
-        claim-checks (when jwks-url {:issuer issuer :audiences audiences})]
+        claim-checks (when jwks-url {:issuer              issuer
+                                     :audiences           audiences
+                                     :access-tokens-only? access-tokens-only?})]
     (fn [request]
       (if (:identity request)
         (handler request)

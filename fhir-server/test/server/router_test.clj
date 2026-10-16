@@ -398,6 +398,23 @@
       (is (= 401 (read {:iss issuer :aud ["https://rcm.example"]})))
       (is (= 401 (read {:iss issuer}))))))
 
+(deftest jwt-access-tokens-only-reaches-the-jwt-middleware
+  (let [store  (mock/create-mock-store {})
+        _      (db/create-resource store tenant :Patient "p-1"
+                                   {:resourceType "Patient" :id "p-1"})
+        app    (sc/fhir-app store test-schemas
+                            (assoc app-opts :jwt-access-tokens-only? true))
+        token  (fn [claims]
+                 (str "Bearer " (jwt/sign (merge {:sub "user-1"} claims) (.getPrivate keypair)
+                                          {:alg :rs256 :header {:kid "kid-1"}})))
+        read   (fn [claims]
+                 (:status (app (GET (str "/" tenant "/fhir/Patient/p-1")
+                                    :headers {"authorization" (token claims)}))))]
+    (with-auth
+      (is (= 200 (read {:client_id "jib3" :scp ["user/*.read"]})))
+      (is (= 401 (read {:aud ["jib3"] :at_hash "h" :fhirUser "Practitioner/forged"}))
+          "an ID token attaches no subject, so Keto answers 401"))))
+
 (def ^:private marker-middleware
   "Short-circuits on X-Marker so its position in the chain is observable."
   {:name ::marker
@@ -592,8 +609,10 @@
                 :lifecycle `presenting-lifecycle
                 :bulk-job-store :jobs
                 :jwt-issuer "https://oauth.example/"
-                :jwt-audiences ["https://flotilla.example/fhir"]})]
+                :jwt-audiences ["https://flotilla.example/fhir"]
+                :jwt-access-tokens-only? true})]
     (is (= jwks-url (:jwks-url opts)))
+    (is (true? (:jwt-access-tokens-only? opts)))
     (is (= "https://oauth.example/" (:jwt-issuer opts)))
     (is (= ["https://flotilla.example/fhir"] (:jwt-audiences opts)))
     (is (= keto-url (:keto-url opts)))

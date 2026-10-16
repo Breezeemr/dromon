@@ -223,7 +223,8 @@
    `:terminology`, `:cors-allowed-origins`,
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
-   `:jwt-issuer` and `:jwt-audiences`; unknown keys are ignored. `:lifecycle`
+   `:jwt-issuer`, `:jwt-audiences` and `:jwt-access-tokens-only?`; unknown keys
+   are ignored. `:lifecycle`
    is carried through as given; [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
    producer, `(fn [request])` returning a stamp or nil; with none, writes carry
    no stamp. `:temporal-canonicals` is `{:basis-tag-system .. :extension-base
@@ -258,9 +259,10 @@
                                `KETO_LEGACY_REALM_BLIND_FALLBACK=0` to disable,
                                else `server.keto/default-legacy-realm-blind-fallback?`.
    - :enforce-smart-scopes? -- argument when non-nil, else `ENFORCE_SMART_SCOPES=1`.
-   - :jwt-issuer, :jwt-audiences -- argument only, no environment fallback;
-                               nil leaves the corresponding claim unchecked
-                               (see `server.auth/wrap-jwt-auth`).
+   - :jwt-issuer, :jwt-audiences, :jwt-access-tokens-only? -- argument only,
+                               no environment fallback; nil leaves the
+                               corresponding claim unchecked (see
+                               `server.auth/wrap-jwt-auth`).
    - :cors-origins          -- [[parse-cors-origins]] of the argument, else of
                                `CORS_ALLOWED_ORIGINS`.
    - :trace-tap             -- `server.dev.trace-tap/wrap-trace-tap`, resolved
@@ -268,13 +270,15 @@
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url keto-admin-url oauth-base-url terminology cors-allowed-origins
            enforce-smart-scopes? bulk-job-store login-url lifecycle tx-metadata
-           temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences]}]
+           temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences
+           jwt-access-tokens-only?]}]
   {:jwks-url              (or jwks-url
                               (System/getenv "JWKS_URL")
                               (when-not (System/getenv "JWT_DEV_SECRET")
                                 "http://localhost:4444/.well-known/jwks.json"))
    :jwt-issuer            jwt-issuer
    :jwt-audiences         jwt-audiences
+   :jwt-access-tokens-only? jwt-access-tokens-only?
    :keto-url              (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
    :keto-admin-url        (or keto-admin-url (System/getenv "KETO_ADMIN_URL") "http://localhost:4467")
    :oauth-base-url        (or oauth-base-url (System/getenv "OAUTH_BASE_URL") "http://localhost:4444")
@@ -404,7 +408,8 @@
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
-                 keto-admin-url oauth-base-url jwks-url jwt-issuer jwt-audiences enforce-smart-scopes? login-url
+                 keto-admin-url oauth-base-url jwks-url jwt-issuer jwt-audiences
+                 jwt-access-tokens-only? enforce-smart-scopes? login-url
                  narrative lifecycle tx-metadata temporal-canonicals
                  legacy-realm-blind-fallback?]
           :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}
@@ -461,9 +466,10 @@
                     (wrap-keto-url handler keto-url legacy-realm-blind-fallback?
                                    keto-admin-url))}
            {:name ::jwt-auth
-            :wrap (fn [handler] (auth/wrap-jwt-auth handler {:jwks-url  jwks-url
-                                                             :issuer    jwt-issuer
-                                                             :audiences jwt-audiences}))}])
+            :wrap (fn [handler] (auth/wrap-jwt-auth handler {:jwks-url            jwks-url
+                                                             :issuer              jwt-issuer
+                                                             :audiences           jwt-audiences
+                                                             :access-tokens-only? jwt-access-tokens-only?}))}])
 
     enforce-smart-scopes?
     (conj {:name ::smart-scope :wrap (fn [handler] (scope/wrap-smart-scope handler {}))}
