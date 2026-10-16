@@ -253,8 +253,9 @@
 ;; LIMIT early-termination) XTDB must evaluate that per row over the whole match
 ;; set, which is expensive (a multi-value OR becomes one mark-join per value).
 ;; We denormalize each top-level Coding/CodeableConcept field into a flat
-;; `<field>_tokens` text[] of "code" and "system|code" strings so the search
-;; layer can match a scalar array with a single UNNEST ... IN (...) instead.
+;; `<field>_tokens` text[] of bare codes so the search layer can compare its
+;; elements by index, a scalar predicate XTDB applies in the scan (see
+;; core/flat-token-column-condition).
 ;; ---------------------------------------------------------------------------
 
 (defn- coding->tokens
