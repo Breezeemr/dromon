@@ -144,6 +144,48 @@
                         (and id (not bad-id?))
                         (assoc :id id)))))))
 
+(defn ^:no-doc version-of-system-time
+  "The versionId of the version XTDB stamped at system time `t` (an Instant,
+   or the ZonedDateTime `_system_from` reads as): `t` in UTC as Instant.toString
+   renders it, without the colons FHIR's id type does not allow, e.g.
+   `2026-10-17T041241.058126Z`. A version written since commit-time
+   versioning stores no fhir_version; its id is derived from its own
+   `_system_from`, which is unique within a resource's history (delete and
+   re-create included) and needs no read before the write. A version split by
+   a later valid-time write keeps its `_system_from`, so it keeps its id."
+  [t]
+  (let [t (if (instance? ZonedDateTime t) (.toInstant ^ZonedDateTime t) t)]
+    (when (instance? Instant t)
+      (str/replace (str t) ":" ""))))
+
+(defn ^:no-doc system-time-of-version
+  "The system time a commit-time versionId names, or nil for any other
+   versionId (a stored counter such as \"3\")."
+  [vid]
+  (let [s (str vid)
+        i (str/index-of s "T")]
+    (when (and i (>= (count s) (+ i 6)))
+      (try
+        (Instant/parse (str (subs s 0 (+ i 3)) ":" (subs s (+ i 3) (+ i 5)) ":" (subs s (+ i 5))))
+        (catch Exception _ nil)))))
+
+(def ^:no-doc version-match-sql
+  "Selects the version `vid` names: a stored fhir_version (rows written before
+   commit-time versioning, and by importers that stamp one), or the row with
+   no stored version whose `_system_from` the id names. Binds
+   version-match-args."
+  "(fhir_version = ? OR (fhir_version IS NULL AND _system_from = ?))")
+
+(defn ^:no-doc version-match-args [vid]
+  [(str vid) (system-time-of-version vid)])
+
+(defn ^:no-doc row-version
+  "The versionId of a row read with its fhir_version and `_system_from`."
+  [row]
+  (or (some-> (or (:fhir-version row) (:fhir_version row) (get row "fhir_version")) str)
+      (version-of-system-time (or (:xt/system-from row) (:xt/system_from row)
+                                  (get row "_system_from")))))
+
 (defn ^:no-doc encode-resource-doc
   "Runs the malli storage encoder for the given resource type and returns the
    raw XTDB document map (pre-SQL-serialization) with :_id and :fhir_version
@@ -171,7 +213,10 @@
 (defn ^:no-doc extract-and-build-sql
   "Takes a resource map and resource-type, builds a parameterized SQL INSERT for XTDB.
    Optional kwargs:
-     :version — the monotonic version string to inject as the \"fhir_version\" column.
+     :version — a version string to store as the \"fhir_version\" column. The
+       store passes none: a version's id is derived from its `_system_from`
+       (version-of-system-time). Importers that keep their own numbering pass
+       one, and it wins on read.
      :valid-time — {:valid-from t :valid-to t-or-nil}; adds the _valid_from /
        _valid_to columns so the row is placed on the valid-time axis instead of
        defaulting to now-until-end-of-time. A nil :valid-to is omitted, which
@@ -238,11 +283,10 @@
   "Reads the current fhir_version column for a resource row. Returns the version
    string or nil if no row exists."
   [node resource-type id]
-  (let [query (format "SELECT fhir_version FROM %s WHERE _id = ?" (table-name resource-type))
+  (let [query (format "SELECT fhir_version, _system_from FROM %s WHERE _id = ?" (table-name resource-type))
         row (first (run-query node [query id]))]
     (when row
-      (when-let [v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
-        (str v)))))
+      (row-version row))))
 
 (defn ^:no-doc current-versions-bulk
   "Bulk variant of current-version: takes a collection of ids for a single
@@ -256,13 +300,13 @@
       {}
       ;; = ANY(?) with a single array param keeps the SQL text stable regardless
       ;; of id count, so it hits XTDB's plan cache instead of recompiling per size.
-      (let [query (format "SELECT _id, fhir_version FROM %s WHERE _id = ANY(?)"
+      (let [query (format "SELECT _id, fhir_version, _system_from FROM %s WHERE _id = ANY(?)"
                           (table-name resource-type))
             rows (run-query node [query (vec ids)])]
         (into {}
               (keep (fn [row]
                       (let [rid (or (:xt/id row) (:_id row) (get row "_id"))
-                            v (or (:fhir-version row) (:fhir_version row) (get row "fhir_version"))]
+                            v (row-version row)]
                         (when (and rid v) [(str rid) (str v)]))))
               rows)))))
 
@@ -294,7 +338,9 @@
               rows)))))
 
 (defn ^:no-doc next-version
-  "Computes the next version string from a current version (or nil for first)."
+  "Computes the next version string from a current version (or nil for first).
+   Kept for importers that number versions themselves; the store derives
+   versionIds from system time (version-of-system-time)."
   [current]
   (if (and current (not (str/blank? current)))
     (if-let [n (parse-long current)]
@@ -422,12 +468,12 @@
   (when-let [idx (:tx-op-idx (ex-data e))]
     (>= idx own-op-count)))
 
-(defn- version-assert-op
+(defn ^:no-doc version-assert-op
   "The ASSERT that fails a transaction unless `id` still holds `vid`."
   [resource-type id vid]
-  [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                (table-name resource-type))
-   [id vid]])
+  [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND %s)"
+                (table-name resource-type) version-match-sql)
+   (into [id] (version-match-args vid))])
 
 (defn- entry-if-match
   "The version a transaction PUT entry's `request.ifMatch` guards on, checked
@@ -1404,7 +1450,7 @@
   [record read-decoders]
   (when record
     (let [id (or (:xt/id record) (:_id record))
-          version (or (:fhir-version record) (:fhir_version record) (get record "fhir_version"))
+          version (row-version record)
           system-from (or (:xt/system_from record) (:xt/system-from record) (get record "_system_from"))
           stripped (-> record
                        (dissoc :xt/id :_id :fhir_version :fhir-version
@@ -2005,16 +2051,16 @@
          results (into [] (run-query node (into [query] (conj for-params id))))]
      (xtdb->fhir (first results) read-decoders))))
 
-(defn- vread-sql
+(defn ^:no-doc vread-sql
   "`vid` is the FHIR versionId, i.e. the `fhir_version` every write stamps, so
    the version is selected by value across system time rather than read AS OF
    a point. Same qualifier as history-sql, so every versionId instance history
    lists can be read back. The column holds strings; an integer vid would
    otherwise match nothing."
   [node resource-type id vid read-decoders]
-  (let [query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME WHERE _id = ? AND fhir_version = ?"
-                      (table-name resource-type))
-        results (into [] (run-query node [query id (str vid)]))]
+  (let [query (format "SELECT *, _system_from FROM %s FOR ALL SYSTEM_TIME WHERE _id = ? AND %s"
+                      (table-name resource-type) version-match-sql)
+        results (into [] (run-query node (into [query id] (version-match-args vid))))]
     (xtdb->fhir (first results) read-decoders)))
 
 (defn- deleted?-sql [node resource-type id]
@@ -2137,34 +2183,43 @@
 ;; Write-side SQL impls.
 ;; ---------------------------------------------------------------------------
 
-(defn- create-sql [node resource-type id resource storage-encoders lc-ctx]
-  (let [version "1"
-        rt-name (name resource-type)
+(defn- create-sql [node resource-type id resource storage-encoders lc-ctx id-minted?]
+  (let [rt-name (name resource-type)
         write (lifecycle-write lc-ctx node :create resource-type id resource)
         resource (:resource write)
-        [sql args] (extract-and-build-sql resource-type id resource storage-encoders
-                                          :version version)
-        assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
-                                (table-name resource-type))
-                   [id]]
-        own-ops [assert-op [:sql sql args]]
+        [sql args] (extract-and-build-sql resource-type id resource storage-encoders)
+        ;; The ASSERT runs inside the transaction on XTDB's single writer, one
+        ;; transaction at a time, and costs a point lookup that grows with the
+        ;; table: it bounds concurrent creates. A minted id cannot exist, so,
+        ;; as for a transaction's POST entries, it gets none.
+        own-ops (cond-> []
+                  (not id-minted?)
+                  (conj [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
+                                      (table-name resource-type))
+                         [id]])
+                  true (conj [:sql sql args]))
         tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
                  (xt/execute-tx node tx-ops)
                  (catch Exception e
-                   (when (lifecycle-op-failure? e (count own-ops))
+                   ;; Only the ASSERT means "already exists"; a minted create
+                   ;; has none, so whatever failed is reported as itself.
+                   (when (or id-minted? (lifecycle-op-failure? e (count own-ops)))
                      (throw e))
                    (throw (ex-info (str "Resource already exists: " rt-name "/" id)
                                    {:fhir/status 409 :fhir/code "conflict"
                                     :resource-type rt-name :id id}
                                    e))))]
     (fire-after-commit! lc-ctx [write] tx-key)
-    (committed resource id version tx-key)))
+    (committed resource id (version-of-system-time (:system-time tx-key)) tx-key)))
 
 (defn- update-sql [node resource-type id resource opts storage-encoders lc-ctx]
   (let [rt-name (table-name resource-type)
         supplied (fp/normalize-if-match (:if-match opts))
-        current (current-version node resource-type id)
+        ;; Only an If-Match reads first. Without one a PUT is last-writer-wins:
+        ;; its versionId comes from the commit, so there is nothing to read
+        ;; or to assert, and two racing PUTs both land.
+        current (when supplied (current-version node resource-type id))
         _ (when (and supplied (nil? current))
             (throw (ex-info "Version conflict: resource does not exist"
                             {:fhir/status 412 :fhir/code "conflict"
@@ -2177,20 +2232,12 @@
             (throw (ex-info "Version conflict"
                             {:fhir/status 412 :fhir/code "conflict"
                              :expected if-match :actual current})))
-        expected-vid (or if-match current)
-        new-version (next-version expected-vid)
         write (lifecycle-write lc-ctx node :update resource-type id resource)
         resource (:resource write)
-        [sql args] (extract-and-build-sql resource-type id resource storage-encoders
-                                          :version new-version)
-        assert-op (if expected-vid
-                    [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                  rt-name)
-                     [id expected-vid]]
-                    [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
-                                  rt-name)
-                     [id]])
-        own-ops [assert-op [:sql sql args]]
+        [sql args] (extract-and-build-sql resource-type id resource storage-encoders)
+        own-ops (cond-> []
+                  if-match (conj (version-assert-op resource-type id if-match))
+                  true (conj [:sql sql args]))
         tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
                  (xt/execute-tx node tx-ops)
@@ -2202,11 +2249,9 @@
                                      {:fhir/status 412 :fhir/code "conflict"
                                       :expected if-match}
                                      e))
-                     (throw (ex-info (str "Conflict: " (ex-message e))
-                                     {:fhir/status 409 :fhir/code "conflict"}
-                                     e)))))]
+                     (throw e))))]
     (fire-after-commit! lc-ctx [write] tx-key)
-    (committed resource id new-version tx-key)))
+    (committed resource id (version-of-system-time (:system-time tx-key)) tx-key)))
 
 (defn- delete-sql [node resource-type id opts]
   (let [rt-name (table-name resource-type)
@@ -2222,9 +2267,7 @@
                             {:fhir/status 412 :fhir/code "conflict"
                              :expected if-match :actual current})))
         assert-op (when if-match
-                    [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                  rt-name)
-                     [id if-match]])
+                    (version-assert-op resource-type id if-match))
         delete-op [:sql (format "DELETE FROM %s WHERE _id = ?" rt-name) [id]]
         tx-ops (if assert-op [assert-op delete-op] [delete-op])
         tx-key (try
@@ -2464,13 +2507,10 @@
 
 (defn- put-valid-time-sql
   [node resource-type id resource vt storage-encoders]
-  (let [current (current-version node resource-type id)
-        new-version (next-version current)
-        [sql args] (extract-and-build-sql resource-type id resource storage-encoders
-                                          :version new-version
+  (let [[sql args] (extract-and-build-sql resource-type id resource storage-encoders
                                           :valid-time vt)
         tx-key (xt/execute-tx node [[:sql sql args]])]
-    (committed resource id new-version tx-key)))
+    (committed resource id (version-of-system-time (:system-time tx-key)) tx-key)))
 
 (defn- refuse-empty-portion!
   "Refuses an empty or inverted portion before the statement is issued.
@@ -2531,10 +2571,13 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (create-xtql node resource-type id resource storage-encoders
-                            (lifecycle-ctx this tenant-id opts))
+                            (lifecycle-ctx this tenant-id (not-empty (dissoc opts :id-minted?))))
          (with-open [conn (jdbc/get-connection pool)]
+           ;; :id-minted? is a hint to the store, not one of the host's
+           ;; opts, so a lifecycle sees the opts without it.
            (create-sql conn resource-type id resource storage-encoders
-                       (lifecycle-ctx this tenant-id opts)))))))
+                       (lifecycle-ctx this tenant-id (not-empty (dissoc opts :id-minted?)))
+                       (true? (:id-minted? opts))))))))
 
   (read-resource [this tenant-id resource-type id]
     (refuse-unencodable-input! {:resource-type resource-type :id id})
@@ -2731,8 +2774,11 @@
            (reduce (fn [acc [rt metas]]
                      (assoc acc rt (current-versions-bulk node rt (map :id metas))))
                    {}
+                   ;; Versions come from the commit, so only a PUT with an
+                   ;; ifMatch needs to know the version it replaces.
                    (group-by :resource-type
-                             (filter #(= "PUT" (:method %)) entry-metas))))
+                             (filter #(and (= "PUT" (:method %)) (:if-match %))
+                                     entry-metas))))
           ;; Single pass over entry-metas: emit tx-ops AND the per-entry
           ;; response metadata (new version, final resource with :id+:meta
           ;; populated). This lets the response builder assemble the Bundle
@@ -2747,17 +2793,15 @@
           ;; `resource` is the lifecycle-PREPARED body for POST/PUT, never
           ;; the entry's submitted one.
           emit-write-op
-          (fn [{:keys [method resource-type id] :as _em} resource vid]
+          (fn [{:keys [method resource-type id] :as _em} resource _vid]
             (case method
               ("POST" "PUT")
               (if xtql-mode?
                 [:put-docs (keyword resource-type)
                  (doc->put-doc
-                  (encode-resource-doc resource-type id resource storage-encoders
-                                       :version vid))]
+                  (encode-resource-doc resource-type id resource storage-encoders))]
                 (let [[sql args] (extract-and-build-sql
-                                   resource-type id resource storage-encoders
-                                   :version vid)]
+                                   resource-type id resource storage-encoders)]
                   [:sql sql args]))
               "DELETE"
               (if xtql-mode?
@@ -2777,9 +2821,8 @@
                        (let [current (get-in put-versions-by-type [resource-type id])
                              if-match (when (= "PUT" method)
                                         (entry-if-match em current))
-                             vid (if (= "POST" method)
-                                   "1"
-                                   (next-version current))
+                             ;; Known once the transaction commits.
+                             vid :commit-time
                              write (lifecycle-write (assoc lc-ctx :opts (entry-opts opts if-match))
                                                     node
                                                     (if (= "POST" method) :create :update)
@@ -2822,6 +2865,15 @@
                                           {:fhir/status 412 :fhir/code "conflict"}
                                           e))
                           (throw e)))))]
+      ;; Fill in the versionIds, known only now: the commit's system time.
+      (let [entry-results (let [cv (version-of-system-time (:system-time tx-key))]
+                            (mapv (fn [r]
+                                    (if (= :commit-time (:vid r))
+                                      (-> r
+                                          (assoc :vid cv)
+                                          (assoc-in [:resource :meta :versionId] cv))
+                                      r))
+                                  entry-results))]
       ;; Once for the whole Bundle. A Bundle of only DELETE/GET entries
       ;; handed nothing to the lifecycle, so it has nothing to report.
       (when (seq lifecycle-writes)
@@ -2872,7 +2924,7 @@
                              resource (assoc :resource
                                              (assoc-in resource [:meta :lastUpdated] last-mod-str)))))
                        entry-results)}
-          tx-key)))))))))
+          tx-key))))))))))
 
   (transact-bundle [this tenant-id entries]
     (fp/transact-bundle this tenant-id entries nil))
@@ -2903,9 +2955,8 @@
                   (case method
                     "POST"
                     (let [new-id (str (java.util.UUID/randomUUID))
-                          res (if-let [o (entry-opts opts nil)]
-                                (fp/create-resource this tenant-id (keyword resource-type) new-id resource o)
-                                (fp/create-resource this tenant-id (keyword resource-type) new-id resource))
+                          res (fp/create-resource this tenant-id (keyword resource-type) new-id resource
+                                                  (assoc (entry-opts opts nil) :id-minted? true))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
