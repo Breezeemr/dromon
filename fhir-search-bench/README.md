@@ -89,6 +89,7 @@ database, then runs every workload `:repeats` times (default 3):
 | workload | what is timed |
 |---|---|
 | single | `create-resource`, `update-resource`, update with `:if-match`, `delete-resource`; one thread, 200 ops each after 50 warmup |
+| edit | `update-resource` that changes one field against one that changes most fields, for 200 Observations and 200 full Synthea Patients each; one field moves a single date leaf, most fields swaps in another resource's content of the same type (rounds run one/most/most/one after a discarded pair) |
 | concurrent | create then update 400 distinct Observations at 1, 4 and 16 threads |
 | tx-size | `transact-transaction` (atomic) and `transact-bundle` (batch) at 1, 10, 100 and 1000 entries |
 | mixed | one transaction: POST an Encounter and 5 Observations referencing it by `urn:uuid`, PUT an Observation with `ifMatch`, DELETE another |
@@ -134,6 +135,9 @@ bb bench-writes
 
 # Compare; :label-a/:label-b name the columns for a before/after of one store.
 bb writes-report :b '"../../dromon-datomic/target/writes-datomic.edn"'
+
+# One workload only (any of :single :edit :concurrent :tx :mixed :rollback :contention).
+bb bench-writes-xtdb :only '[:edit]' :out '"target/writes-edit-xtdb2.edn"'
 
 # A quick smoke run.
 bb bench-writes-xtdb :preload 10000 :n 50 :warmup 10 :repeats 1 :concurrent-n 100 \

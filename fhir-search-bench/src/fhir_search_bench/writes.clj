@@ -172,7 +172,8 @@
                      :else x))]
     ;; subject by its reference alone: fhir-store-datomic adds the Reference's
     ;; optional `type` on read, which is not a change to what was written.
-    (norm (cond-> (select-keys res [:status :code :valueQuantity])
+    (norm (cond-> (select-keys res [:status :code :valueQuantity :category :effectiveDateTime
+                                    :name :birthDate :gender :address :telecom :identifier :extension])
             (:subject res) (assoc :subject (select-keys (:subject res) [:reference]))))))
 
 (defn- readback-check
@@ -443,6 +444,102 @@
              :versions versions
              :lost-updates (- (inc (.get ok)) versions)))))
 
+(defn- leaves
+  "Every leaf of a resource as {path value}, for counting changed fields."
+  [x]
+  (letfn [(walk [path x]
+            (cond (map? x)        (mapcat (fn [[k v]] (walk (conj path k) v)) x)
+                  (sequential? x) (mapcat (fn [i v] (walk (conj path i) v)) (range) x)
+                  :else           [[path x]]))]
+    (into {} (walk [] (dissoc x :id :meta)))))
+
+(defn- change-counts
+  "How much a PUT of `b` over `a` changes: leaves and top-level fields that
+   differ, out of those either body has."
+  [a b]
+  (let [la (leaves a) lb (leaves b)
+        paths (distinct (concat (keys la) (keys lb)))
+        tops  (disj (into (set (keys a)) (keys b)) :id :meta :resourceType)]
+    {:leaves-changed (count (filter #(not= (get la %) (get lb %)) paths))
+     :leaves-total   (count paths)
+     :fields-changed (count (filter #(not= (get a %) (get b %)) tops))
+     :fields-total   (count tops)}))
+
+(defn- input-patients
+  "Full Synthea Patients (identifiers, extensions, address, telecom, narrative),
+   minus the fields that would hold references."
+  [entries]
+  (->> entries
+       (map :resource)
+       (filter #(= "Patient" (:resourceType %)))
+       (map #(dissoc % :id :meta :generalPractitioner :managingOrganization :link :contact))))
+
+(defn- edit-size
+  "PUTs that change one field against PUTs that change most fields, per type.
+   `n` resources of each type are created; each round then PUTs every one of
+   them once: a one-field round moves a single date leaf (Observation
+   effectiveDateTime, Patient birthDate), a most-fields round swaps in the
+   content of a different resource of the same type, so bodies stay valid and
+   similar in size. Rounds alternate one/most after one discarded pair."
+  [store anchors obs patients rep n]
+  (let [counter (AtomicLong. 0)
+        one-field
+        {:Observation (fn [b] (assoc b :effectiveDateTime
+                                     (str (.plusSeconds (java.time.Instant/parse "2020-01-01T00:00:00Z")
+                                                        (.incrementAndGet counter)))))
+         :Patient     (fn [b] (assoc b :birthDate
+                                     (str (.plusDays (java.time.LocalDate/of 1950 1 1)
+                                                     (.incrementAndGet counter)))))}
+        fresh
+        {:Observation (fn [i id] (obs-body (obs) anchors i id))
+         :Patient     (fn [_ id] (assoc (patients) :id id))}
+        compare-keys
+        {:Observation [:status :code :category :valueQuantity :effectiveDateTime :subject]
+         :Patient     [:name :birthDate :gender :address :telecom :identifier :extension]}]
+    (into {}
+          (for [rt [:Observation :Patient]]
+            (let [ids     (mapv #(str "wb-e-" rep "-" (name rt) "-" %) (range n))
+                  current (atom (mapv (fn [i id] ((fresh rt) i id)) (range n) ids))
+                  _       (doseq [[id b] (map vector ids @current)]
+                            (db/create-resource store tenant rt id b))
+                  round   (fn [variant]
+                            (let [olds   @current
+                                  bodies (mapv (fn [i id old]
+                                                 (if (= variant :one-field)
+                                                   ((one-field rt) old)
+                                                   ((fresh rt) i id)))
+                                               (range n) ids olds)
+                                  out    (run-ops 1 (mapv (fn [id b] #(db/update-resource store tenant rt id b))
+                                                          ids bodies))]
+                              (reset! current bodies)
+                              {:samples (:results out)
+                               :wall    (* 1e6 (:wall-ms (:summary out)))
+                               :changes (map change-counts olds bodies)
+                               :chars   (map (comp count pr-str) bodies)}))
+                  ;; A-B-B-A after a discarded pair, so neither variant always
+                  ;; runs first.
+                  _       (round :one-field)
+                  _       (round :most-fields)
+                  rounds  (mapv (fn [v] [v (round v)]) [:one-field :most-fields :most-fields :one-field])
+                  merge-v (fn [v]
+                            (let [rs   (keep (fn [[v' r]] (when (= v v') r)) rounds)
+                                  chs  (mapcat :changes rs)
+                                  avg  (fn [xs] (double (/ (reduce + xs) (max 1 (count xs)))))]
+                              (assoc (summarize (mapcat :samples rs) (reduce + (map :wall rs)))
+                                     :leaves-changed (avg (map :leaves-changed chs))
+                                     :leaves-total   (avg (map :leaves-total chs))
+                                     :fields-changed (avg (map :fields-changed chs))
+                                     :fields-total   (avg (map :fields-total chs))
+                                     :body-chars     (avg (mapcat :chars rs)))))
+                  one     (merge-v :one-field)
+                  most    (merge-v :most-fields)
+                  sample  (take 10 (map vector ids @current))
+                  norm    (fn [r] (comparable (select-keys r (compare-keys rt))))
+                  bad     (count (remove (fn [[id b]] (= (norm b) (norm (db/read-resource store tenant rt id))))
+                                         sample))]
+              [rt {:one-field   one
+                   :most-fields (assoc most :readback {:checked (count sample) :mismatched bad})}])))))
+
 ;; ── Driver ──────────────────────────────────────────────────────────────────
 
 (defn- median [xs] (when (seq xs) (nth (vec (sort xs)) (quot (count xs) 2))))
@@ -462,6 +559,11 @@
              :ops-per-sec (median (nums :ops-per-sec))
              :p50-by-rep  (vec (nums :p50-ms))}
       (seq (nums :entries-per-sec)) (assoc :entries-per-sec (median (nums :entries-per-sec)))
+      (seq (nums :fields-changed)) (assoc :fields-changed (median (nums :fields-changed))
+                                          :fields-total (median (nums :fields-total))
+                                          :leaves-changed (median (nums :leaves-changed))
+                                          :leaves-total (median (nums :leaves-total))
+                                          :body-chars (median (nums :body-chars)))
       (seq (keep :error-kinds reps)) (assoc :error-kinds (apply merge-with + (keep :error-kinds reps)))
       (seq (nums :checks))   (assoc :checks (vec (nums :checks)))
       (seq (nums :readback)) (assoc :readback (vec (nums :readback)))
@@ -472,13 +574,15 @@
 
 (defn- flatten-rep
   "One repeat's nested results as {workload-key summary}."
-  [{:keys [single concurrent tx mixed rollback contention]}]
+  [{:keys [single concurrent tx mixed rollback contention edit]}]
+  (into {} (remove (comp nil? val))
   (merge
    (into {} (for [[k v] (dissoc single :readback)]
               [[:single k] (cond-> v (= k :update-if-match) (assoc :readback (:readback single)))]))
    (into {} (for [[c m] concurrent, [k v] m] [[:concurrent k c] v]))
    (into {} (for [[[mode s] v] tx] [[:tx mode s] v]))
-   {[:mixed] mixed [:rollback] rollback [:contention] contention}))
+   (into {} (for [[rt m] edit, [variant v] m] [[:edit rt variant] v]))
+   {[:mixed] mixed [:rollback] rollback [:contention] contention})))
 
 (defn run
   "Benchmark one backend's writes and transactions. Options:
@@ -496,12 +600,16 @@
    - :mixed-rounds  mixed transactions per repeat (default 50)
    - :rollback-rounds rolled-back transactions per repeat (default 20)
    - :contention-threads / :contention-attempts (default 8 / 25)
+   - :edit-n        resources per type in the one-field vs most-fields PUT
+                    workload (default 200)
+   - :only          workloads to run, a subset of #{:single :edit :concurrent
+                    :tx :mixed :rollback :contention} (default all)
    - :synthea-dir   Synthea fhir bundle dir (default synthea-output/fhir)
    - :out           result file (default target/writes-<backend>.edn)"
   [{:keys [backend store-fn xtdb-pipelined? preload n warmup repeats concurrency concurrent-n
            tx-sizes mixed-rounds rollback-rounds contention-threads contention-attempts
-           synthea-dir out]
-    :or   {xtdb-pipelined? true preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
+           synthea-dir out edit-n only]
+    :or   {edit-n 200 xtdb-pipelined? true preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
            concurrent-n 400 tx-sizes [1 10 100 1000] mixed-rounds 50 rollback-rounds 20
            contention-threads 8 contention-attempts 25 synthea-dir "synthea-output/fhir"}}]
   (when-not (keyword? backend)
@@ -519,6 +627,8 @@
           obs     (input-stream (input-observations (:entries inputs)))
           enc     (input-stream (input-encounters (:entries inputs)))
           tx-in   (input-stream (:entries inputs))
+          pts     (input-stream (input-patients (:entries inputs)))
+          run?    (if only (set only) (constantly true))
           anchors (vec (for [[i p] (map-indexed vector (take 20 (filter #(= "Patient" (:resourceType %))
                                                                         (map :resource (:entries inputs)))))]
                          (let [id (str "wb-pt-" i)]
@@ -532,16 +642,15 @@
           rep-results
           (vec (for [rep (range repeats)]
                  (do (log "Repeat" (inc rep) "/" repeats)
-                     (let [r {:single     (single-writes store anchors obs rep n warmup)
-                              :concurrent (concurrent-writes store anchors obs rep concurrent-n concurrency)
-                              :tx         (tx-size-sweep store tx-in tx-sizes iters)
-                              :mixed      (mixed-tx store anchors obs enc rep mixed-rounds 5)
-                              :rollback   (rollback-tx store anchors obs rep rollback-rounds 10)
-                              :contention (contention store anchors obs rep contention-threads contention-attempts)}]
-                       (log "  single create p50"
-                            (format "%.2f ms" (get-in r [:single :create :p50-ms]))
-                            "| tx 100 p50"
-                            (format "%.1f ms" (or (get-in r [:tx [:transaction 100] :p50-ms]) -1.0)))
+                     (let [r (cond-> {}
+                               (run? :single)     (assoc :single (single-writes store anchors obs rep n warmup))
+                               (run? :edit)       (assoc :edit (edit-size store anchors obs pts rep edit-n))
+                               (run? :concurrent) (assoc :concurrent (concurrent-writes store anchors obs rep concurrent-n concurrency))
+                               (run? :tx)         (assoc :tx (tx-size-sweep store tx-in tx-sizes iters))
+                               (run? :mixed)      (assoc :mixed (mixed-tx store anchors obs enc rep mixed-rounds 5))
+                               (run? :rollback)   (assoc :rollback (rollback-tx store anchors obs rep rollback-rounds 10))
+                               (run? :contention) (assoc :contention (contention store anchors obs rep contention-threads contention-attempts)))]
+                       (log "  done:" (str/join ", " (map name (keys r))))
                        r))))
           flat    (map flatten-rep rep-results)
           workloads (into (sorted-map-by #(compare (str %1) (str %2)))
@@ -553,6 +662,7 @@
                                :mixed-rounds mixed-rounds :rollback-rounds rollback-rounds
                                :contention-threads contention-threads
                                :contention-attempts contention-attempts
+                               :edit-n edit-n :only only
                                :xtdb-pipelined? (when (= :xtdb2 backend) xtdb-pipelined?)}
                    :java      (System/getProperty "java.version")
                    :preload   load
@@ -584,6 +694,7 @@
     :mixed      "mixed tx (POST enc + 5 obs, PUT ifMatch, DELETE)"
     :rollback   "rollback tx (10 PUT + stale ifMatch)"
     :contention "contention (read + update ifMatch)"
+    :edit       (str "PUT " (name a) " " (str/replace (name b) "-" " "))
     (pr-str kind)))
 
 (defn- check-notes
@@ -614,11 +725,13 @@
    (when (some pos? (:lost-updates w))
      [(str "LOST UPDATES " (:lost-updates w))])))
 
-(def ^:private kind-order [:single :concurrent :tx :mixed :rollback :contention])
-(def ^:private sub-order {:create 0 :update 1 :update-if-match 2 :delete 3 :transaction 0 :batch 1})
+(def ^:private kind-order [:single :edit :concurrent :tx :mixed :rollback :contention])
+(def ^:private sub-order {:create 0 :update 1 :update-if-match 2 :delete 3 :transaction 0 :batch 1
+                          :one-field 0 :most-fields 1})
 
 (defn- workload-sort-key [[kind a b]]
-  [(.indexOf ^java.util.List kind-order kind) (get sub-order a 9) (or b 0)])
+  [(.indexOf ^java.util.List kind-order kind) (get sub-order a 9) (str a)
+   (if (keyword? b) (get sub-order b 9) (or b 0))])
 
 (defn report
   "Compare two write-bench result files into target/WRITE-REPORT.md.
@@ -671,6 +784,19 @@
               (when rb (str (fmt (:p50-ms wb)) " | " (fmt (:p95-ms wb)) " | " (rate wb) " | " (or faster "—") " | "))
               notes " |")))
     (emit)
+    (when (some (fn [k] (= :edit (first k))) keys*)
+      (emit "## Edit size")
+      (emit)
+      (emit "What each PUT changes, averaged over its ops: top-level fields and leaf values that differ from the stored version, and body size.")
+      (emit)
+      (doseq [k keys* :when (= :edit (first k))
+              [l r] [[la ra] [lb rb]] :when r
+              :let [w (get-in r [:workloads k])] :when w]
+        (emit "- " (workload-label k) ", " l ": " (format "%.1f" (double (:fields-changed w))) " of "
+              (format "%.1f" (double (:fields-total w))) " fields, "
+              (fmt0 (:leaves-changed w)) " of " (fmt0 (:leaves-total w)) " leaves, ~"
+              (fmt0 (:body-chars w)) " chars"))
+      (emit))
     (emit "## Contention")
     (emit)
     (doseq [[l r] [[la ra] [lb rb]] :when r]
