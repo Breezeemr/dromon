@@ -25,7 +25,7 @@
             [fhir-search-bench.dataset :as dataset]
             [fhir-search-bench.queries :as queries]))
 
-(def ^:private tenant "default")
+(def ^:no-doc tenant "default")
 (def ^:private data-root "data")
 
 (defn- log [& args] (apply println "[bench]" args))
@@ -36,10 +36,14 @@
 
 (defn- xtdb-data-dir [] (str data-root "/xtdb2"))
 
-(defn- make-store
+(defn ^:no-doc make-store
   "Construct a fresh store: `(store-fn)` when given, else the built-in xtdb2
-   store, whose on-disk node directory is wiped first."
-  [backend store-fn]
+   store, whose on-disk node directory is wiped first. `opts` may carry
+   `:xtdb-pipelined?` (default true, the store's own default), which sets the
+   xtdb2 store's pipelined replica-log appends; the store sets that itself, so
+   XTDB_PIPELINED_REPLICA_APPENDS has no effect on it."
+  ([backend store-fn] (make-store backend store-fn {}))
+  ([backend store-fn {:keys [xtdb-pipelined?] :or {xtdb-pipelined? true}}]
   (cond
     store-fn
     ((requiring-resolve store-fn))
@@ -49,14 +53,15 @@
           create (requiring-resolve 'fhir-store-xtdb2.core/create-xtdb-store)]
       (shell/sh "rm" "-rf" dir)
       (.mkdirs (io/file dir))
-      (create {:resource/schemas @schema/schemas
-               :query-mode       :sql
-               :node-config      {:log     [:local {:path (str dir "/log")}]
-                                  :storage [:local {:path (str dir "/storage")}]}}))
+      (create {:resource/schemas            @schema/schemas
+               :query-mode                  :sql
+               :pipelined-replica-appends?  (boolean xtdb-pipelined?)
+               :node-config                 {:log     [:local {:path (str dir "/log")}]
+                                             :storage [:local {:path (str dir "/storage")}]}}))
 
     :else
     (throw (ex-info (str "Unknown backend " backend "; pass :store-fn for a store outside dromon")
-                    {:backend backend}))))
+                    {:backend backend})))))
 
 ;; ── Load ────────────────────────────────────────────────────────────────────
 
@@ -87,7 +92,7 @@
 ;; few dropped intra-patient reference links, which the search workload does not
 ;; touch. In-flight transactions are bounded by `concurrency` for back pressure.
 
-(defn- load-dataset-pooled!
+(defn ^:no-doc load-dataset-pooled!
   "Concurrent load. Splits bundles at `max-tx` and runs up to `concurrency`
    synchronous `transact-transaction` calls at once via a fixed thread pool. The
    pool size bounds in-flight transactions, the database back pressure, the same

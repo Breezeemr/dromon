@@ -72,13 +72,17 @@
    Options:
    - :dir            directory of Synthea bundle json files (default synthea-output/fhir)
    - :max-resources  cap on total resources (default 10000)
+   - :skip-files     bundle files to skip first (default 0). A build that
+                     starts at another build's :files-used reads only bundles
+                     that one did not, e.g. write inputs disjoint from a preload.
 
    Returns {:bundles [{:name :entries [...]} ...]   ; load order
             :entries [...]                           ; flat, for stats
-            :total <n> :by-type {type count} :patients <n>}."
-  [{:keys [dir max-resources] :or {dir default-fhir-dir max-resources 10000}}]
+            :total <n> :by-type {type count} :patients <n>
+            :files-used <n>}                         ; files read, skipped ones included"
+  [{:keys [dir max-resources skip-files] :or {dir default-fhir-dir max-resources 10000 skip-files 0}}]
   (let [supported (schema/supported-types)
-        files     (bundle-files dir)
+        files     (drop skip-files (bundle-files dir))
         _         (log "Found" (count files) "bundle file(s) in" dir)
         ;; Per bundle, keep the supported entries in Synthea's native POST shape.
         bundle->entries
@@ -116,4 +120,5 @@
      :entries  entries
      :total    total
      :patients patients
-     :by-type  by-type}))
+     :by-type  by-type
+     :files-used (+ skip-files (count bundles))}))

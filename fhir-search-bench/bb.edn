@@ -11,6 +11,18 @@
                 "clojure" "-X:xtdb" "fhir-search-bench.bench/run" ":backend" ":xtdb2"
                 *command-line-args*)}
 
+  bench-writes-xtdb
+  {:doc "Run the write/transaction benchmark against the xtdb2 backend. Pass
+         :xtdb-pipelined? false to turn pipelined replica appends off."
+   :task (apply shell
+                "clojure" "-X:xtdb" "fhir-search-bench.writes/run" ":backend" ":xtdb2"
+                *command-line-args*)}
+
+  writes-report
+  {:doc "Compare target/writes-xtdb2.edn with another store's write result
+         (`bb writes-report :b '\"<path>\"'`) into target/WRITE-REPORT.md."
+   :task (apply shell "clojure" "-X" "fhir-search-bench.writes/report" *command-line-args*)}
+
   report
   {:doc "Compare target/bench-xtdb2.edn with another store's result (`bb report :b '\"<path>\"'`) into target/REPORT.md."
    :task (apply shell "clojure" "-X" "fhir-search-bench.bench/report" *command-line-args*)}}}
