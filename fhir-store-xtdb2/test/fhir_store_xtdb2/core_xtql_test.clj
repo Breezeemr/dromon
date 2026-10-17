@@ -78,19 +78,20 @@
           tenant "tq-hist"
           patient {:resourceType "Patient" :active true :name [{"family" "H"}]}]
       (try
-        (db/create-resource store tenant :Patient "h1" patient)
-        (db/update-resource store tenant :Patient "h1" (assoc patient :active false))
+        (let [v1 (get-in (db/create-resource store tenant :Patient "h1" patient)
+                         [:meta :versionId])]
+          (db/update-resource store tenant :Patient "h1" (assoc patient :active false))
 
-        (testing "history returns both versions"
-          (let [versions (db/history store tenant :Patient "h1")]
-            (is (= 2 (count versions)))
-            (is (every? valid-last-updated? versions))))
+          (testing "history returns both versions"
+            (let [versions (db/history store tenant :Patient "h1")]
+              (is (= 2 (count versions)))
+              (is (every? valid-last-updated? versions))))
 
-        (testing "vread returns the earlier version"
-          (let [v (db/vread-resource store tenant :Patient "h1" "1")]
-            (is (some? v))
-            (is (= true (:active v)))
-            (is (valid-last-updated? v))))
+          (testing "vread returns the earlier version"
+            (let [v (db/vread-resource store tenant :Patient "h1" v1)]
+              (is (some? v))
+              (is (= true (:active v)))
+              (is (valid-last-updated? v)))))
 
         (testing "history-type returns rows"
           (let [rows (db/history-type store tenant :Patient {})]
@@ -123,21 +124,25 @@
           tenant "tq-ifmatch"
           patient {:resourceType "Patient" :active true}]
       (try
-        (db/create-resource store tenant :Patient "p1" patient)
-        (testing "matching if-match succeeds"
-          (let [res (db/update-resource store tenant :Patient "p1"
-                                        (assoc patient :active false)
-                                        {:if-match "1"})]
-            (is (= "2" (get-in res [:meta :versionId])))))
-        (testing "mismatched if-match -> 412"
-          (let [e (try
-                    (db/update-resource store tenant :Patient "p1"
-                                        (assoc patient :active true)
-                                        {:if-match "1"})
-                    nil
-                    (catch Throwable ex ex))]
-            (is (some? e))
-            (is (= 412 (:fhir/status (root-ex-data e))))))
+        (let [v1 (get-in (db/create-resource store tenant :Patient "p1" patient)
+                         [:meta :versionId])]
+          (testing "matching if-match succeeds"
+            (let [res (db/update-resource store tenant :Patient "p1"
+                                          (assoc patient :active false)
+                                          {:if-match v1})]
+              (is (not= v1 (get-in res [:meta :versionId])))
+              (is (= (get-in res [:meta :versionId])
+                     (get-in (db/read-resource store tenant :Patient "p1")
+                             [:meta :versionId])))))
+          (testing "mismatched (now stale) if-match -> 412"
+            (let [e (try
+                      (db/update-resource store tenant :Patient "p1"
+                                          (assoc patient :active true)
+                                          {:if-match v1})
+                      nil
+                      (catch Throwable ex ex))]
+              (is (some? e))
+              (is (= 412 (:fhir/status (root-ex-data e)))))))
         (finally (close-store-nodes! store))))))
 
 (deftest test-xtql-transact-transaction
@@ -169,18 +174,22 @@
           xtql-store* (xtql-store)
           patient {:resourceType "Patient" :active true :gender "male"}]
       (try
-        (db/create-resource sql-store "shared" :Patient "s1" patient)
-        (db/create-resource xtql-store* "shared" :Patient "x1" patient)
-        ;; Each tenant is isolated per-store via its own node, so this
-        ;; check is really about encoder/decoder parity between pathways.
-        (testing "sql-written read-back is identical shape to xtql-written"
-          (let [sql-read (db/read-resource sql-store "shared" :Patient "s1")
-                xtql-read (db/read-resource xtql-store* "shared" :Patient "x1")]
-            (is (= (:resourceType sql-read) (:resourceType xtql-read)))
-            (is (= (:active sql-read) (:active xtql-read)))
-            (is (= (:gender sql-read) (:gender xtql-read)))
-            (is (= "1" (get-in sql-read [:meta :versionId])
-                     (get-in xtql-read [:meta :versionId])))))
+        (let [sql-created (db/create-resource sql-store "shared" :Patient "s1" patient)
+              xtql-created (db/create-resource xtql-store* "shared" :Patient "x1" patient)]
+          ;; Each tenant is isolated per-store via its own node, so this
+          ;; check is really about encoder/decoder parity between pathways.
+          (testing "sql-written read-back is identical shape to xtql-written"
+            (let [sql-read (db/read-resource sql-store "shared" :Patient "s1")
+                  xtql-read (db/read-resource xtql-store* "shared" :Patient "x1")]
+              (is (= (:resourceType sql-read) (:resourceType xtql-read)))
+              (is (= (:active sql-read) (:active xtql-read)))
+              (is (= (:gender sql-read) (:gender xtql-read)))
+              ;; Two nodes commit at two times, so the ids differ; each
+              ;; pathway names its version by its own commit the same way.
+              (doseq [[created read] [[sql-created sql-read] [xtql-created xtql-read]]]
+                (is (= (get-in created [:meta :versionId]) (get-in read [:meta :versionId])))
+                (is (= (java.time.Instant/parse (get-in read [:meta :lastUpdated]))
+                       (core-db/system-time-of-version (get-in read [:meta :versionId]))))))))
         (finally
           (close-store-nodes! sql-store)
           (close-store-nodes! xtql-store*))))))

@@ -302,10 +302,14 @@
                                                (db/current-basis store tenant))))))
 
       (testing "create then a guarded update"
-        (db/create-resource store tenant :X12ControlSequence "x" {:value 1})
-        (is (= "2" (get-in (db/update-resource store tenant :X12ControlSequence "x"
-                                               {:value 2} {:if-match "1"})
-                           [:meta :versionId]))))
+        (let [v1 (get-in (db/create-resource store tenant :X12ControlSequence "x" {:value 1})
+                         [:meta :versionId])
+              updated (db/update-resource store tenant :X12ControlSequence "x"
+                                          {:value 2} {:if-match v1})]
+          (is (not= v1 (get-in updated [:meta :versionId])))
+          (is (= (get-in updated [:meta :versionId])
+                 (get-in (db/read-resource store tenant :X12ControlSequence "x")
+                         [:meta :versionId])))))
 
       (testing "a column search on an unwritten schemaless type is not declared, and says so"
         (let [[hits failures] (failure-signals
@@ -365,12 +369,16 @@
   (let [store (core-db/create-xtdb-store {:resource/schemas schemas :query-mode :xtql})
         tenant "decl-xtql-flag"]
     (try
-      (db/create-resource store tenant :Flag "f1" {:resourceType "Flag" :status "active"})
-      (is (= "2" (get-in (db/update-resource store tenant :Flag "f1"
-                                             {:resourceType "Flag" :status "inactive"}
-                                             {:if-match "1"})
-                         [:meta :versionId])))
-      (db/delete-resource store tenant :Flag "f1" {:if-match "2"})
+      (let [v1 (get-in (db/create-resource store tenant :Flag "f1"
+                                           {:resourceType "Flag" :status "active"})
+                       [:meta :versionId])
+            v2 (get-in (db/update-resource store tenant :Flag "f1"
+                                           {:resourceType "Flag" :status "inactive"}
+                                           {:if-match v1})
+                       [:meta :versionId])]
+        (is (some? v2))
+        (is (not= v1 v2))
+        (db/delete-resource store tenant :Flag "f1" {:if-match v2}))
       (is (nil? (db/read-resource store tenant :Flag "f1")))
       (finally (close-store-nodes! store)))))
 

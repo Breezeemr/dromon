@@ -15,12 +15,14 @@
 (deftest minted-ids-skip-the-existence-check
   (let [store (core-db/create-xtdb-store {})]
     (try
-      (testing "a minted create writes version 1 and reads back"
+      (testing "a minted create writes its first version and reads back"
         (let [res (db/create-resource store "t" :Patient "m1"
                                       {:resourceType "Patient" :id "m1" :gender "female"}
-                                      {:id-minted? true})]
-          (is (= "1" (get-in res [:meta :versionId])))
-          (is (= "female" (:gender (db/read-resource store "t" :Patient "m1"))))))
+                                      {:id-minted? true})
+              stored (db/read-resource store "t" :Patient "m1")]
+          (is (some? (core-db/system-time-of-version (get-in res [:meta :versionId]))))
+          (is (= (get-in res [:meta :versionId]) (get-in stored [:meta :versionId])))
+          (is (= "female" (:gender stored)))))
       (testing "without the flag, an existing id is still refused with a 409"
         (db/create-resource store "t" :Patient "c1" {:resourceType "Patient" :id "c1"})
         (is (= 409 (try (db/create-resource store "t" :Patient "c1" {:resourceType "Patient" :id "c1"})
