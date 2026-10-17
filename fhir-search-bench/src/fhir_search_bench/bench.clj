@@ -41,12 +41,25 @@
    store, whose on-disk node directory is wiped first. `opts` may carry
    `:xtdb-pipelined?` (default true, the store's own default), which sets the
    xtdb2 store's pipelined replica-log appends; the store sets that itself, so
-   XTDB_PIPELINED_REPLICA_APPENDS has no effect on it."
+   XTDB_PIPELINED_REPLICA_APPENDS has no effect on it.
+
+   With `:xtdb-server` (\"host:port\"), the xtdb2 store runs against that
+   standalone XTDB server instead of an embedded node, its tenant a database
+   under a fresh `fhirbench_<hex>_` prefix; the server owns pipelining, so
+   `:xtdb-pipelined?` does not apply."
   ([backend store-fn] (make-store backend store-fn {}))
-  ([backend store-fn {:keys [xtdb-pipelined?] :or {xtdb-pipelined? true}}]
+  ([backend store-fn {:keys [xtdb-pipelined? xtdb-server] :or {xtdb-pipelined? true}}]
   (cond
     store-fn
     ((requiring-resolve store-fn))
+
+    xtdb-server
+    (let [[host port] (str/split (str xtdb-server) #":")
+          create      (requiring-resolve 'fhir-store-xtdb2.core/create-xtdb-store)]
+      (create {:resource/schemas @schema/schemas
+               :query-mode       :sql
+               :server           {:host host :port (parse-long port)
+                                  :database-prefix (str "fhirbench_" (subs (str (random-uuid)) 0 8) "_")}}))
 
     (= :xtdb2 backend)
     (let [dir    (xtdb-data-dir)
@@ -184,8 +197,10 @@
                      mega-patient bundle can't dominate the load.
    - :concurrency    max in-flight transactions during load (default 4), the
                      same bound for every store so loads compare.
-   - :synthea-dir    Synthea fhir bundle dir (default synthea-output/fhir)"
-  [{:keys [backend store-fn max-resources max-tx concurrency synthea-dir]
+   - :synthea-dir    Synthea fhir bundle dir (default synthea-output/fhir)
+   - :xtdb-server    \"host:port\" of a standalone XTDB server for the xtdb2
+                     store (see make-store)"
+  [{:keys [backend store-fn max-resources max-tx concurrency synthea-dir xtdb-server]
     :or   {max-resources 10000 max-tx 2000 concurrency 4 synthea-dir "synthea-output/fhir"}}]
   (when-not (keyword? backend)
     (throw (ex-info "Pass :backend, the result label (e.g. :xtdb2)" {:backend backend})))
@@ -197,7 +212,7 @@
   (let [{:keys [bundles total patients by-type]}
         (dataset/build {:dir synthea-dir :max-resources max-resources})
         _      (log "Constructing store and provisioning tenant ...")
-        store  (make-store backend store-fn)]
+        store  (make-store backend store-fn {:xtdb-server xtdb-server})]
     (db/create-tenant store tenant {:if-exists :replace})
     (db/warmup-tenant store tenant)
     (log "Loading" total "resources across" (count bundles) "bundle(s)"

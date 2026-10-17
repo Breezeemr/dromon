@@ -144,6 +144,34 @@ bb bench-writes-xtdb :preload 10000 :n 50 :warmup 10 :repeats 1 :concurrent-n 10
   :mixed-rounds 10 :rollback-rounds 5 :contention-attempts 10
 ```
 
+### Against a standalone XTDB server on Kafka
+
+By default xtdb2 runs embedded: a node inside the benchmark JVM with its log
+and storage on local disk. With `:xtdb-server "host:port"` the store instead
+connects over pgwire to a standalone XTDB server (the store's `:server` mode),
+the benchmark's tenant a database attached to that server with its own Kafka
+topic, under a fresh `fhirbench_<hex>_` prefix.
+
+```bash
+bb xtdb-kafka-up                 # podman pod: Apache Kafka 3.9.1 + XTDB 2.2.0-beta3 (xtdb-aws image)
+bb bench-writes-xtdb-server      # -> target/writes-xtdb2-server.edn
+bb bench-xtdb-server :max-resources 100000   # -> target/bench-xtdb2-server.edn
+bb xtdb-kafka-topics             # the tenant's topic and -replica topic, with offsets
+bb xtdb-kafka-down
+```
+
+The server's config is `docker/xtdb-kafka/config.yaml`: a Kafka log for the
+primary database, local storage in the container, and
+`indexer.pipelinedReplicaAppends: true` (the server's YAML decoder refuses an
+unknown key, so the setting is known to be read; `XTDB_PIPELINED_REPLICA_APPENDS`
+is set as well). The server runs with `-Xmx8g`; Kafka with its image default.
+
+XTDB writes each transaction as one Kafka message, so Kafka's 1 MiB default
+refuses large transactions: a 1000-entry Synthea transaction serializes to
+1.1-1.6 MB and fails with `max.request.size`. The pod raises the producer's
+`max.request.size` and the broker's `message.max.bytes` to 32 MiB; a
+production deployment carrying bundles this size needs the same.
+
 The two stores' durability settings are not normalized. xtdb2 writes its log
 to local disk inside the benchmark's own process. Datomic commits through the
 dev transactor, a separate process on local storage. Neither store's fsync
