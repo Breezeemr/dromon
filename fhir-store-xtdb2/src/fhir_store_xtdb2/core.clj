@@ -1580,11 +1580,17 @@
               (.setPoolName (str "xtdb-" tenant-id)))]
     (HikariDataSource. cfg)))
 
+(defn- close-node!
+  "Closes an embedded node. A remote tenant's DataSource holds nothing open."
+  [node]
+  (when (instance? java.lang.AutoCloseable node)
+    (.close ^java.lang.AutoCloseable node)))
+
 (defn- close-entry!
   "Closes a tenant entry's pool then its node, swallowing errors."
   [{:keys [node pool]}]
   (when pool (try (.close ^HikariDataSource pool) (catch Throwable _ nil)))
-  (when node (try (.close ^java.lang.AutoCloseable node) (catch Throwable _ nil))))
+  (when node (try (close-node! node) (catch Throwable _ nil))))
 
 ;; ---------------------------------------------------------------------------
 ;; Node start: pipelined replica-log appends and table declarations.
@@ -1639,6 +1645,117 @@
              {}
              (xf/build-declared-columns schemas)))
 
+;; ---------------------------------------------------------------------------
+;; Remote mode: tenants as databases on a standalone XTDB server.
+;;
+;; With :server set, the store starts no node. Each tenant is a database
+;; ATTACHed to the server's primary `xtdb` database, reached over pgwire
+;; through xt/client; its log and storage come from :attach-template (by
+;; default a Kafka topic on the server's `kafkaCluster` and a local path). The
+;; server owns every node-level setting, pipelined replica-log appends
+;; included, so the store takes none of them in this mode.
+;; ---------------------------------------------------------------------------
+
+(def ^:no-doc default-attach-template
+  "The ATTACH config a tenant database gets unless :server names another.
+   `{db}` is the database name and `{uid}` is fresh per attach, so a tenant
+   replaced by create-tenant never replays the log of the one it replaced."
+  (str "log: !Kafka\n"
+       "  cluster: kafkaCluster\n"
+       "  topic: 'fhir.{db}.{uid}'\n"
+       "  autoCreateTopic: true\n"
+       "storage: !Local\n"
+       "  path: '/var/lib/xtdb/dbs/{db}-{uid}'"))
+
+(defn ^:no-doc tenant-db-name
+  "The server database holding tenant `tid`: :database-prefix (default
+   \"fhir_\") followed by the tenant id with every character outside a-z and
+   0-9 written as _ and four hex digits, so distinct tenant ids never share a
+   database and every name is a plain SQL identifier."
+  [server tid]
+  (str (:database-prefix server "fhir_")
+       (apply str (map (fn [c]
+                         (if (or (<= (int \a) (int c) (int \z)) (<= (int \0) (int c) (int \9)))
+                           c
+                           (format "_%04x" (int c))))
+                       (str tid)))))
+
+(defn- server-client
+  "An xt/client DataSource on database `db` of the :server."
+  ^xtdb.api.DataSource [server db]
+  (xt/client (assoc (select-keys server [:host :port :user :password]) :dbname db)))
+
+(defn- cause-text [^Throwable e]
+  (str/join " | " (keep ex-message (take-while some? (iterate ex-cause e)))))
+
+(defn- attached-databases
+  "Names of the databases attached to the server, from its status."
+  [server]
+  (set (keys (:latest-completed-txs (xt/status (server-client server "xtdb"))))))
+
+(defn- run-on-primary!
+  "Runs `sql` as a statement of its own on the server's primary database.
+   ATTACH and DETACH refuse to run inside a transaction, so they cannot go
+   through xt/execute-tx."
+  [server sql]
+  (with-open [conn (.getConnection (server-client server "xtdb"))]
+    (.execute (.createStatement conn) sql)))
+
+(defn- retry-until
+  "Calls `f` until it returns without throwing, while `retry?` holds for what
+   it threw and :attach-timeout-ms (default 60s) has not passed."
+  [server retry? f]
+  (let [deadline (+ (System/currentTimeMillis) (long (:attach-timeout-ms server 60000)))]
+    (loop []
+      (let [r (try {:ok (f)} (catch Exception e {:error e}))]
+        (cond
+          (contains? r :ok) (:ok r)
+          (and (retry? (:error r)) (< (System/currentTimeMillis) deadline))
+          (do (Thread/sleep 250) (recur))
+          :else (throw (:error r)))))))
+
+(defn- attach-tenant-database!
+  "Attaches database `db` with a fresh {uid}, retrying while a detach of the
+   same name is still finishing (2.2 detaches asynchronously), then waits
+   until the new database answers a query."
+  [server db]
+  (let [cfg (-> (or (:attach-template server) default-attach-template)
+                (str/replace "{db}" db)
+                (str/replace "{uid}" (subs (str (random-uuid)) 0 8)))]
+    (retry-until server #(str/includes? (cause-text %) "being-detached")
+                 #(run-on-primary! server (str "ATTACH DATABASE " db " WITH $$\n" cfg "\n$$")))
+    (retry-until server (constantly true)
+                 #(xt/q (server-client server db) ["SELECT 1 AS ready"]))
+    nil))
+
+(defn- detach-tenant-database!
+  [server db]
+  (run-on-primary! server (str "DETACH DATABASE " db)))
+
+(defn- remote-tenant-node
+  "The tenant's database on the server as a DataSource, attaching it first when
+   the server has no database of that name."
+  [server tid]
+  (let [db (tenant-db-name server tid)]
+    (when-not (contains? (attached-databases server) db)
+      (attach-tenant-database! server db))
+    (server-client server db)))
+
+(defn- server-has-tenant?
+  "True when the store runs against a server that has tenant `tid`'s database
+   attached."
+  [store tid]
+  (boolean (when-let [server (:server store)]
+             (contains? (attached-databases server) (tenant-db-name server tid)))))
+
+(defn- node-db-name
+  "The database name a tenant's node reports itself under: the tenant's
+   database on a server, `xtdb` on an embedded node."
+  [store tid]
+  (if-let [server (:server store)]
+    (tenant-db-name server tid)
+    "xtdb"))
+
 (defn ^:no-doc declaration-op
   "One `CREATE TABLE <table> (<cols>)` tx op. CREATE TABLE is additive and
    idempotent: on an existing table it adds the columns it lacks and keeps
@@ -1652,23 +1769,25 @@
    start-node returns before a node opened on an existing log has replayed
    it, and a read waits only for transactions submitted through the node
    itself, so until a read awaits this token the node can answer from part
-   of its catalog and part of its rows."
-  [node]
+   of its catalog and part of its rows. Only database `db`'s messages: a
+   server lists every database it has attached."
+  [node db]
   (basis/->tx-basis-str
-   (-> (group-by :db-name (xt/q node ["SHOW LATEST_SUBMITTED_MSG_IDS"]))
+   (-> (group-by :db-name (filter #(= db (:db-name %))
+                                  (xt/q node ["SHOW LATEST_SUBMITTED_MSG_IDS"])))
        (update-vals #(mapv :msg-id %)))))
 
 (defn- columns-on-node
   "table-name -> set of the column names the node's catalog lists, read once
    the node has replayed its whole log. Every later read on the node sees at
    least that much of the log."
-  [node]
+  [node db]
   (reduce (fn [acc {:keys [table-name column-name]}]
             (update acc (quote-ident table-name) (fnil conj #{}) column-name))
           {}
           (xt/q node [(str "SELECT table_name, column_name FROM information_schema.columns"
                            " WHERE table_schema = 'public'")]
-                {:await-token (log-end-token node)})))
+                {:await-token (log-end-token node db)})))
 
 (defn ^:no-doc missing-declarations
   "The part of `declarations` (table-name -> columns) that `on-node` (as
@@ -1717,17 +1836,19 @@
    store-columns, is left out and declared on its first use.
    Closes the node and names the tenant when any of this fails."
   [store tid]
-  (let [node (start-node (:node-config store)
-                         {:pipelined-replica-appends? (:pipelined-replica-appends? store)})]
+  (let [node (if-let [server (:server store)]
+               (remote-tenant-node server tid)
+               (start-node (:node-config store)
+                           {:pipelined-replica-appends? (:pipelined-replica-appends? store)}))]
     (try
       (let [declarations (:declared-columns store)
-            on-node (columns-on-node node)]
+            on-node (columns-on-node node (node-db-name store tid))]
         (declare-tables! node (missing-declarations declarations on-node))
         [node (into (set (keys declarations))
                     (keep (fn [[table cols]] (when (every? cols xf/store-columns) table)))
                     on-node)])
       (catch Throwable e
-        (try (.close ^java.lang.AutoCloseable node) (catch Throwable _ nil))
+        (try (close-node! node) (catch Throwable _ nil))
         (throw (ex-info (str "Could not declare tables for tenant " tid ": " (ex-message e))
                         {:tenant-id tid :tables (count (:declared-columns store))}
                         e))))))
@@ -1749,6 +1870,7 @@
          (let [[new-node declared] (start-tenant-node store tid)
                new-pool (make-pool new-node tid (:pool-opts store))
                new-entry {:node new-node :pool new-pool
+                          :db-name (node-db-name store tid)
                           :declared (atom declared)}
                existing (get (swap! nodes (fn [m]
                                             (if (contains? m tid)
@@ -2136,9 +2258,13 @@
    time of that transaction, normalized to a java.time.Instant; on a node with
    no committed transactions it falls back to the wall-clock now so the returned
    token is always usable by `FOR SYSTEM_TIME AS OF`. A store-started node
-   always has one: the table declarations are its first transaction."
-  [node]
-  (let [tx-key (-> (xt/status node) :latest-completed-txs vals first first)
+   always has one: the table declarations are its first transaction. `db`
+   names the tenant's database, since a server reports every database it has
+   attached; without it the node's only database is read."
+  ([node] (xtdb-current-basis node nil))
+  ([node db]
+  (let [txs    (:latest-completed-txs (xt/status node))
+        tx-key (first (if db (get txs db) (first (vals txs))))
         st     (:system-time tx-key)
         inst   (cond
                  (instance? Instant st)        st
@@ -2146,7 +2272,7 @@
                  (some? st)                     (Instant/parse (str st))
                  :else                          (Instant/now))]
     {:tx-id (:tx-id tx-key)
-     :system-time inst}))
+     :system-time inst})))
 
 (defn ^:no-doc basis->system-time
   "Coerce a basis map's :system-time to a java.time.Instant for use as the
@@ -2849,7 +2975,10 @@
       :data {:tenant-id (str tenant-id) :opts opts}}
      (let [tid       (str tenant-id)
            if-exists (get opts :if-exists :error)
-           existing  (contains? @(:nodes this) tid)]
+           ;; A server keeps a tenant's database across store instances, so
+           ;; one this store has not opened still exists.
+           existing  (or (contains? @(:nodes this) tid)
+                         (server-has-tenant? this tid))]
        (cond
          (and existing (= :error if-exists))
          (throw (ex-info "Tenant already exists"
@@ -2878,18 +3007,24 @@
      (let [tid       (str tenant-id)
            if-absent (get opts :if-absent :error)
            close?    (get opts :close-storage? false)
-           existing  (get @(:nodes this) tid)]
+           existing  (get @(:nodes this) tid)
+           on-server (server-has-tenant? this tid)]
        (cond
-         (and (nil? existing) (= :error if-absent))
+         (and (nil? existing) (not on-server) (= :error if-absent))
          (throw (ex-info "Tenant not found"
                          {:fhir/status 404 :fhir/code "not-found"
                           :tenant-id tid}))
 
-         (some? existing)
+         (or (some? existing) on-server)
          (do
-           (close-entry! existing)
-           (swap! (:nodes this) dissoc tid)
-           (when (and close? (persistent-backend? (:node-config this)))
+           (when existing
+             (close-entry! existing)
+             (swap! (:nodes this) dissoc tid))
+           (cond
+             (and close? on-server)
+             (detach-tenant-database! (:server this) (tenant-db-name (:server this) tid))
+
+             (and close? existing (persistent-backend? (:node-config this)))
              (delete-tenant-storage! this tid))
            nil)
 
@@ -2914,8 +3049,8 @@
     (ftrace/trace!
      {:id :store/current-basis
       :data {:tenant-id (str tenant-id)}}
-     (let [{:keys [node]} (get-or-create-entry this tenant-id)]
-       (xtdb-current-basis node))))
+     (let [{:keys [node db-name]} (get-or-create-entry this tenant-id)]
+       (xtdb-current-basis node db-name))))
 
   (scan-type-as-of [this tenant-id resource-type basis]
     ;; SQL-only (works under both :sql and :xtql query-modes: both write the
@@ -3062,6 +3197,15 @@
      node the store starts (default: on; only false turns it off). false is
      the opt-out for a deployment that must roll back below XTDB 2.2.0-beta3;
      see ->xtdb-config.
+   - :server            — run against a standalone XTDB server instead of
+     starting nodes: {:host :port :user :password} for xt/client, plus
+     :database-prefix (default \"fhir_\", see tenant-db-name),
+     :attach-template (the ATTACH config for a new tenant database, with
+     {db} and {uid} placeholders; default default-attach-template) and
+     :attach-timeout-ms (default 60000). Each tenant is a database attached
+     to the server; create-tenant's :replace and delete-tenant's
+     :close-storage? detach it. Requires :sql query-mode, and refuses
+     :node-config and :pipelined-replica-appends?, which the server owns.
 
    Every tenant node declares the table and columns of each schema type that
    it lacks when it starts, and writes no transaction when it lacks none (see
@@ -3069,17 +3213,28 @@
    transform/store-columns on its first use per tenant, unless the node
    already had them all when it started."
   [{:keys [resource/schemas node-config query-mode pool-opts resource/lifecycle
-           pipelined-replica-appends?]
+           pipelined-replica-appends? server]
     :or {node-config {} schemas [] query-mode :sql pool-opts {}}
     :as config}]
   (assert (contains? #{:sql :xtql} query-mode)
           (str "query-mode must be :sql or :xtql, got " query-mode))
+  (when server
+    (when-not (= :sql query-mode)
+      (throw (ex-info "A :server store supports only :sql query-mode" {:query-mode query-mode})))
+    (when (seq node-config)
+      (throw (ex-info "A :server store starts no node, so it takes no :node-config"
+                      {:node-config-keys (keys node-config)})))
+    (when (some? pipelined-replica-appends?)
+      (throw (ex-info (str "A :server store cannot set :pipelined-replica-appends?: the server "
+                           "owns it (indexer.pipelinedReplicaAppends in its config)")
+                      {}))))
   (let [storage-encoders (xf/build-storage-encoders schemas)
         read-decoders    (xf/build-read-decoders schemas)
         store (->XTDBStore (atom {}) node-config storage-encoders read-decoders query-mode
                            (or pool-opts {}))]
     (assoc store
            :declared-columns (schema-declarations schemas)
+           :server server
            :pipelined-replica-appends? (not (false? pipelined-replica-appends?))
            :operations {:valueset-expand xtdb-valueset-expand
                         :valueset-lookup xtdb-valueset-lookup}
@@ -3096,7 +3251,7 @@
 
 (defmethod ig/init-key :fhir-store/xtdb2-store
   [_ {:keys [node resource/schemas query-mode pool-opts resource/lifecycle
-             pipelined-replica-appends?]}]
+             pipelined-replica-appends? server]}]
   (println "Starting XTDB2 FHIR Store (per-tenant node isolation)"
            (str "[query-mode=" (or query-mode :sql) "]"))
   (create-xtdb-store {:resource/schemas schemas
@@ -3104,7 +3259,8 @@
                       :query-mode (or query-mode :sql)
                       :pool-opts pool-opts
                       :resource/lifecycle lifecycle
-                      :pipelined-replica-appends? pipelined-replica-appends?}))
+                      :pipelined-replica-appends? pipelined-replica-appends?
+                      :server server}))
 
 (defmethod ig/halt-key! :fhir-store/xtdb2-store [_ store]
   (println "Stopping XTDB2 FHIR Store - closing all tenant pools + nodes")
