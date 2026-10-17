@@ -45,7 +45,9 @@
             [hato.client :as hc]
             [jsonista.core :as json]
             [server.compartment :as compartment]
-            [taoensso.telemere :as t]))
+            [taoensso.telemere :as t])
+  (:import (java.nio.charset StandardCharsets)
+           (java.security MessageDigest)))
 
 ;; ---------------------------------------------------------------------------
 ;; Keto endpoints
@@ -549,6 +551,23 @@
                          "relation" "isa"
                          "subject_id" keto-subject}))))
 
+(defn token-hook-secret
+  "TOKEN_HOOK_SECRET, or nil when unset. A function so a test can stand in
+   for the environment."
+  []
+  (System/getenv "TOKEN_HOOK_SECRET"))
+
+(defn secret-matches?
+  "Whether `presented` equals `expected`, in time independent of where they
+   first differ: `not=` returns at the first differing character, so its
+   timing tells a caller how much of a guess was right. Compares UTF-8 bytes
+   with `MessageDigest/isEqual`; only the lengths can show."
+  [^String expected ^String presented]
+  (boolean
+   (and (string? presented)
+        (MessageDigest/isEqual (.getBytes expected StandardCharsets/UTF_8)
+                               (.getBytes presented StandardCharsets/UTF_8)))))
+
 (defn token-hook
   "POST /auth/token-hook -- Ory Hydra token webhook (OAUTH2_TOKEN_HOOK_URL).
    Injects the SMART `patient` launch claim into the access token when Keto
@@ -556,8 +575,8 @@
    rejects issuance otherwise. When TOKEN_HOOK_SECRET is set, requires a
    matching X-Token-Hook-Secret header."
   [req]
-  (let [secret (System/getenv "TOKEN_HOOK_SECRET")]
-    (if (and secret (not= secret (get-in req [:headers "x-token-hook-secret"])))
+  (let [secret (token-hook-secret)]
+    (if (and secret (not (secret-matches? secret (get-in req [:headers "x-token-hook-secret"]))))
       {:status 401 :body {:error "invalid token hook secret"}}
       (let [keto (keto-endpoints req)
             payload (:body-params req)
