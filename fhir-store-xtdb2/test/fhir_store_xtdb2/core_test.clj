@@ -28,49 +28,50 @@
       (try
         ;; Execute the transaction using the IFHIRStore protocol
         (println "Creating resource...")
-        (db/create-resource store tenant-id :Patient "123" patient-doc)
+        (let [created (db/create-resource store tenant-id :Patient "123" patient-doc)]
 
-        ;; Test basic query.
-        (println "Reading resource...")
-        (let [result (db/read-resource store tenant-id :Patient "123")]
-          (is (some? result))
-          (is (= "123" (:id result))) ;; _id maps to :id
-          (is (= true (:active result)))
-          (is (= [{:family "Doe"}] (:name result))))
+          ;; Test basic query.
+          (println "Reading resource...")
+          (let [result (db/read-resource store tenant-id :Patient "123")]
+            (is (some? result))
+            (is (= "123" (:id result))) ;; _id maps to :id
+            (is (= true (:active result)))
+            (is (= [{:family "Doe"}] (:name result))))
 
-        ;; Test search
-        (println "Searching resources...")
-        (let [search-results (db/search store tenant-id :Patient {:active true} nil)]
-          (is (= 1 (count search-results)))
-          (is (= "123" (:id (first search-results)))))
+          ;; Test search
+          (println "Searching resources...")
+          (let [search-results (db/search store tenant-id :Patient {:active true} nil)]
+            (is (= 1 (count search-results)))
+            (is (= "123" (:id (first search-results)))))
 
-        (let [empty-search (db/search store tenant-id :Patient {:active false} nil)]
-          (is (= 0 (count empty-search))))
+          (let [empty-search (db/search store tenant-id :Patient {:active false} nil)]
+            (is (= 0 (count empty-search))))
 
-        ;; Test tenant isolation: data written to tenant-a should not be visible from tenant-b
-        (println "Testing tenant isolation...")
-        (let [isolated-result (db/read-resource store "tenant-b" :Patient "123")]
-          (is (nil? isolated-result) "Tenant-b should NOT see tenant-a's data"))
+          ;; Test tenant isolation: data written to tenant-a should not be visible from tenant-b
+          (println "Testing tenant isolation...")
+          (let [isolated-result (db/read-resource store "tenant-b" :Patient "123")]
+            (is (nil? isolated-result) "Tenant-b should NOT see tenant-a's data"))
 
-        ;; Test update and history
-        (println "Updating resource...")
-        (db/update-resource store tenant-id :Patient "123" (assoc patient-doc :active false))
+          ;; Test update and history
+          (println "Updating resource...")
+          (db/update-resource store tenant-id :Patient "123" (assoc patient-doc :active false))
 
-        (println "Testing history...")
-        (let [hist (db/history store tenant-id :Patient "123")]
-          (is (= 2 (count hist)))
-          ;; History contains both the original and updated versions
-          (let [active-versions (filter :active hist)
-                inactive-versions (remove :active hist)]
-            (is (= 1 (count active-versions)))
-            (is (= 1 (count inactive-versions)))))
+          (println "Testing history...")
+          (let [hist (db/history store tenant-id :Patient "123")]
+            (is (= 2 (count hist)))
+            ;; History contains both the original and updated versions
+            (let [active-versions (filter :active hist)
+                  inactive-versions (remove :active hist)]
+              (is (= 1 (count active-versions)))
+              (is (= 1 (count inactive-versions)))))
 
-        ;; Test vread: version 1 is the active version written before the update
-        (println "Testing vread...")
-        (let [vread-res (db/vread-resource store tenant-id :Patient "123" "1")]
-          (println "Done testing vread.")
-          (is (some? vread-res))
-          (is (= true (:active vread-res))))
+          ;; Test vread: the created version is the active one written before the update
+          (println "Testing vread...")
+          (let [vread-res (db/vread-resource store tenant-id :Patient "123"
+                                             (get-in created [:meta :versionId]))]
+            (println "Done testing vread.")
+            (is (some? vread-res))
+            (is (= true (:active vread-res)))))
         (finally
           (close-store-nodes! store))))))
 
@@ -152,21 +153,25 @@
           tenant-id "tenant-ifmatch"
           patient {:active true :name [{"family" "Doe"}]}]
       (try
-        (db/create-resource store tenant-id :Patient "p1" patient)
-        (testing "matching if-match succeeds"
-          (let [res (db/update-resource store tenant-id :Patient "p1"
-                                        (assoc patient :active false)
-                                        {:if-match "1"})]
-            (is (= "2" (get-in res [:meta :versionId])))))
-        (testing "mismatched if-match -> 412"
-          (let [e (try
-                    (db/update-resource store tenant-id :Patient "p1"
-                                        (assoc patient :active true)
-                                        {:if-match "1"})
-                    nil
-                    (catch Throwable ex ex))]
-            (is (some? e))
-            (is (= 412 (:fhir/status (root-ex-data e))))))
+        (let [v1 (get-in (db/create-resource store tenant-id :Patient "p1" patient)
+                         [:meta :versionId])]
+          (testing "matching if-match succeeds"
+            (let [res (db/update-resource store tenant-id :Patient "p1"
+                                          (assoc patient :active false)
+                                          {:if-match v1})]
+              (is (not= v1 (get-in res [:meta :versionId])))
+              (is (= (get-in res [:meta :versionId])
+                     (get-in (db/read-resource store tenant-id :Patient "p1")
+                             [:meta :versionId])))))
+          (testing "mismatched (now stale) if-match -> 412"
+            (let [e (try
+                      (db/update-resource store tenant-id :Patient "p1"
+                                          (assoc patient :active true)
+                                          {:if-match v1})
+                      nil
+                      (catch Throwable ex ex))]
+              (is (some? e))
+              (is (= 412 (:fhir/status (root-ex-data e)))))))
         (testing "if-match against nonexistent -> 412"
           (let [e (try
                     (db/update-resource store tenant-id :Patient "missing"
@@ -184,20 +189,26 @@
             tenant-id "tenant-ifmatch-forms"
             patient {:active true :name [{"family" "Doe"}]}]
         (try
-          (db/create-resource store tenant-id :Patient "p1" patient)
-          (let [res (db/update-resource store tenant-id :Patient "p1"
+          (let [v1 (get-in (db/create-resource store tenant-id :Patient "p1" patient)
+                           [:meta :versionId])
+                res (db/update-resource store tenant-id :Patient "p1"
                                         (assoc patient :active false)
-                                        {:if-match (spell "1")})]
-            (is (= "2" (get-in res [:meta :versionId]))))
+                                        {:if-match (spell v1)})]
+            (is (= false (:active res)))
+            (is (not= v1 (get-in res [:meta :versionId]))))
           (finally (close-store-nodes! store))))))
   (testing "a value that names no version refuses the write instead of ignoring it"
-    (doseq [bad ["99" "W/\"99\"" "garbage" "" "W/\"1"]]
+    ;; Each takes the current version; the last is its weak ETag, unterminated.
+    (doseq [bad [(constantly "99") (constantly "W/\"99\"") (constantly "garbage")
+                 (constantly "") (fn [v] (str "W/\"" v))]]
       (let [store (core-db/create-xtdb-store {})
             tenant-id "tenant-ifmatch-bad"
             patient {:active true :name [{"family" "Doe"}]}]
         (try
-          (db/create-resource store tenant-id :Patient "p1" patient)
-          (let [e (try
+          (let [v1 (get-in (db/create-resource store tenant-id :Patient "p1" patient)
+                           [:meta :versionId])
+                bad (bad v1)
+                e (try
                     (db/update-resource store tenant-id :Patient "p1"
                                         (assoc patient :active false)
                                         {:if-match bad})
@@ -205,8 +216,8 @@
                     (catch Throwable ex ex))]
             (is (some? e) (str "expected a refusal for " (pr-str bad)))
             (is (= 412 (:fhir/status (root-ex-data e))))
-            (is (= "1" (get-in (db/read-resource store tenant-id :Patient "p1")
-                               [:meta :versionId]))
+            (is (= v1 (get-in (db/read-resource store tenant-id :Patient "p1")
+                              [:meta :versionId]))
                 "the write must not have landed"))
           (finally (close-store-nodes! store)))))))
 
@@ -729,30 +740,38 @@
         (finally
           (close-store-nodes! store))))))
 
-(deftest test-versionid-monotonic
-  (testing "Server-managed integer-monotonic versionIds on create/update/read"
+(deftest test-versionid-from-commit-time
+  (testing "Server-managed versionIds named by each commit's system time on create/update/read"
     (let [store (core-db/create-xtdb-store {})
           tenant-id "tenant-ver"
-          patient {:resourceType "Patient" :active true :name [{"family" "Ver"}]}]
+          patient {:resourceType "Patient" :active true :name [{"family" "Ver"}]}
+          vid #(get-in % [:meta :versionId])
+          last-updated #(java.time.Instant/parse (get-in % [:meta :lastUpdated]))]
       (try
-        (let [created (db/create-resource store tenant-id :Patient "vp1" patient)]
-          (is (= "1" (get-in created [:meta :versionId]))
-              "create-resource returns versionId '1'"))
-
-        (let [read1 (db/read-resource store tenant-id :Patient "vp1")]
-          (is (= "1" (get-in read1 [:meta :versionId]))
-              "read after create exposes versionId '1'"))
-
-        (let [updated (db/update-resource store tenant-id :Patient "vp1"
-                                          (assoc patient :active false))]
-          (is (= "2" (get-in updated [:meta :versionId]))
-              "update-resource returns bumped versionId '2'"))
-
-        (let [read2 (db/read-resource store tenant-id :Patient "vp1")]
-          (is (= "2" (get-in read2 [:meta :versionId]))
-              "read after update exposes versionId '2'")
+        (let [created (db/create-resource store tenant-id :Patient "vp1" patient)
+              read1 (db/read-resource store tenant-id :Patient "vp1")
+              updated (db/update-resource store tenant-id :Patient "vp1"
+                                          (assoc patient :active false))
+              read2 (db/read-resource store tenant-id :Patient "vp1")]
+          (is (= (vid created) (vid read1))
+              "read after create exposes the versionId create returned")
+          (is (= (vid updated) (vid read2))
+              "read after update exposes the versionId update returned")
+          (is (not= (vid created) (vid updated))
+              "every version has its own versionId")
           (is (= false (:active read2))
-              "read after update returns the updated payload"))
+              "read after update returns the updated payload")
+
+          (testing "each versionId names its commit's system time"
+            (doseq [r [read1 read2]]
+              (is (= (last-updated r) (core-db/system-time-of-version (vid r))))))
+
+          (testing "a later version has a later lastUpdated"
+            (is (.isAfter (last-updated read2) (last-updated read1))))
+
+          (testing "each versionId vreads back its own content"
+            (is (= true (:active (db/vread-resource store tenant-id :Patient "vp1" (vid created)))))
+            (is (= false (:active (db/vread-resource store tenant-id :Patient "vp1" (vid updated)))))))
         (finally
           (close-store-nodes! store))))))
 
@@ -772,37 +791,38 @@
           tenant-id "tenant-lastupdated"
           patient {:resourceType "Patient" :active true :name [{"family" "Stamp"}]}]
       (try
-        (db/create-resource store tenant-id :Patient "lu1" patient)
-        (db/update-resource store tenant-id :Patient "lu1" (assoc patient :active false))
+        (let [v1 (get-in (db/create-resource store tenant-id :Patient "lu1" patient)
+                         [:meta :versionId])]
+          (db/update-resource store tenant-id :Patient "lu1" (assoc patient :active false))
 
-        (testing "read"
-          (let [res (db/read-resource store tenant-id :Patient "lu1")]
-            (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
+          (testing "read"
+            (let [res (db/read-resource store tenant-id :Patient "lu1")]
+              (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
 
-        (testing "vread"
-          (let [res (db/vread-resource store tenant-id :Patient "lu1" "1")]
-            (is (some? res))
-            (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
+          (testing "vread"
+            (let [res (db/vread-resource store tenant-id :Patient "lu1" v1)]
+              (is (some? res))
+              (is (fhir-instant? (get-in res [:meta :lastUpdated])))))
 
-        (testing "search without sort (single SELECT branch)"
-          (let [res (db/search store tenant-id :Patient {:active false} nil)]
-            (is (= 1 (count res)))
-            (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
+          (testing "search without sort (single SELECT branch)"
+            (let [res (db/search store tenant-id :Patient {:active false} nil)]
+              (is (= 1 (count res)))
+              (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
 
-        (testing "search with sort (two-phase fetch-by-ids branch)"
-          (let [res (db/search store tenant-id :Patient {"_sort" "_id"} nil)]
-            (is (= 1 (count res)))
-            (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
+          (testing "search with sort (two-phase fetch-by-ids branch)"
+            (let [res (db/search store tenant-id :Patient {"_sort" "_id"} nil)]
+              (is (= 1 (count res)))
+              (is (fhir-instant? (get-in (first res) [:meta :lastUpdated])))))
 
-        (testing "instance history"
-          (let [hist (db/history store tenant-id :Patient "lu1")]
-            (is (= 2 (count hist)))
-            (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
+          (testing "instance history"
+            (let [hist (db/history store tenant-id :Patient "lu1")]
+              (is (= 2 (count hist)))
+              (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
 
-        (testing "type history"
-          (let [hist (db/history-type store tenant-id :Patient {})]
-            (is (= 2 (count hist)))
-            (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist))))
+          (testing "type history"
+            (let [hist (db/history-type store tenant-id :Patient {})]
+              (is (= 2 (count hist)))
+              (is (every? #(fhir-instant? (get-in % [:meta :lastUpdated])) hist)))))
         (finally
           (close-store-nodes! store))))))
 

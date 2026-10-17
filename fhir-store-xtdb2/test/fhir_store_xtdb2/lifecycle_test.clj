@@ -109,26 +109,28 @@
     (let [created (db/create-resource store tenant :Patient "p1" {:active true})]
       (is (= "prepared" (:language created)) "create returns the prepared body")
       (is (= "prepared" (:language (db/read-resource store tenant :Patient "p1")))
-          "create stores the prepared body"))
-    (let [updated (db/update-resource store tenant :Patient "p1" {:active false})]
-      (is (= "prepared" (:language updated)))
-      (is (= "2" (get-in updated [:meta :versionId])))
-      (let [stored (db/read-resource store tenant :Patient "p1")]
-        (is (= "prepared" (:language stored)))
-        (is (= false (:active stored)))))))
+          "create stores the prepared body")
+      (let [updated (db/update-resource store tenant :Patient "p1" {:active false})]
+        (is (= "prepared" (:language updated)))
+        (is (not= (get-in created [:meta :versionId]) (get-in updated [:meta :versionId])))
+        (let [stored (db/read-resource store tenant :Patient "p1")]
+          (is (= (get-in updated [:meta :versionId]) (get-in stored [:meta :versionId])))
+          (is (= "prepared" (:language stored)))
+          (is (= false (:active stored))))))))
 
 (deftest ordering-and-write-map
   (each-mode [store {}]
     (let [calls (atom [])
-          store (assoc store :resource/lifecycle (recording-lifecycle calls))]
-      (db/create-resource store tenant :Patient "p1" {:active true})
+          store (assoc store :resource/lifecycle (recording-lifecycle calls))
+          created (db/create-resource store tenant :Patient "p1" {:active true})]
       (is (= [[:prepare "Patient" "p1" :create]
               ;; tx-ops sees the PREPARED body and the submitted one beside it
               [:tx-ops "Patient" "p1" "prepared" nil]
               [:after-commit tenant [["Patient" "p1" :create]] ["prepared"] true true]]
              @calls))
       (reset! calls [])
-      (db/update-resource store tenant :Patient "p1" {:active false} {:if-match "1"})
+      (db/update-resource store tenant :Patient "p1" {:active false}
+                          {:if-match (get-in created [:meta :versionId])})
       (is (= [:prepare :tx-ops :after-commit] (phases calls)))
       (is (= [["Patient" "p1" :update]] (nth (last @calls) 2))))))
 
@@ -142,8 +144,9 @@
 (deftest refused-writes-move-nothing
   (each-mode [store {}]
     (let [calls (atom [])
-          store (assoc store :resource/lifecycle (recording-lifecycle calls))]
-      (db/create-resource store tenant :Patient "p1" {:active true})
+          store (assoc store :resource/lifecycle (recording-lifecycle calls))
+          v1 (get-in (db/create-resource store tenant :Patient "p1" {:active true})
+                     [:meta :versionId])]
       (reset! calls [])
 
       (testing "an If-Match mismatch is refused before prepare"
@@ -153,8 +156,8 @@
                      (catch Exception e e))]
           (is (= 412 (:fhir/status (root-ex-data e))))
           (is (= [] @calls))
-          (is (= "1" (get-in (db/read-resource store tenant :Patient "p1")
-                             [:meta :versionId])))))
+          (is (= v1 (get-in (db/read-resource store tenant :Patient "p1")
+                            [:meta :versionId])))))
 
       (testing "a create conflict runs no tx-ops write and no after-commit"
         (let [e (try (db/create-resource store tenant :Patient "p1" {:active false})
@@ -202,16 +205,17 @@
           (is (empty? (after-commits calls)))))
 
       (testing "update"
-        (let [plain (dissoc store :resource/lifecycle)]
-          (db/create-resource plain tenant :Patient "p2" {:active true}))
-        (let [e (try (db/update-resource store tenant :Patient "p2" {:active false}
-                                         {:if-match "1"})
+        (let [plain (dissoc store :resource/lifecycle)
+              v1 (get-in (db/create-resource plain tenant :Patient "p2" {:active true})
+                         [:meta :versionId])
+              e (try (db/update-resource store tenant :Patient "p2" {:active false}
+                                         {:if-match v1})
                      nil
                      (catch Exception e e))]
           (is (some? e))
           (is (not= 412 (:fhir/status (root-ex-data e))))
           (let [stored (db/read-resource store tenant :Patient "p2")]
-            (is (= "1" (get-in stored [:meta :versionId])))
+            (is (= v1 (get-in stored [:meta :versionId])))
             (is (= true (:active stored))))
           (is (empty? (after-commits calls)))))
 
@@ -265,23 +269,25 @@
           put (fn [id if-match active]
                 {:request (cond-> {:method "PUT" :url (str "Patient/" id)}
                             if-match (assoc :ifMatch if-match))
-                 :resource {:active active}})]
-      (db/create-resource store tenant :Patient "g1" {:active true})
-      (db/update-resource store tenant :Patient "g1" {:active true})
+                 :resource {:active active}})
+          etag (fn [written] (str "W/\"" (get-in written [:meta :versionId]) "\""))
+          v1 (db/create-resource store tenant :Patient "g1" {:active true})
+          v2 (db/update-resource store tenant :Patient "g1" {:active true})]
       (reset! calls [])
 
       (testing "a stale ifMatch is refused with 412 before prepare"
-        (let [e (try (db/transact-transaction store tenant [(put "g1" "W/\"1\"" false)])
+        (let [e (try (db/transact-transaction store tenant [(put "g1" (etag v1) false)])
                      nil
                      (catch Exception e e))]
           (is (= 412 (:fhir/status (root-ex-data e))))
           (is (= [] @calls))
-          (is (= "2" (get-in (db/read-resource store tenant :Patient "g1")
-                             [:meta :versionId])))
+          (is (= (get-in v2 [:meta :versionId])
+                 (get-in (db/read-resource store tenant :Patient "g1")
+                         [:meta :versionId])))
           (is (= {"Patient/g1" true} (probe-submitted-active store)))))
 
       (testing "an ifMatch on a missing resource is refused with 412"
-        (let [e (try (db/transact-transaction store tenant [(put "absent" "W/\"1\"" true)])
+        (let [e (try (db/transact-transaction store tenant [(put "absent" (etag v1) true)])
                      nil
                      (catch Exception e e))]
           (is (= 412 (:fhir/status (root-ex-data e))))
@@ -296,7 +302,7 @@
                         (db/update-resource racer tenant :Patient "g1" {:active true})
                         [(probe-op write)]))
               e (try (db/transact-transaction (assoc store :resource/lifecycle racing)
-                                              tenant [(put "g1" "W/\"2\"" false)])
+                                              tenant [(put "g1" (etag v2) false)])
                      nil
                      (catch Exception e e))]
           (is (= 412 (:fhir/status (root-ex-data e))))
@@ -352,10 +358,13 @@
                 [{:request {:method "PUT" :url "Patient/p2"} :resource {:active true}}])
           last-updated (fn [vid] (get-in (db/vread-resource store tenant :Patient "p1" vid)
                                          [:meta :lastUpdated]))]
-      (is (= {:active true :id "p1" :meta {:versionId "1" :lastUpdated (last-updated "1")}}
-             created))
-      (is (= {:active false :id "p1" :meta {:versionId "2" :lastUpdated (last-updated "2")}}
-             updated))
+      (let [v1 (get-in created [:meta :versionId])
+            v2 (get-in updated [:meta :versionId])]
+        (is (not= v1 v2))
+        (is (= {:active true :id "p1" :meta {:versionId v1 :lastUpdated (last-updated v1)}}
+               created))
+        (is (= {:active false :id "p1" :meta {:versionId v2 :lastUpdated (last-updated v2)}}
+               updated)))
       (is (= true (get-in resp [:entry 0 :resource :active])))
       (is (nil? (get-in resp [:entry 0 :resource :language])))
       (is (= false (:active (db/read-resource store tenant :Patient "p1")))))))
@@ -372,21 +381,25 @@
                          (after-commit [_ _commit] nil)))
           origin {:write/origin :test}]
       (db/create-resource store tenant :Patient "p1" {:active true})
-      (db/create-resource store tenant :Patient "p2" {:active true} origin)
-      (db/update-resource store tenant :Patient "p2" {:active false} (assoc origin :if-match "1"))
-      (is (= [[:create "p1" nil]
-              [:create "p2" origin]
-              [:update "p2" (assoc origin :if-match "1")]]
-             @seen))
-      (testing "a transaction's opts reach each entry, with the entry's own If-Match"
-        (reset! seen [])
-        (db/transact-transaction
-         store tenant
-         [{:request {:method "PUT" :url "Patient/p2" :ifMatch "W/\"2\""} :resource {:active true}}
-          {:request {:method "PUT" :url "Patient/p3"} :resource {:active true}}]
-         origin)
-        (is (= #{["p2" (assoc origin :if-match "2")] ["p3" origin]}
-               (into #{} (map (fn [[_ id opts]] [id opts])) @seen))))
+      (let [v1 (get-in (db/create-resource store tenant :Patient "p2" {:active true} origin)
+                       [:meta :versionId])
+            v2 (get-in (db/update-resource store tenant :Patient "p2" {:active false}
+                                           (assoc origin :if-match v1))
+                       [:meta :versionId])]
+        (is (= [[:create "p1" nil]
+                [:create "p2" origin]
+                [:update "p2" (assoc origin :if-match v1)]]
+               @seen))
+        (testing "a transaction's opts reach each entry, with the entry's own If-Match"
+          (reset! seen [])
+          (db/transact-transaction
+           store tenant
+           [{:request {:method "PUT" :url "Patient/p2" :ifMatch (str "W/\"" v2 "\"")}
+             :resource {:active true}}
+            {:request {:method "PUT" :url "Patient/p3"} :resource {:active true}}]
+           origin)
+          (is (= #{["p2" (assoc origin :if-match v2)] ["p3" origin]}
+                 (into #{} (map (fn [[_ id opts]] [id opts])) @seen)))))
       (testing "and a batch's"
         (reset! seen [])
         (db/transact-bundle store tenant

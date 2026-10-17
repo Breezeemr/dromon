@@ -42,14 +42,20 @@
       (put! store tid "obs-2" (observation :valueDateTime "2024-05-01T10:00:00Z"))
       {:updated  (put! store tid "obs-1" (observation :valueString "after"))
        :created  (put! store tid "obs-3" (observation :valueBoolean true))
+       :obs-1    (db/history store tid :Observation "obs-1")
        :obs-2    (db/read-resource store tid :Observation "obs-2")
+       :obs-3    (db/read-resource store tid :Observation "obs-3")
        :searched (db/search store tid :Observation {:status "final"} nil)}
       (finally
         (close-store-nodes! store)))))
 
-(defn- check-puts [{:keys [updated created obs-2 searched]}]
-  (is (= ["after" "7"] [(:valueString updated) (get-in updated [:meta :versionId])]))
-  (is (= [true "1"] [(:valueBoolean created) (get-in created [:meta :versionId])]))
+(defn- check-puts [{:keys [updated created obs-1 obs-2 obs-3 searched]}]
+  ;; obs-1's seventh version, newest first in its history
+  (is (= 7 (count obs-1)))
+  (is (= ["after" (get-in (first obs-1) [:meta :versionId])]
+         [(:valueString updated) (get-in updated [:meta :versionId])]))
+  (is (= [true (get-in obs-3 [:meta :versionId])]
+         [(:valueBoolean created) (get-in created [:meta :versionId])]))
   (is (= "2024-05-01T10:00:00Z" (str (:valueDateTime obs-2))))
   (is (= #{"obs-1" "obs-2" "obs-3"} (set (map :id searched)))))
 

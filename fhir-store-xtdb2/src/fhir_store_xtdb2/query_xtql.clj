@@ -43,13 +43,12 @@
 (defn vread-xtql
   "`vid` is the FHIR versionId; see the SQL sibling, core/vread-sql."
   [node resource-type id vid read-decoders]
+  ;; A versionId names a stored fhir_version or a `_system_from`
+  ;; (core/version-match-sql), which the SQL read states directly.
   (ftrace/trace!
    {:id :xtql/vread
     :data {:resource-type (name resource-type) :id id :vid (str vid)}}
-   (let [q (list '-> (from-star-opts (rt-kw resource-type) {:for-system-time :all-time})
-                 (list 'where (list '= 'xt/id id) (list '= 'fhir_version (str vid))))
-         rows (core/run-query node q)]
-     (core/xtdb->fhir (first rows) read-decoders))))
+   (core/vread-sql node resource-type id vid read-decoders)))
 
 (defn deleted?-xtql [node resource-type id]
   (ftrace/trace!
@@ -261,12 +260,10 @@
   (ftrace/trace!
    {:id :xtql/create
     :data {:resource-type (name resource-type) :id id}}
-   (let [version "1"
-         rt-name (name resource-type)
+   (let [rt-name (name resource-type)
          write (core/lifecycle-write lc-ctx node :create resource-type id resource)
          resource (:resource write)
-         doc (core/encode-resource-doc resource-type id resource storage-encoders
-                                       :version version)
+         doc (core/encode-resource-doc resource-type id resource storage-encoders)
          put-doc (core/doc->put-doc doc)
          assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
                                  (core/table-name resource-type))
@@ -284,14 +281,15 @@
                                      :resource-type rt-name :id id}
                                     e))))]
      (core/fire-after-commit! lc-ctx [write] tx-key)
-     (core/committed resource id version tx-key))))
+     (core/committed resource id (core/version-of-system-time (:system-time tx-key)) tx-key))))
 
 (defn update-xtql [node resource-type id resource opts storage-encoders lc-ctx]
   (ftrace/trace!
    {:id :xtql/update
     :data {:resource-type (name resource-type) :id id}}
    (let [if-match (:if-match opts)
-         current (core/current-version node resource-type id)
+         ;; Only an If-Match reads first; see core/update-sql.
+         current (when if-match (core/current-version node resource-type id))
          _ (when (and if-match (nil? current))
              (throw (ex-info "Version conflict: resource does not exist"
                              {:fhir/status 412 :fhir/code "conflict"
@@ -300,22 +298,14 @@
              (throw (ex-info "Version conflict"
                              {:fhir/status 412 :fhir/code "conflict"
                               :expected if-match :actual current})))
-         expected-vid (or if-match current)
-         new-version (core/next-version expected-vid)
          write (core/lifecycle-write lc-ctx node :update resource-type id resource)
          resource (:resource write)
-         doc (core/encode-resource-doc resource-type id resource storage-encoders
-                                       :version new-version)
+         doc (core/encode-resource-doc resource-type id resource storage-encoders)
          put-doc (core/doc->put-doc doc)
-         assert-op (if expected-vid
-                     [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                   (core/table-name resource-type))
-                      [id expected-vid]]
-                     [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
-                                   (core/table-name resource-type))
-                      [id]])
          put-op [:put-docs (rt-kw resource-type) put-doc]
-         own-ops [assert-op put-op]
+         own-ops (cond-> []
+                   if-match (conj (core/version-assert-op resource-type id if-match))
+                   true (conj put-op))
          tx-ops (into own-ops (core/lifecycle-tx-ops write))
          tx-key (try
                   (xt/execute-tx node tx-ops)
@@ -327,11 +317,9 @@
                                       {:fhir/status 412 :fhir/code "conflict"
                                        :expected if-match}
                                       e))
-                      (throw (ex-info (str "Conflict: " (ex-message e))
-                                      {:fhir/status 409 :fhir/code "conflict"}
-                                      e)))))]
+                      (throw e))))]
      (core/fire-after-commit! lc-ctx [write] tx-key)
-     (core/committed resource id new-version tx-key))))
+     (core/committed resource id (core/version-of-system-time (:system-time tx-key)) tx-key))))
 
 (defn delete-xtql [node resource-type id opts]
   (ftrace/trace!
@@ -348,9 +336,7 @@
                              {:fhir/status 412 :fhir/code "conflict"
                               :expected if-match :actual current})))
          assert-op (when if-match
-                     [:sql (format "ASSERT EXISTS (SELECT 1 FROM %s WHERE _id = ? AND fhir_version = ?)"
-                                   (core/table-name resource-type))
-                      [id if-match]])
+                     (core/version-assert-op resource-type id if-match))
          delete-op [:delete-docs (rt-kw resource-type) id]
          tx-ops (if assert-op [assert-op delete-op] [delete-op])
          tx-key (try

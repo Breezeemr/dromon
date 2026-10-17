@@ -167,13 +167,13 @@
   (doseq [mode [:sql :xtql]]
     (testing (str mode)
       (with-store [store {:query-mode mode}]
-        (db/create-resource store "t" :Practitioner "p1" (practitioner "Reyes"))
-        (assert-refused (refusal #(db/update-resource store "t" :Practitioner "p1"
-                                                      (practitioner lone-high)))
-                        family-path)
-        (let [current (db/read-resource store "t" :Practitioner "p1")]
-          (is (= "Reyes" (get-in current [:name 0 :family])) "the stored version is untouched")
-          (is (= "1" (get-in current [:meta :versionId]))))))))
+        (let [created (db/create-resource store "t" :Practitioner "p1" (practitioner "Reyes"))]
+          (assert-refused (refusal #(db/update-resource store "t" :Practitioner "p1"
+                                                        (practitioner lone-high)))
+                          family-path)
+          (let [current (db/read-resource store "t" :Practitioner "p1")]
+            (is (= "Reyes" (get-in current [:name 0 :family])) "the stored version is untouched")
+            (is (= (get-in created [:meta :versionId]) (get-in current [:meta :versionId])))))))))
 
 (deftest transaction-refuses-the-whole-bundle
   (doseq [mode [:sql :xtql]]
@@ -416,22 +416,23 @@
           (assert-refused (refusal #(db/create-resource store "t" :Practitioner "p1"
                                                         (practitioner lone-high)))
                           family-path))
-        (db/create-resource store "t" :Practitioner "p2" (practitioner "Reyes"))
-        (testing "update"
-          (assert-refused (refusal #(db/update-resource store "t" :Practitioner "p2"
-                                                        (practitioner lone-high)))
-                          family-path))
-        (testing "transaction"
-          (assert-refused (refusal #(db/transact-transaction
-                                     store "t"
-                                     [{:request {:method "PUT" :url "Practitioner/p3"}
-                                       :resource (practitioner lone-high)}]))
-                          family-path))
-        (is (nil? (db/read-resource store "t" :Practitioner "p1")))
-        (is (= "1" (get-in (db/read-resource store "t" :Practitioner "p2") [:meta :versionId])))
-        (is (nil? (db/read-resource store "t" :Practitioner "p3")))
-        (is (= {"p2" "Reyes"} (probe-notes store))
-            "only the clean write's probe row landed; no \"Rey?es\"")))))
+        (let [created (db/create-resource store "t" :Practitioner "p2" (practitioner "Reyes"))]
+          (testing "update"
+            (assert-refused (refusal #(db/update-resource store "t" :Practitioner "p2"
+                                                          (practitioner lone-high)))
+                            family-path))
+          (testing "transaction"
+            (assert-refused (refusal #(db/transact-transaction
+                                       store "t"
+                                       [{:request {:method "PUT" :url "Practitioner/p3"}
+                                         :resource (practitioner lone-high)}]))
+                            family-path))
+          (is (nil? (db/read-resource store "t" :Practitioner "p1")))
+          (is (= (get-in created [:meta :versionId])
+                 (get-in (db/read-resource store "t" :Practitioner "p2") [:meta :versionId])))
+          (is (nil? (db/read-resource store "t" :Practitioner "p3")))
+          (is (= {"p2" "Reyes"} (probe-notes store))
+              "only the clean write's probe row landed; no \"Rey?es\""))))))
 
 (deftest lifecycle-tx-ops-with-their-own-unencodable-text-are-a-host-error
   (doseq [mode [:sql :xtql]]

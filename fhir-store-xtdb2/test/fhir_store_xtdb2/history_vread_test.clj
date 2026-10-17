@@ -4,6 +4,7 @@
    timestamp, `TIMESTAMP ?` refused by the parser), which the pool then
    reported only as \"Connection is closed\"."
   (:require [clojure.test :refer [deftest is testing]]
+            [xtdb.api :as xt]
             [fhir-store-xtdb2.core :as core-db]
             [fhir-store.protocol :as db])
   (:import [java.time Instant ZoneOffset]
@@ -36,77 +37,95 @@
   (Instant/parse (get-in resource [:meta :lastUpdated])))
 
 (defn- write-three-versions!
-  "Observation o1 at versions 1..3, a few ms apart so each has its own system
-   time. Returns the three versions as read back by vread."
+  "Observation o1 at three versions, a few ms apart so each has its own system
+   time. Returns the three versions as read back by vread, each by the
+   versionId its write returned."
   [store tid]
-  (db/create-resource store tid :Observation "o1" {:resourceType "Observation" :status "preliminary"})
-  (Thread/sleep 5)
-  (db/update-resource store tid :Observation "o1" {:resourceType "Observation" :status "final"})
-  (Thread/sleep 5)
-  (db/update-resource store tid :Observation "o1" {:resourceType "Observation" :status "amended"})
-  (mapv #(db/vread-resource store tid :Observation "o1" %) ["1" "2" "3"]))
+  (let [w1 (db/create-resource store tid :Observation "o1" {:resourceType "Observation" :status "preliminary"})
+        _ (Thread/sleep 5)
+        w2 (db/update-resource store tid :Observation "o1" {:resourceType "Observation" :status "final"})
+        _ (Thread/sleep 5)
+        w3 (db/update-resource store tid :Observation "o1" {:resourceType "Observation" :status "amended"})]
+    (mapv #(db/vread-resource store tid :Observation "o1" %) (versions [w1 w2 w3]))))
+
+(defn- write-counter-version!
+  "Observation `id` as an importer writes it: a stored fhir_version of \"3\"
+   rather than one derived from its commit."
+  [store tid id]
+  (let [[sql args] (core-db/extract-and-build-sql :Observation id
+                                                  {:resourceType "Observation" :status "final"}
+                                                  (:storage-encoders store)
+                                                  :version "3")]
+    (xt/execute-tx (:node (get @(:nodes store) tid)) [[:sql sql args]])))
 
 (defn- check-vread [store tid]
-  (let [[v1 v2 v3] (write-three-versions! store tid)]
+  (let [[v1 v2 v3] (write-three-versions! store tid)
+        [id1 id2 id3] (versions [v1 v2 v3])]
     (testing "each versionId reads back its own version"
       (is (= ["preliminary" "final" "amended"] (mapv :status [v1 v2 v3])))
-      (is (= ["1" "2" "3"] (versions [v1 v2 v3])))
+      (is (= 3 (count (distinct [id1 id2 id3]))))
+      (is (= [id3 id2 id1] (versions (db/history store tid :Observation "o1"))))
       (is (every? #(= "o1" (:id %)) [v1 v2 v3])))
 
     (testing "every version instance history lists reads back identically"
       (doseq [h (db/history store tid :Observation "o1")]
         (is (= h (db/vread-resource store tid :Observation "o1" (get-in h [:meta :versionId]))))))
 
-    (testing "an integer versionId names the same version"
-      (is (= v2 (db/vread-resource store tid :Observation "o1" 2))))
+    (testing "a stored counter version reads back by its string and its integer"
+      (write-counter-version! store tid "o-legacy")
+      (let [legacy (db/vread-resource store tid :Observation "o-legacy" "3")]
+        (is (= "3" (get-in legacy [:meta :versionId])))
+        (is (= "final" (:status legacy)))
+        (is (= legacy (db/vread-resource store tid :Observation "o-legacy" 3)))))
 
     (testing "an unknown version, an unknown id, and a timestamp all read nothing"
       (is (nil? (db/vread-resource store tid :Observation "o1" "9")))
-      (is (nil? (db/vread-resource store tid :Observation "nope" "1")))
+      (is (nil? (db/vread-resource store tid :Observation "nope" id1)))
       (is (nil? (db/vread-resource store tid :Observation "o1" (str (last-updated v2))))
           "vread is not a point-in-time read; $as-of is"))
 
     (testing "a deleted resource keeps its versions"
       (db/delete-resource store tid :Observation "o1")
       (is (nil? (db/read-resource store tid :Observation "o1")))
-      (is (= v3 (db/vread-resource store tid :Observation "o1" "3"))))))
+      (is (= v3 (db/vread-resource store tid :Observation "o1" id3))))))
 
 (defn- check-history-window [store tid]
   (let [[v1 v2 v3] (write-three-versions! store tid)
+        [id1 id2 id3] (versions [v1 v2 v3])
         t2 (last-updated v2)
         t3 (last-updated v3)
         history (fn [params] (versions (db/history-type store tid :Observation params)))]
-    (is (= ["3" "2" "1"] (history {})))
+    (is (= [id3 id2 id1] (history {})))
 
     (testing "_since keeps versions created at or after the instant"
-      (is (= ["3" "2"] (history {"_since" (str t2)}))
+      (is (= [id3 id2] (history {"_since" (str t2)}))
           "a version's own lastUpdated includes that version")
-      (is (= ["3" "2"] (history {:_since (str t2)})))
-      (is (= ["3" "2"] (history {"_since" (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME (.atOffset t2 (ZoneOffset/ofHours -5)))}))
+      (is (= [id3 id2] (history {:_since (str t2)})))
+      (is (= [id3 id2] (history {"_since" (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME (.atOffset t2 (ZoneOffset/ofHours -5)))}))
           "the same instant at another offset")
-      (is (= ["3" "2"] (history {"_since" t2})) "an Instant passes through")
-      (is (= ["3"] (history {"_since" (str (.plusNanos t2 1000))})))
-      (is (= ["3" "2" "1"] (history {"_since" "2000-01-01T00:00:00Z"})))
+      (is (= [id3 id2] (history {"_since" t2})) "an Instant passes through")
+      (is (= [id3] (history {"_since" (str (.plusNanos t2 1000))})))
+      (is (= [id3 id2 id1] (history {"_since" "2000-01-01T00:00:00Z"})))
       (is (= [] (history {"_since" "2999-01-01T00:00:00Z"})))
-      (is (= ["3" "2" "1"] (history {"_since" ""})) "a blank value is absent"))
+      (is (= [id3 id2 id1] (history {"_since" ""})) "a blank value is absent"))
 
     (testing "_at keeps versions current at some point during the period"
-      (is (= ["2"] (history {"_at" (str t2)})) "an instant names one version")
-      (is (= ["2"] (history {"_at" (str (.minusNanos t3 1000))}))
+      (is (= [id2] (history {"_at" (str t2)})) "an instant names one version")
+      (is (= [id2] (history {"_at" (str (.minusNanos t3 1000))}))
           "the version current just before the next one landed")
-      (is (= ["3"] (history {"_at" (str t3)})))
+      (is (= [id3] (history {"_at" (str t3)})))
       (is (= [] (history {"_at" "2020-06-01T00:00:00Z"})) "before the resource existed")
       (is (= [] (history {"_at" "2020"})))
       (let [month (subs (str t2) 0 7)]
-        (is (every? (set (history {"_at" month})) ["1" "2"])
+        (is (every? (set (history {"_at" month})) [id1 id2])
             (str "both versions were current during " month))))
 
     (testing "_since and _at together"
-      (is (= ["2"] (history {"_since" (str t2) "_at" (str t2)})))
+      (is (= [id2] (history {"_since" (str t2) "_at" (str t2)})))
       (is (= [] (history {"_since" (str t3) "_at" (str t2)}))))
 
     (testing "_count still limits, newest first"
-      (is (= ["3"] (history {"_count" "1" "_since" (str (last-updated v1))}))))
+      (is (= [id3] (history {"_count" "1" "_since" (str (last-updated v1))}))))
 
     (testing "a value that names no instant is refused, not ignored"
       (doseq [[pname bad] [["_since" "2026-01-01"]
