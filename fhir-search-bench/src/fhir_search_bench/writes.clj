@@ -47,6 +47,18 @@
 
 (def ^:private tenant bench/tenant)
 
+(def ^:private ^:dynamic *create-opts*
+  "Opts for the timed creates. The benchmark's ids are fresh and unique, so by
+   default they are passed as :id-minted?, as fhir-server does for a POST: a
+   store may skip its existence check. :minted-creates? false measures
+   caller-assigned ids instead."
+  {:id-minted? true})
+
+(defn- create! [store rt id body]
+  (if *create-opts*
+    (db/create-resource store tenant rt id body *create-opts*)
+    (db/create-resource store tenant rt id body)))
+
 (defn- log [& args] (apply println "[writes]" args))
 (defn- now-ns ^long [] (System/nanoTime))
 (defn- ->ms [ns] (/ (double ns) 1e6))
@@ -212,7 +224,7 @@
         (fn [tag cnt]
           (let [ids     (mapv #(str "wb-s-" rep "-" tag "-" %) (range cnt))
                 bodies  (mapv #(obs-body (obs) anchors %1 %2) (range cnt) ids)
-                create  (run-ops 1 (mapv (fn [id b] #(db/create-resource store tenant :Observation id b)) ids bodies))
+                create  (run-ops 1 (mapv (fn [id b] #(create! store :Observation id b)) ids bodies))
                 bumped  (mapv bump bodies (range cnt))
                 update  (run-ops 1 (mapv (fn [id b] #(db/update-resource store tenant :Observation id b)) ids bumped))
                 vids    (mapv #(vid-of (:value %)) (:results update))
@@ -234,7 +246,7 @@
         (for [c levels]
           (let [ids    (mapv #(str "wb-c-" rep "-" c "-" %) (range n))
                 bodies (mapv #(obs-body (obs) anchors %1 %2) (range n) ids)
-                create (run-ops c (mapv (fn [id b] #(db/create-resource store tenant :Observation id b)) ids bodies))
+                create (run-ops c (mapv (fn [id b] #(create! store :Observation id b)) ids bodies))
                 update (run-ops c (mapv (fn [id b k] #(db/update-resource store tenant :Observation id (bump b k)))
                                         ids bodies (range n)))]
             [c {:create (:summary create) :update (:summary update)}]))))
@@ -604,14 +616,16 @@
    - :contention-threads / :contention-attempts (default 8 / 25)
    - :edit-n        resources per type in the one-field vs most-fields PUT
                     workload (default 200)
+   - :minted-creates? pass :id-minted? on the timed creates, as a POST does
+                    (default true; see *create-opts*)
    - :only          workloads to run, a subset of #{:single :edit :concurrent
                     :tx :mixed :rollback :contention} (default all)
    - :synthea-dir   Synthea fhir bundle dir (default synthea-output/fhir)
    - :out           result file (default target/writes-<backend>.edn)"
   [{:keys [backend store-fn xtdb-pipelined? preload n warmup repeats concurrency concurrent-n
            tx-sizes mixed-rounds rollback-rounds contention-threads contention-attempts
-           synthea-dir out edit-n only xtdb-server]
-    :or   {edit-n 200 xtdb-pipelined? true preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
+           synthea-dir out edit-n only xtdb-server minted-creates?]
+    :or   {minted-creates? true edit-n 200 xtdb-pipelined? true preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
            concurrent-n 400 tx-sizes [1 10 100 1000] mixed-rounds 50 rollback-rounds 20
            contention-threads 8 contention-attempts 25 synthea-dir "synthea-output/fhir"}}]
   (when-not (keyword? backend)
@@ -643,6 +657,7 @@
           _       (log "Visible on return:" visible)
           iters   (fn [s] (case s 1 100, 10 50, 100 10, 1000 3, (max 1 (quot 1000 s))))
           rep-results
+          (binding [*create-opts* (when minted-creates? {:id-minted? true})]
           (vec (for [rep (range repeats)]
                  (do (log "Repeat" (inc rep) "/" repeats)
                      (let [r (cond-> {}
@@ -654,7 +669,7 @@
                                (run? :rollback)   (assoc :rollback (rollback-tx store anchors obs rep rollback-rounds 10))
                                (run? :contention) (assoc :contention (contention store anchors obs rep contention-threads contention-attempts)))]
                        (log "  done:" (str/join ", " (map name (keys r))))
-                       r))))
+                       r)))))
           flat    (map flatten-rep rep-results)
           workloads (into (sorted-map-by #(compare (str %1) (str %2)))
                           (for [k (keys (first flat))]
@@ -665,7 +680,7 @@
                                :mixed-rounds mixed-rounds :rollback-rounds rollback-rounds
                                :contention-threads contention-threads
                                :contention-attempts contention-attempts
-                               :edit-n edit-n :only only
+                               :edit-n edit-n :only only :minted-creates? minted-creates?
                                :xtdb-pipelined? (when (and (= :xtdb2 backend) (not xtdb-server))
                                                   xtdb-pipelined?)
                                :xtdb-server xtdb-server}
