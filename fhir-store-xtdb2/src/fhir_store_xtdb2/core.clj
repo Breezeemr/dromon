@@ -2015,22 +2015,30 @@
 ;; Write-side SQL impls.
 ;; ---------------------------------------------------------------------------
 
-(defn- create-sql [node resource-type id resource storage-encoders lc-ctx]
+(defn- create-sql [node resource-type id resource storage-encoders lc-ctx id-minted?]
   (let [version "1"
         rt-name (name resource-type)
         write (lifecycle-write lc-ctx node :create resource-type id resource)
         resource (:resource write)
         [sql args] (extract-and-build-sql resource-type id resource storage-encoders
                                           :version version)
-        assert-op [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
-                                (table-name resource-type))
-                   [id]]
-        own-ops [assert-op [:sql sql args]]
+        ;; The ASSERT runs inside the transaction on XTDB's single writer, one
+        ;; transaction at a time, and costs a point lookup that grows with the
+        ;; table: it bounds concurrent creates. A minted id cannot exist, so,
+        ;; as for a transaction's POST entries, it gets none.
+        own-ops (cond-> []
+                  (not id-minted?)
+                  (conj [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)"
+                                      (table-name resource-type))
+                         [id]])
+                  true (conj [:sql sql args]))
         tx-ops (into own-ops (lifecycle-tx-ops write))
         tx-key (try
                  (xt/execute-tx node tx-ops)
                  (catch Exception e
-                   (when (lifecycle-op-failure? e (count own-ops))
+                   ;; Only the ASSERT means "already exists"; a minted create
+                   ;; has none, so whatever failed is reported as itself.
+                   (when (or id-minted? (lifecycle-op-failure? e (count own-ops)))
                      (throw e))
                    (throw (ex-info (str "Resource already exists: " rt-name "/" id)
                                    {:fhir/status 409 :fhir/code "conflict"
@@ -2405,10 +2413,13 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (create-xtql node resource-type id resource storage-encoders
-                            (lifecycle-ctx this tenant-id opts))
+                            (lifecycle-ctx this tenant-id (not-empty (dissoc opts :id-minted?))))
          (with-open [conn (jdbc/get-connection pool)]
+           ;; :id-minted? is a hint to the store, not one of the host's
+           ;; opts, so a lifecycle sees the opts without it.
            (create-sql conn resource-type id resource storage-encoders
-                       (lifecycle-ctx this tenant-id opts)))))))
+                       (lifecycle-ctx this tenant-id (not-empty (dissoc opts :id-minted?)))
+                       (true? (:id-minted? opts))))))))
 
   (read-resource [this tenant-id resource-type id]
     (refuse-unencodable-input! {:resource-type resource-type :id id})
@@ -2777,9 +2788,8 @@
                   (case method
                     "POST"
                     (let [new-id (str (java.util.UUID/randomUUID))
-                          res (if-let [o (entry-opts opts nil)]
-                                (fp/create-resource this tenant-id (keyword resource-type) new-id resource o)
-                                (fp/create-resource this tenant-id (keyword resource-type) new-id resource))
+                          res (fp/create-resource this tenant-id (keyword resource-type) new-id resource
+                                                  (assoc (entry-opts opts nil) :id-minted? true))
                           vid (get-in res [:meta :versionId])
                           last-mod (str (get-in res [:meta :lastUpdated]))]
                       {:resource res
