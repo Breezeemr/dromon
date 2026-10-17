@@ -3205,7 +3205,15 @@
      :attach-timeout-ms (default 60000). Each tenant is a database attached
      to the server; create-tenant's :replace and delete-tenant's
      :close-storage? detach it. Requires :sql query-mode, and refuses
-     :node-config and :pipelined-replica-appends?, which the server owns.
+     :node-config and :pipelined-replica-appends?, which the server owns
+     (an ATTACH config has no indexer section, so every tenant database
+     takes the server's node-wide indexer settings).
+     Assumes ONE server node: xt/client's pooled connections carry no
+     await token, so a read sees the store's own writes only because the
+     node that committed a write also serves the read. Against a cluster
+     of several XTDB nodes a read could reach one that has not indexed it.
+     Detaching does not erase: the tenant's Kafka topics and its storage on
+     the server keep every record until removed there.
 
    Every tenant node declares the table and columns of each schema type that
    it lacks when it starts, and writes no transaction when it lacks none (see
