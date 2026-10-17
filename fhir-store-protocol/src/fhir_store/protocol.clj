@@ -232,7 +232,13 @@
      - :tx-metadata — provenance recorded BESIDE the data, in the same
        transaction. See `check-tx-metadata` for the shape, and
        `ITxMetadataStore` for which stores promise to keep it. A store that
-       does not implement `ITxMetadataStore` ignores this key.")
+       does not implement `ITxMetadataStore` ignores this key.
+     - :id-minted? — true when the caller generated `id` itself as a fresh
+       random id for this write (a server-assigned UUID for a POST), so no
+       resource can already hold it. A store may then skip its existence
+       check, as it does for a transaction's POST entries. A caller that
+       passes an id it was given must not set it: an existing id is refused
+       with a 409 only when the check runs.")
   (read-resource [this tenant-id resource-type id])
   (vread-resource [this tenant-id resource-type id vid])
   (update-resource

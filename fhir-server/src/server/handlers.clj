@@ -28,10 +28,12 @@
     (not-empty (cond-> (or opts {}) stamp (assoc :tx-metadata stamp)))))
 
 (defn- create!
-  [req store tenant-id resource-type id resource]
-  (if-let [opts (write-opts req store nil)]
-    (db/create-resource store tenant-id resource-type id resource opts)
-    (db/create-resource store tenant-id resource-type id resource)))
+  ([req store tenant-id resource-type id resource]
+   (create! req store tenant-id resource-type id resource nil))
+  ([req store tenant-id resource-type id resource base-opts]
+   (if-let [opts (write-opts req store base-opts)]
+     (db/create-resource store tenant-id resource-type id resource opts)
+     (db/create-resource store tenant-id resource-type id resource))))
 
 (defn- update!
   ([req store tenant-id resource-type id resource]
@@ -699,14 +701,15 @@
             (get k)))))
 
 (defn- do-create
-  "Perform the actual resource creation, returning a 201 response."
-  [req store tenant-id resource-type resource-body]
+  "Perform the actual resource creation, returning a 201 response. `opts` go
+   to create-resource with the request's own write opts."
+  [req store tenant-id resource-type resource-body opts]
   ;; One edit covers both callers: create-resource's plain path and its
   ;; If-None-Exist zero-match branch. The one-match branch returns an existing
   ;; resource without writing and must NOT be touched.
   (let [resource-body (narrative/ensure-narrative (:fhir/narrative req) resource-type resource-body)
         id (str (java.util.UUID/randomUUID))
-        res (create! req store tenant-id (keyword resource-type) id resource-body)
+        res (create! req store tenant-id (keyword resource-type) id resource-body opts)
         base-url (str (fhir-base req) "/" resource-type "/" id)
         vid (get-in res [:meta :versionId])]
     {:status 201
@@ -738,8 +741,10 @@
                                     search-registry)
                  match-count (count results)]
              (cond
+               ;; The store keeps its existence check for a conditional
+               ;; create, even on the id minted here.
                (zero? match-count)
-               (do-create req store tenant-id resource-type resource-body)
+               (do-create req store tenant-id resource-type resource-body nil)
 
                (= 1 match-count)
                {:status 200
@@ -752,8 +757,9 @@
                        :issue [{:severity "error"
                                 :code "duplicate"
                                 :diagnostics "Conditional create found multiple matches"}]}})))))
-      ;; No If-None-Exist: create normally
-      (do-create req store tenant-id resource-type resource-body))))
+      ;; No If-None-Exist: create normally. The id is minted here, so the
+      ;; store may skip its existence check.
+      (do-create req store tenant-id resource-type resource-body {:id-minted? true}))))
 
 (defn- ensure-coll
   "Coerce a value to a collection. If already sequential, return as-is; otherwise wrap in a vector."
@@ -1143,8 +1149,10 @@
        (cond
          (zero? match-count)
          ;; No matches: create
-         (let [id (or (:id resource-body) (str (java.util.UUID/randomUUID)))
-               res (create! req store tenant-id (keyword resource-type) id resource-body)
+         (let [minted? (nil? (:id resource-body))
+               id (or (:id resource-body) (str (java.util.UUID/randomUUID)))
+               res (create! req store tenant-id (keyword resource-type) id resource-body
+                            (when minted? {:id-minted? true}))
                base-url (str (fhir-base req) "/" resource-type "/" id)
                vid (get-in res [:meta :versionId])]
            {:status 201

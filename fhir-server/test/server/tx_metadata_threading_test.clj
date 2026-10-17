@@ -100,7 +100,35 @@
 (deftest no-producer-keeps-the-plain-arity
   (let [seen (atom [])]
     (write-everything! (recording-store seen true) nil)
-    (is (= #{:plain} (into #{} (comp (remove #(= {:if-match "2"} (second %))) (map second)) @seen)))))
+    (is (= #{:plain} (into #{} (comp (remove #(#{{:if-match "2"} {:id-minted? true}} (second %)))
+                                     (map second))
+                           @seen)))))
+
+(deftest a-post-create-marks-the-id-it-minted
+  (let [seen (atom [])
+        st   (recording-store seen true)]
+    (handlers/create-resource (req st "Substance" :body {:resourceType "Substance"}))
+    (is (= [[:create {:id-minted? true}]] @seen)
+        "the server generated the id, so the store may skip its existence check")
+    (testing "a conditional create (If-None-Exist) keeps the check"
+      (reset! seen [])
+      (handlers/create-resource
+       (-> (req st "Substance" :body {:resourceType "Substance"})
+           (assoc-in [:headers "if-none-exist"] "_id=no-match")
+           (assoc :fhir/search-registry {})))
+      (is (= [[:create :plain]] @seen)))
+    (testing "a conditional update creating under the body's id keeps the check"
+      (reset! seen [])
+      (handlers/conditional-update
+       (-> (req st "Substance" :body {:resourceType "Substance" :id "given"})
+           (assoc :query-params {"_id" "no-match"} :fhir/search-registry {})))
+      (is (= [[:create :plain]] @seen)))
+    (testing "and one creating without an id mints it"
+      (reset! seen [])
+      (handlers/conditional-update
+       (-> (req st "Substance" :body {:resourceType "Substance"})
+           (assoc :query-params {"_id" "no-match"} :fhir/search-registry {})))
+      (is (= [[:create {:id-minted? true}]] @seen)))))
 
 (deftest a-store-that-keeps-no-stamp-is-not-handed-one
   (let [seen (atom [])
