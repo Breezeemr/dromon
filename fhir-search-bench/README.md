@@ -33,6 +33,7 @@ src/fhir_search_bench/
   schema.clj    resolve uscore8 schemas + per-type search registries
   queries.clj   the Blaze-style Observation query set
   bench.clj     per-backend load + search harness; report aggregator
+  writes.clj    per-backend write + transaction harness; its report
 ```
 
 Resources are loaded one FHIR transaction bundle at a time (the shared
@@ -46,7 +47,9 @@ fresh store. Its result file is then compared with xtdb2's by `bb report`.
 
 ## Prerequisites
 
-- **Java 21** (XTDB v2). The bb tasks pin `/usr/lib/jvm/java-21-openjdk-amd64`.
+- **Java 24+**. The `:xtdb` alias passes `--sun-misc-unsafe-memory-access=allow`,
+  which Arrow's allocator needs from Java 24 on and which Java 23 and older
+  reject.
 
 ## Usage
 
@@ -75,6 +78,133 @@ clojure -X fhir-search-bench.bench/report
 ```
 
 `run` accepts `:max-resources N` to change the cap.
+
+## Write and transaction benchmark
+
+`writes.clj` measures the write side through the same `IFHIRStore` protocol,
+store construction and dataset. A run preloads the dataset untimed (default
+100k resources, the search benchmark's scale) so writes land in a populated
+database, then runs every workload `:repeats` times (default 3):
+
+| workload | what is timed |
+|---|---|
+| single | `create-resource`, `update-resource`, update with `:if-match`, `delete-resource`; one thread, 200 ops each after 50 warmup |
+| edit | `update-resource` that changes one field against one that changes most fields, for 200 Observations and 200 full Synthea Patients each; one field moves a single date leaf, most fields swaps in another resource's content of the same type (rounds run one/most/most/one after a discarded pair) |
+| concurrent | create then update 400 distinct Observations at 1, 4 and 16 threads |
+| tx-size | `transact-transaction` (atomic) and `transact-bundle` (batch) at 1, 10, 100 and 1000 entries |
+| mixed | one transaction: POST an Encounter and 5 Observations referencing it by `urn:uuid`, PUT an Observation with `ifMatch`, DELETE another |
+| rollback | 10 PUTs then a PUT with a stale `ifMatch`; the whole transaction must fail |
+| contention | 8 threads x 25 attempts to read then update one Observation with `:if-match` |
+
+Write inputs come from Synthea bundles the preload did not read
+(`dataset/build :skip-files`). Single-resource writes keep only
+Observation fields that hold no reference and point `subject` at anchor
+Patients created during setup; transaction slices drop every `urn:uuid`
+reference the slice itself does not resolve, and batch slices drop all of
+them. Both are needed because fhir-store-datomic refuses a dangling reference
+with a 422 where xtdb2 keeps it as a string, which would otherwise compare a
+failure with a success. Updates always change content (status and value), since
+Datomic diffs an update against the stored version.
+
+Checks recorded beside the timings, flagged in the report's notes column:
+
+- a write is readable as soon as the call returns (`visible-on-return`), so
+  neither store is timed on work it finishes later;
+- a sample of updated resources reads back with the status, code, quantity and
+  subject reference that were written;
+- transaction POSTs read back, and a mixed transaction's Observations point at
+  the Encounter it created;
+- a rolled-back transaction leaves none of its entries and does not move its
+  target's version;
+- contention loses no update: the final version count is successes + 1;
+- the transaction-response lists entries in request order, as FHIR requires.
+
+Failed ops stay in the latency numbers. The report gives, per workload, the
+median across repeats of each repeat's p50 and p95, ops/s (successful ops over
+wall time; entries/s for transactions), and each repeat's p50 so a difference
+can be weighed against run-to-run spread.
+
+```bash
+# xtdb2 (pipelined replica appends on by default; the store sets the flag
+# itself, so XTDB_PIPELINED_REPLICA_APPENDS has no effect).
+bb bench-writes-xtdb
+bb bench-writes-xtdb :xtdb-pipelined? false :out '"target/writes-xtdb2-nopipe.edn"'
+
+# Datomic, from master-at-arms2/dromon-datomic (shared dev transactor on :4334).
+bb bench-writes
+
+# Compare; :label-a/:label-b name the columns for a before/after of one store.
+bb writes-report :b '"../../dromon-datomic/target/writes-datomic.edn"'
+
+# One workload only (any of :single :edit :concurrent :tx :mixed :rollback :contention).
+bb bench-writes-xtdb :only '[:edit]' :out '"target/writes-edit-xtdb2.edn"'
+
+# A quick smoke run.
+bb bench-writes-xtdb :preload 10000 :n 50 :warmup 10 :repeats 1 :concurrent-n 100 \
+  :mixed-rounds 10 :rollback-rounds 5 :contention-attempts 10
+```
+
+### Against a standalone XTDB server on Kafka
+
+By default xtdb2 runs embedded: a node inside the benchmark JVM with its log
+and storage on local disk. With `:xtdb-server "host:port"` the store instead
+connects over pgwire to a standalone XTDB server (the store's `:server` mode),
+the benchmark's tenant a database attached to that server with its own Kafka
+topic, under a fresh `fhirbench_<hex>_` prefix.
+
+```bash
+bb xtdb-kafka-up                 # podman pod: Apache Kafka 3.9.1 + XTDB 2.2.0-beta3 (xtdb-aws image)
+bb bench-writes-xtdb-server      # -> target/writes-xtdb2-server.edn
+bb bench-xtdb-server :max-resources 100000   # -> target/bench-xtdb2-server.edn
+bb xtdb-kafka-topics             # the tenant's topic and -replica topic, with offsets
+bb xtdb-kafka-down
+```
+
+`:transport :flight-sql :xtdb-flight-sql-port 19832` runs the store's reads
+and writes over the server's FlightSQL port instead (ATTACH and DETACH stay on
+pgwire); `:transport` is recorded in the result and named in the report. On
+XTDB 2.2.0-beta3 a FlightSQL run does not finish at the default scale
+(2026-10-18):
+
+- After the 100k preload has flushed blocks, a read of a row whose nested
+  struct lacks a field the flushed blocks carry fails on the server with
+  `no more buffers for field unit: Utf8. Expected 3` (or
+  `result: List<Struct<reference, display>> ... Expected 2`). The same reads
+  over pgwire succeed. Twenty lines reproduce it on an embedded node with
+  `:indexer {:rows-per-block 20}`.
+- Below that scale (`:preload 3000 :tx-sizes [1 10 100]`) the benchmark JVM
+  itself died of SIGSEGV (`jbyte_disjoint_arraycopy` /
+  `jlong_disjoint_arraycopy`) on a worker-pool thread, in two of two runs:
+  once on this alias's netty 4.1.132 pin, with Arrow `flight-client`
+  allocator leaks reported, and once with the netty family overridden to the
+  store's 4.2.9 and `-Dio.netty.noUnsafe=false`. pgwire runs on the same
+  classpath do not crash.
+
+The preload is the one complete FlightSQL write measurement: 100121 resources
+in 28.3 s against 12.9 s over pgwire, and 3513 in 3.5 s against 1.6 s.
+
+Embedded, `bb bench-writes-xtdb :transport :adbc` runs the full default
+benchmark to completion. On 2026-10-18 it beat embedded pgwire on every
+workload: the preload in 6.6 s against 12.5 s, single writes about 1.2x,
+transactions of 100 and 1000 entries 1.5-1.6x, and 16-thread creates and
+updates 1.3x.
+
+The server's config is `docker/xtdb-kafka/config.yaml`: a Kafka log for the
+primary database, local storage in the container, and
+`indexer.pipelinedReplicaAppends: true` (the server's YAML decoder refuses an
+unknown key, so the setting is known to be read; `XTDB_PIPELINED_REPLICA_APPENDS`
+is set as well). The server runs with `-Xmx8g`; Kafka with its image default.
+
+XTDB writes each transaction as one Kafka message, so Kafka's 1 MiB default
+refuses large transactions: a 1000-entry Synthea transaction serializes to
+1.1-1.6 MB and fails with `max.request.size`. The pod raises the producer's
+`max.request.size` and the broker's `message.max.bytes` to 32 MiB; a
+production deployment carrying bundles this size needs the same.
+
+The two stores' durability settings are not normalized. xtdb2 writes its log
+to local disk inside the benchmark's own process. Datomic commits through the
+dev transactor, a separate process on local storage. Neither store's fsync
+behaviour is configured or verified by this harness.
 
 ## Notes
 

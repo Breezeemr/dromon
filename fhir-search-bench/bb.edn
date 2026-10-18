@@ -11,6 +11,71 @@
                 "clojure" "-X:xtdb" "fhir-search-bench.bench/run" ":backend" ":xtdb2"
                 *command-line-args*)}
 
+  bench-writes-xtdb
+  {:doc "Run the write/transaction benchmark against the xtdb2 backend. Pass
+         :xtdb-pipelined? false to turn pipelined replica appends off."
+   :task (apply shell
+                "clojure" "-X:xtdb" "fhir-search-bench.writes/run" ":backend" ":xtdb2"
+                *command-line-args*)}
+
+  writes-report
+  {:doc "Compare target/writes-xtdb2.edn with another store's write result
+         (`bb writes-report :b '\"<path>\"'`) into target/WRITE-REPORT.md."
+   :task (apply shell "clojure" "-X" "fhir-search-bench.writes/report" *command-line-args*)}
+
+  xtdb-kafka-up
+  {:doc "Starts a standalone XTDB 2.2.0-beta3 server on a Kafka log in the podman
+         pod fhirbench-xtdb (Apache Kafka 3.9.1, KRaft, one broker): pgwire on
+         127.0.0.1:15432, FlightSQL on :19832, healthz on :18090, Kafka on :19092. Config in
+         docker/xtdb-kafka/config.yaml (pipelined replica appends on). Replaces
+         a running pod, so every start has empty topics and storage."
+   :requires ([babashka.fs :as fs])
+   :task (let [cfg (str (fs/absolutize "docker/xtdb-kafka/config.yaml"))
+               wait (fn [what ok?]
+                      (loop [i 0]
+                        (cond (ok?) (println what "ready")
+                              (> i 120) (throw (ex-info (str what " did not start") {}))
+                              :else (do (Thread/sleep 1000) (recur (inc i))))))]
+           (shell {:continue true :out nil :err nil} "podman pod rm -f fhirbench-xtdb")
+           (shell "podman pod create --name fhirbench-xtdb -p 15432:5432 -p 19832:9832 -p 18090:8080 -p 19092:9092")
+           (shell "podman run -d --pod fhirbench-xtdb --name fhirbench-kafka docker.io/apache/kafka:3.9.1")
+           (wait "Kafka" (fn [] (zero? (:exit (shell {:continue true :out nil :err nil}
+                                                     "podman exec fhirbench-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list")))))
+           ;; Match the producer's max.request.size in config.yaml: the
+           ;; topics XTDB auto-creates take the broker default.
+           (shell "podman exec fhirbench-kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --entity-type brokers --entity-default --alter --add-config message.max.bytes=33554432")
+           (shell "podman" "run" "-d" "--pod" "fhirbench-xtdb" "--name" "fhirbench-xtdb-server"
+                  "-e" "XTDB_LOG_TOPIC=xtdb-primary" "-e" "XTDB_PIPELINED_REPLICA_APPENDS=true"
+                  "-e" "JAVA_TOOL_OPTIONS=-Xmx8g"
+                  "-v" (str cfg ":/usr/local/lib/xtdb/config.yaml:ro,Z")
+                  "ghcr.io/xtdb/xtdb-aws:2.2.0-beta3")
+           (wait "XTDB" (fn [] (zero? (:exit (shell {:continue true :out nil :err nil}
+                                                    "curl -sf http://127.0.0.1:18090/healthz/alive"))))))}
+
+  xtdb-kafka-down
+  {:doc "Stops and removes the fhirbench-xtdb pod, its topics and storage."
+   :task (shell {:continue true} "podman pod rm -f fhirbench-xtdb")}
+
+  xtdb-kafka-topics
+  {:doc "Lists the pod's Kafka topics with their end offsets: evidence that a
+         remote run's tenant log went to Kafka."
+   :task (shell "podman exec fhirbench-kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092")}
+
+  bench-xtdb-server
+  {:doc "Search benchmark against the standalone server (bb xtdb-kafka-up first).
+         Writes target/bench-xtdb2-server.edn."
+   :task (apply shell "clojure" "-X:xtdb" "fhir-search-bench.bench/run"
+                ":backend" ":xtdb2-server" ":xtdb-server" "\"127.0.0.1:15432\""
+                *command-line-args*)}
+
+  bench-writes-xtdb-server
+  {:doc "Write benchmark against the standalone server (bb xtdb-kafka-up first).
+         Writes target/writes-xtdb2-server.edn. For FlightSQL pass
+         :transport :flight-sql :xtdb-flight-sql-port 19832."
+   :task (apply shell "clojure" "-X:xtdb" "fhir-search-bench.writes/run"
+                ":backend" ":xtdb2-server" ":xtdb-server" "\"127.0.0.1:15432\""
+                *command-line-args*)}
+
   report
   {:doc "Compare target/bench-xtdb2.edn with another store's result (`bb report :b '\"<path>\"'`) into target/REPORT.md."
    :task (apply shell "clojure" "-X" "fhir-search-bench.bench/report" *command-line-args*)}}}

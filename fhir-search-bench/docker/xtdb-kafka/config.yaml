@@ -1,0 +1,35 @@
+# Standalone XTDB server for the fhir-search-bench remote runs: the primary
+# `xtdb` database logs to Kafka in the same pod, storage is local to the
+# container. Tenant databases are ATTACHed by the store with their own topics.
+server:
+  host: '*'
+  port: 5432
+
+# For `:transport :flight-sql` runs; ATTACH and DETACH stay on pgwire.
+flightSql:
+  host: '*'
+  port: 9832
+
+healthz:
+  host: '*'
+  port: 8080
+
+logClusters:
+  kafkaCluster: !Kafka
+    bootstrapServers: "localhost:9092"
+    # XTDB writes each transaction as one Kafka message; the 1 MiB default
+    # refuses a 1000-entry Synthea transaction (1.1-1.6 MB). The broker's
+    # message.max.bytes is raised to match by `bb xtdb-kafka-up`.
+    propertiesMap:
+      max.request.size: "33554432"
+
+log: !Kafka
+  cluster: kafkaCluster
+  topic: !Env XTDB_LOG_TOPIC
+  autoCreateTopic: true
+
+storage: !Local
+  path: "/var/lib/xtdb/storage"
+
+indexer:
+  pipelinedReplicaAppends: true

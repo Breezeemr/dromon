@@ -25,7 +25,7 @@
             [fhir-search-bench.dataset :as dataset]
             [fhir-search-bench.queries :as queries]))
 
-(def ^:private tenant "default")
+(def ^:no-doc tenant "default")
 (def ^:private data-root "data")
 
 (defn- log [& args] (apply println "[bench]" args))
@@ -36,27 +36,53 @@
 
 (defn- xtdb-data-dir [] (str data-root "/xtdb2"))
 
-(defn- make-store
+(defn ^:no-doc make-store
   "Construct a fresh store: `(store-fn)` when given, else the built-in xtdb2
-   store, whose on-disk node directory is wiped first."
-  [backend store-fn]
+   store, whose on-disk node directory is wiped first. `opts` may carry
+   `:xtdb-pipelined?` (default true, the store's own default), which sets the
+   xtdb2 store's pipelined replica-log appends; the store sets that itself, so
+   XTDB_PIPELINED_REPLICA_APPENDS has no effect on it.
+
+   With `:xtdb-server` (\"host:port\"), the xtdb2 store runs against that
+   standalone XTDB server instead of an embedded node, its tenant a database
+   under a fresh `fhirbench_<hex>_` prefix; the server owns pipelining, so
+   `:xtdb-pipelined?` does not apply.
+
+   `:transport` (:pgwire, the default, :adbc or :flight-sql) is the xtdb2
+   store's :transport; with `:xtdb-server` and :flight-sql it needs
+   `:xtdb-flight-sql-port`, the server's FlightSQL port."
+  ([backend store-fn] (make-store backend store-fn {}))
+  ([backend store-fn {:keys [xtdb-pipelined? xtdb-server transport xtdb-flight-sql-port]
+                      :or {xtdb-pipelined? true transport :pgwire}}]
   (cond
     store-fn
     ((requiring-resolve store-fn))
+
+    xtdb-server
+    (let [[host port] (str/split (str xtdb-server) #":")
+          create      (requiring-resolve 'fhir-store-xtdb2.core/create-xtdb-store)]
+      (create {:resource/schemas @schema/schemas
+               :query-mode       :sql
+               :transport        transport
+               :server           (cond-> {:host host :port (parse-long port)
+                                          :database-prefix (str "fhirbench_" (subs (str (random-uuid)) 0 8) "_")}
+                                   xtdb-flight-sql-port (assoc :flight-sql-port xtdb-flight-sql-port))}))
 
     (= :xtdb2 backend)
     (let [dir    (xtdb-data-dir)
           create (requiring-resolve 'fhir-store-xtdb2.core/create-xtdb-store)]
       (shell/sh "rm" "-rf" dir)
       (.mkdirs (io/file dir))
-      (create {:resource/schemas @schema/schemas
-               :query-mode       :sql
-               :node-config      {:log     [:local {:path (str dir "/log")}]
-                                  :storage [:local {:path (str dir "/storage")}]}}))
+      (create {:resource/schemas            @schema/schemas
+               :query-mode                  :sql
+               :transport                   transport
+               :pipelined-replica-appends?  (boolean xtdb-pipelined?)
+               :node-config                 {:log     [:local {:path (str dir "/log")}]
+                                             :storage [:local {:path (str dir "/storage")}]}}))
 
     :else
     (throw (ex-info (str "Unknown backend " backend "; pass :store-fn for a store outside dromon")
-                    {:backend backend}))))
+                    {:backend backend})))))
 
 ;; ── Load ────────────────────────────────────────────────────────────────────
 
@@ -87,7 +113,7 @@
 ;; few dropped intra-patient reference links, which the search workload does not
 ;; touch. In-flight transactions are bounded by `concurrency` for back pressure.
 
-(defn- load-dataset-pooled!
+(defn ^:no-doc load-dataset-pooled!
   "Concurrent load. Splits bundles at `max-tx` and runs up to `concurrency`
    synchronous `transact-transaction` calls at once via a fixed thread pool. The
    pool size bounds in-flight transactions, the database back pressure, the same
@@ -179,8 +205,12 @@
                      mega-patient bundle can't dominate the load.
    - :concurrency    max in-flight transactions during load (default 4), the
                      same bound for every store so loads compare.
-   - :synthea-dir    Synthea fhir bundle dir (default synthea-output/fhir)"
-  [{:keys [backend store-fn max-resources max-tx concurrency synthea-dir]
+   - :synthea-dir    Synthea fhir bundle dir (default synthea-output/fhir)
+   - :xtdb-server    \"host:port\" of a standalone XTDB server for the xtdb2
+                     store (see make-store)
+   - :transport / :xtdb-flight-sql-port  the xtdb2 store's transport (see make-store)"
+  [{:keys [backend store-fn max-resources max-tx concurrency synthea-dir xtdb-server
+           transport xtdb-flight-sql-port]
     :or   {max-resources 10000 max-tx 2000 concurrency 4 synthea-dir "synthea-output/fhir"}}]
   (when-not (keyword? backend)
     (throw (ex-info "Pass :backend, the result label (e.g. :xtdb2)" {:backend backend})))
@@ -192,7 +222,9 @@
   (let [{:keys [bundles total patients by-type]}
         (dataset/build {:dir synthea-dir :max-resources max-resources})
         _      (log "Constructing store and provisioning tenant ...")
-        store  (make-store backend store-fn)]
+        store  (make-store backend store-fn {:xtdb-server xtdb-server
+                                                :transport transport
+                                                :xtdb-flight-sql-port xtdb-flight-sql-port})]
     (db/create-tenant store tenant {:if-exists :replace})
     (db/warmup-tenant store tenant)
     (log "Loading" total "resources across" (count bundles) "bundle(s)"
