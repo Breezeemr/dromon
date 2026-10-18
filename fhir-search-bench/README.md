@@ -160,6 +160,25 @@ bb xtdb-kafka-topics             # the tenant's topic and -replica topic, with o
 bb xtdb-kafka-down
 ```
 
+`:transport :flight-sql :xtdb-flight-sql-port 19832` runs the store's reads
+and writes over the server's FlightSQL port instead (ATTACH and DETACH stay on
+pgwire); `:transport` is recorded in the result and named in the report. On
+XTDB 2.2.0-beta3 a FlightSQL run does not finish at the default scale
+(2026-10-18):
+
+- After the 100k preload has flushed blocks, a read of a row whose nested
+  struct lacks a field the flushed blocks carry fails on the server with
+  `no more buffers for field unit: Utf8. Expected 3` (or
+  `result: List<Struct<reference, display>> ... Expected 2`). The same reads
+  over pgwire succeed. Twenty lines reproduce it on an embedded node with
+  `:indexer {:rows-per-block 20}`.
+- Below that scale (`:preload 3000 :tx-sizes [1 10 100]`) one run ended with
+  the benchmark JVM itself dying of SIGSEGV in `jbyte_disjoint_arraycopy` on a
+  worker-pool thread, with Arrow `flight-client` allocator leaks reported.
+
+The preload is the one complete FlightSQL write measurement: 100121 resources
+in 28.3 s against 12.9 s over pgwire, and 3513 in 3.5 s against 1.6 s.
+
 The server's config is `docker/xtdb-kafka/config.yaml`: a Kafka log for the
 primary database, local storage in the container, and
 `indexer.pipelinedReplicaAppends: true` (the server's YAML decoder refuses an
