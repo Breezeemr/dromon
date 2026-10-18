@@ -5,6 +5,11 @@ server:
   host: '*'
   port: 5432
 
+# For `:transport :flight-sql` runs; ATTACH and DETACH stay on pgwire.
+flightSql:
+  host: '*'
+  port: 9832
+
 healthz:
   host: '*'
   port: 8080
