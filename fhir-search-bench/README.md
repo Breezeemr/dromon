@@ -172,12 +172,22 @@ XTDB 2.2.0-beta3 a FlightSQL run does not finish at the default scale
   `result: List<Struct<reference, display>> ... Expected 2`). The same reads
   over pgwire succeed. Twenty lines reproduce it on an embedded node with
   `:indexer {:rows-per-block 20}`.
-- Below that scale (`:preload 3000 :tx-sizes [1 10 100]`) one run ended with
-  the benchmark JVM itself dying of SIGSEGV in `jbyte_disjoint_arraycopy` on a
-  worker-pool thread, with Arrow `flight-client` allocator leaks reported.
+- Below that scale (`:preload 3000 :tx-sizes [1 10 100]`) the benchmark JVM
+  itself died of SIGSEGV (`jbyte_disjoint_arraycopy` /
+  `jlong_disjoint_arraycopy`) on a worker-pool thread, in two of two runs:
+  once on this alias's netty 4.1.132 pin, with Arrow `flight-client`
+  allocator leaks reported, and once with the netty family overridden to the
+  store's 4.2.9 and `-Dio.netty.noUnsafe=false`. pgwire runs on the same
+  classpath do not crash.
 
 The preload is the one complete FlightSQL write measurement: 100121 resources
 in 28.3 s against 12.9 s over pgwire, and 3513 in 3.5 s against 1.6 s.
+
+Embedded, `bb bench-writes-xtdb :transport :adbc` runs the full default
+benchmark to completion. On 2026-10-18 it beat embedded pgwire on every
+workload: the preload in 6.6 s against 12.5 s, single writes about 1.2x,
+transactions of 100 and 1000 entries 1.5-1.6x, and 16-thread creates and
+updates 1.3x.
 
 The server's config is `docker/xtdb-kafka/config.yaml`: a Kafka log for the
 primary database, local storage in the container, and

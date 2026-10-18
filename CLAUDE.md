@@ -304,8 +304,10 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   unit: Utf8. Expected 3`); pgwire reads it fine. The suite's `--profile
   flight-sql` never flushes a block, so it passes regardless; a node with
   `:indexer {:rows-per-block 20}` reproduces it. Under the fhir-search-bench
-  write workload a FlightSQL client JVM also once died of SIGSEGV in
-  `jbyte_disjoint_arraycopy`. Keep deployments on `:pgwire`.
+  write workload, at a scale that flushes no block, the FlightSQL client JVM
+  also died of SIGSEGV (`j*_disjoint_arraycopy` on a worker thread) in two of
+  two runs, on netty 4.1.132 and on 4.2.9 with `-Dio.netty.noUnsafe=false`.
+  Keep deployments on `:pgwire`.
 
 ### Transaction metadata (`:tx-metadata`)
 
