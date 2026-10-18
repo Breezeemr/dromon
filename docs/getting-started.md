@@ -361,7 +361,7 @@ are unaffected.
 | Jetty | ring-jetty9 0.39.2 | HTTP server with virtual threads |
 | Integrant | 0.13.1 | Component lifecycle |
 | Buddy | 3.x | JWT authentication |
-| Ory Hydra/Kratos/Keto | v2.2/v1.3/v0.12 | OAuth2, identity, authorization |
+| Ory Hydra/Kratos/Keto | v2.2/v26.2/v0.12 | OAuth2, identity, authorization |
 
 ## Further Reading
 

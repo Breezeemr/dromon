@@ -314,6 +314,12 @@
 
 (declare start!)
 
+(def kratos-image
+  "Production's Kratos version. `migrate sql up` runs before every `serve`, so an
+   ory-pg volume created by an older pin migrates forward on the next
+   `start-auth-stack!`; the migrated kratos database cannot go back."
+  "docker.io/oryd/kratos:v26.2.0")
+
 (def kratos-cookie-secret
   "Cookie-signing secret for the local dev Kratos. Kratos does not substitute
    $VAR placeholders in YAML config values (docs/tasks/kratos-cipher-secret-config.md),
@@ -359,7 +365,7 @@
     ["-e" (str "DSN=" pg-dsn-base "kratos?sslmode=disable")
      "-e" (str "SECRETS_COOKIE=" kratos-cookie-secret)
      "-e" (str "SECRETS_CIPHER=" kratos-cipher-secret)
-     "docker.io/oryd/kratos:v1.3.0" "serve" "-c" "/etc/config/kratos/kratos.yml" "--dev"]))
+     kratos-image "serve" "-c" "/etc/config/kratos/kratos.yml" "--dev"]))
 
 (defn start-auth-stack!
   "Starts the secondary auth stack on top of the main pool: ensures
@@ -410,8 +416,8 @@
                            "-v" (str pwd "/docker/identity.schema.json:/etc/config/kratos/identity.schema.json")]
                           ory-tls-docker-args
                           ["-e" (str "DSN=" pg-dsn-base "kratos?sslmode=disable")
-                           "docker.io/oryd/kratos:v1.3.0"
-                           "migrate" "sql" "-e" "--yes" "-c" "/etc/config/kratos/kratos.yml"]))
+                           kratos-image
+                           "migrate" "sql" "up" "-e" "--yes" "-c" "/etc/config/kratos/kratos.yml"]))
      (println "Recreating Ory Kratos (TLS," (:kratos-public urls) ")...")
      ;; Always recreated: the rendered config may name different hosts than
      ;; the running container was started with.

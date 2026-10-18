@@ -1,4 +1,10 @@
-# Ory Kratos v1.3.0 config for the local auth stack (start-auth-stack!).
+# Ory Kratos v26.2.0 config for the local auth stack (start-auth-stack!).
+#
+# Kept in step with the consuming host's production Kratos config wherever it
+# changes what a user sees or what a whoami caller gets back: the registration
+# style, the second-factor methods, the session lifespan and whoami's
+# required_aal. Hostnames, ports and cookies stay local. Recovery,
+# verification and the courier stay off because nothing local sends mail.
 #
 # The cookie and cipher secrets are deliberately NOT in this file. Kratos
 # does not perform $VAR-style environment substitution in YAML config
@@ -56,10 +62,33 @@ selfservice:
   methods:
     password:
       enabled: true
+    profile:
+      enabled: false
+    # The second factors production enables. Enabling them enforces nothing:
+    # Kratos asks for a second factor only from an identity that has enrolled
+    # one. Once an identity has, a password-only login answers 422
+    # browser_location_change_required (redirect to ?aal=aal2, return_to
+    # kept), and whoami answers its aal1 sessions with 403
+    # session_aal2_required (see session.whoami below).
+    totp:
+      enabled: true
+      config:
+        # A label of its own keeps a local enrolment from sitting next to a
+        # production one in an authenticator app under the same name.
+        issuer: dromon (local)
+    lookup_secret:
+      enabled: true
   flows:
+    # Where the second factors above are enrolled.
+    settings:
+      ui_url: {{LOGIN_APP_BASE_URL}}/kratos/settings
     login:
       ui_url: {{LOGIN_APP_BASE_URL}}/kratos/login
     registration:
+      # Production pins one-step registration. Without it Kratos v1.2+
+      # defaults to profile_first, a two-screen sign-up production does not
+      # show.
+      style: unified
       ui_url: {{LOGIN_APP_BASE_URL}}/kratos/register
     recovery:
       enabled: false
@@ -76,3 +105,10 @@ identity:
   schemas:
     - id: default
       url: file:///etc/config/kratos/identity.schema.json
+
+session:
+  # Production's values. required_aal is the Kratos default, written down
+  # because whoami's 403 for an enrolled identity's aal1 session depends on it.
+  lifespan: 24h
+  whoami:
+    required_aal: highest_available

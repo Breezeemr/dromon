@@ -2,7 +2,6 @@
   (:require [xtdb.api :as xt]
             [xtdb.basis :as basis]
             [xtdb.node :as xtn]
-            [next.jdbc :as jdbc]
             [clojure.string :as str]
             [clojure.set :as set]
             [clojure.walk :as walk]
@@ -13,6 +12,7 @@
             [cheshire.generate :as json-gen]
             [integrant.core :as ig]
             [fhir-store.protocol :as fp :refer [IFHIRStore]]
+            [fhir-store-xtdb2.conns :as conns :refer [with-conn]]
             [fhir-store-xtdb2.datetime :as dt]
             [fhir-store-xtdb2.transform :as xf]
             [xtdb.serde :as serde])
@@ -21,7 +21,7 @@
            [java.time.format DateTimeFormatter]
            [com.zaxxer.hikari HikariConfig HikariDataSource SQLExceptionOverride SQLExceptionOverride$Override]
            [org.postgresql.util PSQLException ServerErrorMessage]
-           [xtdb.api DataSource$ConnectionBuilder]
+           [xtdb.api DataSource$ConnectionBuilder FlightSqlConfig]
            [xtdb.api.error Incorrect]))
 
 (defn- method-order
@@ -406,7 +406,7 @@
 (defn ^:no-doc lifecycle-write
   "Run the lifecycle's prepare, then its tx-ops, for one create or update
    whose preconditions have passed and whose id is final. `db` is the node or
-   jdbc connection the write executes through. Returns the write map with
+   connection the write executes through. Returns the write map with
    :resource the PREPARED body (the one to encode), :submitted the body as
    sent, and :tx-ops the ops to append to the same execute-tx (nil for none).
    Exceptions propagate: they refuse the write before anything is sent."
@@ -1612,6 +1612,11 @@
         SQLExceptionOverride$Override/DO_NOT_EVICT
         SQLExceptionOverride$Override/CONTINUE_EVICT))))
 
+(extend-protocol conns/ConnSource
+  HikariDataSource
+  (acquire [pool] (.getConnection pool))
+  (release [_ conn _failure] (.close ^java.sql.Connection conn)))
+
 (defn- make-pool
   "Builds a HikariCP pool over the XTDB node (which is a javax.sql.DataSource)."
   ^HikariDataSource [node tenant-id pool-opts]
@@ -1626,16 +1631,34 @@
               (.setPoolName (str "xtdb-" tenant-id)))]
     (HikariDataSource. cfg)))
 
+(defn- make-conn-source
+  "The tenant's connection source for its :transport (see
+   fhir-store-xtdb2.conns): a Hikari pool over `node`'s pgwire server, ADBC
+   connections on the node itself, or FlightSQL sessions on the node's
+   FlightSQL port. A remote tenant's FlightSQL `node` already is its pool."
+  [store node tenant-id]
+  (let [pool-opts (merge default-pool-opts (:pool-opts store))]
+    (case (:transport store)
+      :pgwire (make-pool node tenant-id (:pool-opts store))
+      :adbc (conns/adbc-source node)
+      :flight-sql (if (:server store)
+                    node
+                    (conns/flight-sql-pool
+                     (assoc (select-keys pool-opts [:max-size :connection-timeout-ms])
+                            :port (.getFlightSqlPort ^xtdb.api.Xtdb node)))))))
+
 (defn- close-node!
-  "Closes an embedded node. A remote tenant's DataSource holds nothing open."
+  "Closes an embedded node, or a remote tenant's FlightSQL pool. A remote
+   tenant's pgwire DataSource holds nothing open."
   [node]
   (when (instance? java.lang.AutoCloseable node)
     (.close ^java.lang.AutoCloseable node)))
 
 (defn- close-entry!
-  "Closes a tenant entry's pool then its node, swallowing errors."
+  "Closes a tenant entry's connection source then its node, swallowing errors.
+   A remote FlightSQL tenant's two are one pool, and closing it twice is safe."
   [{:keys [node pool]}]
-  (when pool (try (.close ^HikariDataSource pool) (catch Throwable _ nil)))
+  (when pool (try (.close ^java.lang.AutoCloseable pool) (catch Throwable _ nil)))
   (when node (try (close-node! node) (catch Throwable _ nil))))
 
 ;; ---------------------------------------------------------------------------
@@ -1660,11 +1683,16 @@
    or in-memory log, always its own leader, so the beta3 caveat about older
    nodes reading a pipelining leader's log cannot arise. Pass false only for a
    deployment that must roll back below beta3: turn it off on every node, wait
-   for a block to be written, then downgrade."
-  ^xtdb.api.Xtdb$Config [node-config {:keys [pipelined-replica-appends?]}]
+   for a block to be written, then downgrade.
+
+   `:flight-sql?` starts the node's FlightSQL server on a free loopback port,
+   unless `node-config` already configures one."
+  ^xtdb.api.Xtdb$Config [node-config {:keys [pipelined-replica-appends? flight-sql?]}]
   (let [cfg (xtn/->config node-config)]
     (.pipelinedReplicaAppends ^xtdb.api.IndexerConfig (.getIndexer cfg)
                               (not (false? pipelined-replica-appends?)))
+    (when (and flight-sql? (nil? (.getFlightSql cfg)))
+      (.setFlightSql cfg (FlightSqlConfig. "127.0.0.1" 0)))
     cfg))
 
 (defn start-node
@@ -1779,13 +1807,22 @@
   (run-on-primary! server (str "DETACH DATABASE " db)))
 
 (defn- remote-tenant-node
-  "The tenant's database on the server as a DataSource, attaching it first when
-   the server has no database of that name."
-  [server tid]
+  "The tenant's database on the server, attaching it first when the server has
+   no database of that name: a pgwire DataSource, or over :flight-sql a pool of
+   FlightSQL sessions on it. ATTACH, DETACH and the attached-database list stay
+   on pgwire either way."
+  [store server tid]
   (let [db (tenant-db-name server tid)]
     (when-not (contains? (attached-databases server) db)
       (attach-tenant-database! server db))
-    (server-client server db)))
+    (if (= :flight-sql (:transport store))
+      (conns/flight-sql-pool
+       (assoc (select-keys (merge default-pool-opts (:pool-opts store))
+                           [:max-size :connection-timeout-ms])
+              :host (:host server "127.0.0.1")
+              :port (:flight-sql-port server)
+              :dbname db))
+      (server-client server db))))
 
 (defn- server-has-tenant?
   "True when the store runs against a server that has tenant `tid`'s database
@@ -1883,9 +1920,10 @@
    Closes the node and names the tenant when any of this fails."
   [store tid]
   (let [node (if-let [server (:server store)]
-               (remote-tenant-node server tid)
+               (remote-tenant-node store server tid)
                (start-node (:node-config store)
-                           {:pipelined-replica-appends? (:pipelined-replica-appends? store)}))]
+                           {:pipelined-replica-appends? (:pipelined-replica-appends? store)
+                            :flight-sql? (= :flight-sql (:transport store))}))]
     (try
       (let [declarations (:declared-columns store)
             on-node (columns-on-node node (node-db-name store tid))]
@@ -1900,10 +1938,11 @@
                         e))))))
 
 (defn- get-or-create-entry
-  "Returns {:node node :pool HikariDataSource :declared atom} for the tenant,
-   creating them if absent. compare-and-set via swap! handles concurrent
-   creation; the loser of a race closes the pool+node it created and uses the
-   winner's entry. :declared holds the table names declared on the node so
+  "Returns {:node node :pool conn-source :declared atom} for the tenant,
+   creating them if absent; :pool is where the store's operations borrow
+   their connections (see make-conn-source). compare-and-set via swap!
+   handles concurrent creation; the loser of a race closes the pool+node it
+   created and uses the winner's entry. :declared holds the table names declared on the node so
    far, seeded with the tables start-tenant-node finds or declares (see
    ensure-declared!)."
   [store tenant-id]
@@ -1914,7 +1953,7 @@
          {:id :store/node.start
           :data {:tenant-id tid}}
          (let [[new-node declared] (start-tenant-node store tid)
-               new-pool (make-pool new-node tid (:pool-opts store))
+               new-pool (make-conn-source store new-node tid)
                new-entry {:node new-node :pool new-pool
                           :db-name (node-db-name store tid)
                           :declared (atom declared)}
@@ -2342,7 +2381,7 @@
   [pool resource-type ^java.time.Instant as-of read-decoders page-size]
   (reify clojure.lang.IReduceInit
     (reduce [_ f init]
-      (with-open [conn (jdbc/get-connection pool)]
+      (with-conn [conn pool]
         (let [q (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id > ? ORDER BY _id LIMIT ?"
                         (table-name resource-type))]
           (loop [after "" acc init]
@@ -2572,7 +2611,7 @@
        (case query-mode
          :xtql (create-xtql node resource-type id resource storage-encoders
                             (lifecycle-ctx this tenant-id (not-empty (dissoc opts :id-minted?))))
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            ;; :id-minted? is a hint to the store, not one of the host's
            ;; opts, so a lifecycle sees the opts without it.
            (create-sql conn resource-type id resource storage-encoders
@@ -2587,7 +2626,7 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (read-xtql node resource-type id read-decoders)
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            (read-sql conn resource-type id read-decoders))))))
 
   (vread-resource [this tenant-id resource-type id vid]
@@ -2598,7 +2637,7 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (vread-xtql node resource-type id vid read-decoders)
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            (vread-sql conn resource-type id vid read-decoders))))))
 
   (update-resource [this tenant-id resource-type id resource]
@@ -2613,7 +2652,7 @@
        (case query-mode
          :xtql (update-xtql node resource-type id resource opts storage-encoders
                             (lifecycle-ctx this tenant-id opts))
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            (update-sql conn resource-type id resource opts storage-encoders
                        (lifecycle-ctx this tenant-id opts)))))))
 
@@ -2628,7 +2667,7 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (delete-xtql node resource-type id opts)
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            (delete-sql conn resource-type id opts))))))
 
   (resource-deleted? [this tenant-id resource-type id]
@@ -2640,7 +2679,7 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (deleted?-xtql node resource-type id)
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            (deleted?-sql conn resource-type id))))))
 
   (search [this tenant-id resource-type params search-registry]
@@ -2655,7 +2694,7 @@
        (try
          (case query-mode
            :xtql (search-xtql node resource-type args read-decoders sql-thunk)
-           (with-open [conn (jdbc/get-connection pool)]
+           (with-conn [conn pool]
              (search-sql conn resource-type args read-decoders)))
          (catch Exception e
            ;; Search failures should never yield HTTP 500. Per FHIR spec, unsupported
@@ -2680,7 +2719,7 @@
       (try
         (case query-mode
           :xtql (count-resources-xtql node resource-type args sql-thunk)
-          (with-open [conn (jdbc/get-connection pool)]
+          (with-conn [conn pool]
             (count-sql conn resource-type args)))
         (catch Exception e
           (t/event! ::count-query-failed
@@ -2700,7 +2739,7 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (history-xtql node resource-type id read-decoders)
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            (history-sql conn resource-type id read-decoders))))))
 
   (history-type [this tenant-id resource-type params]
@@ -2711,7 +2750,7 @@
      (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (history-type-xtql node resource-type params read-decoders)
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            (history-type-sql conn resource-type params read-decoders))))))
 
   (transact-transaction [this tenant-id entries]
@@ -2725,7 +2764,7 @@
      {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
     (let [{:keys [pool] :as entry} (get-or-create-entry this tenant-id)]
-     (with-open [conn (jdbc/get-connection pool)]
+     (with-conn [conn pool]
       (let [node conn
           entry-metas
           (ftrace/trace!
@@ -3123,7 +3162,7 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (try
-         (with-open [conn (jdbc/get-connection pool)]
+         (with-conn [conn pool]
            (count-as-of-sql conn resource-type (basis->system-time basis)))
          (catch Exception e
            (t/event! ::count-as-of-failed
@@ -3143,7 +3182,7 @@
      {:id :store/read-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
-       (with-open [conn (jdbc/get-connection pool)]
+       (with-conn [conn pool]
          (read-sql conn resource-type id read-decoders basis)))))
 
   (search-as-of [this tenant-id resource-type params search-registry basis]
@@ -3154,7 +3193,7 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)
            args (prepare-search-args params search-registry)]
-       (with-open [conn (jdbc/get-connection pool)]
+       (with-conn [conn pool]
          (search-sql conn resource-type args read-decoders basis)))))
 
   (count-as-of-basis [this tenant-id resource-type params search-registry basis]
@@ -3165,7 +3204,7 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)
            args (prepare-search-args params search-registry)]
-       (with-open [conn (jdbc/get-connection pool)]
+       (with-conn [conn pool]
          (count-sql conn resource-type args basis)))))
 
   (resource-timeline [this tenant-id resource-type id _opts]
@@ -3175,7 +3214,7 @@
      {:id :store/resource-timeline
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
-       (with-open [conn (jdbc/get-connection pool)]
+       (with-conn [conn pool]
          (timeline-sql conn resource-type id read-decoders)))))
 
   fp/IValidTimeStore
@@ -3187,7 +3226,7 @@
      {:id :store/put-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
-       (with-open [conn (jdbc/get-connection pool)]
+       (with-conn [conn pool]
          (put-valid-time-sql conn resource-type id resource vt storage-encoders)))))
 
   (close-valid-time [this tenant-id resource-type id valid-from]
@@ -3200,7 +3239,7 @@
      {:id :store/close-valid-time
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
-       (with-open [conn (jdbc/get-connection pool)]
+       (with-conn [conn pool]
          (close-valid-time-sql conn resource-type id valid-from valid-to))))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
@@ -3230,6 +3269,13 @@
                {:name "display"
                 :valueString "XTDB"}]})
 
+(def ^:dynamic *default-transport*
+  "The :transport of a store whose config names none. The test suite binds it
+   to run every store test over each transport (tests.edn profiles)."
+  :pgwire)
+
+(def ^:private transports #{:pgwire :adbc :flight-sql})
+
 (defn create-xtdb-store
   "Creates an XTDB implementation of IFHIRStore with per-tenant node isolation.
    Config map keys:
@@ -3238,9 +3284,22 @@
    - :query-mode        — pathway for reads and writes. :sql (default) uses
      dynamic SQL + INSERT/DELETE. :xtql uses XTQL reads and put-docs/delete-docs
      writes, with [:sql ASSERT ...] retained for optimistic concurrency.
-   - :pool-opts         — per-tenant HikariCP connection-pool overrides
+   - :transport         — how reads and writes reach XTDB (see
+     fhir-store-xtdb2.conns); default *default-transport*, :pgwire.
+     :pgwire     a HikariCP pool of pgwire JDBC connections.
+     :adbc       in-process ADBC connections (xt/open-adbc-conn) on the
+                 tenant's embedded node; no socket. Refused with :server.
+     :flight-sql a pool of FlightSQL sessions: on an embedded node's own
+                 FlightSQL server (started on a free loopback port unless
+                 :node-config configures one), or with :server on the
+                 server's :flight-sql-port.
+     The node-level work (table declarations, the start-up catalog read,
+     current-basis, the :xtql pathway) runs on the embedded node itself,
+     which XTDB drives in-process, on every transport.
+   - :pool-opts         — per-tenant connection-pool overrides
      (:max-size, :min-idle, :connection-timeout-ms, :prepare-threshold); see
-     default-pool-opts.
+     default-pool-opts. :flight-sql uses :max-size and
+     :connection-timeout-ms; :adbc pools nothing and uses none.
    - :resource/lifecycle — a write lifecycle (qualified symbol, value, or
      constructor fn of this config map); resolved once here and kept on the
      store under :resource/lifecycle. See fhir-store.lifecycle.
@@ -3253,7 +3312,9 @@
      :database-prefix (default \"fhir_\", see tenant-db-name),
      :attach-template (the ATTACH config for a new tenant database, with
      {db} and {uid} placeholders; default default-attach-template) and
-     :attach-timeout-ms (default 60000). Each tenant is a database attached
+     :attach-timeout-ms (default 60000), and for :transport :flight-sql
+     :flight-sql-port, the server's FlightSQL port (ATTACH, DETACH and the
+     attached-database list still go over pgwire). Each tenant is a database attached
      to the server; create-tenant's :replace and delete-tenant's
      :close-storage? detach it. Requires :sql query-mode, and refuses
      :node-config and :pipelined-replica-appends?, which the server owns
@@ -3272,11 +3333,21 @@
    transform/store-columns on its first use per tenant, unless the node
    already had them all when it started."
   [{:keys [resource/schemas node-config query-mode pool-opts resource/lifecycle
-           pipelined-replica-appends? server]
+           pipelined-replica-appends? server transport]
     :or {node-config {} schemas [] query-mode :sql pool-opts {}}
     :as config}]
   (assert (contains? #{:sql :xtql} query-mode)
           (str "query-mode must be :sql or :xtql, got " query-mode))
+  (let [transport (or transport *default-transport*)]
+    (when-not (contains? transports transport)
+      (throw (ex-info (str "transport must be one of " transports ", got " transport)
+                      {:transport transport})))
+    (when (and server (= :adbc transport))
+      (throw (ex-info "A :server store cannot use the :adbc transport: ADBC runs in-process, on an embedded node"
+                      {})))
+    (when (and server (= :flight-sql transport) (not (:flight-sql-port server)))
+      (throw (ex-info "A :server store on the :flight-sql transport needs the server's :flight-sql-port"
+                      {}))))
   (when server
     (when-not (= :sql query-mode)
       (throw (ex-info "A :server store supports only :sql query-mode" {:query-mode query-mode})))
@@ -3294,6 +3365,7 @@
     (assoc store
            :declared-columns (schema-declarations schemas)
            :server server
+           :transport (or transport *default-transport*)
            :pipelined-replica-appends? (not (false? pipelined-replica-appends?))
            :operations {:valueset-expand xtdb-valueset-expand
                         :valueset-lookup xtdb-valueset-lookup}
@@ -3310,16 +3382,18 @@
 
 (defmethod ig/init-key :fhir-store/xtdb2-store
   [_ {:keys [node resource/schemas query-mode pool-opts resource/lifecycle
-             pipelined-replica-appends? server]}]
+             pipelined-replica-appends? server transport]}]
   (println "Starting XTDB2 FHIR Store (per-tenant node isolation)"
-           (str "[query-mode=" (or query-mode :sql) "]"))
+           (str "[query-mode=" (or query-mode :sql)
+                " transport=" (or transport *default-transport*) "]"))
   (create-xtdb-store {:resource/schemas schemas
                       :node-config node
                       :query-mode (or query-mode :sql)
                       :pool-opts pool-opts
                       :resource/lifecycle lifecycle
                       :pipelined-replica-appends? pipelined-replica-appends?
-                      :server server}))
+                      :server server
+                      :transport transport}))
 
 (defmethod ig/halt-key! :fhir-store/xtdb2-store [_ store]
   (println "Stopping XTDB2 FHIR Store - closing all tenant pools + nodes")

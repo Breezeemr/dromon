@@ -281,6 +281,23 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   protocol violations are 08P01 with no detail, and the ones that end a
   session close the socket without sending anything; those, and either state
   pgjdbc raises itself, are left to Hikari.
+- The store's `:transport` picks where its per-operation connections come
+  from (`fhir-store-xtdb2.conns`): `:pgwire` (the Hikari pool above, the
+  default), `:adbc` (`xt/open-adbc-conn` on the embedded node, no socket) or
+  `:flight-sql` (a pool of `xtdb.flight-sql/open-conn` sessions, on an
+  embedded node's own FlightSQL port or a `:server`'s `:flight-sql-port`).
+  All three are `xtdb.protocols/Connectable`s, so the SQL is the same; run the
+  suite over one with `clojure -M:test --profile adbc` (or `flight-sql`).
+  Verified on 2.2.0-beta3: rows decode `=` across the three, and a failed
+  `ASSERT` is the same `:xtdb/assert-failed` conflict carrying `:tx-op-idx`.
+  `xt/q`/`xt/execute-tx` on an `Xtdb` node already run in-process ADBC
+  (`xtdb.node.impl`), so declarations, the start-up catalog read and the
+  `:xtql` pathway never touched pgwire; only the pool did. A fresh ADBC
+  connection has no await token, so the source seeds it from the node.
+  A FlightSQL connection is a server-side session; `FlightSqlConn.close` drops
+  the channel without ending it, so the pool sends `CloseSession` first.
+  FlightSQL refuses `:metadata` tx-opts (BEGIN cannot be parameterised).
+  ATTACH and DETACH stay on pgwire on every transport.
 
 ### Transaction metadata (`:tx-metadata`)
 

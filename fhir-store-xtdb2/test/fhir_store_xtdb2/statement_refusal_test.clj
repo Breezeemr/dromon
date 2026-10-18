@@ -2,7 +2,7 @@
   "XTDB refuses an SQL feature or a parameter type it does not support with
    SQLSTATE 0A000, and an incorrect statement (a parse or plan error, a failed
    cast) with 08P01. Hikari treats both as a broken connection. These pin that
-   the store's pool keeps the connection, so the refusal reaches the caller
+   the store's pgwire pool keeps the connection, so the refusal reaches the caller
    rather than the \"Connection is closed\" xt/q's ROLLBACK raises on an
    evicted one."
   (:require [clojure.string :as str]
@@ -41,7 +41,8 @@
   (boolean (some #(str/includes? % text) messages)))
 
 (deftest unsupported-refusal-reaches-the-caller
-  (let [store (core-db/create-xtdb-store {:pool-opts {:max-size 1 :min-idle 1}})
+  (let [store (core-db/create-xtdb-store {:transport :pgwire
+                                          :pool-opts {:max-size 1 :min-idle 1}})
         tid "t-statement-refusal"]
     (try
       (db/create-resource store tid :Observation "obs-1"
@@ -67,7 +68,8 @@
         (close-store-nodes! store)))))
 
 (deftest incorrect-refusal-reaches-the-caller
-  (let [store (core-db/create-xtdb-store {:pool-opts {:max-size 1 :min-idle 1}})
+  (let [store (core-db/create-xtdb-store {:transport :pgwire
+                                          :pool-opts {:max-size 1 :min-idle 1}})
         tid "t-incorrect-refusal"]
     (try
       (db/create-resource store tid :Observation "obs-1"
