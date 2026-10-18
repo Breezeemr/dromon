@@ -360,3 +360,25 @@
                    (catch clojure.lang.ExceptionInfo e e))]
         (is (= {:keto-url-key :read-url} (ex-data e)))
         (is (empty? @calls))))))
+
+(deftest the-token-hook-secret-is-compared-in-constant-time
+  (testing "secret-matches? is exact equality over UTF-8 bytes"
+    (is (true? (grant/secret-matches? "s3cret" "s3cret")))
+    (is (true? (grant/secret-matches? "caf\u00e9" "caf\u00e9")))
+    (is (false? (grant/secret-matches? "s3cret" "s3cre")))
+    (is (false? (grant/secret-matches? "s3cret" "s3cret ")))
+    (is (false? (grant/secret-matches? "s3cret" "S3cret")))
+    (is (false? (grant/secret-matches? "s3cret" "")))
+    (is (false? (grant/secret-matches? "s3cret" nil))))
+  (testing "with a secret set, the hook refuses a missing or wrong header before Keto"
+    (with-redefs [grant/token-hook-secret (constantly "s3cret")]
+      (with-recorded-keto [calls []]
+        (doseq [headers [{} {"x-token-hook-secret" "wrong"} {"x-token-hook-secret" "s3cre"}]]
+          (is (= {:status 401 :body {:error "invalid token hook secret"}}
+                 (grant/token-hook (assoc keto-request :headers headers :body-params {})))))
+        (is (empty? @calls)))
+      (with-recorded-keto [calls []]
+        (is (= 200 (:status (grant/token-hook
+                             (assoc keto-request
+                                    :headers {"x-token-hook-secret" "s3cret"}
+                                    :body-params {:request {:client_id "c1"}})))))))))
