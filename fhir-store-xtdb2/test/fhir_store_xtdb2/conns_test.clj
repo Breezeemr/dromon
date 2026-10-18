@@ -24,6 +24,7 @@
   (testing "a transport failure or a fault does not"
     (is (conns/broken-session? (err/unavailable nil "UNAVAILABLE: io exception" {})))
     (is (conns/broken-session? (err/fault nil "boom" {})))
+    (is (conns/broken-session? (ex-info "wrapped" {} (InterruptedException.))))
     (is (conns/broken-session?
          (ex-info "wrapped" {}
                   (.toRuntimeException (CallStatus. FlightStatusCode/UNAVAILABLE nil "gone" nil)))))))

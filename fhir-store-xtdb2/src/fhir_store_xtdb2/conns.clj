@@ -20,6 +20,7 @@
             [xtdb.flight-sql :as flight-sql]
             [xtdb.protocols :as xtp])
   (:import [clojure.lang IReduceInit]
+           [java.nio.channels ClosedByInterruptException]
            [java.util.concurrent LinkedBlockingDeque Semaphore TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean]
            [org.apache.arrow.flight CallOption CloseSessionRequest FlightRuntimeException]
@@ -38,14 +39,15 @@
    it afterwards, also when `body` throws."
   [[sym src] & body]
   `(let [src# ~src
-         ~sym (acquire src#)]
-     (try
-       (let [result# (do ~@body)]
-         (release src# ~sym nil)
-         result#)
-       (catch Throwable e#
-         (release src# ~sym e#)
-         (throw e#)))))
+         ~sym (acquire src#)
+         result# (try
+                   ~@body
+                   (catch Throwable e#
+                     (release src# ~sym e#)
+                     (throw e#)))]
+     ;; Outside the try, so a release that throws is never released again.
+     (release src# ~sym nil)
+     result#))
 
 ;; ---------------------------------------------------------------------------
 ;; :adbc
@@ -96,9 +98,11 @@
    statement refusal (incorrect, conflict, ...) keeps the session, anything
    else (a fault, the server unavailable, a call cancelled) does not. XTDB
    keeps the FlightRuntimeException it read as that anomaly's cause, so only
-   one with no anomaly above it counts as a transport failure. A failure with
-   neither is the store's own (a 412 precondition, a 400 refusal) and never
-   reached the server."
+   one with no anomaly above it counts as a transport failure. So does an
+   interrupt, which XTDB rethrows as is: it may have landed between BEGIN and
+   COMMIT with the rollback interrupted too. A failure with none of these is
+   the store's own (a 412 precondition, a 400 refusal) and never reached the
+   server."
   [^Throwable failure]
   (loop [^Throwable c failure]
     (cond
@@ -106,6 +110,8 @@
       (:cognitect.anomalies/category (ex-data c))
       (not (contains? statement-categories (:cognitect.anomalies/category (ex-data c))))
       (instance? FlightRuntimeException c) true
+      (instance? InterruptedException c) true
+      (instance? ClosedByInterruptException c) true
       :else (recur (ex-cause c)))))
 
 (def ^:private no-call-opts (make-array CallOption 0))
