@@ -79,3 +79,59 @@
             (doseq [[_ {:keys [node pool]}] @(:nodes store)]
               (.close ^java.lang.AutoCloseable pool)
               (.close ^java.lang.AutoCloseable node))))))))
+
+;; XTDB 2.2.0-beta3's FlightSQL server loads result pages into the declared
+;; result type by position (see fhir-store-xtdb2.conns). These pin that a
+;; session's reads come back as the node's own xt/q returns them anyway.
+
+(defn- pool-on [node]
+  (conns/flight-sql-pool {:port (.getFlightSqlPort node) :max-size 2 :connection-timeout-ms 5000}))
+
+(deftest flight-sql-reads-a-struct-missing-a-field-flushed-blocks-carry
+  (with-open [node (xtn/start-node {:flight-sql {:port 0} :indexer {:rows-per-block 20}})
+              pool (pool-on node)]
+    (doseq [i (range 50)]
+      (xt/execute-tx node [[:sql (str "INSERT INTO obs RECORDS {_id: 'f" i "', vq: {value: 1.0, unit: 'mg'}, xs: [1]}")]]))
+    (doseq [i (range 3)]
+      (xt/execute-tx node [[:sql (str "INSERT INTO obs RECORDS {_id: 'l" i "', vq: {value: 2.0}, xs: ['a', {k: 1}]}")]]))
+    (doseq [[sql args] [["SELECT * FROM obs WHERE _id = ?" ["l1"]]
+                        ["SELECT * FROM obs WHERE _id = ?" ["f1"]]
+                        ["SELECT *, _system_from FROM obs FOR ALL SYSTEM_TIME" []]]]
+      (testing sql
+        (is (= (set (xt/q node (into [sql] args)))
+               (set (with-conn [c pool] (xt/q c (into [sql] args))))))))
+    (testing "the query's own row order survives"
+      (let [sql "SELECT _id, vq FROM obs ORDER BY _id DESC LIMIT 7 OFFSET 3"]
+        (is (= (xt/q node [sql]) (with-conn [c pool] (xt/q c [sql]))))))
+    (testing "a statement that is not a query is sent as is"
+      (is (seq (with-conn [c pool]
+                 (xt/execute-tx c [[:sql "INSERT INTO t (_id) VALUES (1)"]])
+                 (xt/q c ["SHOW LATEST_SUBMITTED_TX"])))))))
+
+(deftest flight-sql-reads-struct-fields-in-another-order-than-the-jvm-saw-first
+  ;; A JVM that has seen a struct's fields in one order declares that order for
+  ;; every later struct with the same fields, on any node. Unconformed, the
+  ;; second read returns other fields' bytes, or crashes the JVM.
+  (let [vq {"value" 60.0 "unit" "UNIT" "system" "SYSTEM" "code" "CODE"}
+        ordered (fn [ks] (apply array-map (mapcat (fn [k] [k (vq k)]) ks)))]
+    (doseq [order [["system" "unit" "value" "code"] ["value" "unit" "system" "code"] ["code" "value" "unit" "system"]]]
+      (with-open [node (xtn/start-node {:flight-sql {:port 0}})
+                  pool (pool-on node)]
+        (with-conn [c pool]
+          (xt/execute-tx c [[:sql "INSERT INTO obs (_id, vq) VALUES (?, ?)" ["o1" (ordered order)]]])
+          (is (= {:value 60.0 :unit "UNIT" :system "SYSTEM" :code "CODE"}
+                 (:vq (first (xt/q c ["SELECT * FROM obs WHERE _id = ?" "o1"]))))
+              (str "written in order " order)))))))
+
+(deftest materialized-sql-wraps-queries-only
+  (is (= (str "SELECT * FROM (SELECT *, ROW_NUMBER() OVER () AS _xt_flight_row FROM (SELECT 1 AS a) AS _xt_flight_rows)"
+              " AS _xt_flight_sorted ORDER BY _xt_flight_row")
+         (conns/materialized-sql "SELECT 1 AS a;  ")))
+  (with-open [node (xtn/start-node {:flight-sql {:port 0}})
+              pool (pool-on node)]
+    (testing "the row number never reaches the caller, under any key-fn"
+      (is (= [{:a 1}] (with-conn [c pool] (xt/q c ["SELECT 1 AS a"]))))
+      (is (= [{:a 1}] (with-conn [c pool] (xt/q c ["SELECT 1 AS a"] {:key-fn :snake-case-keyword}))))
+      (is (= [{"a" 1}] (with-conn [c pool] (xt/q c ["SELECT 1 AS a"] {:key-fn :snake-case-string})))))
+    (testing "a WITH query is wrapped too"
+      (is (= [{:b 2}] (with-conn [c pool] (xt/q c ["WITH t AS (SELECT 2 AS b) SELECT b FROM t"])))))))

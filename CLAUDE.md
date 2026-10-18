@@ -298,16 +298,23 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   the channel without ending it, so the pool sends `CloseSession` first.
   FlightSQL refuses `:metadata` tx-opts (BEGIN cannot be parameterised).
   ATTACH and DETACH stay on pgwire on every transport.
-  **FlightSQL is not usable on real data on 2.2.0-beta3.** Once a table has
-  flushed blocks, a FlightSQL read of a row whose nested struct lacks a field
-  the flushed blocks carry fails on the server (`no more buffers for field
-  unit: Utf8. Expected 3`); pgwire reads it fine. The suite's `--profile
-  flight-sql` never flushes a block, so it passes regardless; a node with
-  `:indexer {:rows-per-block 20}` reproduces it. Under the fhir-search-bench
-  write workload, at a scale that flushes no block, the FlightSQL client JVM
-  also died of SIGSEGV (`j*_disjoint_arraycopy` on a worker thread) in two of
-  two runs, on netty 4.1.132 and on 4.2.9 with `-Dio.netty.noUnsafe=false`.
-  Keep deployments on `:pgwire`.
+  **2.2.0-beta3's FlightSQL server loads result pages by position.** It
+  streams a query by loading each page into an Arrow root of the declared
+  result type with `VectorLoader`, which matches buffers by position. A page
+  lacking a struct field or union leg the declared type has fails on the
+  server (`no more buffers for field unit: Utf8. Expected 3`, typical once
+  blocks have flushed). A page whose struct fields come in another order than
+  the declared type's is sent with each field's buffers under another field's
+  name: wrong values, or a client JVM SIGSEGV decoding them. A JVM keeps the
+  first field order it saw for a field set (struct type equality ignores
+  order), so this crosses nodes and databases. So the `:flight-sql` pool's
+  sessions (`conns/MaterializingSession`) send every SELECT/WITH as
+  `SELECT * FROM (SELECT *, ROW_NUMBER() OVER () AS _xt_flight_row FROM (<q>)
+  ...) ORDER BY _xt_flight_row`: the sort copies each row by name into
+  vectors of the declared type before that load, the row number keeps the
+  query's order, and the column is stripped from every row. Results stay
+  nested Arrow. `conns_test` pins both failure modes; without the wrapper the
+  field-order test crashes the JVM. pgwire and `:adbc` never take this path.
 
 ### Transaction metadata (`:tx-metadata`)
 
