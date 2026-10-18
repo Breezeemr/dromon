@@ -1,0 +1,6 @@
+#kaocha/v1
+{;; `clojure -M:test --profile adbc` (or flight-sql) runs every store test
+ ;; over that transport; a test that is about one transport names it itself.
+ :kaocha/bindings #profile {:adbc       {fhir-store-xtdb2.core/*default-transport* :adbc}
+                            :flight-sql {fhir-store-xtdb2.core/*default-transport* :flight-sql}
+                            :default    {}}}

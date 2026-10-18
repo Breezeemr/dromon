@@ -1,12 +1,15 @@
 (ns fhir-store-xtdb2.remote-server-test
   "The store's :server mode: tenants as databases attached to a standalone
-   XTDB server. The naming and option checks run everywhere; the rest needs a
-   server and runs only when XTDB_TEST_SERVER names one as host:port, e.g.
-   the fhir-search-bench podman pod (`bb xtdb-kafka-up`, 127.0.0.1:15432),
-   whose config defines the `kafkaCluster` the default attach template uses."
+   XTDB server. The naming and option checks run everywhere, and so does the
+   tenant lifecycle against an in-process node serving pgwire and FlightSQL
+   with in-memory tenant databases. The lifecycle also runs against a real
+   server when XTDB_TEST_SERVER names one as host:port, e.g. the
+   fhir-search-bench podman pod (`bb xtdb-kafka-up`, 127.0.0.1:15432), whose
+   config defines the `kafkaCluster` the default attach template uses."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [xtdb.api :as xt]
+            [xtdb.node :as xtn]
             [fhir-store-xtdb2.core :as core-db]
             [fhir-store.protocol :as db]))
 
@@ -24,13 +27,18 @@
 (deftest server-mode-refuses-what-the-server-owns
   (let [server {:host "127.0.0.1" :port 1}]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only :sql"
-                          (core-db/create-xtdb-store {:server server :query-mode :xtql})))
+                          (core-db/create-xtdb-store {:server server :transport :pgwire
+                                                      :query-mode :xtql})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no :node-config"
-                          (core-db/create-xtdb-store {:server server
+                          (core-db/create-xtdb-store {:server server :transport :pgwire
                                                       :node-config {:log [:local {:path "x"}]}})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"server\s+owns it"
-                          (core-db/create-xtdb-store {:server server
-                                                      :pipelined-replica-appends? true})))))
+                          (core-db/create-xtdb-store {:server server :transport :pgwire
+                                                      :pipelined-replica-appends? true})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot use the :adbc transport"
+                          (core-db/create-xtdb-store {:server server :transport :adbc})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs the server's :flight-sql-port"
+                          (core-db/create-xtdb-store {:server server :transport :flight-sql})))))
 
 (def ^:private skipped?
   "Evaluated into the server test's var metadata at load time, so kaocha
@@ -56,46 +64,64 @@
 (defn- patient [id family]
   {:resourceType "Patient" :id id :name [{:family family}]})
 
-(deftest ^{:kaocha/pending skipped?} tenant-lifecycle-on-a-server
-  (when-let [server (test-server)]
-    (let [store (core-db/create-xtdb-store {:server server})
-          db    (core-db/tenant-db-name server "t1")]
-      (try
-        (db/create-tenant store "t1")
-        (testing "create-tenant attaches the tenant's database"
-          (is (attached? server db)))
+(defn- tenant-lifecycle [server transport]
+  (let [store (core-db/create-xtdb-store {:server server :transport transport})
+        db    (core-db/tenant-db-name server "t1")]
+    (try
+      (db/create-tenant store "t1")
+      (testing "create-tenant attaches the tenant's database"
+        (is (attached? server db)))
 
-        (testing "writes read back, and a basis is the tenant's own"
-          (db/create-resource store "t1" :Patient "p1" (patient "p1" "One"))
-          (is (= "One" (get-in (db/read-resource store "t1" :Patient "p1") [:name 0 :family])))
-          (is (= ["p1"] (mapv :id (db/search store "t1" :Patient {} {}))))
-          (is (some? (:tx-id (db/current-basis store "t1")))))
+      (testing "writes read back, and a basis is the tenant's own"
+        (db/create-resource store "t1" :Patient "p1" (patient "p1" "One"))
+        (is (= "One" (get-in (db/read-resource store "t1" :Patient "p1") [:name 0 :family])))
+        (is (= ["p1"] (mapv :id (db/search store "t1" :Patient {} {}))))
+        (is (some? (:tx-id (db/current-basis store "t1")))))
 
-        (testing "a write is visible to reads on other pooled connections"
-          (let [misses (->> (range 32)
-                            (pmap (fn [i]
-                                    (let [id (str "v" i)]
-                                      (db/create-resource store "t1" :Patient id (patient id "V"))
-                                      (nil? (db/read-resource store "t1" :Patient id)))))
-                            (filter true?)
-                            count)]
-            (is (zero? misses))))
+      (testing "a write is visible to reads on other pooled connections"
+        (let [misses (->> (range 32)
+                          (pmap (fn [i]
+                                  (let [id (str "v" i)]
+                                    (db/create-resource store "t1" :Patient id (patient id "V"))
+                                    (nil? (db/read-resource store "t1" :Patient id)))))
+                          (filter true?)
+                          count)]
+          (is (zero? misses))))
 
-        (testing "a second store instance finds the tenant on the server"
-          (let [other (core-db/create-xtdb-store {:server server})]
+      (testing "a second store instance finds the tenant on the server"
+        (let [other (core-db/create-xtdb-store {:server server :transport transport})]
+          (try
             (is (= "Tenant already exists"
                    (try (db/create-tenant other "t1") nil
                         (catch Exception e (root-message e)))))
-            (is (= "One" (get-in (db/read-resource other "t1" :Patient "p1") [:name 0 :family])))))
+            (is (= "One" (get-in (db/read-resource other "t1" :Patient "p1") [:name 0 :family])))
+            (finally
+              (doseq [[_ {:keys [pool]}] @(:nodes other)]
+                (.close ^java.lang.AutoCloseable pool))))))
 
-        (testing ":replace gives a fresh database, not a replay of the old log"
-          (db/create-tenant store "t1" {:if-exists :replace})
-          (is (attached? server db))
-          (is (nil? (db/read-resource store "t1" :Patient "p1")))
-          (is (empty? (db/search store "t1" :Patient {} {}))))
+      (testing ":replace gives a fresh database, not a replay of the old log"
+        (db/create-tenant store "t1" {:if-exists :replace})
+        (is (attached? server db))
+        (is (nil? (db/read-resource store "t1" :Patient "p1")))
+        (is (empty? (db/search store "t1" :Patient {} {}))))
 
-        (testing "delete-tenant with :close-storage? detaches it"
-          (db/delete-tenant store "t1" {:close-storage? true})
-          (is (not (attached? server db))))
-        (finally
-          (db/delete-tenant store "t1" {:if-absent :ignore :close-storage? true}))))))
+      (testing "delete-tenant with :close-storage? detaches it"
+        (db/delete-tenant store "t1" {:close-storage? true})
+        (is (not (attached? server db))))
+      (finally
+        (db/delete-tenant store "t1" {:if-absent :ignore :close-storage? true})))))
+
+(deftest ^{:kaocha/pending skipped?} tenant-lifecycle-on-a-server
+  (when-let [server (test-server)]
+    (tenant-lifecycle server :pgwire)))
+
+(deftest tenant-lifecycle-on-an-in-process-server
+  (with-open [node (xtn/start-node {:server {:port 0} :flight-sql {:port 0}})]
+    (doseq [transport [:pgwire :flight-sql]]
+      (testing (str transport)
+        (tenant-lifecycle {:host "127.0.0.1"
+                           :port (.getServerPort node)
+                           :flight-sql-port (.getFlightSqlPort node)
+                           :database-prefix (str "rst_" (str/replace (name transport) "-" "_") "_")
+                           :attach-template "log: !InMemory\nstorage: !InMemory"}
+                          transport)))))
