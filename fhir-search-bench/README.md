@@ -252,6 +252,7 @@ bb flightsql-repro-beta3                         # ghcr.io/xtdb/xtdb:2.2.0-beta3
 bb flightsql-repro-nightly :focused-only true    # focused cases only, ~3 min
 bb flightsql-repro-nightly :preload 20000 :repeats 1   # smaller benchmark
 bb flightsql-repro-from-sha :sha 9f8553ce2c3cd2133bdba7f63477caceb11ea294   # XTDB built from a commit
+bb flightsql-repro-from-sha :repo https://github.com/<user>/xtdb.git :sha <sha>   # ... from a fork
 bb flightsql-repro-down                          # remove leftover containers
 ```
 
@@ -370,8 +371,19 @@ The two upstream drafts were built from source with `bb flightsql-repro-from-sha
 | write bench, flight-sql | FAIL, bug 3: the run completes, but `[:contention]` has 47 errors (`Interrupted` 40, `Fault` 6, `Incorrect` 1) and **one lost update**; 40x `range(0, 0)` on the server | not run |
 
 So with #6222 the FlightSQL benchmark now gets past bug 1 and completes. Its
-concurrent workload then hits bug 3. A build with both PRs applied has not been
-run.
+concurrent workload then hits bug 3.
+
+**Both PRs together fix all three bugs.** The test commit was `52cbd01c4479`, a
+local merge of the two heads that exists only in a local clone and was not
+pushed. It was run with `:repo <path to that clone>`, and the task exited 0:
+- all 10 focused cases PASS, including 0 bad of 104429 concurrent FlightSQL reads;
+- both benchmark runs PASS;
+- FlightSQL's preload of 100121 resources took 31.4 s, and its contention
+  workload had 0 errors besides the expected 412s and 0 lost updates.
+
+The merge conflicted in `FixedSizeListVector.kt` and `StructVector.kt`. It
+was resolved by keeping #6222's `unloadOwnPage` and using #6233's
+`newEmptyBuffer()` in place of the shared `empty` buffer.
 
 ### From a git commit
 
@@ -382,8 +394,11 @@ released. The steps:
 1. **Fetch.** A shallow fetch of the commit into `target/flightsql-repro/xtdb-src/`.
    - `:sha` takes a full 40-character sha (any commit GitHub serves, including
      PR heads), or a branch, tag or `pull/<n>/head` that `git ls-remote` resolves.
-   - `:repo` names another remote, e.g. a fork; the default is
-     `https://github.com/xtdb/xtdb.git`.
+   - `:repo` is the git remote to fetch from, default
+     `https://github.com/xtdb/xtdb.git`. It takes any URL or path `git fetch`
+     does: a fork (`:repo https://github.com/<user>/xtdb.git`), or a local
+     clone, for a commit that is not pushed anywhere
+     (`:repo /path/to/xtdb :sha <its sha>`, or a local branch name as `:sha`).
 2. **Build with Gradle.** `:docker:standalone:shadowJar`, plus the
    `xtdb-api`/`xtdb-core` jars and their generated POMs, with
    `XTDB_VERSION=2.2.0-repro-<sha12>`. Nothing is signed or published: the two
