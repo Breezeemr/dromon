@@ -180,6 +180,9 @@ XTDB 2.2.0-beta3 a FlightSQL run does not finish at the default scale
   store's 4.2.9 and `-Dio.netty.noUnsafe=false`. pgwire runs on the same
   classpath do not crash.
 
+The causes are three XTDB/Arrow bugs; see
+[Reproducing the XTDB FlightSQL bugs](#reproducing-the-xtdb-flightsql-bugs).
+
 The preload is the one complete FlightSQL write measurement: 100121 resources
 in 28.3 s against 12.9 s over pgwire, and 3513 in 3.5 s against 1.6 s.
 
@@ -205,6 +208,158 @@ The two stores' durability settings are not normalized. xtdb2 writes its log
 to local disk inside the benchmark's own process. Datomic commits through the
 dev transactor, a separate process on local storage. Neither store's fsync
 behaviour is configured or verified by this harness.
+
+## Reproducing the XTDB FlightSQL bugs
+
+fhir-store-xtdb2's `:transport :flight-sql` is unsafe on XTDB 2.2.0-beta3. Three
+bugs in XTDB's Arrow streaming make FlightSQL reads fail, return wrong values
+without an error, or crash the client JVM. pgwire, embedded `xt/q` and the
+store's `:adbc` transport read pages row by row, by name, and are unaffected.
+
+| bug | cause | what it looks like |
+|---|---|---|
+| 1 | `ResultCursor.toArrowReader()` (`Xtdb.kt`) loads each result page, by position, into a root built from the query's declared (merged) result type. A page carries only the struct fields and union legs its own rows use, as when a flushed block and the live index differ. | Server-side `no more buffers for field X. Expected N` or `no more field nodes for field X`, sent to the client as the query's error. |
+| 2 | The same positional load, when a page's struct fields come in another order than the declared type. A server JVM keeps the first order it saw for a given field set, across every database and table. | No error: each field gets another field's buffers, so strings come back swapped. When an f64 lands on a Utf8 field, the `xtdb.flight-sql` client decodes its bytes as offsets without bounds checks, and the client JVM dies of SIGSEGV in `VariableWidthVector.getByteArray`. |
+| 3 | Arrow's zero-length buffer is one object per JVM, with mutable reader/writer indices. XTDB puts it into the batches it streams, and concurrent FlightSQL streams overwrite each other's indices. | Server-side `IndexOutOfBoundsException: index: 0, length: 4 (expected: range(0, 0))`, the stream cancelled (`RST_STREAM`), wrong rows, or a client SIGSEGV. Under write load the server can stop ingesting (`Ingestion stopped`). A single stream never fails. |
+
+Upstream, draft [xtdb/xtdb#6222](https://github.com/xtdb/xtdb/pull/6222) fixes
+bugs 1 and 2: it copies each page into the declared schema by name before
+unloading it. It does **not** fix bug 3, which draft
+[xtdb/xtdb#6233](https://github.com/xtdb/xtdb/pull/6233) addresses separately.
+dromon's draft client-side workaround for bugs 1 and 2 is
+[Breezeemr/dromon#141](https://github.com/Breezeemr/dromon/pull/141).
+
+### Prerequisites
+
+- podman (rootless is fine), with network access to ghcr.io.
+- bb and the Clojure CLI, with network access to Maven Central and, for the
+  nightly run, Maven Central's snapshot repository
+  (`https://central.sonatype.com/repository/maven-snapshots/`).
+- Java 24+, for the `:xtdb` alias's flags (`--add-opens=java.base/java.nio=ALL-UNNAMED`,
+  `--sun-misc-unsafe-memory-access=allow`, `--enable-preview`). The task adds
+  `-XX:ErrorFile=<evidence dir>/hs_err_*` and `-XX:-CreateCoredumpOnCrash`, so
+  a client crash leaves a log rather than a core dump.
+- The Synthea dataset for the write benchmark (`bb synthea`, or pass
+  `:synthea-dir`); `:focused-only true` skips the benchmark and needs none.
+- Free host ports 25432-25433, 28090-28091 and 29832-29833 on 127.0.0.1. They
+  avoid the `fhirbench-xtdb` and `xtdb2-local` pods (15432/18090/19092/19832).
+
+### Run
+
+```bash
+bb flightsql-repro-nightly                       # ghcr.io/xtdb/xtdb:nightly
+bb flightsql-repro-beta3                         # ghcr.io/xtdb/xtdb:2.2.0-beta3
+bb flightsql-repro-nightly :focused-only true    # focused cases only, ~3 min
+bb flightsql-repro-nightly :preload 20000 :repeats 1   # smaller benchmark
+bb flightsql-repro-down                          # remove leftover containers
+```
+
+The task pulls the image, then runs the following, each against a fresh
+container with an in-memory log and storage:
+
+1. **Focused cases** (`fhir-search-bench.flightsql-repro`). Rows are written
+   over pgwire, then each read runs over pgwire and over FlightSQL and the two
+   are compared. Each group runs in its own JVM, so a client crash ends only
+   that group.
+   - Bug 1, on a server with `rowsPerBlock: 20`: 50 rows flush with
+     `vq {value, unit}` and a long `v`; one live row has `vq {value}` and a
+     string `v`. The cases are a by-id read of the live row, a by-id read of a
+     flushed row, and `SELECT *`.
+   - Bug 2: a struct `{alpha, bravo, charlie}` in one table, then the same
+     fields in another order in a second table (strings swapped). The f64
+     variant writes `{system, unit, value, code}` in two orders, and its
+     second read can crash the client.
+   - Bug 3, on a server that flushes no block: 200 Observation-shaped rows in
+     one key order, where every third row carries a `component` list of
+     structs holding a list. Eight threads read random rows for 20 s
+     (`:race-secs`). The controls are the same reads over pgwire and over a
+     single FlightSQL stream.
+2. **The write benchmark** (`fhir-search-bench.writes`, defaults: 100k preload,
+   3 repeats) with `:xtdb-server`, first over `:pgwire` as the control, then
+   over `:flight-sql`. The server has `rowsPerBlock: 10000`, so the preload
+   flushes blocks. Tenant databases are attached with
+   `:xtdb-attach-template "log: !InMemory\nstorage: !InMemory"`, since the
+   plain `xtdb` image has no Kafka module.
+
+A nightly server needs the nightly client: XTDB after 2.2.0-beta3 refuses the
+beta3 client's BEGIN/COMMIT over FlightSQL. So `flightsql-repro-nightly` runs
+every client JVM with `com.xtdb/xtdb-core` and `xtdb-api` overridden to
+`2.2.0-SNAPSHOT`. `fhir-store-xtdb2` builds its FlightSQL config with the
+no-argument constructor for the same reason: the `(host, port)` constructor
+is gone after beta3. The image and the snapshot are separate builds, so the
+summary prints both: the image digest with its `org.opencontainers.image.revision`,
+and the client jar's `Scm-Revision`.
+
+Containers carry the label `dromon.fhir-search-bench=flightsql-repro`. They are
+named `fhirbench-flightsql-repro` and `fhirbench-flightsql-bench`, and are
+removed when the run ends. The task refuses to replace a container of either
+name that it did not create, and touches no other container.
+
+### Output
+
+Everything lands in `target/flightsql-repro/<version>/`:
+- `summary.txt`;
+- each JVM's output (`focused-*.out`, `bench-*.out`);
+- each server's log (`server-*.log`);
+- the benchmark results (`writes-*.edn`);
+- any client crash log (`hs_err_*.log`).
+
+The task exits 0 only when every case and both benchmark runs PASS, so a fixed
+XTDB build reads as exit 0.
+
+A focused case passes when FlightSQL returns what pgwire returns. A benchmark
+run passes when all of the following hold:
+- the JVM exits 0 and writes its result;
+- the result shows no errors other than the expected 412s, no readback
+  mismatch and no lost update;
+- neither the client output, the server log nor a crash log has a bug's
+  signature: the error texts in the table above, plus `Not enough capacity
+  for data buffer` / `Unable to allocate buffer of size` for bug 2.
+
+A run that stops without a signature, e.g. a connection or classpath problem,
+is reported as ERROR, not as a reproduction. If a pgwire control does not pass,
+the summary says the FlightSQL results are not conclusive.
+
+### Observed
+
+These runs were on 2026-10-19 with OpenJDK 25. The nightly server was
+`ghcr.io/xtdb/xtdb:nightly`, i.e. `nightly-20261016`
+(`sha256:2277eb83...`, revision `c0923cdd3`). Its client was the
+`2.2.0-SNAPSHOT` jar of 2026-10-19 (`Scm-Revision 287517d88`, the upstream
+base of #6222 and #6233). The beta3 server and client were both revision
+`591d5c593`. **All three bugs reproduce on nightly and on beta3**, with the
+same error text:
+
+| case | nightly | beta3 |
+|---|---|---|
+| bug1-live-row-lacks-struct-field | FAIL `no more buffers for field i64: Int(64, true) not null. Expected 2` | same |
+| bug1-flushed-row-long-string-union | FAIL `no more field nodes for field value: FloatingPoint(DOUBLE) not null and vector []` | same |
+| bug1-select-star | FAIL, as above | same |
+| bug2-first-key-order (control) | PASS | PASS |
+| bug2-second-key-order-strings | FAIL: written `{b2_charlie "C", b2_alpha "A", b2_bravo "B"}`, read `{b2_alpha "C", b2_bravo "A", b2_charlie "B"}`, no error | same |
+| bug2-mixed-second-key-order-f64 | FAIL: client JVM SIGSEGV | same |
+| bug3-control-pgwire-concurrent-reads | PASS, 0 bad of ~31k | PASS |
+| bug3-control-flight-sql-one-reader | PASS, 0 bad of ~26k | PASS |
+| bug3-flight-sql-concurrent-reads | FAIL: wrong rows, e.g. `:system ""` or `:text ""`, then a client SIGSEGV within seconds; server log 6-46x `index: 0, length: 4 (expected: range(0, 0))` | FAIL, same; 40x on the server |
+| write bench, pgwire | PASS | not rerun |
+| write bench, flight-sql | FAIL: the 100121-resource preload completes (31.5 s), then the first read aborts the run with `no more buffers for field code: Utf8 not null. Expected 3` | not rerun; failed the same way on 2026-10-18 (above) |
+
+Notes on these results:
+- On nightly the FlightSQL benchmark stops at bug 1 before it reaches the
+  concurrent workloads. The bug 3 evidence is therefore the focused race
+  case, not the benchmark.
+- The client JVMs exit with status 1 rather than 134 on SIGSEGV, because the
+  task passes `-XX:-CreateCoredumpOnCrash`.
+- The pgwire benchmark's one failed check, the response order of a
+  transaction, comes from fhir-store-xtdb2, not the transport. The summary
+  lists it as "not judged": the store answers a transaction's DELETE entry
+  first, whatever the request order.
+
+Against an XTDB build with #6222 and #6233 applied, every case and both
+benchmark runs should PASS, and the task should exit 0. That build has not
+been run through this task. To try one, build the image from that branch and
+change `:image` in `bb/flightsql_repro.clj`, with a client from the same
+commit.
 
 ## Notes
 
