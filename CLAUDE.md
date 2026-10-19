@@ -315,6 +315,16 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   query's order, and the column is stripped from every row. Results stay
   nested Arrow. `conns_test` pins both failure modes; without the wrapper the
   field-order test crashes the JVM. pgwire and `:adbc` never take this path.
+  **FlightSQL is still unsafe under concurrency on 2.2.0-beta3; keep
+  deployments on `:pgwire`.** Arrow's zero-length buffer is one JVM-wide
+  object (`NettyAllocationManager.EMPTY_BUFFER`) with mutable reader/writer
+  indices; XTDB unloads it as every non-nullable vector's validity buffer, and
+  XTDB's and Arrow's load/unload code set its indices. Concurrent FlightSQL
+  streams therefore overwrite each other's buffer lengths: the server cancels
+  them (`index: 0, length: 4 (expected: range(0, 0))`) or the client decodes
+  garbage and can crash. Eight readers and no writers reproduce it; the
+  wrapper cannot help, and no Arrow release fixes it (19.0.0 is the newest and
+  is what XTDB beta3 ships).
 
 ### Transaction metadata (`:tx-metadata`)
 
