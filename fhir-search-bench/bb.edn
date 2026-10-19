@@ -82,10 +82,12 @@
          (client: the xtdb-core 2.2.0-SNAPSHOT build): focused cases, then the
          write benchmark over :pgwire (control) and :flight-sql, each against a
          fresh podman container on 127.0.0.1:25432-25433/28090-28091/29832-29833.
-         Prints PASS/FAIL per case and transport; exits 1 unless all pass.
+         Memory-constrained servers (3500m cgroup limit, 256 MiB XTDB memory
+         cache). Prints PASS/FAIL per case and transport; exits 1 unless all pass.
          Evidence in target/flightsql-repro/nightly/. Options: :focused-only true,
          :bench-only true, :race-secs N, :timeout-min N, :rounds N (ABBA pairs of
-         bench runs, default 2); anything else goes to
+         bench runs, default 2), :storage :disk/:kafka/:all (bench server log
+         on a disk volume, on Kafka, or both; default :all); anything else goes to
          fhir-search-bench.writes/run (e.g. :preload 20000 :repeats 1)."
    :requires ([flightsql-repro :as fr])
    :task (fr/repro! :nightly *command-line-args*)}

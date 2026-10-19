@@ -251,6 +251,7 @@ bb flightsql-repro-nightly                       # ghcr.io/xtdb/xtdb:nightly
 bb flightsql-repro-beta3                         # ghcr.io/xtdb/xtdb:2.2.0-beta3
 bb flightsql-repro-nightly :focused-only true    # focused cases only, ~3 min
 bb flightsql-repro-nightly :preload 20000 :repeats 1   # smaller benchmark
+bb flightsql-repro-nightly :bench-only true :storage :kafka   # one storage variant (:disk, :kafka, :all)
 bb flightsql-repro-from-sha :sha 9f8553ce2c3cd2133bdba7f63477caceb11ea294   # XTDB built from a commit
 bb flightsql-repro-from-sha :repo https://github.com/<user>/xtdb.git :sha <sha>   # ... from a fork
 bb flightsql-repro-down                          # remove leftover containers
@@ -279,9 +280,34 @@ container with an in-memory log and storage:
 2. **The write benchmark** (`fhir-search-bench.writes`, defaults: 100k preload,
    3 repeats) with `:xtdb-server`, over `:pgwire` as the control and over
    `:flight-sql`. The server has `rowsPerBlock: 10000`, so the preload
-   flushes blocks. Tenant databases are attached with
-   `:xtdb-attach-template "log: !InMemory\nstorage: !InMemory"`, since the
-   plain `xtdb` image has no Kafka module.
+   flushes blocks. It runs once per storage variant (`:storage`, default
+   `:all`):
+   - **disk** (`docker/xtdb-flightsql/bench.yaml`): the plain `xtdb` image,
+     with log and storage `!Local` on a fresh podman volume at
+     `/var/lib/xtdb`. Tenant databases are attached with the same layout under
+     `/var/lib/xtdb/dbs/` (`:xtdb-attach-template`).
+   - **kafka** (`docker/xtdb-flightsql/bench-kafka.yaml`): the `xtdb-aws`
+     image, which carries the Kafka module, in a podman pod with an Apache
+     Kafka 3.9.1 broker (KRaft, one node; `message.max.bytes` raised to
+     32 MiB to match the producer). Storage is local on a volume. Tenants get
+     the store's default ATTACH config, as in production: a Kafka topic per
+     tenant database plus local storage. The server log ends with the
+     topics' end offsets, as evidence that the log went through Kafka.
+
+   The data is kept out of memory:
+   - XTDB's memory cache is capped at 256 MiB (`memoryCache.maxSizeBytes`).
+     By default it takes half the JVM's max direct memory, enough for the
+     whole dataset.
+   - The server JVM runs with `-Xms3g -Xmx3g -XX:MaxDirectMemorySize=1g`
+     under a 3500m cgroup limit (`--memory`, no extra swap), and the broker
+     under 2g. cgroup v2 charges a container's page cache to its limit, so
+     the OS cannot cache the data on the server's behalf either.
+   - The 100k run leaves 1.1-1.6G of data on disk, and the server's JVM uses
+     about 2.9G. Limits of 8g and 5g let the page cache hold 100% of the data;
+     3500m keeps it near 30%.
+   - Each run reports the cgroup's peak memory, its page cache against the
+     data on disk, how often the limit was reached (reclaim), any OOM kills,
+     and XTDB's `memory_cache_*` metrics.
 
    The timings are controlled for JVM warm-up and run order:
    - **Warm-up.** Each run starts a fresh server and a fresh client JVM, and
@@ -290,19 +316,19 @@ container with an in-memory log and storage:
      (`:warmup-repeats 1`, overridable), so reads, transactions and
      contention are JIT-compiled too before anything is timed. Single writes
      also discard their first 50 ops (`:warmup`).
-   - **Heap.** The bench server runs with a fixed heap (`-Xms8g -Xmx8g`) and
-     the client JVMs with `-Xms4g`, so no timed window pays for heap resizing.
-     The heaps are not pre-touched: the warm-up repeat touches what the timed
-     repeats use, and a pre-touched 12g server heap was OOM-killed on a 64G
-     machine shared with other work. A server that dies mid-run is reported
-     with its exit code.
+   - **Heap.** The bench server runs with a fixed heap (`-Xms3g -Xmx3g`, see
+     above) and the client JVMs with `-Xms4g`, so no timed window pays for
+     heap resizing. The heaps are not pre-touched: the warm-up repeat touches
+     what the timed repeats use, and a pre-touched 12g server heap was
+     OOM-killed on a 64G machine shared with other work. A server that dies
+     mid-run is reported with its exit code.
    - **Order.** `:rounds N` (default 2) runs the pair N times in ABBA order:
      round 1 pgwire then flight-sql, round 2 flight-sql then pgwire, and so
      on. Neither transport always runs first or last on the machine.
    - **Noise.** Each run records the 1-minute load average and the available
      memory before and after.
-     `COMPARISON.md` pools every measured repeat's p50 per transport across
-     the rounds, and gives the ratio per round. It marks a workload "within
+     `COMPARISON-<storage>.md` pools every measured repeat's p50 per
+     transport across the rounds, and gives the ratio per round. It marks a workload "within
      noise" when the two transports' ranges of repeat p50s overlap.
 
 A nightly server needs the nightly client: XTDB after 2.2.0-beta3 refuses the
@@ -314,10 +340,12 @@ is gone after beta3. The image and the snapshot are separate builds, so the
 summary prints both: the image digest with its `org.opencontainers.image.revision`,
 and the client jar's `Scm-Revision`.
 
-Containers carry the label `dromon.fhir-search-bench=flightsql-repro`. They are
-named `fhirbench-flightsql-repro` and `fhirbench-flightsql-bench`, and are
-removed when the run ends. The task refuses to replace a container of either
-name that it did not create, and touches no other container.
+Containers, the Kafka pod and the data volumes carry the label
+`dromon.fhir-search-bench=flightsql-repro`. They are named
+`fhirbench-flightsql-repro`, `fhirbench-flightsql-bench` and
+`fhirbench-flightsql-kafka` (pod), and are removed when the run ends. The
+task refuses to replace one of those names that it did not create, and
+touches no other container, pod or volume.
 
 ### Output
 
@@ -407,31 +435,50 @@ The merge conflicted in `FixedSizeListVector.kt` and `StructVector.kt`. It
 was resolved by keeping #6222's `unloadOwnPage` and using #6233's
 `newEmptyBuffer()` in place of the shared `empty` buffer.
 
-How fast FlightSQL writes are once correct was measured on the same commit
-with the warm-up controls described above:
-- 2 ABBA rounds (`:bench-only true`), 4 runs, all PASS;
-- each run discarded one warm-up repeat and timed 3, so 6 repeats per transport;
-- load average 3-6 on 32 cores, with 45-47G available.
+How fast FlightSQL writes are once correct was measured on the same commit,
+in one full `bb flightsql-repro-from-sha` run. Every case and all 8 benchmark
+runs PASSed, and the task exited 0. The setup:
+- the disk and Kafka storage variants, 2 ABBA rounds each;
+- per run, one warm-up repeat discarded and 3 repeats timed, so 6 repeats
+  per transport and variant;
+- the memory limits above: per run, the server's page cache ended at 8-19%
+  of the data on disk (2.2-3.4G), the 3500m limit was reached 750-1800 times
+  (reclaim), and there were no OOM kills;
+- contention: 0 errors besides 412s and 0 lost updates in every run.
 
-**pgwire is faster on every write workload, by 1.3-2.1x at the median p50.**
-The per-round ratios agree within about 0.15 in both orders, so neither run
-order nor warm-up explains the gap.
+Median p50 in ms. `x` is flight-sql / pgwire, per round:
 
-| workload | flight-sql p50 ms | pgwire p50 ms | flight / pgwire (round 1, 2) |
-|---|---:|---:|---|
-| single create / update | 1.42 / 1.37 | 0.86 / 0.86 | 1.65, 1.70 / 1.52, 1.68 |
-| PUT Observation, one / most fields | 1.28 / 1.29 | 0.86 / 0.90 | 1.49, 1.38 / 1.41, 1.46 |
-| create x1 / x4 / x16 threads | 1.26 / 1.80 / 3.12 | 0.83 / 1.08 / 2.06 | 1.5 / 1.7 / 1.5 |
-| update x1 / x4 / x16 threads | 1.24 / 1.84 / 3.34 | 0.83 / 1.14 / 2.05 | 1.5 / 1.6-1.8 / 1.5-1.6 |
-| transaction 10 / 100 / 1000 entries | 8.95 / 71.5 / 722 | 4.34 / 35.3 / 337 | 2.1 / 2.0-2.1 / 2.1-2.3 |
-| batch 10 / 100 / 1000 entries | 14.7 / 152 / 1558 | 9.31 / 92.2 / 939 | 1.6 / 1.6-1.7 / 1.7 |
-| mixed tx | 12.3 | 7.83 | 1.59, 1.58 |
-| preload, 100121 resources | 29.0 s, 29.4 s | 13.2 s, 12.9 s | 2.2 |
+| workload | disk: flight-sql / pgwire | disk x | kafka: flight-sql / pgwire | kafka x |
+|---|---:|---|---:|---|
+| single create | 6.87 / 3.51 | 1.73, 2.68 | 7.82 / 7.21 | 1.07, 1.12 |
+| single update-if-match | 18.2 / 9.07 | 1.79, 2.08 | 13.7 / 11.7 | 1.21, 1.14 |
+| PUT Patient most fields | 8.16 / 5.67 | 1.23, 2.00 | 8.30 / 7.48 | 1.15, 1.09 |
+| create x16 threads | 10.5 / 8.65 | 1.25, 1.18 | 4.06 / 2.72 | 1.54, 1.43 |
+| update x16 threads | 10.5 / 8.74 | 1.26, 1.15 | 4.21 / 2.80 | 1.53, 1.53 |
+| transaction 100 entries | 144 / 44.5 | 3.51, 3.43 | 84.0 / 40.1 | 2.05, 2.16 |
+| transaction 1000 entries | 1406 / 362 | 2.93, 3.76 | 729 / 348 | 2.18, 2.03 |
+| batch 1000 entries | 8062 / 3661 | 1.75, 2.26 | 8036 / 7223 | 1.11, 1.11 |
+| mixed tx | 43.2 / 14.0 | 2.01, 3.09 | 22.2 / 16.8 | 1.29, 1.33 |
+| contention | 57.4 / 31.3 | 1.13, 2.07 | 27.3 / 22.7 | 1.23, 1.12 |
+| preload, 100121 resources | 41-45 s / 14-20 s | | 31 s / 14-16 s | |
 
-Four workloads overlap in their repeat ranges and so count as within noise,
-though flight-sql's median is still the slower: update-if-match (1.37x),
-delete (1.33x), rollback (1.34x) and contention (1.16x). Contention was clean
-on both transports: 0 non-412 errors and 0 lost updates in every repeat.
+How to read these:
+- **pgwire is faster on every workload in both variants.** No per-round ratio
+  is below 0.98.
+- **Kafka log.** The runs are steady: the two rounds agree within about 0.1.
+  A single write costs about 7 ms on either transport, mostly the Kafka round
+  trip, so FlightSQL adds only 7-12% there. The gap stays at 1.4-1.5x for 16
+  threads and 2x for transactions of 100+ entries.
+- **Disk log.** Writes are slower and the rounds vary more (fsync on a shared
+  NVMe). Many workloads are therefore "within noise" even at 1.5-2x medians.
+  Transactions of 100+ entries are 3-4x slower over FlightSQL in both
+  rounds.
+- **Earlier unconstrained run.** It used an in-memory log and storage, with
+  no memory limit. It measured smaller absolute times, about 0.9 ms per single
+  write over pgwire, and the same ordering.
+
+The full tables are in `COMPARISON-disk.md` and `COMPARISON-kafka.md`, with
+per-run memory and Kafka offsets in `summary.txt` and the server logs.
 
 ### From a git commit
 
@@ -453,9 +500,14 @@ released. The steps:
    jars are laid out as a Maven repository in `target/flightsql-repro/xtdb-m2/`.
    The client JVMs then resolve them from there, so server and client always
    come from the same commit.
-3. **Build the image.** `podman build -f docker/Dockerfile` with `VARIANT=standalone`,
-   tagged `localhost/xtdb-flightsql-repro:<sha12>` and labelled like the
-   containers. The `revision` the summary prints is the commit.
+3. **Build the images.** `podman build -f docker/Dockerfile`, labelled like the
+   containers, twice:
+   - `VARIANT=standalone`, tagged `localhost/xtdb-flightsql-repro:<sha12>`, for the
+     focused cases and the disk-log bench;
+   - `VARIANT=aws`, tagged `<sha12>-aws`, for the Kafka-log bench, since that
+     variant carries the Kafka module.
+
+   The `revision` the summary prints is the commit.
 4. **Run** the focused cases and the benchmark, as above. Evidence lands in
    `target/flightsql-repro/sha-<sha12>/`, including `build-xtdb.out` and
    `build-image.out`.
