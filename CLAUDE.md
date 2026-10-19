@@ -307,7 +307,9 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   write workload, at a scale that flushes no block, the FlightSQL client JVM
   also died of SIGSEGV (`j*_disjoint_arraycopy` on a worker thread) in two of
   two runs, on netty 4.1.132 and on 4.2.9 with `-Dio.netty.noUnsafe=false`.
-  Keep deployments on `:pgwire`.
+  Keep deployments on `:pgwire`. `bb flightsql-repro-nightly` (or `-beta3`)
+  in fhir-search-bench reproduces the three underlying XTDB bugs in one
+  command; its README says what each failure looks like.
 
 ### Transaction metadata (`:tx-metadata`)
 

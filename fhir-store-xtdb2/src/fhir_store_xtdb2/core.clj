@@ -1692,7 +1692,9 @@
     (.pipelinedReplicaAppends ^xtdb.api.IndexerConfig (.getIndexer cfg)
                               (not (false? pipelined-replica-appends?)))
     (when (and flight-sql? (nil? (.getFlightSql cfg)))
-      (.setFlightSql cfg (FlightSqlConfig. "127.0.0.1" 0)))
+      ;; No-arg ctor plus setters: XTDB after 2.2.0-beta3 dropped the
+      ;; (host, port) constructor.
+      (.setFlightSql cfg (doto (FlightSqlConfig.) (.setHost "127.0.0.1") (.setPort 0))))
     cfg))
 
 (defn start-node

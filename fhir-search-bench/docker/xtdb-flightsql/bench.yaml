@@ -1,0 +1,37 @@
+# Standalone XTDB server for `bb flightsql-repro-*`'s write-bench runs: one
+# fresh container per run, with a fresh podman volume at /var/lib/xtdb for
+# the log and storage, so writes go to disk as on a real server. Tenant
+# databases are attached with the same layout (the task's attach template).
+#
+# Every listener binds '*': the defaults bind 127.0.0.1 inside the container,
+# which the published ports cannot reach.
+server:
+  host: '*'
+  port: 5432
+
+flightSql:
+  host: '*'
+  port: 9832
+
+healthz:
+  host: '*'
+  port: 8080
+
+log: !Local
+  path: /var/lib/xtdb/log
+
+storage: !Local
+  path: /var/lib/xtdb/storage
+
+# Small enough that the 100k-resource preload flushes blocks (about 16), so
+# reads span flushed blocks and the live index as on a long-running server.
+# XTDB caches storage pages up to half the JVM's max direct memory by default,
+# enough to hold the whole 100k-resource dataset. A small cache, with the
+# container's memory limit capping the page cache too (`bb flightsql-repro-*`
+# runs the server with --memory), makes reads go to disk as on a server whose
+# data outgrows its memory.
+memoryCache:
+  maxSizeBytes: 268435456
+
+indexer:
+  rowsPerBlock: 10000

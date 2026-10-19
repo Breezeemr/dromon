@@ -1,0 +1,20 @@
+# Standalone XTDB server for `bb flightsql-repro-*`'s focused cases
+# (fhir-search-bench.flightsql-repro).
+server:
+  host: '*'
+  port: 5432
+
+flightSql:
+  host: '*'
+  port: 9832
+
+healthz:
+  host: '*'
+  port: 8080
+
+log: !InMemory
+storage: !InMemory
+
+# 20 rows per block: the bug 1 cases need rows on both sides of a block flush.
+indexer:
+  rowsPerBlock: 20

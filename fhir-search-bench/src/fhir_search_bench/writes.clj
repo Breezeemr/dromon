@@ -608,10 +608,15 @@
                     :flight-sql (see fhir-search-bench.bench/make-store)
    - :xtdb-flight-sql-port the standalone server's FlightSQL port, for
                     :xtdb-server with :transport :flight-sql
+   - :xtdb-attach-template the tenant database's ATTACH config, for
+                    :xtdb-server (see fhir-search-bench.bench/make-store)
    - :preload       resources preloaded, untimed (default 100000)
    - :n             ops per single-write kind per repeat (default 200)
    - :warmup        discarded ops per single-write kind (default 50)
    - :repeats       repeats of every workload (default 3)
+   - :warmup-repeats full repeats run first and discarded (default 0), so
+                    both JVMs have compiled every workload's code path before
+                    anything is measured
    - :concurrency   thread counts for the concurrent workload (default [1 4 16])
    - :concurrent-n  ops per concurrency level (default 400)
    - :tx-sizes      entries per transaction (default [1 10 100 1000])
@@ -628,8 +633,9 @@
    - :out           result file (default target/writes-<backend>.edn)"
   [{:keys [backend store-fn xtdb-pipelined? preload n warmup repeats concurrency concurrent-n
            tx-sizes mixed-rounds rollback-rounds contention-threads contention-attempts
-           synthea-dir out edit-n only xtdb-server minted-creates? transport xtdb-flight-sql-port]
-    :or   {transport :pgwire minted-creates? true edit-n 200 xtdb-pipelined? true preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
+           synthea-dir out edit-n only xtdb-server minted-creates? transport xtdb-flight-sql-port
+           xtdb-attach-template warmup-repeats]
+    :or   {warmup-repeats 0 transport :pgwire minted-creates? true edit-n 200 xtdb-pipelined? true preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
            concurrent-n 400 tx-sizes [1 10 100 1000] mixed-rounds 50 rollback-rounds 20
            contention-threads 8 contention-attempts 25 synthea-dir "synthea-output/fhir"}}]
   (when-not (keyword? backend)
@@ -642,7 +648,8 @@
         store  (bench/make-store backend store-fn {:xtdb-pipelined? xtdb-pipelined?
                                                    :xtdb-server xtdb-server
                                                    :transport transport
-                                                   :xtdb-flight-sql-port xtdb-flight-sql-port})]
+                                                   :xtdb-flight-sql-port xtdb-flight-sql-port
+                                                   :xtdb-attach-template xtdb-attach-template})]
     (db/create-tenant store tenant {:if-exists :replace})
     (db/warmup-tenant store tenant)
     (let [load    (bench/load-dataset-pooled! store (:bundles base) (:total base) 2000 4)
@@ -664,8 +671,10 @@
           iters   (fn [s] (case s 1 100, 10 50, 100 10, 1000 3, (max 1 (quot 1000 s))))
           rep-results
           (binding [*create-opts* (when minted-creates? {:id-minted? true})]
-          (vec (for [rep (range repeats)]
-                 (do (log "Repeat" (inc rep) "/" repeats)
+          (vec (for [rep (range (+ warmup-repeats repeats))]
+                 (do (if (< rep warmup-repeats)
+                       (log "Warm-up repeat" (inc rep) "/" warmup-repeats "(discarded)")
+                       (log "Repeat" (inc (- rep warmup-repeats)) "/" repeats))
                      (let [r (cond-> {}
                                (run? :single)     (assoc :single (single-writes store anchors obs rep n warmup))
                                (run? :edit)       (assoc :edit (edit-size store anchors obs pts rep edit-n))
@@ -676,12 +685,13 @@
                                (run? :contention) (assoc :contention (contention store anchors obs rep contention-threads contention-attempts)))]
                        (log "  done:" (str/join ", " (map name (keys r))))
                        r)))))
-          flat    (map flatten-rep rep-results)
+          flat    (map flatten-rep (drop warmup-repeats rep-results))
           workloads (into (sorted-map-by #(compare (str %1) (str %2)))
                           (for [k (keys (first flat))]
                             [k (combine (keep #(get % k) flat))]))
           result  {:backend   backend
                    :options   {:preload (:total base) :n n :warmup warmup :repeats repeats
+                               :warmup-repeats warmup-repeats
                                :concurrency concurrency :concurrent-n concurrent-n :tx-sizes tx-sizes
                                :mixed-rounds mixed-rounds :rollback-rounds rollback-rounds
                                :contention-threads contention-threads
@@ -691,7 +701,8 @@
                                                   xtdb-pipelined?)
                                :xtdb-server xtdb-server
                                :transport (when-not store-fn transport)
-                               :xtdb-flight-sql-port xtdb-flight-sql-port}
+                               :xtdb-flight-sql-port xtdb-flight-sql-port
+                               :xtdb-attach-template xtdb-attach-template}
                    :java      (System/getProperty "java.version")
                    :preload   load
                    :visible-on-return visible
