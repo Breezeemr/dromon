@@ -407,6 +407,32 @@ The merge conflicted in `FixedSizeListVector.kt` and `StructVector.kt`. It
 was resolved by keeping #6222's `unloadOwnPage` and using #6233's
 `newEmptyBuffer()` in place of the shared `empty` buffer.
 
+How fast FlightSQL writes are once correct was measured on the same commit
+with the warm-up controls described above:
+- 2 ABBA rounds (`:bench-only true`), 4 runs, all PASS;
+- each run discarded one warm-up repeat and timed 3, so 6 repeats per transport;
+- load average 3-6 on 32 cores, with 45-47G available.
+
+**pgwire is faster on every write workload, by 1.3-2.1x at the median p50.**
+The per-round ratios agree within about 0.15 in both orders, so neither run
+order nor warm-up explains the gap.
+
+| workload | flight-sql p50 ms | pgwire p50 ms | flight / pgwire (round 1, 2) |
+|---|---:|---:|---|
+| single create / update | 1.42 / 1.37 | 0.86 / 0.86 | 1.65, 1.70 / 1.52, 1.68 |
+| PUT Observation, one / most fields | 1.28 / 1.29 | 0.86 / 0.90 | 1.49, 1.38 / 1.41, 1.46 |
+| create x1 / x4 / x16 threads | 1.26 / 1.80 / 3.12 | 0.83 / 1.08 / 2.06 | 1.5 / 1.7 / 1.5 |
+| update x1 / x4 / x16 threads | 1.24 / 1.84 / 3.34 | 0.83 / 1.14 / 2.05 | 1.5 / 1.6-1.8 / 1.5-1.6 |
+| transaction 10 / 100 / 1000 entries | 8.95 / 71.5 / 722 | 4.34 / 35.3 / 337 | 2.1 / 2.0-2.1 / 2.1-2.3 |
+| batch 10 / 100 / 1000 entries | 14.7 / 152 / 1558 | 9.31 / 92.2 / 939 | 1.6 / 1.6-1.7 / 1.7 |
+| mixed tx | 12.3 | 7.83 | 1.59, 1.58 |
+| preload, 100121 resources | 29.0 s, 29.4 s | 13.2 s, 12.9 s | 2.2 |
+
+Four workloads overlap in their repeat ranges and so count as within noise,
+though flight-sql's median is still the slower: update-if-match (1.37x),
+delete (1.33x), rollback (1.34x) and contention (1.16x). Contention was clean
+on both transports: 0 non-412 errors and 0 lost updates in every repeat.
+
 ### From a git commit
 
 `bb flightsql-repro-from-sha :sha <commit>` runs the same repro against XTDB
