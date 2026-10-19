@@ -1,0 +1,24 @@
+# Standalone XTDB server for `bb flightsql-repro-*`'s write-bench runs: one
+# fresh container per transport, nothing kept between runs.
+#
+# Every listener binds '*': the defaults bind 127.0.0.1 inside the container,
+# which the published ports cannot reach.
+server:
+  host: '*'
+  port: 5432
+
+flightSql:
+  host: '*'
+  port: 9832
+
+healthz:
+  host: '*'
+  port: 8080
+
+log: !InMemory
+storage: !InMemory
+
+# Small enough that the 100k-resource preload flushes blocks (about 16), so
+# reads span flushed blocks and the live index as on a long-running server.
+indexer:
+  rowsPerBlock: 10000

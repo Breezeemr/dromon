@@ -608,6 +608,8 @@
                     :flight-sql (see fhir-search-bench.bench/make-store)
    - :xtdb-flight-sql-port the standalone server's FlightSQL port, for
                     :xtdb-server with :transport :flight-sql
+   - :xtdb-attach-template the tenant database's ATTACH config, for
+                    :xtdb-server (see fhir-search-bench.bench/make-store)
    - :preload       resources preloaded, untimed (default 100000)
    - :n             ops per single-write kind per repeat (default 200)
    - :warmup        discarded ops per single-write kind (default 50)
@@ -628,7 +630,8 @@
    - :out           result file (default target/writes-<backend>.edn)"
   [{:keys [backend store-fn xtdb-pipelined? preload n warmup repeats concurrency concurrent-n
            tx-sizes mixed-rounds rollback-rounds contention-threads contention-attempts
-           synthea-dir out edit-n only xtdb-server minted-creates? transport xtdb-flight-sql-port]
+           synthea-dir out edit-n only xtdb-server minted-creates? transport xtdb-flight-sql-port
+           xtdb-attach-template]
     :or   {transport :pgwire minted-creates? true edit-n 200 xtdb-pipelined? true preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
            concurrent-n 400 tx-sizes [1 10 100 1000] mixed-rounds 50 rollback-rounds 20
            contention-threads 8 contention-attempts 25 synthea-dir "synthea-output/fhir"}}]
@@ -642,7 +645,8 @@
         store  (bench/make-store backend store-fn {:xtdb-pipelined? xtdb-pipelined?
                                                    :xtdb-server xtdb-server
                                                    :transport transport
-                                                   :xtdb-flight-sql-port xtdb-flight-sql-port})]
+                                                   :xtdb-flight-sql-port xtdb-flight-sql-port
+                                                   :xtdb-attach-template xtdb-attach-template})]
     (db/create-tenant store tenant {:if-exists :replace})
     (db/warmup-tenant store tenant)
     (let [load    (bench/load-dataset-pooled! store (:bundles base) (:total base) 2000 4)
@@ -691,7 +695,8 @@
                                                   xtdb-pipelined?)
                                :xtdb-server xtdb-server
                                :transport (when-not store-fn transport)
-                               :xtdb-flight-sql-port xtdb-flight-sql-port}
+                               :xtdb-flight-sql-port xtdb-flight-sql-port
+                               :xtdb-attach-template xtdb-attach-template}
                    :java      (System/getProperty "java.version")
                    :preload   load
                    :visible-on-return visible

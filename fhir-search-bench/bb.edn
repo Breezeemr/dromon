@@ -1,4 +1,5 @@
-{:tasks
+{:paths ["bb"]
+ :tasks
  {:requires ([babashka.process :as p])
 
   synthea
@@ -75,6 +76,30 @@
    :task (apply shell "clojure" "-X:xtdb" "fhir-search-bench.writes/run"
                 ":backend" ":xtdb2-server" ":xtdb-server" "\"127.0.0.1:15432\""
                 *command-line-args*)}
+
+  flightsql-repro-nightly
+  {:doc "Reproduces the XTDB FlightSQL bugs against ghcr.io/xtdb/xtdb:nightly
+         (client: the xtdb-core 2.2.0-SNAPSHOT build): focused cases, then the
+         write benchmark over :pgwire (control) and :flight-sql, each against a
+         fresh podman container on 127.0.0.1:25432-25433/28090-28091/29832-29833.
+         Prints PASS/FAIL per case and transport; exits 1 unless all pass.
+         Evidence in target/flightsql-repro/nightly/. Options: :focused-only true,
+         :bench-only true, :race-secs N, :timeout-min N; anything else goes to
+         fhir-search-bench.writes/run (e.g. :preload 20000 :repeats 1)."
+   :requires ([flightsql-repro :as fr])
+   :task (fr/repro! :nightly *command-line-args*)}
+
+  flightsql-repro-beta3
+  {:doc "As flightsql-repro-nightly, against ghcr.io/xtdb/xtdb:2.2.0-beta3 with the
+         2.2.0-beta3 client. Evidence in target/flightsql-repro/beta3/."
+   :requires ([flightsql-repro :as fr])
+   :task (fr/repro! :beta3 *command-line-args*)}
+
+  flightsql-repro-down
+  {:doc "Removes the containers flightsql-repro-* started (label
+         dromon.fhir-search-bench=flightsql-repro), and no others."
+   :requires ([flightsql-repro :as fr])
+   :task (fr/down!)}
 
   report
   {:doc "Compare target/bench-xtdb2.edn with another store's result (`bb report :b '\"<path>\"'`) into target/REPORT.md."
