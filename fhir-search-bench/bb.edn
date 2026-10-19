@@ -95,6 +95,18 @@
    :requires ([flightsql-repro :as fr])
    :task (fr/repro! :beta3 *command-line-args*)}
 
+  flightsql-repro-from-sha
+  {:doc "As flightsql-repro-nightly, against XTDB built from a git commit:
+         `bb flightsql-repro-from-sha :sha <40-char sha>` (or a branch, tag or
+         pull/<n>/head). Builds the standalone server image
+         (localhost/xtdb-flightsql-repro:<sha12>) and the matching xtdb-api /
+         xtdb-core client in target/flightsql-repro/, reused for a sha already
+         built. :repo names another remote (default github.com/xtdb/xtdb),
+         :rebuild true builds again. Needs JDK 21 and 25 (JAVA_HOME_21_X64 /
+         JAVA_HOME_25_X64). Evidence in target/flightsql-repro/sha-<sha12>/."
+   :requires ([flightsql-repro :as fr])
+   :task (fr/repro-from-sha! *command-line-args*)}
+
   flightsql-repro-down
   {:doc "Removes the containers flightsql-repro-* started (label
          dromon.fhir-search-bench=flightsql-repro), and no others."

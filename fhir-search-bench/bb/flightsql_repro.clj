@@ -1,8 +1,10 @@
 (ns flightsql-repro
-  "`bb flightsql-repro-nightly` (and `-beta3`): reproduces the XTDB FlightSQL
-   bugs against a standalone XTDB server in podman, then prints PASS/FAIL.
+  "`bb flightsql-repro-nightly` (and `-beta3`, `-from-sha`): reproduces the
+   XTDB FlightSQL bugs against a standalone XTDB server in podman, then prints
+   PASS/FAIL.
 
-   1. Pulls the server image.
+   1. Pulls the server image, or for `-from-sha` builds the server image and
+      the xtdb-api/xtdb-core client jars from an XTDB git commit.
    2. Focused cases (fhir-search-bench.flightsql-repro) against a server with
       rowsPerBlock 20.
    3. The write benchmark (fhir-search-bench.writes) over :pgwire, the
@@ -30,7 +32,7 @@
   ;; The FlightSQL client has to match the server: XTDB after 2.2.0-beta3
   ;; refuses the beta3 client's BEGIN/COMMIT over FlightSQL, so a nightly
   ;; server is driven by the nightly snapshot of xtdb-core.
-  {:nightly {:image "ghcr.io/xtdb/xtdb:nightly" :client "2.2.0-SNAPSHOT"}
+  {:nightly {:image "ghcr.io/xtdb/xtdb:nightly" :client "2.2.0-SNAPSHOT" :client-repo snapshot-repo}
    :beta3   {:image "ghcr.io/xtdb/xtdb:2.2.0-beta3"}})
 
 ;; Host ports clear of the fhirbench-xtdb and xtdb2-local pods.
@@ -95,11 +97,11 @@
 (defn- clojure-cmd
   "A `clojure` invocation for `version`: `jvm-opts`, then `exec-flag` (-M, -X
    or -A) on the bench's :xtdb alias, with xtdb-core and xtdb-api overridden
-   to the version's client when it has one."
-  [{:keys [client]} jvm-opts exec-flag]
+   to the version's client, from its :client-repo, when it has one."
+  [{:keys [client client-repo]} jvm-opts exec-flag]
   (concat ["clojure"]
           (when client
-            ["-Sdeps" (pr-str {:mvn/repos {"central-snapshots" {:url snapshot-repo}}
+            ["-Sdeps" (pr-str {:mvn/repos {"xtdb-client" {:url client-repo}}
                                :aliases   {:xtdb-client {:override-deps
                                                          {'com.xtdb/xtdb-core {:mvn/version client}
                                                           'com.xtdb/xtdb-api  {:mvn/version client}}}}})])
@@ -124,14 +126,16 @@
 
 (defn- image-info [image]
   (out "podman" "image" "inspect" "--format"
-       "{{index .RepoDigests 0}} (revision {{index .Labels \"org.opencontainers.image.revision\"}}, created {{.Created}})"
+       "{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}image {{.Id}}{{end}} (revision {{index .Labels \"org.opencontainers.image.revision\"}}, created {{.Created}})"
        image))
 
 (defn- run-logged!
   "Runs `cmd`, echoing its merged stdout and stderr and writing them to
-   `log-file`. Returns the exit code, or :timeout after `timeout-min`."
-  [cmd log-file timeout-min]
-  (let [proc (apply p/process {:err :out} cmd)]
+   `log-file`. Returns the exit code, or :timeout after `timeout-min`.
+   `opts` are babashka.process options such as :dir and :extra-env."
+  ([cmd log-file timeout-min] (run-logged! {} cmd log-file timeout-min))
+  ([opts cmd log-file timeout-min]
+  (let [proc (apply p/process (merge opts {:err :out}) cmd)]
     (with-open [w (io/writer (str log-file))]
       (let [pump (future (with-open [r (io/reader (:out proc))]
                            (doseq [line (line-seq r)]
@@ -141,7 +145,104 @@
             done (.waitFor ^Process (:proc proc) timeout-min TimeUnit/MINUTES)]
         (when-not done (p/destroy-tree proc))
         @pump
-        (if done (.exitValue ^Process (:proc proc)) :timeout)))))
+        (if done (.exitValue ^Process (:proc proc)) :timeout))))))
+
+;; ── XTDB from a git commit ──────────────────────────────────────────────────
+
+(def ^:private default-xtdb-repo "https://github.com/xtdb/xtdb.git")
+
+(def ^:private xtdb-src "target/flightsql-repro/xtdb-src")
+(def ^:private xtdb-m2 "target/flightsql-repro/xtdb-m2")
+
+(defn- jdk-home
+  "XTDB's Gradle build compiles on JDK 21 and runs tests on 25
+   (org.gradle.java.installations.fromEnv in its gradle.properties)."
+  [env-var version]
+  (or (System/getenv env-var)
+      (let [d (str "/usr/lib/jvm/java-" version "-openjdk-amd64")]
+        (when (fs/directory? d) d))
+      (throw (ex-info (str "Set " env-var " to a JDK " version " home; XTDB's build needs JDK 21 and 25")
+                      {:env env-var}))))
+
+(defn- git [& args]
+  (apply p/shell {:dir xtdb-src :out :string :err :string} "git" args))
+
+(defn- checkout!
+  "Checks out `rev` of `repo` in target/flightsql-repro/xtdb-src and returns
+   its full sha. `rev` is a full sha (any commit GitHub serves, PR heads
+   included) or a ref `git ls-remote` resolves, such as a branch, a tag or
+   pull/6222/head."
+  [repo rev]
+  (when-not (fs/directory? (str xtdb-src "/.git"))
+    (fs/create-dirs xtdb-src)
+    (git "init" "-q")
+    (git "remote" "add" "origin" repo))
+  (git "remote" "set-url" "origin" repo)
+  (let [sha (if (re-matches #"[0-9a-f]{40}" rev)
+              rev
+              (or (some->> (out "git" "ls-remote" repo rev) str/split-lines first (re-find #"^[0-9a-f]{40}"))
+                  (throw (ex-info (str "Cannot resolve " rev " in " repo
+                                       "; pass the full 40-character sha or a branch, tag or pull/<n>/head")
+                                  {:rev rev :repo repo}))))]
+    (println "Fetching" sha "from" repo)
+    (git "fetch" "-q" "--depth" "1" "origin" sha)
+    (git "checkout" "-q" "--detach" "--force" sha)
+    sha))
+
+(defn- install-client!
+  "Lays xtdb-api and xtdb-core out as a Maven repository under
+   target/flightsql-repro/xtdb-m2 (jar plus the POM Gradle generates), so the
+   client JVMs resolve them by version like any other dependency."
+  [version]
+  (doseq [[module artifact] [["api" "xtdb-api"] ["core" "xtdb-core"]]]
+    (let [dir (str xtdb-m2 "/com/xtdb/" artifact "/" version)]
+      (fs/create-dirs dir)
+      (fs/copy (str xtdb-src "/" module "/build/libs/" artifact "-" version ".jar")
+               (str dir "/" artifact "-" version ".jar") {:replace-existing true})
+      (fs/copy (str xtdb-src "/" module "/build/publications/maven/pom-default.xml")
+               (str dir "/" artifact "-" version ".pom") {:replace-existing true}))))
+
+(defn- build-from-sha!
+  "Builds XTDB at `rev` of `repo`: the standalone server image, tagged
+   localhost/xtdb-flightsql-repro:<sha12>, and the client jars. Skips a sha
+   already built unless `rebuild?`. Returns the version map repro runs with."
+  [repo rev rebuild? dir timeout-min]
+  (let [sha     (checkout! repo rev)
+        sha12   (subs sha 0 12)
+        version (str "2.2.0-repro-" sha12)
+        image   (str "localhost/xtdb-flightsql-repro:" sha12)
+        result  {:image image :client version :local-image? true
+                 :client-repo (str "file://" (fs/absolutize xtdb-m2))
+                 :source (str repo " @ " sha)}
+        built?  (and (out "podman" "image" "exists" image)
+                     (fs/exists? (str xtdb-m2 "/com/xtdb/xtdb-core/" version "/xtdb-core-" version ".jar")))]
+    (if (and built? (not rebuild?))
+      (println "Reusing" image "and client" version "(pass :rebuild true to build again)")
+      (let [jdk21 (jdk-home "JAVA_HOME_21_X64" 21)
+            jdk25 (jdk-home "JAVA_HOME_25_X64" 25)
+            _     (println "Building XTDB" sha12 "(Gradle, then podman build); log in" (str dir "/build-xtdb.out"))
+            exit  (run-logged! {:dir xtdb-src
+                                :extra-env {"JAVA_HOME" jdk21 "JAVA_HOME_21_X64" jdk21
+                                            "JAVA_HOME_25_X64" jdk25 "XTDB_VERSION" version}}
+                               ["./gradlew" "--no-daemon" "--console=plain"
+                                ":docker:standalone:shadowJar" ":xtdb-api:jar" ":xtdb-core:jar"
+                                ":xtdb-api:generatePomFileForMavenPublication"
+                                ":xtdb-core:generatePomFileForMavenPublication"]
+                               (str dir "/build-xtdb.out") timeout-min)]
+        (when (not= 0 exit)
+          (throw (ex-info (str "XTDB Gradle build failed (exit " exit "); see " dir "/build-xtdb.out") {})))
+        (install-client! version)
+        (let [exit (run-logged! {:dir xtdb-src}
+                                ["podman" "build" "-f" "docker/Dockerfile"
+                                 "--build-arg" "VARIANT=standalone"
+                                 "--build-arg" (str "GIT_SHA=" sha)
+                                 "--build-arg" (str "XTDB_VERSION=" version)
+                                 "--label" (str label-key "=" label-val)
+                                 "-t" image "."]
+                                (str dir "/build-image.out") timeout-min)]
+          (when (not= 0 exit)
+            (throw (ex-info (str "XTDB image build failed (exit " exit "); see " dir "/build-image.out") {}))))))
+    result))
 
 ;; ── Evidence ────────────────────────────────────────────────────────────────
 
@@ -330,7 +431,10 @@
 
 ;; ── Task ────────────────────────────────────────────────────────────────────
 
-(def ^:private own-options #{:focused-only :bench-only :race-secs :timeout-min})
+(def ^:private own-options #{:focused-only :bench-only :race-secs :timeout-min :sha :repo :rebuild})
+
+;; Read as plain strings, so `:sha 9f8553ce2c3c...` needs no EDN quoting.
+(def ^:private string-options #{:sha :repo})
 
 (defn- parse-args
   "Splits `args` (key/value pairs, as for clojure -X) into this task's own
@@ -340,8 +444,14 @@
     (throw (ex-info "Arguments are key/value pairs, e.g. :preload 20000 :repeats 1" {:args args})))
   (reduce (fn [acc [k v]]
             (let [kw (edn/read-string k)]
-              (if (own-options kw)
+              (cond
+                (string-options kw)
+                (assoc-in acc [:own kw] (str/replace v #"^\"|\"$" ""))
+
+                (own-options kw)
                 (assoc-in acc [:own kw] (edn/read-string v))
+
+                :else
                 (-> acc
                     (update :bench-args into [k v])
                     (assoc-in [:bench-opts kw] (edn/read-string v))))))
@@ -355,14 +465,15 @@
              :when n]
          (parse-long n))))
 
-(defn- summary [version-key version server client {:keys [cases server-evidence]} bench dir]
+(defn- summary [label version server client {:keys [cases server-evidence]} bench dir]
   (let [control-failed (concat (filter #(and (re-find #"control" (:id %)) (not= "PASS" (:verdict %))) cases)
                                (filter #(and (= "pgwire" (:transport %)) (not= "PASS" (:verdict %))) bench))
         flight (first (filter #(= "flight-sql" (:transport %)) bench))
         bugs   (sort-by str (into (bugs-in-focused cases) (:bugs flight)))
         lines  (concat
-                ["" (str "XTDB FlightSQL repro: " (name version-key))
-                 (str "  server  " (:image version) " = " server)
+                ["" (str "XTDB FlightSQL repro: " label)]
+                (when-let [src (:source version)] [(str "  source  " src)])
+                [(str "  server  " (:image version) " = " server)
                  (str "  client  " client)]
                 (when (seq cases)
                   (concat ["" "Focused cases (written over pgwire; each FlightSQL read compared with pgwire)"]
@@ -382,13 +493,32 @@
                 [(str "Evidence: " dir "/")])]
     (str/join "\n" lines)))
 
-(defn repro!
-  "Entry point of `bb flightsql-repro-<version>`. Exits 1 unless every case
-   and both benchmark runs PASS, so a fixed XTDB build reads as exit 0."
-  [version-key args]
-  (let [version (or (versions version-key) (throw (ex-info "Unknown XTDB version" {:version version-key})))
-        {:keys [own bench-args bench-opts]} (parse-args args)
-        dir         (str "target/flightsql-repro/" (name version-key))
+(defn- run-repro!
+  "Runs the repro for `version` with output in `dir`; exits 1 unless every
+   case and both benchmark runs PASS, so a fixed XTDB build reads as exit 0."
+  [label version dir {:keys [own bench-args]}]
+  (let [pass?
+        (try
+          (let [server  (image-info (:image version))
+                client  (client-info version)
+                _       (println "Server image:" server "\nClient:" client)
+                timeout (or (:timeout-min own) 60)
+                focused (when-not (:bench-only own)
+                          (focused! version dir (or (:race-secs own) 20) timeout))
+                bench   (when-not (:focused-only own)
+                          (mapv #(bench! version dir % bench-args timeout) [:pgwire :flight-sql]))
+                text    (summary label version server client focused bench dir)]
+            (println text)
+            (spit (str dir "/summary.txt") (str text "\n"))
+            (every? #(= "PASS" %) (concat (map :verdict (:cases focused)) (map :verdict bench))))
+          (finally (down!)))]
+    (when-not pass? (System/exit 1))))
+
+(defn- prepare!
+  "Parses `args`, checks the Synthea data the benchmark needs, and empties
+   `dir`."
+  [args dir]
+  (let [{:keys [own bench-opts] :as parsed} (parse-args args)
         synthea-dir (or (:synthea-dir bench-opts) "synthea-output/fhir")]
     (when (and (not (:focused-only own)) (not (fs/directory? synthea-dir)))
       (throw (ex-info (str "No Synthea data in " synthea-dir ": run `bb synthea` first, or pass"
@@ -396,21 +526,29 @@
                       {:synthea-dir synthea-dir})))
     (fs/delete-tree dir)
     (fs/create-dirs dir)
+    parsed))
+
+(defn repro!
+  "Entry point of `bb flightsql-repro-nightly` and `-beta3`."
+  [version-key args]
+  (let [version (or (versions version-key) (throw (ex-info "Unknown XTDB version" {:version version-key})))
+        dir     (str "target/flightsql-repro/" (name version-key))
+        parsed  (prepare! args dir)]
     (println "Pulling" (:image version))
     (p/shell "podman" "pull" (:image version))
-    (let [pass?
-          (try
-            (let [server  (image-info (:image version))
-                  client  (client-info version)
-                  _       (println "Server image:" server "\nClient:" client)
-                  timeout (or (:timeout-min own) 60)
-                  focused (when-not (:bench-only own)
-                            (focused! version dir (or (:race-secs own) 20) timeout))
-                  bench   (when-not (:focused-only own)
-                            (mapv #(bench! version dir % bench-args timeout) [:pgwire :flight-sql]))
-                  text    (summary version-key version server client focused bench dir)]
-              (println text)
-              (spit (str dir "/summary.txt") (str text "\n"))
-              (every? #(= "PASS" %) (concat (map :verdict (:cases focused)) (map :verdict bench))))
-            (finally (down!)))]
-      (when-not pass? (System/exit 1)))))
+    (run-repro! (name version-key) version dir parsed)))
+
+(defn repro-from-sha!
+  "Entry point of `bb flightsql-repro-from-sha :sha <sha>`: builds XTDB at
+   that commit (server image and matching client) and runs the repro on it.
+   `:repo` names another git remote, e.g. a fork; `:rebuild true` builds a
+   sha again."
+  [args]
+  (let [{:keys [sha repo rebuild timeout-min]} (:own (parse-args args))]
+    (when (str/blank? sha)
+      (throw (ex-info "Pass :sha <commit>, e.g. bb flightsql-repro-from-sha :sha 9f8553ce2c3cd2133bdba7f63477caceb11ea294" {})))
+    (let [label  (str "sha-" (subs (str/replace sha #"[^0-9A-Za-z._-]" "_") 0 (min 12 (count sha))))
+          dir    (str "target/flightsql-repro/" label)
+          parsed (prepare! args dir)
+          version (build-from-sha! (or repo default-xtdb-repo) sha (true? rebuild) dir (or timeout-min 60))]
+      (run-repro! label version dir parsed))))

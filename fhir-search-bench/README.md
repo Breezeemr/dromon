@@ -251,10 +251,11 @@ bb flightsql-repro-nightly                       # ghcr.io/xtdb/xtdb:nightly
 bb flightsql-repro-beta3                         # ghcr.io/xtdb/xtdb:2.2.0-beta3
 bb flightsql-repro-nightly :focused-only true    # focused cases only, ~3 min
 bb flightsql-repro-nightly :preload 20000 :repeats 1   # smaller benchmark
+bb flightsql-repro-from-sha :sha 9f8553ce2c3cd2133bdba7f63477caceb11ea294   # XTDB built from a commit
 bb flightsql-repro-down                          # remove leftover containers
 ```
 
-The task pulls the image, then runs the following, each against a fresh
+The task pulls the image (or, for `-from-sha`, builds it; see below), then runs the following, each against a fresh
 container with an in-memory log and storage:
 
 1. **Focused cases** (`fhir-search-bench.flightsql-repro`). Rows are written
@@ -355,11 +356,58 @@ Notes on these results:
   lists it as "not judged": the store answers a transaction's DELETE entry
   first, whatever the request order.
 
-Against an XTDB build with #6222 and #6233 applied, every case and both
-benchmark runs should PASS, and the task should exit 0. That build has not
-been run through this task. To try one, build the image from that branch and
-change `:image` in `bb/flightsql_repro.clj`, with a client from the same
-commit.
+The two upstream drafts were built from source with `bb flightsql-repro-from-sha`
+(see below) on 2026-10-19. Each fixes exactly the bugs it claims:
+
+| case | #6222 head `9f8553ce2c3c` (bugs 1-2), full run | #6233 head `979b221252f2` (bug 3), `:focused-only` |
+|---|---|---|
+| bug 1, all three cases | PASS | FAIL, same text as nightly |
+| bug 2, strings only | PASS | FAIL, strings swapped |
+| bug 2, f64 | PASS | FAIL, but no client crash: the server now throws `index: 0, length: 1078853632 (expected: range(0, 0))` (60.0's high word read as an offset) and cancels the stream |
+| bug 3, 8 readers | FAIL: wrong rows (`:code "    "`), `RST_STREAM ... CANCEL`, client SIGSEGV; 5x `range(0, 0)` on the server | PASS, 0 bad of 123262 reads |
+| bug 3 controls | PASS | PASS |
+| write bench, pgwire | PASS | not run |
+| write bench, flight-sql | FAIL, bug 3: the run completes, but `[:contention]` has 47 errors (`Interrupted` 40, `Fault` 6, `Incorrect` 1) and **one lost update**; 40x `range(0, 0)` on the server | not run |
+
+So with #6222 the FlightSQL benchmark now gets past bug 1 and completes. Its
+concurrent workload then hits bug 3. A build with both PRs applied has not been
+run.
+
+### From a git commit
+
+`bb flightsql-repro-from-sha :sha <commit>` runs the same repro against XTDB
+built from that commit. This is how to check an upstream fix before it is
+released. The steps:
+
+1. **Fetch.** A shallow fetch of the commit into `target/flightsql-repro/xtdb-src/`.
+   - `:sha` takes a full 40-character sha (any commit GitHub serves, including
+     PR heads), or a branch, tag or `pull/<n>/head` that `git ls-remote` resolves.
+   - `:repo` names another remote, e.g. a fork; the default is
+     `https://github.com/xtdb/xtdb.git`.
+2. **Build with Gradle.** `:docker:standalone:shadowJar`, plus the
+   `xtdb-api`/`xtdb-core` jars and their generated POMs, with
+   `XTDB_VERSION=2.2.0-repro-<sha12>`. Nothing is signed or published: the two
+   jars are laid out as a Maven repository in `target/flightsql-repro/xtdb-m2/`.
+   The client JVMs then resolve them from there, so server and client always
+   come from the same commit.
+3. **Build the image.** `podman build -f docker/Dockerfile` with `VARIANT=standalone`,
+   tagged `localhost/xtdb-flightsql-repro:<sha12>` and labelled like the
+   containers. The `revision` the summary prints is the commit.
+4. **Run** the focused cases and the benchmark, as above. Evidence lands in
+   `target/flightsql-repro/sha-<sha12>/`, including `build-xtdb.out` and
+   `build-image.out`.
+
+A sha that is already built is reused. Pass `:rebuild true` to build it again.
+
+XTDB's Gradle build compiles on JDK 21 and runs on 25. It finds them through
+`JAVA_HOME_21_X64` and `JAVA_HOME_25_X64`, which default to
+`/usr/lib/jvm/java-{21,25}-openjdk-amd64`. With a warm Gradle cache the build
+takes about a minute; the image build pulls `ghcr.io/xtdb/xtdb-builder`.
+To remove the built images:
+
+```bash
+podman rmi $(podman images -q --filter label=dromon.fhir-search-bench=flightsql-repro)
+```
 
 ## Notes
 
