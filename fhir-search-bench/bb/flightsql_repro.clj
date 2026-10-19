@@ -40,7 +40,18 @@
   {:repro {:name "fhirbench-flightsql-repro" :config "docker/xtdb-flightsql/repro.yaml"
            :pg-port 25433 :flight-port 29833 :health-port 28091}
    :bench {:name "fhirbench-flightsql-bench" :config "docker/xtdb-flightsql/bench.yaml"
-           :pg-port 25432 :flight-port 29832 :health-port 28090}})
+           :pg-port 25432 :flight-port 29832 :health-port 28090
+           ;; A fixed heap, so no benchmark run times heap resizing and both
+           ;; transports' servers have the same one. Not pre-touched: the
+           ;; discarded warm-up repeat touches what the timed repeats use, and a
+           ;; pre-touched 12g server heap got the server OOM-killed on a 64G
+           ;; machine shared with other work.
+           :java-opts "-Xms8g -Xmx8g"}})
+
+(def ^:private bench-client-jvm-opts
+  "Benchmark client JVMs start with a fixed initial heap for the same reason;
+   the :xtdb alias sets -Xmx."
+  ["-Xms4g"])
 
 ;; ── podman ──────────────────────────────────────────────────────────────────
 
@@ -72,15 +83,17 @@
                                  {:throw false :timeout 2000})))
        (catch Exception _ false)))
 
-(defn- start-server! [{:keys [name config pg-port flight-port health-port]} image]
+(defn- start-server! [{:keys [name config pg-port flight-port health-port java-opts]} image]
   (remove-own-container! name)
-  (p/shell {:out :string}
-           "podman" "run" "-d" "--name" name "--label" (str label-key "=" label-val)
-           "-p" (str "127.0.0.1:" pg-port ":5432")
+  (apply p/shell {:out :string}
+         "podman" "run" "-d" "--name" name "--label" (str label-key "=" label-val)
+         (concat
+          (when java-opts ["-e" (str "JAVA_TOOL_OPTIONS=" java-opts)])
+          ["-p" (str "127.0.0.1:" pg-port ":5432")
            "-p" (str "127.0.0.1:" flight-port ":9832")
            "-p" (str "127.0.0.1:" health-port ":8080")
            "-v" (str (fs/absolutize config) ":/usr/local/lib/xtdb/config.yaml:ro,Z")
-           image)
+           image]))
   (loop [i 0]
     (cond
       (ready? health-port) (println name "ready")
@@ -88,9 +101,18 @@
       (throw (ex-info (str name " did not become ready:\n" (out "podman" "logs" "--tail" "30" name)) {}))
       :else (do (Thread/sleep 1000) (recur (inc i))))))
 
-(defn- stop-server! [{:keys [name]} log-file]
+(defn- stop-server!
+  "Saves the server's log, removes the container, and returns a note when the
+   server was no longer running, e.g. killed by the OOM killer."
+  [{:keys [name]} log-file]
   (spit log-file (str (:out (p/shell {:out :string :err :out :continue true} "podman" "logs" name))))
-  (remove-own-container! name))
+  (let [state (out "podman" "container" "inspect" "--format"
+                   "{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}" name)]
+    (remove-own-container! name)
+    (when-let [[_ code oom] (some->> state (re-matches #"false (\S+) (\S+)"))]
+      (str "server container had exited with code " code
+           (when (= "true" oom) " (OOM-killed)")
+           "; a kernel OOM kill shows in `journalctl -k`"))))
 
 ;; ── clojure ─────────────────────────────────────────────────────────────────
 
@@ -383,19 +405,29 @@
 
 ;; ── Write benchmark ─────────────────────────────────────────────────────────
 
+(defn- machine-load
+  "The 1-minute load average and available memory, as a noise note."
+  []
+  (let [load (some-> (out "cat" "/proc/loadavg") (str/split #" ") first)
+        mem  (some->> (out "cat" "/proc/meminfo") (re-find #"MemAvailable:\s+(\d+)") second parse-long)]
+    (str "load " (or load "n/a") ", " (if mem (format "%.0fG" (/ mem 1048576.0)) "n/a") " available")))
+
 (defn- bench!
   "One fhir-search-bench.writes run over `transport` against a fresh bench
-   server."
-  [version dir transport bench-args timeout-min]
-  (println "\n== Write benchmark:" (name transport))
+   server, as round `round`."
+  [version dir round transport bench-args timeout-min]
+  (println "\n== Write benchmark, round" round ":" (name transport))
   (let [srv    (:bench servers)
         t      (name transport)
-        prefix (str "hs_err_bench_" t)
-        result (str (fs/absolutize dir) "/writes-" t ".edn")
-        log    (str dir "/bench-" t ".out")
-        slog   (str dir "/server-bench-" t ".log")]
+        run-id (str t "-r" round)
+        prefix (str "hs_err_bench_" run-id)
+        result (str (fs/absolutize dir) "/writes-" run-id ".edn")
+        log    (str dir "/bench-" run-id ".out")
+        slog   (str dir "/server-bench-" run-id ".log")]
     (start-server! srv (:image version))
-    (let [exit     (try (run-logged! (concat (clojure-cmd version (crash-opts dir prefix) "-X")
+    (let [load-before (machine-load)
+          server-note (volatile! nil)
+          exit     (try (run-logged! (concat (clojure-cmd version (concat bench-client-jvm-opts (crash-opts dir prefix)) "-X")
                                              ["fhir-search-bench.writes/run"
                                               ":backend" (str ":xtdb2-" t)
                                               ":xtdb-server" (pr-str (str "127.0.0.1:" (:pg-port srv)))
@@ -407,7 +439,8 @@
                                                [":xtdb-flight-sql-port" (str (:flight-port srv))])
                                              bench-args)
                                      log timeout-min)
-                        (finally (stop-server! srv slog)))
+                        (finally (vreset! server-note (stop-server! srv slog))))
+          load-after (machine-load)
           crash    (first (crash-logs dir prefix))
           evidence (concat (evidence-lines "client" (slurp log))
                            (evidence-lines "server log" (slurp-if slog))
@@ -420,18 +453,90 @@
                      (or (seq evidence) (seq problems)) "FAIL"
                      :else "ERROR")]
       {:transport t
+       :round     round
+       :result    res
        :verdict   verdict
        :bugs      (set (map :bug evidence))
-       :details   (concat (map :line evidence)
+       :details   (concat [(str "machine: " load-before " before, " load-after " after")]
+                          (when @server-note [@server-note])
+                          (map :line evidence)
                           (take 10 problems)
                           (for [n (when res (store-notes res))]
                             (str "not judged (store behaviour, not the transport; also seen over FlightSQL on other XTDB builds): " n))
                           (when (not= 0 exit) [(str "bench exit " exit (when-not res ", no result file"))])
                           (when (= "ERROR" verdict) [(str "last lines of " log ":\n" (tail log 12))]))})))
 
+;; ── Transport comparison ────────────────────────────────────────────────────
+
+(defn- median [xs]
+  (when (seq xs)
+    (let [v (vec (sort xs)) n (count v)]
+      (if (odd? n) (v (quot n 2)) (/ (+ (v (dec (quot n 2))) (v (quot n 2))) 2.0)))))
+
+(defn- workload-label [[kind a b]]
+  (case kind
+    :single     (str "single " (name a))
+    :edit       (str "PUT " (name a) " " (str/replace (name b) "-" " "))
+    :concurrent (str (name a) " x" b " threads")
+    :tx         (str (name a) " " b " entries")
+    :mixed      "mixed tx"
+    :rollback   "rollback tx"
+    :contention "contention (read + update ifMatch)"
+    (pr-str kind)))
+
+(def ^:private kind-order [:single :edit :concurrent :tx :mixed :rollback :contention])
+
+(def ^:private sub-order {:create 0 :update 1 :update-if-match 2 :delete 3 :transaction 0 :batch 1
+                          :one-field 0 :most-fields 1})
+
+(defn- workload-sort-key [[kind a b]]
+  [(.indexOf ^java.util.List kind-order kind) (get sub-order a 9) (str a)
+   (if (keyword? b) (get sub-order b 9) (or b 0))])
+
+(defn- comparison
+  "Pools every measured repeat's p50 per transport across all rounds of
+   `runs`. A workload whose two ranges of repeat p50s overlap is marked as
+   within noise, so only separated ranges count as a difference."
+  [runs]
+  (let [ok      (filter :result runs)
+        by-t    (group-by :transport ok)
+        reps    (fn [t k] (vec (mapcat #(get-in % [:result :workloads k :p50-by-rep]) (by-t t))))
+        rounds  (sort (distinct (map :round ok)))
+        per-rnd (fn [t k r] (median (mapcat #(when (= r (:round %)) (get-in % [:result :workloads k :p50-by-rep])) (by-t t))))
+        ks      (sort-by workload-sort-key
+                         (distinct (mapcat #(keys (get-in % [:result :workloads])) ok)))
+        fmt     (fn [x] (if (number? x) (format "%.2f" (double x)) "-"))
+        row     (fn [k]
+                  (let [f (reps "flight-sql" k) g (reps "pgwire" k)]
+                    (when (and (seq f) (seq g))
+                      (let [mf (median f) mg (median g)
+                            overlap? (and (<= (apply min f) (apply max g)) (<= (apply min g) (apply max f)))
+                            ratios (for [r rounds
+                                         :let [a (per-rnd "flight-sql" k r) b (per-rnd "pgwire" k r)]
+                                         :when (and a b (pos? b))]
+                                     (format "%.2f" (/ (double a) b)))]
+                        (format "| %s | %s (%d) | %s (%d) | %.2f | %s | %s |"
+                                (workload-label k) (fmt mf) (count f) (fmt mg) (count g)
+                                (/ (double mf) mg) (str/join ", " ratios)
+                                (if overlap? "within noise" (if (> mf mg) "pgwire faster" "flight-sql faster")))))))
+        preload (fn [t] (str/join ", " (for [r (sort-by :round (by-t t))]
+                                         (format "%.1f s" (/ (get-in r [:result :preload :elapsed-ms] 0.0) 1000)))))]
+    (when (and (seq (by-t "flight-sql")) (seq (by-t "pgwire")))
+      (str/join "\n"
+                (concat
+                 ["Median p50 in ms over every measured repeat of every round (repeat count in brackets)."
+                  "The ratio is flight-sql / pgwire; per round it is the ratio of that round's medians."
+                  "\"within noise\" means the two transports' ranges of repeat p50s overlap."
+                  ""
+                  (str "Preload: flight-sql " (preload "flight-sql") "; pgwire " (preload "pgwire"))
+                  ""
+                  "| workload | flight-sql p50 | pgwire p50 | flight/pgwire | per round | verdict |"
+                  "|---|---:|---:|---:|---|---|"]
+                 (keep row ks))))))
+
 ;; ── Task ────────────────────────────────────────────────────────────────────
 
-(def ^:private own-options #{:focused-only :bench-only :race-secs :timeout-min :sha :repo :rebuild})
+(def ^:private own-options #{:focused-only :bench-only :race-secs :timeout-min :sha :repo :rebuild :rounds})
 
 ;; Read as plain strings, so `:sha 9f8553ce2c3c...` needs no EDN quoting.
 (def ^:private string-options #{:sha :repo})
@@ -468,8 +573,8 @@
 (defn- summary [label version server client {:keys [cases server-evidence]} bench dir]
   (let [control-failed (concat (filter #(and (re-find #"control" (:id %)) (not= "PASS" (:verdict %))) cases)
                                (filter #(and (= "pgwire" (:transport %)) (not= "PASS" (:verdict %))) bench))
-        flight (first (filter #(= "flight-sql" (:transport %)) bench))
-        bugs   (sort-by str (into (bugs-in-focused cases) (:bugs flight)))
+        bugs   (sort-by str (into (bugs-in-focused cases)
+                                      (mapcat :bugs (filter #(= "flight-sql" (:transport %)) bench))))
         lines  (concat
                 ["" (str "XTDB FlightSQL repro: " label)]
                 (when-let [src (:source version)] [(str "  source  " src)])
@@ -482,8 +587,8 @@
                           (for [{:keys [line]} server-evidence] (str "        " line))))
                 (when (seq bench)
                   (concat ["" "Write benchmark (fhir-search-bench.writes against the server)"]
-                          (mapcat (fn [{:keys [transport verdict details]}]
-                                    (cons (format "  %-5s %s" verdict transport)
+                          (mapcat (fn [{:keys [transport round verdict details]}]
+                                    (cons (format "  %-5s %s, round %d" verdict transport round)
                                           (map #(str "        " %) details)))
                                   bench)))
                 [""
@@ -496,7 +601,11 @@
 (defn- run-repro!
   "Runs the repro for `version` with output in `dir`; exits 1 unless every
    case and both benchmark runs PASS, so a fixed XTDB build reads as exit 0."
-  [label version dir {:keys [own bench-args]}]
+  [label version dir {:keys [own bench-args bench-opts]}]
+  (let [bench-args (cond-> bench-args
+                     ;; One full repeat, discarded, warms both JVMs on every
+                     ;; workload's code path before anything is timed.
+                     (not (contains? bench-opts :warmup-repeats)) (into [":warmup-repeats" "1"]))]
   (let [pass?
         (try
           (let [server  (image-info (:image version))
@@ -505,14 +614,22 @@
                 timeout (or (:timeout-min own) 60)
                 focused (when-not (:bench-only own)
                           (focused! version dir (or (:race-secs own) 20) timeout))
+                ;; ABBA: round 1 runs pgwire first, round 2 flight-sql first,
+                ;; and so on, so neither transport always gets the warmer
+                ;; machine or the later slot.
                 bench   (when-not (:focused-only own)
-                          (mapv #(bench! version dir % bench-args timeout) [:pgwire :flight-sql]))
-                text    (summary label version server client focused bench dir)]
+                          (vec (for [round (range 1 (inc (or (:rounds own) 2)))
+                                     t     (cond-> [:pgwire :flight-sql] (even? round) reverse)]
+                                 (bench! version dir round t bench-args timeout))))
+                cmp     (comparison bench)
+                text    (str (summary label version server client focused bench dir)
+                             (when cmp (str "\n\nflight-sql vs pgwire\n\n" cmp)))]
             (println text)
             (spit (str dir "/summary.txt") (str text "\n"))
+            (when cmp (spit (str dir "/COMPARISON.md") (str "# flight-sql vs pgwire: " label "\n\n" cmp "\n")))
             (every? #(= "PASS" %) (concat (map :verdict (:cases focused)) (map :verdict bench))))
           (finally (down!)))]
-    (when-not pass? (System/exit 1))))
+    (when-not pass? (System/exit 1)))))
 
 (defn- prepare!
   "Parses `args`, checks the Synthea data the benchmark needs, and empties

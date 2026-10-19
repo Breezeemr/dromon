@@ -277,11 +277,33 @@ container with an in-memory log and storage:
      (`:race-secs`). The controls are the same reads over pgwire and over a
      single FlightSQL stream.
 2. **The write benchmark** (`fhir-search-bench.writes`, defaults: 100k preload,
-   3 repeats) with `:xtdb-server`, first over `:pgwire` as the control, then
-   over `:flight-sql`. The server has `rowsPerBlock: 10000`, so the preload
+   3 repeats) with `:xtdb-server`, over `:pgwire` as the control and over
+   `:flight-sql`. The server has `rowsPerBlock: 10000`, so the preload
    flushes blocks. Tenant databases are attached with
    `:xtdb-attach-template "log: !InMemory\nstorage: !InMemory"`, since the
    plain `xtdb` image has no Kafka module.
+
+   The timings are controlled for JVM warm-up and run order:
+   - **Warm-up.** Each run starts a fresh server and a fresh client JVM, and
+     the untimed 100k preload already exercises the write path on both. On top
+     of that, one full repeat of every workload runs first and is discarded
+     (`:warmup-repeats 1`, overridable), so reads, transactions and
+     contention are JIT-compiled too before anything is timed. Single writes
+     also discard their first 50 ops (`:warmup`).
+   - **Heap.** The bench server runs with a fixed heap (`-Xms8g -Xmx8g`) and
+     the client JVMs with `-Xms4g`, so no timed window pays for heap resizing.
+     The heaps are not pre-touched: the warm-up repeat touches what the timed
+     repeats use, and a pre-touched 12g server heap was OOM-killed on a 64G
+     machine shared with other work. A server that dies mid-run is reported
+     with its exit code.
+   - **Order.** `:rounds N` (default 2) runs the pair N times in ABBA order:
+     round 1 pgwire then flight-sql, round 2 flight-sql then pgwire, and so
+     on. Neither transport always runs first or last on the machine.
+   - **Noise.** Each run records the 1-minute load average and the available
+     memory before and after.
+     `COMPARISON.md` pools every measured repeat's p50 per transport across
+     the rounds, and gives the ratio per round. It marks a workload "within
+     noise" when the two transports' ranges of repeat p50s overlap.
 
 A nightly server needs the nightly client: XTDB after 2.2.0-beta3 refuses the
 beta3 client's BEGIN/COMMIT over FlightSQL. So `flightsql-repro-nightly` runs
