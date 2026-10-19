@@ -324,7 +324,9 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   them (`index: 0, length: 4 (expected: range(0, 0))`) or the client decodes
   garbage and can crash. Eight readers and no writers reproduce it; the
   wrapper cannot help, and no Arrow release fixes it (19.0.0 is the newest and
-  is what XTDB beta3 ships).
+  is what XTDB beta3 ships). `bb flightsql-repro-nightly` (or `-beta3`,
+  `-from-sha`) in fhir-search-bench reproduces the three underlying XTDB bugs
+  in one command; its README says what each failure looks like.
 
 ### Transaction metadata (`:tx-metadata`)
 

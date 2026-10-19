@@ -180,6 +180,9 @@ XTDB 2.2.0-beta3 a FlightSQL run does not finish at the default scale
   store's 4.2.9 and `-Dio.netty.noUnsafe=false`. pgwire runs on the same
   classpath do not crash.
 
+The causes are three XTDB/Arrow bugs; see
+[Reproducing the XTDB FlightSQL bugs](#reproducing-the-xtdb-flightsql-bugs).
+
 The preload is the one complete FlightSQL write measurement: 100121 resources
 in 28.3 s against 12.9 s over pgwire, and 3513 in 3.5 s against 1.6 s.
 
@@ -205,6 +208,321 @@ The two stores' durability settings are not normalized. xtdb2 writes its log
 to local disk inside the benchmark's own process. Datomic commits through the
 dev transactor, a separate process on local storage. Neither store's fsync
 behaviour is configured or verified by this harness.
+
+## Reproducing the XTDB FlightSQL bugs
+
+fhir-store-xtdb2's `:transport :flight-sql` is unsafe on XTDB 2.2.0-beta3. Three
+bugs in XTDB's Arrow streaming make FlightSQL reads fail, return wrong values
+without an error, or crash the client JVM. pgwire, embedded `xt/q` and the
+store's `:adbc` transport read pages row by row, by name, and are unaffected.
+
+| bug | cause | what it looks like |
+|---|---|---|
+| 1 | `ResultCursor.toArrowReader()` (`Xtdb.kt`) loads each result page, by position, into a root built from the query's declared (merged) result type. A page carries only the struct fields and union legs its own rows use, as when a flushed block and the live index differ. | Server-side `no more buffers for field X. Expected N` or `no more field nodes for field X`, sent to the client as the query's error. |
+| 2 | The same positional load, when a page's struct fields come in another order than the declared type. A server JVM keeps the first order it saw for a given field set, across every database and table. | No error: each field gets another field's buffers, so strings come back swapped. When an f64 lands on a Utf8 field, the `xtdb.flight-sql` client decodes its bytes as offsets without bounds checks, and the client JVM dies of SIGSEGV in `VariableWidthVector.getByteArray`. |
+| 3 | Arrow's zero-length buffer is one object per JVM, with mutable reader/writer indices. XTDB puts it into the batches it streams, and concurrent FlightSQL streams overwrite each other's indices. | Server-side `IndexOutOfBoundsException: index: 0, length: 4 (expected: range(0, 0))`, the stream cancelled (`RST_STREAM`), wrong rows, or a client SIGSEGV. Under write load the server can stop ingesting (`Ingestion stopped`). A single stream never fails. |
+
+Upstream, draft [xtdb/xtdb#6222](https://github.com/xtdb/xtdb/pull/6222) fixes
+bugs 1 and 2: it copies each page into the declared schema by name before
+unloading it. It does **not** fix bug 3, which draft
+[xtdb/xtdb#6233](https://github.com/xtdb/xtdb/pull/6233) addresses separately.
+dromon's draft client-side workaround for bugs 1 and 2 is
+[Breezeemr/dromon#141](https://github.com/Breezeemr/dromon/pull/141).
+
+### Prerequisites
+
+- podman (rootless is fine), with network access to ghcr.io.
+- bb and the Clojure CLI, with network access to Maven Central and, for the
+  nightly run, Maven Central's snapshot repository
+  (`https://central.sonatype.com/repository/maven-snapshots/`).
+- Java 24+, for the `:xtdb` alias's flags (`--add-opens=java.base/java.nio=ALL-UNNAMED`,
+  `--sun-misc-unsafe-memory-access=allow`, `--enable-preview`). The task adds
+  `-XX:ErrorFile=<evidence dir>/hs_err_*` and `-XX:-CreateCoredumpOnCrash`, so
+  a client crash leaves a log rather than a core dump.
+- The Synthea dataset for the write benchmark (`bb synthea`, or pass
+  `:synthea-dir`); `:focused-only true` skips the benchmark and needs none.
+- Free host ports 25432-25433, 28090-28091 and 29832-29833 on 127.0.0.1. They
+  avoid the `fhirbench-xtdb` and `xtdb2-local` pods (15432/18090/19092/19832).
+
+### Run
+
+```bash
+bb flightsql-repro-nightly                       # ghcr.io/xtdb/xtdb:nightly
+bb flightsql-repro-beta3                         # ghcr.io/xtdb/xtdb:2.2.0-beta3
+bb flightsql-repro-nightly :focused-only true    # focused cases only, ~3 min
+bb flightsql-repro-nightly :preload 20000 :repeats 1   # smaller benchmark
+bb flightsql-repro-nightly :bench-only true :storage :kafka   # one storage variant (:disk, :kafka, :all)
+bb flightsql-repro-from-sha :sha 9f8553ce2c3cd2133bdba7f63477caceb11ea294   # XTDB built from a commit
+bb flightsql-repro-from-sha :repo https://github.com/<user>/xtdb.git :sha <sha>   # ... from a fork
+bb flightsql-repro-down                          # remove leftover containers
+```
+
+The task pulls the image (or, for `-from-sha`, builds it; see below), then runs the following, each against a fresh
+container with an in-memory log and storage:
+
+1. **Focused cases** (`fhir-search-bench.flightsql-repro`). Rows are written
+   over pgwire, then each read runs over pgwire and over FlightSQL and the two
+   are compared. Each group runs in its own JVM, so a client crash ends only
+   that group.
+   - Bug 1, on a server with `rowsPerBlock: 20`: 50 rows flush with
+     `vq {value, unit}` and a long `v`; one live row has `vq {value}` and a
+     string `v`. The cases are a by-id read of the live row, a by-id read of a
+     flushed row, and `SELECT *`.
+   - Bug 2: a struct `{alpha, bravo, charlie}` in one table, then the same
+     fields in another order in a second table (strings swapped). The f64
+     variant writes `{system, unit, value, code}` in two orders, and its
+     second read can crash the client.
+   - Bug 3, on a server that flushes no block: 200 Observation-shaped rows in
+     one key order, where every third row carries a `component` list of
+     structs holding a list. Eight threads read random rows for 20 s
+     (`:race-secs`). The controls are the same reads over pgwire and over a
+     single FlightSQL stream.
+2. **The write benchmark** (`fhir-search-bench.writes`, defaults: 100k preload,
+   3 repeats) with `:xtdb-server`, over `:pgwire` as the control and over
+   `:flight-sql`. The server has `rowsPerBlock: 10000`, so the preload
+   flushes blocks. It runs once per storage variant (`:storage`, default
+   `:all`):
+   - **disk** (`docker/xtdb-flightsql/bench.yaml`): the plain `xtdb` image,
+     with log and storage `!Local` on a fresh podman volume at
+     `/var/lib/xtdb`. Tenant databases are attached with the same layout under
+     `/var/lib/xtdb/dbs/` (`:xtdb-attach-template`).
+   - **kafka** (`docker/xtdb-flightsql/bench-kafka.yaml`): the `xtdb-aws`
+     image, which carries the Kafka module, in a podman pod with an Apache
+     Kafka 3.9.1 broker (KRaft, one node; `message.max.bytes` raised to
+     32 MiB to match the producer). Storage is local on a volume. Tenants get
+     the store's default ATTACH config, as in production: a Kafka topic per
+     tenant database plus local storage. The server log ends with the
+     topics' end offsets, as evidence that the log went through Kafka.
+
+   The data is kept out of memory:
+   - XTDB's memory cache is capped at 256 MiB (`memoryCache.maxSizeBytes`).
+     By default it takes half the JVM's max direct memory, enough for the
+     whole dataset.
+   - The server JVM runs with `-Xms3g -Xmx3g -XX:MaxDirectMemorySize=1g`
+     under a 3500m cgroup limit (`--memory`, no extra swap), and the broker
+     under 2g. cgroup v2 charges a container's page cache to its limit, so
+     the OS cannot cache the data on the server's behalf either.
+   - The 100k run leaves 1.1-1.6G of data on disk, and the server's JVM uses
+     about 2.9G. Limits of 8g and 5g let the page cache hold 100% of the data;
+     3500m keeps it near 30%.
+   - Each run reports the cgroup's peak memory, its page cache against the
+     data on disk, how often the limit was reached (reclaim), any OOM kills,
+     and XTDB's `memory_cache_*` metrics.
+
+   The timings are controlled for JVM warm-up and run order:
+   - **Warm-up.** Each run starts a fresh server and a fresh client JVM, and
+     the untimed 100k preload already exercises the write path on both. On top
+     of that, one full repeat of every workload runs first and is discarded
+     (`:warmup-repeats 1`, overridable), so reads, transactions and
+     contention are JIT-compiled too before anything is timed. Single writes
+     also discard their first 50 ops (`:warmup`).
+   - **Heap.** The bench server runs with a fixed heap (`-Xms3g -Xmx3g`, see
+     above) and the client JVMs with `-Xms4g`, so no timed window pays for
+     heap resizing. The heaps are not pre-touched: the warm-up repeat touches
+     what the timed repeats use, and a pre-touched 12g server heap was
+     OOM-killed on a 64G machine shared with other work. A server that dies
+     mid-run is reported with its exit code.
+   - **Order.** `:rounds N` (default 2) runs the pair N times in ABBA order:
+     round 1 pgwire then flight-sql, round 2 flight-sql then pgwire, and so
+     on. Neither transport always runs first or last on the machine.
+   - **Noise.** Each run records the 1-minute load average and the available
+     memory before and after.
+     `COMPARISON-<storage>.md` pools every measured repeat's p50 per
+     transport across the rounds, and gives the ratio per round. It marks a workload "within
+     noise" when the two transports' ranges of repeat p50s overlap.
+
+A nightly server needs the nightly client: XTDB after 2.2.0-beta3 refuses the
+beta3 client's BEGIN/COMMIT over FlightSQL. So `flightsql-repro-nightly` runs
+every client JVM with `com.xtdb/xtdb-core` and `xtdb-api` overridden to
+`2.2.0-SNAPSHOT`. `fhir-store-xtdb2` builds its FlightSQL config with the
+no-argument constructor for the same reason: the `(host, port)` constructor
+is gone after beta3. The image and the snapshot are separate builds, so the
+summary prints both: the image digest with its `org.opencontainers.image.revision`,
+and the client jar's `Scm-Revision`.
+
+Containers, the Kafka pod and the data volumes carry the label
+`dromon.fhir-search-bench=flightsql-repro`. They are named
+`fhirbench-flightsql-repro`, `fhirbench-flightsql-bench` and
+`fhirbench-flightsql-kafka` (pod), and are removed when the run ends. The
+task refuses to replace one of those names that it did not create, and
+touches no other container, pod or volume.
+
+### Output
+
+Everything lands in `target/flightsql-repro/<version>/`:
+- `summary.txt`;
+- each JVM's output (`focused-*.out`, `bench-*.out`);
+- each server's log (`server-*.log`);
+- the benchmark results (`writes-*.edn`);
+- any client crash log (`hs_err_*.log`).
+
+The task exits 0 only when every case and both benchmark runs PASS, so a fixed
+XTDB build reads as exit 0.
+
+A focused case passes when FlightSQL returns what pgwire returns. A benchmark
+run passes when all of the following hold:
+- the JVM exits 0 and writes its result;
+- the result shows no errors other than the expected 412s, no readback
+  mismatch and no lost update;
+- neither the client output, the server log nor a crash log has a bug's
+  signature: the error texts in the table above, plus `Not enough capacity
+  for data buffer` / `Unable to allocate buffer of size` for bug 2.
+
+A run that stops without a signature, e.g. a connection or classpath problem,
+is reported as ERROR, not as a reproduction. If a pgwire control does not pass,
+the summary says the FlightSQL results are not conclusive.
+
+### Observed
+
+These runs were on 2026-10-19 with OpenJDK 25. The nightly server was
+`ghcr.io/xtdb/xtdb:nightly`, i.e. `nightly-20261016`
+(`sha256:2277eb83...`, revision `c0923cdd3`). Its client was the
+`2.2.0-SNAPSHOT` jar of 2026-10-19 (`Scm-Revision 287517d88`, the upstream
+base of #6222 and #6233). The beta3 server and client were both revision
+`591d5c593`. **All three bugs reproduce on nightly and on beta3**, with the
+same error text:
+
+| case | nightly | beta3 |
+|---|---|---|
+| bug1-live-row-lacks-struct-field | FAIL `no more buffers for field i64: Int(64, true) not null. Expected 2` | same |
+| bug1-flushed-row-long-string-union | FAIL `no more field nodes for field value: FloatingPoint(DOUBLE) not null and vector []` | same |
+| bug1-select-star | FAIL, as above | same |
+| bug2-first-key-order (control) | PASS | PASS |
+| bug2-second-key-order-strings | FAIL: written `{b2_charlie "C", b2_alpha "A", b2_bravo "B"}`, read `{b2_alpha "C", b2_bravo "A", b2_charlie "B"}`, no error | same |
+| bug2-mixed-second-key-order-f64 | FAIL: client JVM SIGSEGV | same |
+| bug3-control-pgwire-concurrent-reads | PASS, 0 bad of ~31k | PASS |
+| bug3-control-flight-sql-one-reader | PASS, 0 bad of ~26k | PASS |
+| bug3-flight-sql-concurrent-reads | FAIL: wrong rows, e.g. `:system ""` or `:text ""`, then a client SIGSEGV within seconds; server log 6-46x `index: 0, length: 4 (expected: range(0, 0))` | FAIL, same; 40x on the server |
+| write bench, pgwire | PASS | not rerun |
+| write bench, flight-sql | FAIL: the 100121-resource preload completes (31.5 s), then the first read aborts the run with `no more buffers for field code: Utf8 not null. Expected 3` | not rerun; failed the same way on 2026-10-18 (above) |
+
+Notes on these results:
+- On nightly the FlightSQL benchmark stops at bug 1 before it reaches the
+  concurrent workloads. The bug 3 evidence is therefore the focused race
+  case, not the benchmark.
+- The client JVMs exit with status 1 rather than 134 on SIGSEGV, because the
+  task passes `-XX:-CreateCoredumpOnCrash`.
+- The pgwire benchmark's one failed check, the response order of a
+  transaction, comes from fhir-store-xtdb2, not the transport. The summary
+  lists it as "not judged": the store answers a transaction's DELETE entry
+  first, whatever the request order.
+
+The two upstream drafts were built from source with `bb flightsql-repro-from-sha`
+(see below) on 2026-10-19. Each fixes exactly the bugs it claims:
+
+| case | #6222 head `9f8553ce2c3c` (bugs 1-2), full run | #6233 head `979b221252f2` (bug 3), `:focused-only` |
+|---|---|---|
+| bug 1, all three cases | PASS | FAIL, same text as nightly |
+| bug 2, strings only | PASS | FAIL, strings swapped |
+| bug 2, f64 | PASS | FAIL, but no client crash: the server now throws `index: 0, length: 1078853632 (expected: range(0, 0))` (60.0's high word read as an offset) and cancels the stream |
+| bug 3, 8 readers | FAIL: wrong rows (`:code "    "`), `RST_STREAM ... CANCEL`, client SIGSEGV; 5x `range(0, 0)` on the server | PASS, 0 bad of 123262 reads |
+| bug 3 controls | PASS | PASS |
+| write bench, pgwire | PASS | not run |
+| write bench, flight-sql | FAIL, bug 3: the run completes, but `[:contention]` has 47 errors (`Interrupted` 40, `Fault` 6, `Incorrect` 1) and **one lost update**; 40x `range(0, 0)` on the server | not run |
+
+So with #6222 the FlightSQL benchmark now gets past bug 1 and completes. Its
+concurrent workload then hits bug 3.
+
+**Both PRs together fix all three bugs.** The test commit was `52cbd01c4479`, a
+local merge of the two heads that exists only in a local clone and was not
+pushed. It was run with `:repo <path to that clone>`, and the task exited 0:
+- all 10 focused cases PASS, including 0 bad of 104429 concurrent FlightSQL reads;
+- both benchmark runs PASS;
+- FlightSQL's preload of 100121 resources took 31.4 s, and its contention
+  workload had 0 errors besides the expected 412s and 0 lost updates.
+
+The merge conflicted in `FixedSizeListVector.kt` and `StructVector.kt`. It
+was resolved by keeping #6222's `unloadOwnPage` and using #6233's
+`newEmptyBuffer()` in place of the shared `empty` buffer.
+
+How fast FlightSQL writes are once correct was measured on the same commit,
+in one full `bb flightsql-repro-from-sha` run. Every case and all 8 benchmark
+runs PASSed, and the task exited 0. The setup:
+- the disk and Kafka storage variants, 2 ABBA rounds each;
+- per run, one warm-up repeat discarded and 3 repeats timed, so 6 repeats
+  per transport and variant;
+- the memory limits above: per run, the server's page cache ended at 8-19%
+  of the data on disk (2.2-3.4G), the 3500m limit was reached 750-1800 times
+  (reclaim), and there were no OOM kills;
+- contention: 0 errors besides 412s and 0 lost updates in every run.
+
+Median p50 in ms. `x` is flight-sql / pgwire, per round:
+
+| workload | disk: flight-sql / pgwire | disk x | kafka: flight-sql / pgwire | kafka x |
+|---|---:|---|---:|---|
+| single create | 6.87 / 3.51 | 1.73, 2.68 | 7.82 / 7.21 | 1.07, 1.12 |
+| single update-if-match | 18.2 / 9.07 | 1.79, 2.08 | 13.7 / 11.7 | 1.21, 1.14 |
+| PUT Patient most fields | 8.16 / 5.67 | 1.23, 2.00 | 8.30 / 7.48 | 1.15, 1.09 |
+| create x16 threads | 10.5 / 8.65 | 1.25, 1.18 | 4.06 / 2.72 | 1.54, 1.43 |
+| update x16 threads | 10.5 / 8.74 | 1.26, 1.15 | 4.21 / 2.80 | 1.53, 1.53 |
+| transaction 100 entries | 144 / 44.5 | 3.51, 3.43 | 84.0 / 40.1 | 2.05, 2.16 |
+| transaction 1000 entries | 1406 / 362 | 2.93, 3.76 | 729 / 348 | 2.18, 2.03 |
+| batch 1000 entries | 8062 / 3661 | 1.75, 2.26 | 8036 / 7223 | 1.11, 1.11 |
+| mixed tx | 43.2 / 14.0 | 2.01, 3.09 | 22.2 / 16.8 | 1.29, 1.33 |
+| contention | 57.4 / 31.3 | 1.13, 2.07 | 27.3 / 22.7 | 1.23, 1.12 |
+| preload, 100121 resources | 41-45 s / 14-20 s | | 31 s / 14-16 s | |
+
+How to read these:
+- **pgwire is faster on every workload in both variants.** No per-round ratio
+  is below 0.98.
+- **Kafka log.** The runs are steady: the two rounds agree within about 0.1.
+  A single write costs about 7 ms on either transport, mostly the Kafka round
+  trip, so FlightSQL adds only 7-12% there. The gap stays at 1.4-1.5x for 16
+  threads and 2x for transactions of 100+ entries.
+- **Disk log.** Writes are slower and the rounds vary more (fsync on a shared
+  NVMe). Many workloads are therefore "within noise" even at 1.5-2x medians.
+  Transactions of 100+ entries are 3-4x slower over FlightSQL in both
+  rounds.
+- **Earlier unconstrained run.** It used an in-memory log and storage, with
+  no memory limit. It measured smaller absolute times, about 0.9 ms per single
+  write over pgwire, and the same ordering.
+
+The full tables are in `COMPARISON-disk.md` and `COMPARISON-kafka.md`, with
+per-run memory and Kafka offsets in `summary.txt` and the server logs.
+
+### From a git commit
+
+`bb flightsql-repro-from-sha :sha <commit>` runs the same repro against XTDB
+built from that commit. This is how to check an upstream fix before it is
+released. The steps:
+
+1. **Fetch.** A shallow fetch of the commit into `target/flightsql-repro/xtdb-src/`.
+   - `:sha` takes a full 40-character sha (any commit GitHub serves, including
+     PR heads), or a branch, tag or `pull/<n>/head` that `git ls-remote` resolves.
+   - `:repo` is the git remote to fetch from, default
+     `https://github.com/xtdb/xtdb.git`. It takes any URL or path `git fetch`
+     does: a fork (`:repo https://github.com/<user>/xtdb.git`), or a local
+     clone, for a commit that is not pushed anywhere
+     (`:repo /path/to/xtdb :sha <its sha>`, or a local branch name as `:sha`).
+2. **Build with Gradle.** `:docker:standalone:shadowJar`, plus the
+   `xtdb-api`/`xtdb-core` jars and their generated POMs, with
+   `XTDB_VERSION=2.2.0-repro-<sha12>`. Nothing is signed or published: the two
+   jars are laid out as a Maven repository in `target/flightsql-repro/xtdb-m2/`.
+   The client JVMs then resolve them from there, so server and client always
+   come from the same commit.
+3. **Build the images.** `podman build -f docker/Dockerfile`, labelled like the
+   containers, twice:
+   - `VARIANT=standalone`, tagged `localhost/xtdb-flightsql-repro:<sha12>`, for the
+     focused cases and the disk-log bench;
+   - `VARIANT=aws`, tagged `<sha12>-aws`, for the Kafka-log bench, since that
+     variant carries the Kafka module.
+
+   The `revision` the summary prints is the commit.
+4. **Run** the focused cases and the benchmark, as above. Evidence lands in
+   `target/flightsql-repro/sha-<sha12>/`, including `build-xtdb.out` and
+   `build-image.out`.
+
+A sha that is already built is reused. Pass `:rebuild true` to build it again.
+
+XTDB's Gradle build compiles on JDK 21 and runs on 25. It finds them through
+`JAVA_HOME_21_X64` and `JAVA_HOME_25_X64`, which default to
+`/usr/lib/jvm/java-{21,25}-openjdk-amd64`. With a warm Gradle cache the build
+takes about a minute; the image build pulls `ghcr.io/xtdb/xtdb-builder`.
+To remove the built images:
+
+```bash
+podman rmi $(podman images -q --filter label=dromon.fhir-search-bench=flightsql-repro)
+```
 
 ## Notes
 

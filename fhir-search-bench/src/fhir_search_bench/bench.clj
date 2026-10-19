@@ -50,9 +50,13 @@
 
    `:transport` (:pgwire, the default, :adbc or :flight-sql) is the xtdb2
    store's :transport; with `:xtdb-server` and :flight-sql it needs
-   `:xtdb-flight-sql-port`, the server's FlightSQL port."
+   `:xtdb-flight-sql-port`, the server's FlightSQL port.
+   `:xtdb-attach-template` replaces the store's ATTACH config for the tenant
+   database (default a Kafka log on the server's `kafkaCluster`), e.g.
+   \"log: !InMemory\\nstorage: !InMemory\" for a server without Kafka."
   ([backend store-fn] (make-store backend store-fn {}))
-  ([backend store-fn {:keys [xtdb-pipelined? xtdb-server transport xtdb-flight-sql-port]
+  ([backend store-fn {:keys [xtdb-pipelined? xtdb-server transport xtdb-flight-sql-port
+                             xtdb-attach-template]
                       :or {xtdb-pipelined? true transport :pgwire}}]
   (cond
     store-fn
@@ -66,7 +70,8 @@
                :transport        transport
                :server           (cond-> {:host host :port (parse-long port)
                                           :database-prefix (str "fhirbench_" (subs (str (random-uuid)) 0 8) "_")}
-                                   xtdb-flight-sql-port (assoc :flight-sql-port xtdb-flight-sql-port))}))
+                                   xtdb-flight-sql-port (assoc :flight-sql-port xtdb-flight-sql-port)
+                                   xtdb-attach-template (assoc :attach-template xtdb-attach-template))}))
 
     (= :xtdb2 backend)
     (let [dir    (xtdb-data-dir)
@@ -208,9 +213,10 @@
    - :synthea-dir    Synthea fhir bundle dir (default synthea-output/fhir)
    - :xtdb-server    \"host:port\" of a standalone XTDB server for the xtdb2
                      store (see make-store)
-   - :transport / :xtdb-flight-sql-port  the xtdb2 store's transport (see make-store)"
+   - :transport / :xtdb-flight-sql-port  the xtdb2 store's transport (see make-store)
+   - :xtdb-attach-template the tenant database's ATTACH config (see make-store)"
   [{:keys [backend store-fn max-resources max-tx concurrency synthea-dir xtdb-server
-           transport xtdb-flight-sql-port]
+           transport xtdb-flight-sql-port xtdb-attach-template]
     :or   {max-resources 10000 max-tx 2000 concurrency 4 synthea-dir "synthea-output/fhir"}}]
   (when-not (keyword? backend)
     (throw (ex-info "Pass :backend, the result label (e.g. :xtdb2)" {:backend backend})))
@@ -224,7 +230,8 @@
         _      (log "Constructing store and provisioning tenant ...")
         store  (make-store backend store-fn {:xtdb-server xtdb-server
                                                 :transport transport
-                                                :xtdb-flight-sql-port xtdb-flight-sql-port})]
+                                                :xtdb-flight-sql-port xtdb-flight-sql-port
+                                                :xtdb-attach-template xtdb-attach-template})]
     (db/create-tenant store tenant {:if-exists :replace})
     (db/warmup-tenant store tenant)
     (log "Loading" total "resources across" (count bundles) "bundle(s)"
