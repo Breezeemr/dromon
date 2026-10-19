@@ -1,0 +1,44 @@
+# Standalone XTDB server for `bb flightsql-repro-*`'s Kafka write-bench runs:
+# a Kafka log (an Apache Kafka broker in the same podman pod) and local
+# storage on a fresh podman volume at /var/lib/xtdb. Tenant databases get the
+# store's default ATTACH config, a Kafka topic on `kafkaCluster` plus local
+# storage, as in production. Needs an image with the Kafka module (xtdb-aws).
+server:
+  host: '*'
+  port: 5432
+
+flightSql:
+  host: '*'
+  port: 9832
+
+healthz:
+  host: '*'
+  port: 8080
+
+logClusters:
+  kafkaCluster: !Kafka
+    bootstrapServers: "localhost:9092"
+    # XTDB writes each transaction as one Kafka message; the 1 MiB default
+    # refuses a 1000-entry Synthea transaction. The broker's
+    # message.max.bytes is raised to match when the pod starts.
+    propertiesMap:
+      max.request.size: "33554432"
+
+log: !Kafka
+  cluster: kafkaCluster
+  topic: xtdb-primary
+  autoCreateTopic: true
+
+storage: !Local
+  path: /var/lib/xtdb/storage
+
+# XTDB caches storage pages up to half the JVM's max direct memory by default,
+# enough to hold the whole 100k-resource dataset. A small cache, with the
+# container's memory limit capping the page cache too (`bb flightsql-repro-*`
+# runs the server with --memory), makes reads go to disk as on a server whose
+# data outgrows its memory.
+memoryCache:
+  maxSizeBytes: 268435456
+
+indexer:
+  rowsPerBlock: 10000

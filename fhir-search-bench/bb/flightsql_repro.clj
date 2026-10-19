@@ -32,8 +32,24 @@
   ;; The FlightSQL client has to match the server: XTDB after 2.2.0-beta3
   ;; refuses the beta3 client's BEGIN/COMMIT over FlightSQL, so a nightly
   ;; server is driven by the nightly snapshot of xtdb-core.
-  {:nightly {:image "ghcr.io/xtdb/xtdb:nightly" :client "2.2.0-SNAPSHOT" :client-repo snapshot-repo}
-   :beta3   {:image "ghcr.io/xtdb/xtdb:2.2.0-beta3"}})
+  ;; :kafka-image is the same build with the Kafka module (the plain image
+  ;; has none), for the Kafka-log benchmark.
+  {:nightly {:image "ghcr.io/xtdb/xtdb:nightly" :kafka-image "ghcr.io/xtdb/xtdb-aws:nightly"
+             :client "2.2.0-SNAPSHOT" :client-repo snapshot-repo}
+   :beta3   {:image "ghcr.io/xtdb/xtdb:2.2.0-beta3" :kafka-image "ghcr.io/xtdb/xtdb-aws:2.2.0-beta3"}})
+
+(def ^:private kafka-broker-image "docker.io/apache/kafka:3.9.1")
+
+;; Bench servers: a fixed heap, so no run times heap resizing, and a cgroup
+;; memory limit that also caps the page cache (cgroup v2 charges a
+;; container's page cache to it), so neither XTDB's memory cache (256 MiB in
+;; the bench configs) nor the OS can hold the whole dataset. The 100k run
+;; leaves 1.1-1.6G of data on disk and the server's JVM uses about 2.9G, so
+;; 3.5g leaves the page cache well under half the data. (At 5g and 8g the
+;; page cache held all of it.)
+(def ^:private server-java-opts "-Xms3g -Xmx3g -XX:MaxDirectMemorySize=1g")
+(def ^:private server-memory "3500m")
+(def ^:private broker-memory "2g")
 
 ;; Host ports clear of the fhirbench-xtdb and xtdb2-local pods.
 (def ^:private servers
@@ -46,7 +62,26 @@
            ;; discarded warm-up repeat touches what the timed repeats use, and a
            ;; pre-touched 12g server heap got the server OOM-killed on a 64G
            ;; machine shared with other work.
-           :java-opts "-Xms8g -Xmx8g"}})
+           :java-opts server-java-opts
+           :memory    server-memory
+           ;; Log and storage on disk: a fresh podman volume per run.
+           :volume?   true
+           :attach-template (str "log: !Local\n"
+                                 "  path: '/var/lib/xtdb/dbs/{db}-{uid}/log'\n"
+                                 "storage: !Local\n"
+                                 "  path: '/var/lib/xtdb/dbs/{db}-{uid}/storage'")}
+   ;; Kafka log: a broker and the server in one pod, storage on a volume.
+   ;; No :attach-template, so tenants get the store's default: a Kafka topic
+   ;; per tenant database plus local storage.
+   :bench-kafka {:name "fhirbench-flightsql-bench-kafka" :pod "fhirbench-flightsql-kafka"
+                 :config "docker/xtdb-flightsql/bench-kafka.yaml"
+                 :pg-port 25432 :flight-port 29832 :health-port 28090
+                 :java-opts server-java-opts :memory server-memory :volume? true}})
+
+(def ^:private storages
+  "Write-benchmark variants: where the bench server keeps its log."
+  {:disk {:server :bench :image-key :image}
+   :kafka {:server :bench-kafka :image-key :kafka-image}})
 
 (def ^:private bench-client-jvm-opts
   "Benchmark client JVMs start with a fixed initial heap for the same reason;
@@ -69,30 +104,100 @@
                            " Remove or rename it yourself.") {:name cname})))
     (out "podman" "rm" "-f" cname)))
 
+(defn- labelled [& args]
+  (remove str/blank? (some-> (apply out (concat args ["--filter" (str "label=" label-key "=" label-val)]))
+                             (str/split-lines))))
+
 (defn down!
-  "Removes every container labelled by this task, and only those."
+  "Removes every pod, container and volume labelled by this task, and only
+   those."
   []
-  (let [ids (some-> (out "podman" "ps" "-a" "-q" "--filter" (str "label=" label-key "=" label-val))
-                    (str/split-lines))]
-    (doseq [id (remove str/blank? ids)]
-      (out "podman" "rm" "-f" id))
-    (println "Removed" (count (remove str/blank? ids)) "flightsql-repro container(s)")))
+  (let [pods (labelled "podman" "pod" "ps" "-q")
+        _    (doseq [id pods] (out "podman" "pod" "rm" "-f" id))
+        ids  (labelled "podman" "ps" "-a" "-q")
+        _    (doseq [id ids] (out "podman" "rm" "-f" id))
+        vols (labelled "podman" "volume" "ls" "-q")]
+    (doseq [v vols] (out "podman" "volume" "rm" "-f" v))
+    (println "Removed" (count pods) "pod(s)," (count ids) "container(s) and" (count vols)
+             "volume(s) labelled flightsql-repro")))
+
+(defn- remove-own-pod!
+  "Removes pod `pname` if this task created it; refuses one it did not."
+  [pname]
+  (when-let [l (out "podman" "pod" "inspect" "--format"
+                    (str "{{index .Labels \"" label-key "\"}}") pname)]
+    (when (not= label-val l)
+      (throw (ex-info (str "A pod named " pname " exists that this task did not create."
+                           " Remove or rename it yourself.") {:name pname})))
+    (out "podman" "pod" "rm" "-f" pname)))
+
+(defn- wait-for! [what timeout-s ok?]
+  (loop [i 0]
+    (cond (ok?) true
+          (> i timeout-s) (throw (ex-info (str what " did not become ready") {}))
+          :else (do (Thread/sleep 1000) (recur (inc i))))))
+
+(defn- kafka-cmd [pod tool & args]
+  (concat ["podman" "exec" (str pod "-broker") (str "/opt/kafka/bin/" tool)
+           "--bootstrap-server" "localhost:9092"]
+          args))
+
+(defn- start-pod!
+  "A pod publishing the server's ports, with a Kafka broker (KRaft, one node)
+   whose message.max.bytes matches the server's max.request.size."
+  [{:keys [pod pg-port flight-port health-port]}]
+  (remove-own-pod! pod)
+  (p/shell {:out :string} "podman" "pod" "create" "--name" pod "--label" (str label-key "=" label-val)
+           "-p" (str "127.0.0.1:" pg-port ":5432")
+           "-p" (str "127.0.0.1:" flight-port ":9832")
+           "-p" (str "127.0.0.1:" health-port ":8080"))
+  (p/shell {:out :string} "podman" "run" "-d" "--pod" pod "--name" (str pod "-broker")
+           "--label" (str label-key "=" label-val)
+           "--memory" broker-memory "--memory-swap" broker-memory kafka-broker-image)
+  (wait-for! "Kafka" 120 #(some? (apply out (kafka-cmd pod "kafka-topics.sh" "--list"))))
+  (apply p/shell {:out :string}
+         (kafka-cmd pod "kafka-configs.sh" "--entity-type" "brokers" "--entity-default" "--alter"
+                    "--add-config" "message.max.bytes=33554432")))
+
+(defn- volume-name [cname] (str cname "-data"))
+
+(defn- remove-own-volume!
+  "Removes volume `vname` if this task created it; refuses one it did not."
+  [vname]
+  (when-let [l (out "podman" "volume" "inspect" "--format"
+                    (str "{{index .Labels \"" label-key "\"}}") vname)]
+    (when (not= label-val l)
+      (throw (ex-info (str "A volume named " vname " exists that this task did not create."
+                           " Remove or rename it yourself.") {:name vname})))
+    (out "podman" "volume" "rm" "-f" vname)))
 
 (defn- ready? [port]
   (try (= 200 (:status (http/get (str "http://127.0.0.1:" port "/healthz/ready")
                                  {:throw false :timeout 2000})))
        (catch Exception _ false)))
 
-(defn- start-server! [{:keys [name config pg-port flight-port health-port java-opts]} image]
+(defn- start-server! [{:keys [name config pg-port flight-port health-port java-opts memory volume? pod] :as srv} image]
   (remove-own-container! name)
+  (when pod (start-pod! srv))
+  (when volume?
+    (remove-own-volume! (volume-name name))
+    (p/shell {:out :string} "podman" "volume" "create" "--label" (str label-key "=" label-val)
+             (volume-name name)))
   (apply p/shell {:out :string}
          "podman" "run" "-d" "--name" name "--label" (str label-key "=" label-val)
          (concat
           (when java-opts ["-e" (str "JAVA_TOOL_OPTIONS=" java-opts)])
-          ["-p" (str "127.0.0.1:" pg-port ":5432")
-           "-p" (str "127.0.0.1:" flight-port ":9832")
-           "-p" (str "127.0.0.1:" health-port ":8080")
-           "-v" (str (fs/absolutize config) ":/usr/local/lib/xtdb/config.yaml:ro,Z")
+          ;; Swap capped at the same value, so the limit is not met from swap.
+          (when memory ["--memory" memory "--memory-swap" memory])
+          ;; A named volume starts with the image's /var/lib/xtdb, owned by
+          ;; the image's xtdb user.
+          (when volume? ["-v" (str (volume-name name) ":/var/lib/xtdb")])
+          (if pod
+            ["--pod" pod]
+            ["-p" (str "127.0.0.1:" pg-port ":5432")
+             "-p" (str "127.0.0.1:" flight-port ":9832")
+             "-p" (str "127.0.0.1:" health-port ":8080")])
+          ["-v" (str (fs/absolutize config) ":/usr/local/lib/xtdb/config.yaml:ro,Z")
            image]))
   (loop [i 0]
     (cond
@@ -101,18 +206,58 @@
       (throw (ex-info (str name " did not become ready:\n" (out "podman" "logs" "--tail" "30" name)) {}))
       :else (do (Thread/sleep 1000) (recur (inc i))))))
 
+(defn- server-memory-notes
+  "Peak memory and page cache of the server's cgroup, and XTDB's cache
+   metrics: evidence that the dataset was not held in memory."
+  [{:keys [name health-port memory]}]
+  (let [cg    (out "podman" "exec" name "sh" "-c"
+                   "cat /sys/fs/cgroup/memory.peak; grep -E '^(anon|file) ' /sys/fs/cgroup/memory.stat; grep -E '^(max|oom_kill) ' /sys/fs/cgroup/memory.events")
+        data  (some-> (out "podman" "exec" name "sh" "-c" "du -sb /var/lib/xtdb | cut -f1") parse-long)
+        [peak & stat] (some-> cg str/split-lines)
+        kv    (into {} (for [l stat :let [[k v] (str/split l #" ")]] [k (parse-long v)]))
+        gib   #(when % (format "%.2fG" (/ (double %) (* 1024 1024 1024))))
+        cache (try (->> (str/split-lines (:body (http/get (str "http://127.0.0.1:" health-port "/metrics")
+                                                       {:throw false :timeout 5000})))
+                        (filter #(re-find #"(?i)^[a-z_]*(memory_cache|memorycache|buffer_pool|disk_cache)[a-z_]*(\{|\s)" %))
+                        (remove #(str/starts-with? % "#"))
+                        (take 6))
+                   (catch Exception _ nil))]
+    (cond-> []
+      peak  (conj (str "server cgroup: peak " (gib (parse-long (str/trim peak))) " of " memory " limit; at the end "
+                       (gib (kv "anon")) " anonymous, " (gib (kv "file")) " page cache"
+                       (when (and data (kv "file") (pos? data))
+                         (format " against %s of data on disk (%.0f%%)"
+                                 (gib data) (* 100.0 (/ (double (kv "file")) data))))
+                       "; the limit was reached " (kv "max") " time(s), " (kv "oom_kill") " OOM kill(s)"))
+      (seq cache) (conj (str "XTDB cache metrics at the end: " (str/join "; " cache))))))
+
 (defn- stop-server!
-  "Saves the server's log, removes the container, and returns a note when the
-   server was no longer running, e.g. killed by the OOM killer."
-  [{:keys [name]} log-file]
+  "Saves the server's log, removes the container (and its pod and volume),
+   and returns notes for the summary: memory evidence, and whether the server
+   was no longer running, e.g. killed by the OOM killer."
+  [{:keys [name volume? pod memory] :as srv} log-file]
   (spit log-file (str (:out (p/shell {:out :string :err :out :continue true} "podman" "logs" name))))
+  (when pod
+    (spit log-file (str "\n--- Kafka topics and end offsets: the log went through Kafka\n"
+                        (apply out (kafka-cmd pod "kafka-get-offsets.sh")))
+          :append true))
   (let [state (out "podman" "container" "inspect" "--format"
-                   "{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}" name)]
+                   "{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}" name)
+        mem   (when (and memory (str/starts-with? (str state) "true")) (server-memory-notes srv))]
+    (when volume?
+      (spit log-file (str "\n--- /var/lib/xtdb on disk at the end of the run\n"
+                          (out "podman" "exec" name "sh" "-c" "du -sh /var/lib/xtdb/* 2>/dev/null"))
+            :append true))
+    (when (seq mem)
+      (spit log-file (str "\n--- memory\n" (str/join "\n" mem) "\n") :append true))
     (remove-own-container! name)
-    (when-let [[_ code oom] (some->> state (re-matches #"false (\S+) (\S+)"))]
-      (str "server container had exited with code " code
-           (when (= "true" oom) " (OOM-killed)")
-           "; a kernel OOM kill shows in `journalctl -k`"))))
+    (when pod (remove-own-pod! pod))
+    (when volume? (remove-own-volume! (volume-name name)))
+    (concat mem
+            (when-let [[_ code oom] (some->> state (re-matches #"false (\S+) (\S+)"))]
+              [(str "server container had exited with code " code
+                    (when (= "true" oom) " (OOM-killed)")
+                    "; a kernel OOM kill shows in `journalctl -k`")]))))
 
 ;; ── clojure ─────────────────────────────────────────────────────────────────
 
@@ -233,10 +378,12 @@
         sha12   (subs sha 0 12)
         version (str "2.2.0-repro-" sha12)
         image   (str "localhost/xtdb-flightsql-repro:" sha12)
-        result  {:image image :client version :local-image? true
+        kimage  (str image "-aws")
+        result  {:image image :kafka-image kimage :client version :local-image? true
                  :client-repo (str "file://" (fs/absolutize xtdb-m2))
                  :source (str repo " @ " sha)}
         built?  (and (out "podman" "image" "exists" image)
+                     (out "podman" "image" "exists" kimage)
                      (fs/exists? (str xtdb-m2 "/com/xtdb/xtdb-core/" version "/xtdb-core-" version ".jar")))]
     (if (and built? (not rebuild?))
       (println "Reusing" image "and client" version "(pass :rebuild true to build again)")
@@ -247,23 +394,28 @@
                                 :extra-env {"JAVA_HOME" jdk21 "JAVA_HOME_21_X64" jdk21
                                             "JAVA_HOME_25_X64" jdk25 "XTDB_VERSION" version}}
                                ["./gradlew" "--no-daemon" "--console=plain"
-                                ":docker:standalone:shadowJar" ":xtdb-api:jar" ":xtdb-core:jar"
+                                ":docker:standalone:shadowJar" ":docker:aws:shadowJar"
+                                ":xtdb-api:jar" ":xtdb-core:jar"
                                 ":xtdb-api:generatePomFileForMavenPublication"
                                 ":xtdb-core:generatePomFileForMavenPublication"]
                                (str dir "/build-xtdb.out") timeout-min)]
         (when (not= 0 exit)
           (throw (ex-info (str "XTDB Gradle build failed (exit " exit "); see " dir "/build-xtdb.out") {})))
         (install-client! version)
-        (let [exit (run-logged! {:dir xtdb-src}
-                                ["podman" "build" "-f" "docker/Dockerfile"
-                                 "--build-arg" "VARIANT=standalone"
-                                 "--build-arg" (str "GIT_SHA=" sha)
-                                 "--build-arg" (str "XTDB_VERSION=" version)
-                                 "--label" (str label-key "=" label-val)
-                                 "-t" image "."]
-                                (str dir "/build-image.out") timeout-min)]
-          (when (not= 0 exit)
-            (throw (ex-info (str "XTDB image build failed (exit " exit "); see " dir "/build-image.out") {}))))))
+        ;; The standalone image for the disk-log runs, the aws one (which
+        ;; carries the Kafka module) for the Kafka-log runs.
+        (doseq [[variant tag] [["standalone" image] ["aws" kimage]]]
+          (let [exit (run-logged! {:dir xtdb-src}
+                                  ["podman" "build" "-f" "docker/Dockerfile"
+                                   "--build-arg" (str "VARIANT=" variant)
+                                   "--build-arg" (str "GIT_SHA=" sha)
+                                   "--build-arg" (str "XTDB_VERSION=" version)
+                                   "--label" (str label-key "=" label-val)
+                                   "-t" tag "."]
+                                  (str dir "/build-image-" variant ".out") timeout-min)]
+            (when (not= 0 exit)
+              (throw (ex-info (str "XTDB " variant " image build failed (exit " exit "); see "
+                                   dir "/build-image-" variant ".out") {})))))))
     result))
 
 ;; ── Evidence ────────────────────────────────────────────────────────────────
@@ -414,17 +566,18 @@
 
 (defn- bench!
   "One fhir-search-bench.writes run over `transport` against a fresh bench
-   server, as round `round`."
-  [version dir round transport bench-args timeout-min]
-  (println "\n== Write benchmark, round" round ":" (name transport))
-  (let [srv    (:bench servers)
+   server for `storage` (:disk or :kafka), as round `round`."
+  [version dir storage round transport bench-args timeout-min]
+  (println "\n== Write benchmark," (name storage) "log, round" round ":" (name transport))
+  (let [{:keys [server image-key]} (storages storage)
+        srv    (servers server)
         t      (name transport)
-        run-id (str t "-r" round)
+        run-id (str t "-" (name storage) "-r" round)
         prefix (str "hs_err_bench_" run-id)
         result (str (fs/absolutize dir) "/writes-" run-id ".edn")
         log    (str dir "/bench-" run-id ".out")
         slog   (str dir "/server-bench-" run-id ".log")]
-    (start-server! srv (:image version))
+    (start-server! srv (image-key version))
     (let [load-before (machine-load)
           server-note (volatile! nil)
           exit     (try (run-logged! (concat (clojure-cmd version (concat bench-client-jvm-opts (crash-opts dir prefix)) "-X")
@@ -432,14 +585,14 @@
                                               ":backend" (str ":xtdb2-" t)
                                               ":xtdb-server" (pr-str (str "127.0.0.1:" (:pg-port srv)))
                                               ":transport" (str transport)
-                                              ":out" (pr-str result)
-                                              ;; The plain xtdb image has no Kafka module.
-                                              ":xtdb-attach-template" (pr-str "log: !InMemory\nstorage: !InMemory")]
+                                              ":out" (pr-str result)]
+                                             (when-let [tpl (:attach-template srv)]
+                                               [":xtdb-attach-template" (pr-str tpl)])
                                              (when (= :flight-sql transport)
                                                [":xtdb-flight-sql-port" (str (:flight-port srv))])
                                              bench-args)
                                      log timeout-min)
-                        (finally (vreset! server-note (stop-server! srv slog))))
+                        (finally (vreset! server-note (doall (stop-server! srv slog)))))
           load-after (machine-load)
           crash    (first (crash-logs dir prefix))
           evidence (concat (evidence-lines "client" (slurp log))
@@ -453,12 +606,13 @@
                      (or (seq evidence) (seq problems)) "FAIL"
                      :else "ERROR")]
       {:transport t
+       :storage   (name storage)
        :round     round
        :result    res
        :verdict   verdict
        :bugs      (set (map :bug evidence))
        :details   (concat [(str "machine: " load-before " before, " load-after " after")]
-                          (when @server-note [@server-note])
+                          @server-note
                           (map :line evidence)
                           (take 10 problems)
                           (for [n (when res (store-notes res))]
@@ -536,7 +690,18 @@
 
 ;; ── Task ────────────────────────────────────────────────────────────────────
 
-(def ^:private own-options #{:focused-only :bench-only :race-secs :timeout-min :sha :repo :rebuild :rounds})
+(def ^:private own-options #{:focused-only :bench-only :race-secs :timeout-min :sha :repo :rebuild :rounds
+                              :storage})
+
+(defn- storage-keys
+  "The write-benchmark variants `:storage` asks for: :disk, :kafka or :all
+   (the default)."
+  [own]
+  (case (or (:storage own) :all)
+    :all   [:disk :kafka]
+    :disk  [:disk]
+    :kafka [:kafka]
+    (throw (ex-info "Pass :storage :disk, :kafka or :all" {:storage (:storage own)}))))
 
 ;; Read as plain strings, so `:sha 9f8553ce2c3c...` needs no EDN quoting.
 (def ^:private string-options #{:sha :repo})
@@ -570,7 +735,7 @@
              :when n]
          (parse-long n))))
 
-(defn- summary [label version server client {:keys [cases server-evidence]} bench dir]
+(defn- summary [label version server kafka-server client {:keys [cases server-evidence]} bench dir]
   (let [control-failed (concat (filter #(and (re-find #"control" (:id %)) (not= "PASS" (:verdict %))) cases)
                                (filter #(and (= "pgwire" (:transport %)) (not= "PASS" (:verdict %))) bench))
         bugs   (sort-by str (into (bugs-in-focused cases)
@@ -578,8 +743,10 @@
         lines  (concat
                 ["" (str "XTDB FlightSQL repro: " label)]
                 (when-let [src (:source version)] [(str "  source  " src)])
-                [(str "  server  " (:image version) " = " server)
-                 (str "  client  " client)]
+                [(str "  server  " (:image version) " = " server)]
+                (when kafka-server
+                  [(str "  server, Kafka log  " (:kafka-image version) " = " kafka-server)])
+                [(str "  client  " client)]
                 (when (seq cases)
                   (concat ["" "Focused cases (written over pgwire; each FlightSQL read compared with pgwire)"]
                           (for [{:keys [id verdict detail]} cases]
@@ -587,8 +754,8 @@
                           (for [{:keys [line]} server-evidence] (str "        " line))))
                 (when (seq bench)
                   (concat ["" "Write benchmark (fhir-search-bench.writes against the server)"]
-                          (mapcat (fn [{:keys [transport round verdict details]}]
-                                    (cons (format "  %-5s %s, round %d" verdict transport round)
+                          (mapcat (fn [{:keys [transport storage round verdict details]}]
+                                    (cons (format "  %-5s %s, %s log, round %d" verdict transport storage round)
                                           (map #(str "        " %) details)))
                                   bench)))
                 [""
@@ -609,6 +776,8 @@
   (let [pass?
         (try
           (let [server  (image-info (:image version))
+                kserver (when (and (not (:focused-only own)) (some #{:kafka} (storage-keys own)))
+                          (image-info (:kafka-image version)))
                 client  (client-info version)
                 _       (println "Server image:" server "\nClient:" client)
                 timeout (or (:timeout-min own) 60)
@@ -618,15 +787,22 @@
                 ;; and so on, so neither transport always gets the warmer
                 ;; machine or the later slot.
                 bench   (when-not (:focused-only own)
-                          (vec (for [round (range 1 (inc (or (:rounds own) 2)))
-                                     t     (cond-> [:pgwire :flight-sql] (even? round) reverse)]
-                                 (bench! version dir round t bench-args timeout))))
-                cmp     (comparison bench)
-                text    (str (summary label version server client focused bench dir)
-                             (when cmp (str "\n\nflight-sql vs pgwire\n\n" cmp)))]
+                          (vec (for [storage (storage-keys own)
+                                     round   (range 1 (inc (or (:rounds own) 2)))
+                                     t       (cond-> [:pgwire :flight-sql] (even? round) reverse)]
+                                 (bench! version dir storage round t bench-args timeout))))
+                cmps    (for [storage (distinct (map :storage bench))
+                              :let [c (comparison (filter #(= storage (:storage %)) bench))]
+                              :when c]
+                          [storage c])
+                text    (str (summary label version server kserver client focused bench dir)
+                             (apply str (for [[storage c] cmps]
+                                          (str "\n\nflight-sql vs pgwire, " storage " log\n\n" c))))]
             (println text)
             (spit (str dir "/summary.txt") (str text "\n"))
-            (when cmp (spit (str dir "/COMPARISON.md") (str "# flight-sql vs pgwire: " label "\n\n" cmp "\n")))
+            (doseq [[storage c] cmps]
+              (spit (str dir "/COMPARISON-" storage ".md")
+                    (str "# flight-sql vs pgwire, " storage " log: " label "\n\n" c "\n")))
             (every? #(= "PASS" %) (concat (map :verdict (:cases focused)) (map :verdict bench))))
           (finally (down!)))]
     (when-not pass? (System/exit 1)))))
@@ -650,9 +826,12 @@
   [version-key args]
   (let [version (or (versions version-key) (throw (ex-info "Unknown XTDB version" {:version version-key})))
         dir     (str "target/flightsql-repro/" (name version-key))
-        parsed  (prepare! args dir)]
-    (println "Pulling" (:image version))
-    (p/shell "podman" "pull" (:image version))
+        parsed  (prepare! args dir)
+        kafka?  (and (not (get-in parsed [:own :focused-only]))
+                     (some #{:kafka} (storage-keys (:own parsed))))]
+    (doseq [image (cond-> [(:image version)] kafka? (conj (:kafka-image version) kafka-broker-image))]
+      (println "Pulling" image)
+      (p/shell "podman" "pull" image))
     (run-repro! (name version-key) version dir parsed)))
 
 (defn repro-from-sha!
