@@ -21,7 +21,7 @@
                     ;; memory access; without this the node init dies in
                     ;; DefaultAllocationManagerFactory.<clinit>.
                     "--sun-misc-unsafe-memory-access=allow"
-                    ;; XTDB 2.2.0-beta3 asks for this on JDK 25+: Netty disables
+                    ;; XTDB 2.2 (rc2) asks for this on JDK 25+: Netty disables
                     ;; sun.misc.Unsafe there unless told otherwise. Today Netty
                     ;; also infers it from the flag above; this keeps it explicit.
                     "-Dio.netty.noUnsafe=false"]}}}
