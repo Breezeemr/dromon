@@ -81,9 +81,10 @@
               (.close ^java.lang.AutoCloseable node))))))))
 
 ;; XTDB 2.2.0-beta3's FlightSQL server loaded result pages into the declared
-;; result type by position (see fhir-store-xtdb2.conns); rc2 fixes that
-;; (xtdb#6215, #6222). These pin that a session's reads come back as the
-;; node's own xt/q returns them, whichever is underneath.
+;; result type by position, so both of these failed there; rc2 conforms each
+;; page on the server (xtdb#6215, #6222). The pool sends queries unchanged, so
+;; these pin that the server's reads come back as the node's own xt/q returns
+;; them.
 
 (defn- pool-on [node]
   (conns/flight-sql-pool {:port (.getFlightSqlPort node) :max-size 2 :connection-timeout-ms 5000}))
@@ -114,8 +115,8 @@
 
 (deftest flight-sql-reads-struct-fields-in-another-order-than-the-jvm-saw-first
   ;; A JVM that has seen a struct's fields in one order declares that order for
-  ;; every later struct with the same fields, on any node. Unconformed, the
-  ;; second read returns other fields' bytes, or crashes the JVM.
+  ;; every later struct with the same fields, on any node. On beta3 the
+  ;; second read returned other fields' bytes, or crashed the JVM.
   (let [vq {"value" 60.0 "unit" "UNIT" "system" "SYSTEM" "code" "CODE"}
         ordered (fn [ks] (apply array-map (mapcat (fn [k] [k (vq k)]) ks)))]
     (doseq [order [["system" "unit" "value" "code"] ["value" "unit" "system" "code"] ["code" "value" "unit" "system"]]]
@@ -126,16 +127,3 @@
           (is (= {:value 60.0 :unit "UNIT" :system "SYSTEM" :code "CODE"}
                  (:vq (first (xt/q c ["SELECT * FROM obs WHERE _id = ?" "o1"]))))
               (str "written in order " order)))))))
-
-(deftest materialized-sql-wraps-queries-only
-  (is (= (str "SELECT * FROM (SELECT *, ROW_NUMBER() OVER () AS _xt_flight_row FROM (SELECT 1 AS a) AS _xt_flight_rows)"
-              " AS _xt_flight_sorted ORDER BY _xt_flight_row")
-         (conns/materialized-sql "SELECT 1 AS a;  ")))
-  (with-open [node (xtn/start-node {:flight-sql {:port 0}})
-              pool (pool-on node)]
-    (testing "the row number never reaches the caller, under any key-fn"
-      (is (= [{:a 1}] (with-conn [c pool] (xt/q c ["SELECT 1 AS a"]))))
-      (is (= [{:a 1}] (with-conn [c pool] (xt/q c ["SELECT 1 AS a"] {:key-fn :snake-case-keyword}))))
-      (is (= [{"a" 1}] (with-conn [c pool] (xt/q c ["SELECT 1 AS a"] {:key-fn :snake-case-string})))))
-    (testing "a WITH query is wrapped too"
-      (is (= [{:b 2}] (with-conn [c pool] (xt/q c ["WITH t AS (SELECT 2 AS b) SELECT b FROM t"])))))))

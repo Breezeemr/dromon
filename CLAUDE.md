@@ -298,35 +298,26 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   the channel without ending it, so the pool sends `CloseSession` first.
   FlightSQL refuses `:metadata` tx-opts (BEGIN cannot be parameterised).
   ATTACH and DETACH stay on pgwire on every transport.
-  **2.2.0-beta3's FlightSQL server loads result pages by position.** It
-  streams a query by loading each page into an Arrow root of the declared
-  result type with `VectorLoader`, which matches buffers by position. A page
-  lacking a struct field or union leg the declared type has fails on the
-  server (`no more buffers for field unit: Utf8. Expected 3`, typical once
-  blocks have flushed). A page whose struct fields come in another order than
-  the declared type's is sent with each field's buffers under another field's
-  name: wrong values, or a client JVM SIGSEGV decoding them. A JVM keeps the
-  first field order it saw for a field set (struct type equality ignores
-  order), so this crosses nodes and databases. So the `:flight-sql` pool's
-  sessions (`conns/MaterializingSession`) send every SELECT/WITH as
-  `SELECT * FROM (SELECT *, ROW_NUMBER() OVER () AS _xt_flight_row FROM (<q>)
-  ...) ORDER BY _xt_flight_row`: the sort copies each row by name into
-  vectors of the declared type before that load, the row number keeps the
-  query's order, and the column is stripped from every row. Results stay
-  nested Arrow. `conns_test` pins both failure modes; without the wrapper the
-  field-order test crashes the JVM. pgwire and `:adbc` never take this path.
-  **FlightSQL is still unsafe under concurrency on 2.2.0-beta3; keep
-  deployments on `:pgwire`.** Arrow's zero-length buffer is one JVM-wide
-  object (`NettyAllocationManager.EMPTY_BUFFER`) with mutable reader/writer
-  indices; XTDB unloads it as every non-nullable vector's validity buffer, and
-  XTDB's and Arrow's load/unload code set its indices. Concurrent FlightSQL
-  streams therefore overwrite each other's buffer lengths: the server cancels
-  them (`index: 0, length: 4 (expected: range(0, 0))`) or the client decodes
-  garbage and can crash. Eight readers and no writers reproduce it; the
-  wrapper cannot help, and no Arrow release fixes it (19.0.0 is the newest and
-  is what XTDB beta3 ships). `bb flightsql-repro-nightly` (or `-beta3`,
-  `-from-sha`) in fhir-search-bench reproduces the three underlying XTDB bugs
-  in one command; its README says what each failure looks like.
+  **FlightSQL needs XTDB 2.2.0-rc2 or later.** 2.2.0-beta3 had three server
+  and Arrow bugs, all fixed in rc2 (it carries xtdb/xtdb#6222 and upstream's
+  empty-list shared-buffer fix):
+  - The server loaded each result page by position into an Arrow root of the
+    declared result type. A page lacking a struct field or union leg failed
+    (`no more buffers for field unit: Utf8. Expected 3`, typical once blocks
+    have flushed).
+  - A page whose struct fields came in another order than the declared type's
+    was sent with each field's buffers under another field's name: wrong
+    values, or a client JVM SIGSEGV. A JVM keeps the first field order it saw
+    for a field set, so this crossed nodes and databases.
+  - Arrow's zero-length buffer is one JVM-wide object with mutable indices,
+    so concurrent FlightSQL streams corrupted each other (`index: 0, length: 4
+    (expected: range(0, 0))`).
+  `conns_test` pins the first two. dromon#141 worked around them on the
+  client by wrapping every query in a `ROW_NUMBER() OVER ()` sort; the
+  wrapper was removed once the store moved to rc2, so the pool sends queries
+  unchanged. `bb flightsql-repro-beta3` / `-nightly` / `-from-sha` in
+  fhir-search-bench reproduce or rule out the three bugs in one command; its
+  README says what each failure looks like.
 
 ### Transaction metadata (`:tx-metadata`)
 
