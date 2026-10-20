@@ -1,5 +1,6 @@
 (ns server.core
-  (:require [malli.core :as m]
+  (:require [clojure.edn :as edn]
+            [malli.core :as m]
             [malli.util :as mu]
             [ring.adapter.jetty9 :as jetty]
             [server.router :as router]
@@ -11,8 +12,8 @@
             [integrant.core :as ig]))
 
 ;; Back-compat aliases. These moved to server.router when the router assembly
-;; was made composable; consumers outside this repo (test-server tests, the
-;; jib2 contract spike) still reference them here.
+;; was made composable; consumers outside this repo (test-server tests, and
+;; hosts built against the old names) still reference them here.
 
 (def java-time-encode-mapper
   "Moved to server.router; alias kept for external consumers."
@@ -122,7 +123,7 @@
 
 (defn- lenient-schema
   "Relax `schema` for response validation of externally produced (e.g.
-   decanted) resources: every inline :map becomes open and all its entries
+   migrated) resources: every inline :map becomes open and all its entries
    optional, so undeclared promoted keys pass and base-required elements the
    store never held do not fail the read. Keys that ARE present still
    validate against their declared schemas. m/walk does not enter :ref
@@ -220,26 +221,49 @@
                        deref)]
     v))
 
-(defn- maybe-apply-breeze-storage-overlay
-  "When the Breeze storage registry is on the classpath (breeze-ig malli
-   package), recompile `schema` so HumanName/Address resolve to USEP
-   card-one string annotations. No-op when the package is absent so
-   open-source dromon stays free of a hard breeze-ig dependency."
+(def schema-overlays-resource
+  "The classpath resource a schema package uses to declare overlays: an EDN
+   vector of fully qualified symbols, each naming a function of a resolved
+   server schema that returns a replacement schema, or nil to leave it. Every
+   copy on the classpath is read, so several packages can each ship one."
+  "dromon/schema-overlays.edn")
+
+(defn- declared-schema-overlays
+  "The overlay functions every [[schema-overlays-resource]] on the classpath
+   declares, in classpath order. A declared overlay that does not resolve
+   throws: skipping it would change how resources are stored with no error
+   anywhere."
+  []
+  (let [loader (or (.getContextClassLoader (Thread/currentThread))
+                   (clojure.lang.RT/baseLoader))]
+    (into []
+          (comp (mapcat (fn [url]
+                          (let [syms (edn/read-string (slurp url))]
+                            (when-not (and (vector? syms) (every? qualified-symbol? syms))
+                              (throw (ex-info (str schema-overlays-resource
+                                                   " must hold a vector of qualified symbols")
+                                              {:url (str url) :value syms})))
+                            (map (fn [sym] [sym url]) syms))))
+                (map (fn [[sym url]]
+                       (or (some-> (requiring-resolve sym) deref)
+                           (throw (ex-info (str "Schema overlay does not resolve: " sym)
+                                           {:overlay sym :url (str url)}))))))
+          (enumeration-seq (.getResources loader schema-overlays-resource)))))
+
+(def ^:private schema-overlays
+  (delay (declared-schema-overlays)))
+
+(defn- apply-schema-overlays
+  "`schema` after every declared overlay (see [[schema-overlays-resource]])."
   [schema]
-  (try
-    (if-let [apply-overlay (requiring-resolve
-                            'com.breezehealthplatform.breeze.storage.registry/apply-overlay)]
-      (or (apply-overlay schema) schema)
-      schema)
-    (catch Throwable _
-      schema)))
+  (reduce (fn [sch overlay] (or (overlay sch) sch)) schema @schema-overlays))
 
 (defn resolve-schema
   "Resolve a single schema spec into a server-ready capability schema.
    A spec is either:
    - a fully qualified symbol naming a Var holding either the new
-     capability data map (e.g. `us-core.capability.v8-0-1.Patient/capability`
-     or `breeze.capability.v1-0-0.Patient/capability`) or a pre-compiled
+     capability data map (e.g. `us-core.capability.v8-0-1.Patient/capability`)
+     or a pre-compiled
      malli `:multi` schema (legacy/base-resource Vars); OR
    - a map `{:schema <fq-sym> :interactions [..] :search-params [..]}` where
      :interactions and :search-params, when provided, override what the schema
@@ -260,12 +284,11 @@
    whose :default branch is open with all-optional entries; used by routing
    for read/vread/create/update RESPONSE validation while request bodies
    keep the strict cap-schema. For stores that hold externally produced
-   (decanted) resources without meta.profile.
+   (migrated) resources without meta.profile.
 
-   When `com.breezehealthplatform.breeze.storage.registry` is loadable,
-   the resolved schema is recompiled under that registry overlay so
-   ordered multi-string fields (HumanName.given/prefix/suffix,
-   Address.line) store as USEP cardinality-one strings."
+   The resolved schema then passes through every overlay a schema package on
+   the classpath declares (see [[schema-overlays-resource]]), for example
+   one that changes how a datatype is stored."
   ([spec] (resolve-schema spec nil))
   ([spec {:keys [operations]}]
    (let [{:keys [schema interactions search-params lenient-default-responses?]} (if (map? spec) spec {:schema spec})
@@ -284,7 +307,7 @@
          ;; Attach the lenient copy AFTER the overlay so the overlay's
          ;; (m/schema (m/form stamped) opts) recompile never has to carry it.
          server-schema (-> (capability-schema->server-schema resolved registry operations)
-                           maybe-apply-breeze-storage-overlay)]
+                           apply-schema-overlays)]
      (if (and lenient-default-responses? (cap-data? resolved))
        (mu/update-properties server-schema assoc :fhir/response-schema
                              (lenient-default-branch-multi resolved (or registry (:registry resolved))))
@@ -312,6 +335,8 @@
    `:terminology`, `:cors-allowed-origins`, `:enforce-smart-scopes?`,
    `:bulk-job-store`; each falls back to an
    environment variable as documented on `server.router/resolve-options`.
+   `:cors-allow-headers`, `:compartment-overrides` and `:token-claims` have
+   no environment fallback; see the same docstring.
    `:lifecycle` (see `server.router/default-middleware`) and
    `:temporal-canonicals` (the canonical URLs temporal responses state, see
    `server.temporal/default-canonicals`) have no environment fallback.
@@ -327,7 +352,8 @@
 
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
                                                 jwks-url keto-url keto-admin-url oauth-base-url terminology
-                                                cors-allowed-origins bulk-job-store lifecycle temporal-canonicals]}]
+                                                cors-allowed-origins cors-allow-headers bulk-job-store lifecycle
+                                                temporal-canonicals compartment-overrides token-claims]}]
   ;; A nil :port means TLS only. The adapter's default is a cleartext
   ;; connector beside the TLS one, so it has to be told (:http? false) rather
   ;; than merely not given a port.
@@ -348,8 +374,12 @@
     (jetty/run-jetty (fhir-app store schemas :jwks-url jwks-url :keto-url keto-url
                                :keto-admin-url keto-admin-url :oauth-base-url oauth-base-url
                                :terminology terminology
-                               :cors-allowed-origins cors-allowed-origins :bulk-job-store bulk-job-store
-                               :lifecycle lifecycle :temporal-canonicals temporal-canonicals)
+                               :cors-allowed-origins cors-allowed-origins
+                               :cors-allow-headers cors-allow-headers
+                               :bulk-job-store bulk-job-store
+                               :lifecycle lifecycle :temporal-canonicals temporal-canonicals
+                               :compartment-overrides compartment-overrides
+                               :token-claims token-claims)
                      jetty-opts)))
 
 (defmethod ig/halt-key! :server/jetty [_ server]

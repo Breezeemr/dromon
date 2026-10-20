@@ -13,6 +13,17 @@
 
 (def ^:private tenant "default")
 
+;; The narrowing a host whose staff work items name the patient (call-back
+;; requests, workflow Tasks, staff-to-staff messages about a patient) passes as
+;; `:compartment-overrides`. Most tests below run under it, which exercises the
+;; override path end to end; `r4b-*` tests pin the defaults.
+(def ^:private narrowed-overrides
+  {"Patient" {"Communication"        ["sender" "recipient"]
+              "CommunicationRequest" ["requester"]
+              "Task"                 ["requester"]}})
+
+(def ^:private narrowed-defs (compartment/with-overrides narrowed-overrides))
+
 ;; A minimal registry mirroring how the real search registry resolves the R4B
 ;; Patient-compartment link params: `subject`/`performer` for Observation, and
 ;; for Task the four link params plus a non-link param the capability pack also
@@ -118,7 +129,8 @@
     store))
 
 (defn- fstore [base]
-  (compartment/filtering-store base {:patient-id "123" :all-registries registries}))
+  (compartment/filtering-store base {:patient-id "123" :all-registries registries
+                                    :definitions narrowed-defs}))
 
 (deftest search-confined-to-compartment-union
   (let [store (fstore (seeded-store))
@@ -191,7 +203,8 @@
   (let [store (compartment/filtering-store
                (mock/create-mock-store {})
                {:patient-id "123"
-                :all-registries (assoc registries "Appointment" appointment-registry)})]
+                :all-registries (assoc registries "Appointment" appointment-registry)
+                :definitions narrowed-defs})]
     (testing "an Appointment naming the launch patient as a participant actor is writable"
       (is (= "a1" (:id (db/create-resource store tenant :Appointment "a1"
                                            (appt "a1" "Practitioner/9" "Patient/123"))))))
@@ -271,10 +284,10 @@
                               (obs "moved" "Patient/999"))))))
 
 ;; ---------------------------------------------------------------------------
-;; Task: a deliberate, narrowed forward-port of R5's Patient/Task compartment
-;; entry. Only `requester` is a link, so patient-filed demographic change
-;; requests stay visible to their author while staff workflow Tasks (which name
-;; the patient in Task.for or Task.owner) are not readable by a patient token.
+;; Task under `narrowed-overrides`: a member R4B does not list, linked only by
+;; `requester`, so a patient-filed Task stays visible to its author while staff
+;; workflow Tasks (which name the patient in Task.for or Task.owner) are not
+;; readable by a patient token.
 ;; ---------------------------------------------------------------------------
 
 (defn- task [id & {:keys [for requester owner]}]
@@ -286,7 +299,7 @@
 (defn- seeded-task-store []
   (let [store (mock/create-mock-store {})
         put!  (fn [t] (db/create-resource store tenant :Task (:id t) t))]
-    ;; the shape Patient/$request-demographic-change stages
+    ;; a Task the patient filed
     (put! (task "task-authored" :for "Patient/123" :requester "Patient/123"))
     ;; staff workflow Tasks that name the patient in the other roles
     (put! (task "task-staff-for" :for "Patient/123" :requester "Practitioner/p1"))
@@ -308,18 +321,18 @@
   (set (map (comp :id :resource) (get-in resp [:body :entry]))))
 
 (deftest task-is-a-patient-compartment-member
-  (is (compartment/patient-compartment-member? "Task"))
-  (is (= ["requester"] (compartment/compartment-link-params "Patient" "Task"))))
+  (is (compartment/patient-compartment-member? narrowed-defs "Task"))
+  (is (= ["requester"] (compartment/compartment-link-params narrowed-defs "Patient" "Task"))))
 
 (deftest task-descriptor-covers-only-the-authored-link
-  (let [desc (compartment/compartment-descriptor "Patient" "Task" (get registries "Task"))]
+  (let [desc (compartment/compartment-descriptor narrowed-defs "Patient" "Task" (get registries "Task"))]
     (is (= "reference" (:type desc)))
     (is (= ["Patient"] (:target desc)))
     (is (= [{:col "requester"}] (:columns desc))
         "for and owner are registered but are not compartment links for Task")))
 
 (deftest confine-task-search-under-patient-token
-  (let [outcome (compartment/confine "Patient" "123" "Task" {} (get registries "Task"))]
+  (let [outcome (compartment/confine narrowed-defs "Patient" "123" "Task" {} (get registries "Task"))]
     (testing "a Task search is confined, never denied, once the link param resolves"
       (is (not= :deny outcome))
       (let [[tag params registry] outcome]
@@ -360,7 +373,7 @@
                               (task "t-x" :for "Patient/123" :requester "Practitioner/p1"))))))
 
 ;; ---------------------------------------------------------------------------
-;; CommunicationRequest: narrowed from R4B like Task. Staff call-back requests
+;; CommunicationRequest under `narrowed-overrides`: staff call-back requests
 ;; name the patient as subject and recipient, so only `requester` is a link.
 ;; Communication: narrowed to `sender` and `recipient`. A staff-started message
 ;; thread lists the patient in `recipient` after its owner.
@@ -413,20 +426,20 @@
               :path-params {:tenant-id tenant :id id}})))
 
 (deftest communication-types-stay-patient-compartment-members
-  (is (compartment/patient-compartment-member? "CommunicationRequest"))
-  (is (compartment/patient-compartment-member? "Communication"))
-  (is (= ["requester"] (compartment/compartment-link-params "Patient" "CommunicationRequest")))
+  (is (compartment/patient-compartment-member? narrowed-defs "CommunicationRequest"))
+  (is (compartment/patient-compartment-member? narrowed-defs "Communication"))
+  (is (= ["requester"] (compartment/compartment-link-params narrowed-defs "Patient" "CommunicationRequest")))
   (is (= ["sender" "recipient"]
-         (compartment/compartment-link-params "Patient" "Communication"))))
+         (compartment/compartment-link-params narrowed-defs "Patient" "Communication"))))
 
 (deftest communication-descriptors-cover-only-the-narrowed-links
   (is (= [{:col "requester"}]
          (:columns (compartment/compartment-descriptor
-                     "Patient" "CommunicationRequest" (get registries "CommunicationRequest"))))
+                     narrowed-defs "Patient" "CommunicationRequest" (get registries "CommunicationRequest"))))
       "subject, sender and recipient are registered but are not links")
   (is (= [{:col "sender"} {:col "recipient" :array? true}]
          (:columns (compartment/compartment-descriptor
-                     "Patient" "Communication" (get registries "Communication"))))
+                     narrowed-defs "Patient" "Communication" (get registries "Communication"))))
       "subject is registered but is not a link"))
 
 (deftest patient-token-reads-only-the-communication-request-it-filed
@@ -495,7 +508,8 @@
            :path-params (cond-> {:tenant-id tenant}
                           id (assoc :id id)
                           target-type (assoc :target-type target-type))
-           :reitit.core/match {:data {:fhir/all-registries registries}}}
+           :reitit.core/match {:data {:fhir/all-registries registries}}
+           :fhir/compartment-definitions narrowed-defs}
     patient (assoc-in [:identity :patient] patient)))
 
 (defn- wrapped [] (compartment/wrap-patient-compartment echo-store-handler {}))
@@ -814,7 +828,8 @@
 (defn- exempt-store [base & types]
   (compartment/filtering-store base {:patient-id "123"
                                      :all-registries (assoc registries "Basic" basic-registry)
-                                     :exempt-write-types types}))
+                                     :exempt-write-types types
+                                     :definitions narrowed-defs}))
 
 (deftest types-outside-the-compartment-are-not-writable-by-default
   (let [store (fstore (seeded-store))]
@@ -875,7 +890,8 @@
   (testing "a member type with no registered link parameter cannot be judged, so it is refused"
     (let [store (compartment/filtering-store (seeded-store)
                                              {:patient-id "123" :all-registries registries
-                                              :exempt-write-types ["Basic"]})]
+                                              :exempt-write-types ["Basic"]
+                                              :definitions narrowed-defs})]
       (is (= 403 (refusal-status
                   #(db/create-resource store tenant :Basic "b1"
                                        {:resourceType "Basic" :id "b1"})))))))
@@ -917,7 +933,7 @@
 ;; A resource's current version deciding whether ANY of its versions may be
 ;; read lets a version from before the resource entered the compartment leak:
 ;; an Observation refiled from another patient's chart, or a Task whose
-;; requester changed. Each version is judged on its own, as history judges it.
+;; requester changed (under `narrowed-overrides`). Each version is judged on its own, as history judges it.
 ;; ---------------------------------------------------------------------------
 
 (defn- refiled-store
@@ -963,3 +979,64 @@
   (let [base (mock/create-mock-store {})
         _    (db/create-resource base tenant :Medication "m1" {:resourceType "Medication" :id "m1"})]
     (is (= "m1" (:id (db/vread-resource (fstore base) tenant :Medication "m1" "1"))))))
+
+
+;; ---------------------------------------------------------------------------
+;; Defaults and overrides
+;; ---------------------------------------------------------------------------
+
+(deftest r4b-communication-links-are-the-specification's
+  (is (= ["subject" "sender" "recipient"]
+         (compartment/compartment-link-params "Patient" "Communication")))
+  (is (= ["subject" "sender" "recipient" "requester"]
+         (compartment/compartment-link-params "Patient" "CommunicationRequest"))))
+
+(deftest r4b-task-is-not-a-patient-compartment-member
+  (is (not (compartment/patient-compartment-member? "Task")))
+  (is (= :passthrough (compartment/confine "Patient" "123" "Task" {} (get registries "Task")))))
+
+(deftest r4b-patient-token-reads-every-communication-request-naming-it
+  (let [store (compartment/filtering-store (seeded-comm-store)
+                                           {:patient-id "123" :all-registries registries})]
+    (doseq [id ["cr-filed" "cr-callback" "cr-review"]]
+      (is (= 200 (read-comm store "CommunicationRequest" id)) id))
+    (is (= 404 (read-comm store "CommunicationRequest" "cr-other")))))
+
+(deftest with-overrides-replaces-adds-and-removes-members
+  (let [defs (compartment/with-overrides {"Patient" {"Observation" ["subject"]
+                                                     "Task"        ["requester"]
+                                                     "Account"     nil}})]
+    (is (= ["subject"] (compartment/compartment-link-params defs "Patient" "Observation")))
+    (is (= ["requester"] (compartment/compartment-link-params defs "Patient" "Task")))
+    (is (not (compartment/member? defs "Patient" "Account")))
+    (is (= (get-in compartment/compartment-definitions ["Practitioner"])
+           (get defs "Practitioner"))
+        "compartments the overrides do not name keep their R4B members"))
+  (is (= compartment/compartment-definitions (compartment/with-overrides nil))))
+
+(deftest with-overrides-refuses-what-it-cannot-apply
+  (testing "a compartment type FHIR does not define"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown compartment type"
+          (compartment/with-overrides {"Patients" {"Task" ["requester"]}}))))
+  (testing "links that are not a non-empty vector of names"
+    (doseq [links [[] "requester" ["requester" 1] '("requester") [""]]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be nil or a non-empty vector"
+            (compartment/with-overrides {"Patient" {"Task" links}}))
+          (pr-str links))))
+  (testing "a member map that is not a map"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a map"
+          (compartment/with-overrides {"Patient" [["Task" ["requester"]]]})))))
+
+(deftest middleware-reads-membership-from-the-request
+  (let [task-req (fn [defs]
+                   (cond-> (base-req "patient/Task.read" :patient "123"
+                                     :uri "/default/fhir/Task")
+                     true (dissoc :fhir/compartment-definitions)
+                     defs (assoc :fhir/compartment-definitions defs)))]
+    (testing "R4B: Task is outside the Patient compartment"
+      (is (= 403 (:status ((wrapped) (task-req nil))))))
+    (testing "overridden: Task is a member and the store is confined"
+      (let [resp ((wrapped) (task-req narrowed-defs))]
+        (is (= 200 (:status resp)))
+        (is (instance? CompartmentFilteringStore (:body resp)))
+        (is (= narrowed-defs (:definitions (:body resp))))))))

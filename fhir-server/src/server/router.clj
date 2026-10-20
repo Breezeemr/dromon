@@ -191,6 +191,23 @@
                              :fhir/keto-legacy-realm-blind-fallback? legacy-realm-blind-fallback?)
                 keto-admin-url (assoc :fhir/keto-admin-url keto-admin-url))))))
 
+(defn wrap-compartment-definitions
+  "Inject the compartment definitions in force as
+   `:fhir/compartment-definitions`. Every membership question a request asks
+   (`server.compartment/request-definitions`) reads this one value, so search,
+   writes, compartment search, bulk export and grants agree on it."
+  [handler definitions]
+  (fn [req]
+    (handler (assoc req :fhir/compartment-definitions definitions))))
+
+(defn wrap-token-claims
+  "Inject the host's token-claims function as `:fhir/token-claims`, which
+   `server.grant/token-hook` calls for extra access-token claims. nil when the
+   host supplies none."
+  [handler token-claims]
+  (fn [req]
+    (handler (assoc req :fhir/token-claims token-claims))))
+
 (defn wrap-oauth-base-url
   "Inject the authorization server's base URL as `:fhir/oauth-base-url`, which
    SMART discovery (`server.handlers/smart-configuration`) publishes as
@@ -220,7 +237,8 @@
    consumed by [[default-middleware]].
 
    Accepts `:jwks-url`, `:keto-url`, `:keto-admin-url`, `:oauth-base-url`,
-   `:terminology`, `:cors-allowed-origins`,
+   `:terminology`, `:cors-allowed-origins`, `:cors-allow-headers`,
+   `:compartment-overrides`, `:token-claims`,
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
    `:jwt-issuer`, `:jwt-audiences` and `:jwt-access-tokens-only?`; unknown keys
@@ -265,10 +283,20 @@
                                `server.auth/wrap-jwt-auth`).
    - :cors-origins          -- [[parse-cors-origins]] of the argument, else of
                                `CORS_ALLOWED_ORIGINS`.
+   - :cors-allow-headers    -- argument only: request header names added to
+                               the preflight's allow list
+                               (`server.middleware/wrap-cors`).
+   - :compartment-definitions -- `server.compartment/with-overrides` of the
+                               `:compartment-overrides` argument: R4B when
+                               none is given. A malformed override throws here.
+   - :token-claims          -- argument only: the host's extra access-token
+                               claims for the token hook
+                               (`server.grant/token-hook`), or nil.
    - :trace-tap             -- `server.dev.trace-tap/wrap-trace-tap`, resolved
                                only when `DROMON_DEV_TRACE_TAP=1`, so the OTel
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url keto-admin-url oauth-base-url terminology cors-allowed-origins
+           cors-allow-headers compartment-overrides token-claims
            enforce-smart-scopes? bulk-job-store login-url lifecycle tx-metadata
            temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences
            jwt-access-tokens-only?]}]
@@ -297,6 +325,9 @@
    :cors-origins          (parse-cors-origins
                             (or cors-allowed-origins
                                 (System/getenv "CORS_ALLOWED_ORIGINS")))
+   :cors-allow-headers    (vec cors-allow-headers)
+   :compartment-definitions (compartment/with-overrides compartment-overrides)
+   :token-claims          token-claims
    :trace-tap             (when (= "1" (System/getenv "DROMON_DEV_TRACE_TAP"))
                             (some-> (requiring-resolve 'server.dev.trace-tap/wrap-trace-tap)
                                     deref))
@@ -363,7 +394,8 @@
       OperationOutcomes); `::coerce-exceptions` is retained for compatibility.
    7. The injection middleware (`::fhir-store`, `::terminology`,
       `::narrative`, `::lifecycle`, `::tx-metadata`, `::temporal-canonicals`,
-      `::bulk-job-store`, `::keto-url`, `::oauth-base-url`) must sit
+      `::bulk-job-store`, `::compartment-definitions`, `::token-claims`,
+      `::keto-url`, `::oauth-base-url`) must sit
       outside `::patient-compartment`, which reads and REPLACES `:fhir/store`
       with a compartment-filtering store, and outside the handlers that
       consume the injected values.
@@ -407,12 +439,13 @@
        401 and 403 -- do reach the group, which is why
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
-  [store {:keys [trace-tap cors-origins terminology bulk-job-store keto-url
+  [store {:keys [trace-tap cors-origins cors-allow-headers terminology bulk-job-store keto-url
                  keto-admin-url oauth-base-url jwks-url jwt-issuer jwt-audiences
                  jwt-access-tokens-only? enforce-smart-scopes? login-url
                  narrative lifecycle tx-metadata temporal-canonicals
-                 legacy-realm-blind-fallback?]
-          :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?}
+                 legacy-realm-blind-fallback? compartment-definitions token-claims]
+          :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?
+               compartment-definitions compartment/compartment-definitions}
           :as opts}]
   (cond-> []
     trace-tap
@@ -423,7 +456,8 @@
            {:name ::otel-context :wrap middleware/wrap-otel-context}
            {:name ::head :wrap wrap-head}
            {:name ::request-id :wrap middleware/wrap-request-id}
-           {:name ::cors :wrap (fn [handler] (middleware/wrap-cors handler cors-origins))}
+           {:name ::cors :wrap (fn [handler]
+                                 (middleware/wrap-cors handler cors-origins cors-allow-headers))}
            (assoc parameters/parameters-middleware :name ::parameters)
            {:name ::format-override :wrap middleware/wrap-format-override}
            {:name ::not-acceptable :wrap middleware/wrap-not-acceptable}
@@ -459,6 +493,10 @@
     :always
     (into [{:name ::bulk-job-store
             :wrap (fn [handler] (wrap-bulk-job-store handler bulk-job-store))}
+           {:name ::compartment-definitions
+            :wrap (fn [handler] (wrap-compartment-definitions handler compartment-definitions))}
+           {:name ::token-claims
+            :wrap (fn [handler] (wrap-token-claims handler token-claims))}
            {:name ::oauth-base-url
             :wrap (fn [handler] (wrap-oauth-base-url handler oauth-base-url))}
            {:name ::keto-url
@@ -534,7 +572,7 @@
 ;; rebuilds it with assoc-in, and it does this for every route and every method
 ;; under it. Records are the one map it does not descend into. As a plain map
 ;; the registries were walked once per route per merge, which was ~90% of
-;; building the router (18 s of 19 s for the Breeze IG's 516 routes; 1.3 s as a
+;; building the router (18 s of 19 s for an IG of 516 routes; 1.3 s as a
 ;; record), and every route kept its own rebuilt copy (261 MB retained per
 ;; router; 128 MB as a record). A record still answers `get`, `keys` and `seq`
 ;; like the map it wraps.

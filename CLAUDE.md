@@ -118,9 +118,13 @@ tree, and prints it to stderr; the body flows through to stdout.
 `bb setup` / `bb teardown` -- Ory auth infrastructure
 `bb inferno-check` -- smoke test (containers + server health)
 `bb inferno-run` -- Inferno web UI for interactive testing
-`bb check-domains` -- fails when a tracked file names a production domain or a
-consuming host's development hostnames; fixtures, docs and defaults here read
-localhost (`bb check-domains-test` tests the check)
+`bb check-domains` -- fails when a tracked file names a production domain, a
+consuming host's development hostnames, or a consuming host's own systems
+(its packages, services, Keto namespaces, realms); fixtures, docs and defaults
+here read localhost, and host behavior arrives through options. Lines that
+predate the name check are listed in `bb/check-domains-baseline.edn`; a fix
+deletes its entry (`bb check-domains --prune`), nothing adds one
+(`bb check-domains-test` tests the check)
 
 ## Architecture
 
@@ -410,6 +414,12 @@ each backend's storage home, and the adoption order.
 - **JWT**: `server.auth/wrap-jwt-auth` -- HS256 with `JWT_DEV_SECRET` env var (dev) or RS256 with JWKS from `JWKS_URL` (prod)
 - **Authorization**: `server.keto/wrap-keto-authorization` -- checks Ory Keto for instance-level permissions (GET->read, POST/PUT/PATCH->write, DELETE->delete)
 - **FHIR format**: `server.fhir-format` -- Malli encode/decode middleware for FHIR JSON wire format
+- **Host extensions** (`server.router/resolve-options`), so nothing host-specific lives here:
+  `:compartment-overrides` (membership beyond the R4B CompartmentDefinitions, read by every
+  compartment check, grants and bulk export through `:fhir/compartment-definitions`),
+  `:cors-allow-headers` (a host client's own request headers), `:token-claims` (extra
+  access-token claims from `/auth/token-hook`). A schema package declares storage overlays in
+  a `dromon/schema-overlays.edn` classpath resource (`server.core/schema-overlays-resource`)
 
 ### Middleware chain (in order)
 telemere trace -> wrap-params -> muuntaja format -> fhir-exceptions -> fhir-decode -> store injection -> jwt-auth -> keto-authz -> handler

@@ -166,9 +166,18 @@
     (testing "the preflight admits the headers cookie mode and dev-token mode need,
               plus the trace-context headers an instrumented browser client sends"
       (let [hdrs (get-in (preflight allowed) [:headers "Access-Control-Allow-Headers"])]
-        (doseq [h ["Authorization" "Cookie" "X-Breeze-Client" "Content-Type"
+        (doseq [h ["Authorization" "Cookie" "Content-Type"
                    "traceparent" "b3"]]
           (is (clojure.string/includes? hdrs h) (str h " is not admitted")))))
+
+    (testing "a host's own request headers are admitted only when it names them"
+      (let [hdrs (fn [extra]
+                   (get-in ((middleware/wrap-cors (fn [_] {:status 200}) #{allowed} extra)
+                            {:request-method :options :headers {"origin" allowed}})
+                           [:headers "Access-Control-Allow-Headers"]))]
+        (is (not (clojure.string/includes? (hdrs nil) "X-Host-Csrf")))
+        (is (clojure.string/ends-with? (hdrs ["X-Host-Csrf" "X-Other"])
+                                       "traceparent, b3, X-Host-Csrf, X-Other"))))
 
     (testing "an origin outside the allowlist gets neither reflection nor credentials"
       (let [resp (preflight "https://evil.example")]

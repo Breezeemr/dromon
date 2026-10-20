@@ -1,0 +1,492 @@
+;; Lines that name a consuming host's systems and predate the check.
+;; `bb check-domains` allows them and nothing else; delete an entry
+;; once its line no longer names the host. See server.check-domains.
+[["CLAUDE.md"
+  "(`dromon-datomic`) reuses this same function, so it honors the same env"]
+ ["CLAUDE.md"
+  "| `ITemporalReadStore` | `temporal-axes`, `read-as-of`, `search-as-of`, `count-as-of-basis`, `resource-timeline` | fhir-store-xtdb2, fhir-store-datomic |"]
+ ["README.md"
+  "schema package (`:malli/uscore8`, `:malli/r4b`, a private Breeze IG outside"]
+ ["bb/src/server/compartment_e2e_runner.clj"
+  "[[run-with!]] (master-at-arms2's dromon-datomic does, for Datomic).\""]
+ ["bb/src/server/keto_realm_backfill.clj"
+  "(list-all-tuples \"breezeehr-role\" :relation \"has-role\" :subject-id prefixed)"]
+ ["bb/src/server/keto_realm_backfill.clj"
+  "(list-all-tuples \"breezeehr-role\" :relation \"has-role\")"]
+ ["bb/src/server/keto_realm_backfill.clj"
+  "(list-all-tuples \"practitioner-id\" :relation \"isa\" :subject-id prefixed))))"]
+ ["bb/src/server/keto_realm_backfill.clj"
+  "(list-all-tuples \"practitioner-id\" :relation \"isa\")))"]
+ ["bb/src/server/keto_realm_backfill.clj"
+  "(println \"WARNING: no realms found in breezeehr-role or practitioner-id.\")"]
+ ["bb/src/server/keto_realm_backfill.clj"
+  "`breezeehr-role` and `practitioner-id` namespaces, which spell their subject"]
+ ["bb/src/server/smart_grant.clj"
+  "host (flotilla) routes outside wrap-smart-scope, so they call"]
+ ["bb/test/server/keto_realm_backfill_test.clj"
+  ":subject_set {:namespace \"breezeehr-role\""]
+ ["docker/kratos.yml"
+  "# The login-consent app (Hydra login/consent challenge UI) serves the"]
+ ["docs/design/backends.md"
+  "backend lives in a separate `fhir-store-datomic` repo and is kept only for benchmarking"]
+ ["docs/design/backends.md"
+  "| `fhir-store-datomic` | the transaction entity every write already names, which is also the value of `:fhir/version-id` | planned |"]
+ ["docs/getting-started.md" "### Datomic (`fhir-store-datomic`)"]
+ ["docs/getting-started.md"
+  "the uscore8 and breeze schema packages, so it is routed, validated, and"]
+ ["docs/getting-started.md"
+  "| `ITemporalReadStore` | `temporal-axes`, `read-as-of`, `search-as-of`, `count-as-of-basis`, `resource-timeline` | fhir-store-xtdb2, fhir-store-datomic |"]
+ ["docs/keto-authorization.md"
+  "`breezeehr-role` and `practitioner-id` namespaces spell the same person"]
+ ["docs/keto-realm-scoping.md" "## `login-consent` has no realm"]
+ ["docs/keto-realm-scoping.md"
+  "(`login-consent handlers/accept-consent-and-link!`), so this accumulates per"]
+ ["docs/keto-realm-scoping.md"
+  "- Prerequisite: `login-consent` must have its realm configured (see below), or"]
+ ["docs/keto-realm-scoping.md"
+  "One tuple per realm per type, and membership comes from the `breezeehr-role`"]
+ ["docs/keto-realm-scoping.md"
+  "`breezeehr-role#has-role` on `\"<realm>/<role>\"` and `practitioner-id#isa` on"]
+ ["docs/keto-realm-scoping.md"
+  "`cookie-authentication/.../authentication.clj`'s `keto-relations`, not at the"]
+ ["docs/keto-realm-scoping.md"
+  "`cookie-authentication/.../authentication.clj`, `flotilla/.../bff.clj` and"]
+ ["docs/keto-realm-scoping.md" "`docs/flotilla-dromon2-removal.md`."]
+ ["docs/keto-realm-scoping.md"
+  "`flotilla/.../admin_routes.clj`. They read only the `breezeehr-role` and"]
+ ["docs/keto-realm-scoping.md"
+  "`flotilla/.../fhir.clj`'s `acting-practitioner-middleware`, which requires a"]
+ ["docs/keto-realm-scoping.md"
+  "`flotilla/dev/README.md:247-258` says so explicitly because it has already cost"]
+ ["docs/keto-realm-scoping.md"
+  "`login-consent` writes the SMART launch tuple"]
+ ["docs/keto-realm-scoping.md"
+  "`practitioner-id` namespaces, whose objects keep two segments."]
+ ["docs/keto-realm-scoping.md"
+  "`practitioner-id` tuple for the realm in the path. That is one tuple deep, it"]
+ ["docs/keto-realm-scoping.md"
+  "`server.grant/breeze-claims-for` applies the same prefix by hand."]
+ ["docs/keto-realm-scoping.md"
+  "evidence available is the subject's `breezeehr-role` / `practitioner-id`"]
+ ["docs/keto-realm-scoping.md"
+  "fhir:<realm>/Observation#read@(breezeehr-role:<realm>/provider#has-role)"]
+ ["docs/keto-realm-scoping.md"
+  "flotilla's impersonation containment rule (`admin_routes/act-as-in-realm`)"]
+ ["docs/keto-realm-scoping.md"
+  "list (`User`, `Group`, `fhir`, `breezeehr-role`, `practitioner-id`) and"]
+ ["docs/keto-realm-scoping.md"
+  "subject**. `flotilla/dev/README.md` provisions read+write for eighteen types by"]
+ ["docs/keto-realm-scoping.md"
+  "that is how `breezeehr-role` membership tuples spell their subject. The `fhir`"]
+ ["docs/keto-realm-scoping.md"
+  "tuples with no `breezeehr-role` or `practitioner-id` tuple to attribute a"]
+ ["docs/keto-realm-scoping.md"
+  "| `flotilla/dev/README.md` | the documented dev provisioning loop, read+write for eighteen types. Not updating it means every dev environment provisions the old shape |"]
+ ["docs/keto-realm-scoping.md"
+  "| `login-consent/src/com/breezeehr/login_consent/linkage.clj` `launch-tuple` | the SMART launch tuple. Its comment says \"same shapes as server.grant/grant-tuples\", so the two move together or SMART launch breaks |"]
+ ["docs/proposals/xtdb2-create-per-tx-floor.md"
+  "`dromon-datomic/src/com/breezeehr/dromon_datomic/core.clj` previously"]
+ ["docs/proposals/xtdb2-create-per-tx-floor.md"
+  "`fhir-store-datomic` showed xtdb2 trailing on `store/create` (mean 17.4 ms"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "(`:dromon-datomic/seeder`) has to"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "- `fhir-store-datomic/core.clj:60 ensure-tenant-conn!` does the"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "2. **The seeder (`:test-server/seeder` in dromon, `:dromon-datomic/seeder`"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "3. `fhir-store-datomic/docs/tasks/35-tenant-lifecycle.md` (mirrors"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "The seeder in both dromon (`:test-server/seeder`) and dromon-datomic"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "`fhir-store-datomic/docs/tasks/35-tenant-lifecycle.md`,"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "fast-path in `fhir-store-datomic.core/ensure-tenant-conn!`) should"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "in dromon-datomic)** — add an"]
+ ["docs/tasks/fhir-store-tenant-lifecycle-protocol.md"
+  "via `warmup-store!` on line 124; `dromon-datomic`'s runner"]
+ ["docs/tasks/fhir-store-tx-metadata-channel.md"
+  "- **furl: yes.** furl writes go through `IFHIRStore` verbs, so the seam"]
+ ["docs/tasks/fhir-store-tx-metadata-channel.md"
+  ":device    {:name      \"purser\"                  ; required inside :device"]
+ ["docs/tasks/fhir-store-tx-metadata-channel.md"
+  ":versions  {\"purser\" \"<git sha>\" \"rcm-x12\" \"<git sha>\"}"]
+ ["docs/tasks/fhir-store-tx-metadata-channel.md"
+  "The host's furl routes call `update-resource`, `delete-resource` and"]
+ ["docs/tasks/fhir-store-tx-metadata-channel.md"
+  "The host's own TODO claims a store seam closes \"the furl and narrative"]
+ ["docs/tasks/fhir-store-tx-metadata-channel.md"
+  "data. The host (flotilla) computes who made a request and emits it through"]
+ ["docs/tasks/fhir-store-tx-metadata-channel.md"
+  "the fn, stamps the furl path, and carries the Device and its version shas"]
+ ["docs/tasks/fhir-store-tx-metadata-channel.md"
+  "| fhir-store-datomic | the transaction entity every write already names — it is also the value of `:fhir/version-id`, so version-id -> tx entity -> stamp is one lookup |"]
+ ["docs/tasks/otel-telemere-instrumentation.md"
+  "- `dromon-datomic/perf-analysis/REPORT.md` — latency baseline the span"]
+ ["docs/tasks/tasklist.md"
+  "- `fhir-store-datomic/docs/tasks/34-otel-instrumentation.md` — Wrap every `IFHIRStore` method on `DatomicStore` in a `t/trace!` block mirroring the fhir-store-xtdb2 pattern. Today the datomic backend has zero `store/*` spans in Jaeger (vs xtdb2's `store/search` / `store/create` / `store/read` / `store/node.start` / `store/transact-transaction`), so no per-layer perf comparison is possible. **Lives in the fhir-store-datomic repo**, not this dromon repo."]
+ ["docs/tasks/tasklist.md"
+  "- `fhir-store-datomic/docs/tasks/35-tenant-lifecycle.md` — Implements the three methods on `DatomicStore`, delegating to `ensure-tenant-conn!` and refactoring the existing `:fhir-store/datomic-store` halt-key to iterate via the new `delete-tenant`. **Lives in the fhir-store-datomic repo**, not this dromon repo."]
+ ["fhir-defintions-to-malli/src/com/breezeehr/main.clj"
+  ";; (fhir-datomic-decant ig-extensions). Only the Extension StructureDefinitions are"]
+ ["fhir-defintions-to-malli/src/com/breezeehr/main.clj"
+  ";; The decant carries the CRD ext-coverage-information extension self-describing"]
+ ["fhir-defintions-to-malli/src/com/breezeehr/main.clj"
+  ";; generated; the CRD profiles are out of scope for the decant read surface. The"]
+ ["fhir-search-bench/README.md"
+  "# Datomic, from master-at-arms2/dromon-datomic (shared dev transactor on :4334)."]
+ ["fhir-search-bench/README.md"
+  "Not every store can resolve these to an entity (fhir-store-datomic aborts the"]
+ ["fhir-search-bench/README.md"
+  "bb report :b '\"../../dromon-datomic/target/bench-datomic.edn\"'"]
+ ["fhir-search-bench/README.md"
+  "bb writes-report :b '\"../../dromon-datomic/target/writes-datomic.edn\"'"]
+ ["fhir-search-bench/README.md"
+  "master-at-arms2's `dromon-datomic` does this for Datomic (`bb bench` there)."]
+ ["fhir-search-bench/README.md"
+  "them. Both are needed because fhir-store-datomic refuses a dangling reference"]
+ ["fhir-search-bench/src/fhir_search_bench/bench.clj"
+  "dromon-datomic does this for Datomic). `report` compares two result files:"]
+ ["fhir-search-bench/src/fhir_search_bench/bench.clj"
+  "store's result, e.g. dromon-datomic's target/bench-datomic.edn. Either may be"]
+ ["fhir-search-bench/src/fhir_search_bench/writes.clj"
+  ";; subject by its reference alone: fhir-store-datomic adds the Reference's"]
+ ["fhir-search-bench/src/fhir_search_bench/writes.clj"
+  "A slice of a Synthea bundle cuts some intra-patient links; fhir-store-datomic"]
+ ["fhir-search-bench/src/fhir_search_bench/writes.clj"
+  "reference it does not hold (fhir-store-datomic refuses a dangling one with"]
+ ["fhir-server/src/server/auth.clj"
+  "the BFF seam: flotilla authenticates the opaque session cookie itself and"]
+ ["fhir-server/src/server/bulk_export.clj"
+  "flotilla's realm-membership middleware are both bypassed. A realm-blind"]
+ ["fhir-server/src/server/handlers.clj"
+  "(flotilla's `com.breezeehr.flotilla.search.store/read-page`), so its page"]
+ ["fhir-server/src/server/handlers.clj"
+  "`count-resources` is exact on every store, but fhir-store-datomic"]
+ ["fhir-server/src/server/handlers.clj"
+  "that is what jib3's session transport sends. A bare operations array is"]
+ ["fhir-server/src/server/keto.clj"
+  "(com.breezeehr.cookie-authentication.authentication/unauthorized-response);"]
+ ["fhir-server/src/server/keto.clj"
+  ";; flotilla/.../fhir.clj `request->realm` uses. Read from the"]
+ ["fhir-server/src/server/keto.clj"
+  "config change. It is the same field mast's 401 carries"]
+ ["fhir-server/src/server/logging.clj"
+  "fhir-store-datomic.core -> fhir_store_datomic/core.clj. Used to fill"]
+ ["fhir-server/src/server/search_registry.clj"
+  "of the registry lookup (`fhir-store-datomic.search/build-param-clauses`),"]
+ ["fhir-server/src/server/temporal.clj"
+  "`rcm-design/design/02-bitemporality.md` §5.2). They are therefore additive"]
+ ["fhir-server/test/server/auth_test.clj"
+  "(is (= :aud (auth/claims-rejection {:aud [\"other\"]} {:audiences [\"flotilla\"]})))"]
+ ["fhir-server/test/server/auth_test.clj"
+  "(is (= :aud (auth/claims-rejection {:aud []} {:audiences [\"flotilla\"]})))"]
+ ["fhir-server/test/server/auth_test.clj"
+  "(is (= :aud (auth/claims-rejection {} {:audiences [\"flotilla\"]})))))"]
+ ["fhir-server/test/server/auth_test.clj"
+  "(is (= :client_id (auth/claims-rejection (assoc hydra-access-token-claims :client_id [\"jib3\"]) opts))))"]
+ ["fhir-server/test/server/auth_test.clj"
+  "(is (nil? (auth/claims-rejection {:aud \"flotilla\"} {:audiences [\"flotilla\"]})))"]
+ ["fhir-server/test/server/auth_test.clj"
+  "(is (nil? (auth/claims-rejection {:aud [\"other\" \"flotilla\"]} {:audiences [\"mcp\" \"flotilla\"]})))"]
+ ["fhir-server/test/server/auth_test.clj"
+  "(let [opts {:issuer hydra-issuer :audiences [\"https://flotilla.example/fhir\"]}]"]
+ ["fhir-server/test/server/auth_test.clj"
+  ":aud [\"https://flotilla.example/fhir\"]})))))"]
+ ["fhir-server/test/server/auth_test.clj"
+  ":aud [\"https://flotilla.example/fhir\"]})))))"]
+ ["fhir-server/test/server/auth_test.clj"
+  ":audiences [\"https://flotilla.example/fhir\"]})"]
+ ["fhir-server/test/server/auth_test.clj"
+  ":audiences [\"https://flotilla.example/fhir\"]})]"]
+ ["fhir-server/test/server/auth_test.clj"
+  "untouched -- this is the BFF seam: flotilla authenticates the"]
+ ["fhir-server/test/server/auth_test.clj"
+  "{:iss hydra-issuer :aud [\"jib3\"] :at_hash \"h\" :auth_time 1 :rat 1 :sid \"s\""]
+ ["fhir-server/test/server/auth_test.clj"
+  "{:iss hydra-issuer :aud [] :client_id \"jib3\" :scp [\"openid\" \"user/*.read\"]"]
+ ["fhir-server/test/server/handlers_test.clj"
+  "\"The shape FHIR puts a patch document in a Bundle entry, and the one jib3's"]
+ ["fhir-server/test/server/handlers_test.clj"
+  "\"The value fhir-store-datomic's transact-transaction returns when a"]
+ ["fhir-server/test/server/handlers_test.clj"
+  "throwing — the shape fhir-store-datomic produces on a failed"]
+ ["fhir-server/test/server/handlers_test.clj"
+  "{:resourceType \"Organization\" :id \"org1\" :name \"Breeze\"})"]
+ ["fhir-server/test/server/json_patch_test.clj"
+  "(testing \"the guarded note edit jib3's hospitalizations page sends\""]
+ ["fhir-server/test/server/json_patch_test.clj"
+  ";; The stored side is what a store reads back: fhir-store-datomic returns a"]
+ ["fhir-server/test/server/json_patch_test.clj"
+  ";; is the guard jib3's Observation editor needs: a test of the stored value"]
+ ["fhir-server/test/server/json_patch_test.clj"
+  ";; stored one a BigDecimal, as fhir-store-datomic reads a decimal back. This"]
+ ["fhir-server/test/server/keto_test.clj"
+  "breezeehr-role and practitioner-id already use\""]
+ ["fhir-server/test/server/keto_test.clj"
+  "routes bypass both the Keto middleware and flotilla's realm check\""]
+ ["fhir-server/test/server/router_test.clj"
+  "(is (= 200 (read {:client_id \"jib3\" :scp [\"user/*.read\"]})))"]
+ ["fhir-server/test/server/router_test.clj"
+  "(is (= 401 (read {:aud [\"jib3\"] :at_hash \"h\" :fhirUser \"Practitioner/forged\"}))"]
+ ["fhir-server/test/server/router_test.clj"
+  "(is (= [\"https://flotilla.example/fhir\"] (:jwt-audiences opts)))"]
+ ["fhir-server/test/server/router_test.clj"
+  "(testing \"external consumers (test-server tests, the jib2 contract spike)"]
+ ["fhir-server/test/server/router_test.clj"
+  ":jwt-audiences [\"https://flotilla.example/fhir\"]"]
+ ["fhir-server/test/server/router_test.clj"
+  ";; the Breeze IG that walk was ~90% of building the router."]
+ ["fhir-server/test/server/text_search_test.clj"
+  ";; from the record store, as flotilla's IndexedStore does: `missing` is a hit"]
+ ["fhir-server/test/server/text_search_test.clj"
+  ";; standing in for flotilla's IndexedStore. Reads and writes go to the mock"]
+ ["fhir-store-mock/src/fhir_store/mock/core.clj"
+  ";; A host lifecycle may keep rows of its own beside the resources (flotilla's"]
+ ["fhir-store-mock/src/fhir_store/mock/test_setup.clj"
+  "It replaces the store half of furl's test harness (pyr's mock client):"]
+ ["fhir-store-mock/src/fhir_store/mock/test_setup.clj"
+  "same ids in the same order on every run. The ids are UUID strings, as furl's"]
+ ["fhir-store-mock/src/fhir_store/mock/test_setup.clj"
+  "seeded random-id service minted, but not the same UUIDs: furl drew them"]
+ ["fhir-store-mock/src/fhir_store/mock/test_setup.clj"
+  "the resource field of the same name, as pyr's mock refused a search it"]
+ ["fhir-store-mock/src/fhir_store/mock/test_setup.clj"
+  "under If-Match of the version read, furl's `rest-swap`. Returns the stored"]
+ ["fhir-store-mock/src/fhir_store/mock/test_setup.clj"
+  "| furl / pyr                              | here                                   |"]
+ ["fhir-store-mock/src/fhir_store/mock/test_setup.clj"
+  "| hand-registered search answers          | the matcher; `pin-search!` only where it cannot evaluate a search or a fixture disagrees; `strict-search!` refuses what it cannot evaluate, as pyr's \\\"search not provided by mock\\\" did |"]
+ ["fhir-store-mock/test/fhir_store/mock/search_test.clj"
+  "\"The search shapes furl's eRx tests registered by hand against pyr's mock"]
+ ["fhir-store-mock/test/fhir_store/mock/search_test.clj"
+  "(deftest id-comma-or-and-furl-id-parameter"]
+ ["fhir-store-mock/test/fhir_store/mock/search_test.clj"
+  "(testing \"furl's id parameter, by the field\""]
+ ["fhir-store-mock/test/fhir_store/mock/search_test.clj"
+  "(testing \"furl's managingOrganization=Organization/x, which no registry declares, by the field\""]
+ ["fhir-store-mock/test/fhir_store/mock/search_test.clj"
+  "fhir-server builds for the Breeze capability (printed from"]
+ ["fhir-store-mock/test/fhir_store/mock/test_setup_test.clj"
+  "store, as flotilla's eRx member does.\""]
+ ["fhir-store-protocol/src/fhir_store/lifecycle.clj"
+  "A host (flotilla, for example) may need to do more than persist the body a"]
+ ["fhir-store-protocol/src/fhir_store/protocol.clj"
+  ":device    {:name      \\\"purser\\\"                  ; required inside :device"]
+ ["fhir-store-protocol/src/fhir_store/protocol.clj"
+  ":versions  {\\\"purser\\\" \\\"<git sha>\\\" \\\"rcm-x12\\\" \\\"<git sha>\\\"}"]
+ ["fhir-store-protocol/src/fhir_store/protocol.clj"
+  ";;                      (flotilla) by delegation to their base"]
+ ["fhir-store-protocol/src/fhir_store/protocol.clj"
+  ";;   fhir-store-datomic       not implemented"]
+ ["fhir-store-protocol/src/fhir_store/protocol.clj"
+  ";;   fhir-store-datomic ITemporalReadStore only               (system time)"]
+ ["fhir-store-protocol/src/fhir_store/protocol.clj"
+  ";;   fhir-store-datomic planned: `:db` is the db value the tx data is built"]
+ ["fhir-store-protocol/src/fhir_store/protocol.clj"
+  ";;   fhir-store-datomic planned: the transaction entity every write already"]
+ ["fhir-store-protocol/src/fhir_store/protocol.clj"
+  ";;   flotilla's IndexedStore  ITextSearchStore, per realm and per type"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(:tx-metadata/problem (problem {:device \"purser\"}))))"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(:tx-metadata/problem (problem {:device {:versions {\"purser\" \"a1\"}}})))"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(db/check-tx-metadata {:device {:name \"flotilla\"}}))"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(is (= \"exception\" (:fhir/code (problem \"purser\")))))"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(is (= 500 (:fhir/status (problem \"purser\"))))"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(is (= :not-a-map (:tx-metadata/problem (problem \"purser\"))))"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(is (= {:device {:name \"flotilla\"}}"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(let [m {:device {:name \"purser\"} :breeze/correlation-id \"abc\"}]"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  "(problem {:device {:name \"purser\" :versions {\"purser\" 3}}})))"]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  ":device    {:name \"purser\""]
+ ["fhir-store-protocol/test/fhir_store/tx_metadata_test.clj"
+  ":versions {\"purser\" \"a1b2c3d\" \"rcm-x12\" \"9f8e7d6\"}}})"]
+ ["fhir-store-xtdb2/src/fhir_store_xtdb2/core.clj"
+  "->xtdb-config for `opts`. Public so bulk importers (fhir-datomic-decant's"]
+ ["fhir-store-xtdb2/src/fhir_store_xtdb2/core.clj"
+  "Public (no-doc) so bulk importers (fhir-datomic-decant's xtdb target) reuse the"]
+ ["fhir-store-xtdb2/test/fhir_store_xtdb2/resource_level_search_test.clj"
+  "\"A registry like US Core Patient's or any purser type's: no `_lastUpdated`,"]
+ ["fhir-store-xtdb2/test/fhir_store_xtdb2/temporal_test.clj"
+  "`rcm-design/design/02-bitemporality.md` §2.1 and §2.2, expressed through the"]
+ ["perf-analysis/analyze-log.clj"
+  ";; Mirrors dromon-datomic/perf-analysis/analyze-log.clj so results from"]
+ ["perf-analysis/sample-mem.sh"
+  "# dromon-datomic/perf-analysis/sample-mem.sh so the two runs are comparable."]
+ ["test-server/deps.edn"
+  ":malli/breeze          {:extra-deps {com.breezeehr/fhir-malli-breeze          {:local/root \"../../fhir-igs/breeze-ig/malli/breeze\"}"]
+ ["test-server/deps.edn"
+  ";; Breeze IG capabilities + storage overlays (HumanName/Address USEP)."]
+ ["test-server/deps.edn"
+  ";; fhir-malli-breeze package references the fhir-igs"]
+ ["test-server/deps.edn"
+  "com.breezeehr/fhir-malli-breeze  {:local/root \"../../fhir-igs/breeze-ig/malli/breeze\"}}"]
+ ["test-server/deps.edn"
+  "com.breezeehr/fhir-malli-r4b             {:local/root \"../../fhir-igs/r4b\"}}}"]
+ ["test-server/deps.edn"
+  "com.breezeehr/fhir-malli-uscore8         {:local/root \"../../fhir-igs/uscore8\"}"]
+ ["test-server/src/test_server/core.clj"
+  ":breeze  'test-server.schemas.breeze})"]
+ ["test-server/src/test_server/core.clj"
+  ";; Breeze IG capabilities + storage overlays (USEP HumanName/Address)."]
+ ["test-server/src/test_server/core.clj"
+  ";; Requires the `:malli/breeze` deps alias."]
+ ["test-server/src/test_server/core.clj"
+  "Use :breeze with the `:malli/breeze` alias for Breeze IG"]
+ ["test-server/src/test_server/core.clj"
+  "capabilities and USEP card-one name/address storage."]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "\"Schema specs for the Breeze IG capability surface."]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Appointment/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Basic/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.CarePlan/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.CareTeam/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Claim/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.CodeSystem/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Composition/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Condition/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Consent/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Coverage/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Device/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.DiagnosticReport/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.DocumentReference/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Encounter/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Endpoint/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.FamilyMemberHistory/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Goal/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.HealthcareService/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Immunization/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.List/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Location/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Media/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Medication/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.MedicationDispense/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.MedicationRequest/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.MedicationStatement/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Observation/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Organization/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Patient/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Person/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Practitioner/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.PractitionerRole/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Procedure/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Provenance/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Questionnaire/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.QuestionnaireResponse/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.RelatedPerson/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Schedule/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.ServiceRequest/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Slot/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Specimen/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.Task/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "'breeze.capability.v1-0-0.ValueSet/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "(`:malli/breeze` alias). `server.core/resolve-schemas` applies the"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "(ns test-server.schemas.breeze"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  ";; Group: no breeze capability; base R4B for bulk export group membership"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "Breeze storage registry overlay when present, so HumanName/Address"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "Prefer Breeze capability namespaces; fall back to R4B full-sch maps"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "Uses `breeze.capability.v1-0-0.*` from the breeze-ig malli package"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "['breeze.capability.v1-0-0.AllergyIntolerance/capability"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "multi-string fields install as USEP card-one strings on the Datomic"]
+ ["test-server/src/test_server/schemas/breeze.clj"
+  "only where breeze-ig has no capability (rare).\""]
+ ["test-server/src/test_server/schemas/uscore8.clj"
+  ";; member via `actor`, used by the cabotage2 home screen."]
+ ["test-server/test/test_server/mock_search_registry_test.clj"
+  "(core/resolve-schemas breeze/specs))))"]
+ ["test-server/test/test_server/mock_search_registry_test.clj"
+  "[test-server.schemas.breeze :as breeze]))"]
+ ["test-server/test/test_server/mock_search_registry_test.clj"
+  "checks the copies still match, and runs furl's search shapes through the"]
+ ["test-server/test/test_server/mock_search_registry_test.clj"
+  "really builds for the Breeze capability. fhir-store-mock's own search tests"]
+ ["test-server/test/test_server/person_search_params_test.clj"
+  "\"Every parameter `breeze.capability.v1-0-0.Person/capability` declares.\""]
+ ["test-server/test/test_server/person_search_params_test.clj"
+  "(delay (first (core/resolve-schemas ['breeze.capability.v1-0-0.Person/capability]))))"]
+ ["test-server/test/test_server/person_search_params_test.clj"
+  "(testing \"active is the breeze SearchParameter over the boolean Person.active\""]
+ ["test-server/test/test_server/person_search_params_test.clj"
+  "Two more are authored in the CapabilityStatement. `active` is a breeze"]
+ ["test-server/test/test_server/person_search_params_test.clj"
+  "`fhir-igs/breeze-ig/package/CapabilityStatement-breeze-server.json`; its 19"]
+ ["test-server/test/test_server/person_search_params_test.clj"
+  "generated `breeze.capability.v1-0-0.Person/capability`. Nothing at runtime"]
+ ["test-server/test/test_server/search_param_contract_test.clj"
+  "\"Every resource type the Breeze surface serves, capability namespaces and"]
+ ["test-server/test/test_server/search_param_contract_test.clj"
+  "(delay (core/resolve-schemas breeze/specs)))"]
+ ["test-server/test/test_server/search_param_contract_test.clj"
+  ";; standing in for flotilla's IndexedStore behind a realm whose index is"]
+ ["test-server/test/test_server/search_param_contract_test.clj"
+  "[test-server.schemas.breeze :as breeze]))"]
+ ["test-server/test/test_server/search_param_contract_test.clj"
+  "`fhir-igs/breeze-ig/package/CapabilityStatement-breeze-server.json` —"]
+ ["test-server/test/test_server/search_param_contract_test.clj"
+  "index: the directory types jib3 searches by name\""]
+ ["test-server/test/test_server/terminology_routes_test.clj"
+  "\"The built-in terminology operations route on the Breeze surface test-server"]
+ ["test-server/test/test_server/terminology_routes_test.clj"
+  "(delay (ring/router (routing/build-fhir-routes (core/resolve-schemas breeze/specs))"]
+ ["test-server/test/test_server/terminology_routes_test.clj"
+  "[test-server.schemas.breeze :as breeze]))"]]

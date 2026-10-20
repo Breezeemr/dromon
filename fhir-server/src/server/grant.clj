@@ -92,8 +92,7 @@
 ;; Realm scoping
 ;;
 ;; Objects in the `fhir` namespace carry the realm as their first segment --
-;; "<realm>/Patient", "<realm>/Patient/<id>" -- matching the convention the
-;; breezeehr-role and practitioner-id namespaces already use. See
+;; "<realm>/Patient", "<realm>/Patient/<id>". See
 ;; docs/keto-realm-scoping.md for why the object is the only slot available.
 ;;
 ;; Writers DUAL-WRITE the realm-scoped and the legacy realm-blind shape for the
@@ -162,7 +161,11 @@
   (hc/delete (str (keto-url keto :admin-url) "/admin/relation-tuples")
              {:query-params query :throw-exceptions false}))
 
-(defn- list-tuples [keto query]
+(defn list-tuples
+  "The relation tuples matching `query` (Keto's list API parameters), first
+   page of 500, or nil when Keto answers other than 200. Public for a host's
+   `:token-claims` function, which reads Keto through the same `keto` map."
+  [keto query]
   (let [resp (hc/get (str (keto-url keto :read-url) "/relation-tuples")
                      {:query-params (assoc query "page_size" 500)
                       :as :json
@@ -175,23 +178,25 @@
 ;; ---------------------------------------------------------------------------
 
 (defn patient-member-types
-  "Resource types belonging to the Patient compartment (excluding Patient)."
-  []
-  (->> (get compartment/compartment-definitions "Patient")
-       keys
-       sort
-       vec))
+  "Resource types belonging to the Patient compartment (excluding Patient) in
+   `defs` (default R4B; see `server.compartment/with-overrides`)."
+  ([] (patient-member-types compartment/compartment-definitions))
+  ([defs]
+   (->> (get defs "Patient")
+        keys
+        sort
+        vec)))
 
 (defn- grant-object+relations
   "The [object relation] pairs a patient-set grant comprises, realm-blind.
    `grant-tuples` scopes each object to the realm."
-  [patient-ids relations]
+  [defs patient-ids relations]
   (-> []
       (into (for [pid patient-ids]
               [(str "Patient/" pid) launch-relation]))
       (into (for [pid patient-ids, rel relations]
               [(str "Patient/" pid) rel]))
-      (into (for [t (patient-member-types)
+      (into (for [t (patient-member-types defs)
                   rel relations
                   :when (not (instance-only-relations rel))]
               [t rel]))))
@@ -205,13 +210,18 @@
    reader back to the previous release still finds grants it understands; a
    grant written scoped-only would be invisible to it. It is a no-op when
    `realm` is blank, where the scoped object already IS the legacy object.
-   See docs/keto-realm-scoping.md."
-  [realm subject patient-ids relations legacy?]
-  (vec
-   (for [[object relation] (grant-object+relations patient-ids relations)
-         obj (cond-> [(scoped-object realm object)]
-               (and legacy? (not (str/blank? (str realm)))) (conj object))]
-     {:namespace "fhir" :object obj :relation relation :subject_id subject})))
+   See docs/keto-realm-scoping.md.
+
+   `defs` is the compartment definitions in force: its Patient members are
+   the types granted at type level."
+  ([realm subject patient-ids relations legacy?]
+   (grant-tuples compartment/compartment-definitions realm subject patient-ids relations legacy?))
+  ([defs realm subject patient-ids relations legacy?]
+   (vec
+    (for [[object relation] (grant-object+relations defs patient-ids relations)
+          obj (cond-> [(scoped-object realm object)]
+                (and legacy? (not (str/blank? (str realm)))) (conj object))]
+      {:namespace "fhir" :object obj :relation relation :subject_id subject}))))
 
 (defn grant-patient-set!
   "Grants `subject` access to the given patient ids within `realm`, with the
@@ -230,10 +240,15 @@
    A nil `realm` grants the legacy realm-blind shape, which is access in EVERY
    realm the deployment hosts. It stays callable so pre-existing callers keep
    working during the migration, and it is recorded on the event so such a
-   grant is findable afterwards."
-  [keto realm subject patient-ids & {:keys [relations] :or {relations default-relations}}]
-  (run! #(put-tuple! keto %) (grant-tuples realm subject patient-ids relations
-                                           (dual-write-legacy?)))
+   grant is findable afterwards.
+
+   `:compartment-definitions` names the Patient member types granted at type
+   level (default R4B; the HTTP handler passes the request's)."
+  [keto realm subject patient-ids & {:keys [relations compartment-definitions]
+                                     :or {relations default-relations
+                                          compartment-definitions compartment/compartment-definitions}}]
+  (run! #(put-tuple! keto %) (grant-tuples compartment-definitions realm subject patient-ids
+                                           relations (dual-write-legacy?)))
   (t/event! :grant/patient-set-granted
             {:data {:realm realm :realm-blind? (str/blank? (str realm))
                     :subject subject :patients (vec patient-ids)
@@ -305,8 +320,11 @@
    the legacy realm-blind object, and the realm-scoped object for every realm
    the subject holds a launch tuple for. Over-deleting is the only acceptable
    direction here -- a revoke that leaves one shape behind leaves the access it
-   was called to remove, and reports success."
-  [keto subject patient-ids]
+   was called to remove, and reports success. For the same reason the
+   type-level sweep covers the Patient members of R4B AND of
+   `:compartment-definitions`, so a grant written under other definitions is
+   still removed."
+  [keto subject patient-ids & {:keys [compartment-definitions]}]
   (let [;; Read before deleting: this is what tells us which realms the
         ;; subject's tuples live in, and they are deleted below.
         ;;
@@ -325,7 +343,8 @@
                             "object" object
                             "subject_id" subject}))
     (when (empty? (granted-patients keto subject))
-      (doseq [t (patient-member-types)
+      (doseq [t (sort (into (set (patient-member-types))
+                            (some-> compartment-definitions patient-member-types)))
               object (cons t (map #(scoped-object % t) realms))]
         (delete-tuples! keto {"namespace" "fhir" "object" object "subject_id" subject})))
     (t/event! :grant/patient-set-revoked
@@ -362,7 +381,9 @@
       :else {:status 201
              :body (assoc (grant-patient-set! (keto-endpoints req) realm subject patients
                                               :relations (or (not-empty relations)
-                                                             default-relations))
+                                                             default-relations)
+                                              :compartment-definitions
+                                              (compartment/request-definitions req))
                           :realm-blind? (str/blank? (str realm)))})))
 
 (defn read-grant
@@ -383,7 +404,10 @@
     (cond
       (str/blank? (str subject)) (bad-request "subject is required")
       (empty? patients) (bad-request "patients must be a non-empty list")
-      :else {:status 200 :body (revoke-patient-set! (keto-endpoints req) subject patients)})))
+      :else {:status 200
+             :body (revoke-patient-set! (keto-endpoints req) subject patients
+                                        :compartment-definitions
+                                        (compartment/request-definitions req))})))
 
 (defn my-patients
   "GET /auth/my-patients -- the authenticated subject's granted patient set.
@@ -494,62 +518,29 @@
                       "pass patient=<id> on the token request")})))))
 
 ;; ---------------------------------------------------------------------------
-;; First-party claims (mast BFF)
+;; Host claims
 ;;
-;; First-party clients (the mast backend-for-frontend) get realm/role claims
-;; resolved from the same Keto namespaces mast's cookie minting used:
-;; breezeehr-role `has-role` on "<realm>/<role>" and practitioner-id `isa` on
-;; "<realm>/<practitioner-uuid>". The claims land under `breeze` in the
-;; access token's ext, next to the SMART `patient` claim this hook already
-;; owns, so one hook serves both consumers.
+;; A host that wants claims of its own in the access token (realm or role
+;; claims its UI reads, say) passes `:token-claims` to
+;; `server.router/resolve-options`, a function of
+;;   {:keto keto :subject s :client-id c :payload hook-payload}
+;; returning a map merged into the token's `ext`, or nil. `keto` is the map
+;; `list-tuples` takes. It is called only for an end-user issuance that the
+;; launch decision did not deny.
 ;; ---------------------------------------------------------------------------
 
-(defn first-party-client-ids
-  "Client ids that receive first-party breeze claims, from the
-   FIRST_PARTY_CLIENT_IDS env var (comma separated)."
-  []
-  (into #{}
-        (comp (map str/trim) (remove str/blank?))
-        (str/split (str (System/getenv "FIRST_PARTY_CLIENT_IDS")) #",")))
-
-(defn resolve-first-party-claims
-  "Pure: Keto relation tuples -> the `breeze` access-token claim
-   {:realms [..] :roles {realm [..]} :practitioners {realm uuid}}.
-   :realms uses the same rule as mast's legacy cookie minting: the
-   intersection of realms granted a role and realms granting a
-   practitioner identity."
-  [role-tuples practitioner-tuples]
-  (let [split2        (fn [o] (some-> o str (str/split #"/" 2)))
-        roles         (reduce (fn [acc {:keys [object]}]
-                                (let [[realm role] (split2 object)]
-                                  (cond-> acc
-                                    (and realm role)
-                                    (update realm (fnil conj (sorted-set)) role))))
-                              {}
-                              role-tuples)
-        practitioners (reduce (fn [acc {:keys [object]}]
-                                (let [[realm practitioner-uuid] (split2 object)]
-                                  (cond-> acc
-                                    (and realm practitioner-uuid)
-                                    (assoc realm practitioner-uuid))))
-                              {}
-                              practitioner-tuples)]
-    {:realms        (vec (sort (filter (set (keys roles)) (keys practitioners))))
-     :roles         (into {} (map (fn [[realm role-set]] [realm (vec role-set)])) roles)
-     :practitioners practitioners}))
-
-(defn- breeze-claims-for
-  "Fetches and shapes the first-party claims for a Kratos subject. Keto
-   subject ids carry the user:/ prefix, as mast writes them."
-  [keto subject]
-  (let [keto-subject (str "user:/" subject)]
-    (resolve-first-party-claims
-      (list-tuples keto {"namespace" "breezeehr-role"
-                         "relation" "has-role"
-                         "subject_id" keto-subject})
-      (list-tuples keto {"namespace" "practitioner-id"
-                         "relation" "isa"
-                         "subject_id" keto-subject}))))
+(defn- host-claims
+  "The host's extra claims for this issuance, or nil. A function that throws
+   fails the hook (Hydra then refuses issuance) rather than issuing a token
+   without claims the host's clients rely on."
+  [token-claims keto subject client-id payload]
+  (when (and token-claims subject)
+    (let [claims (token-claims {:keto keto :subject subject :client-id client-id
+                                :payload payload})]
+      (when (and (some? claims) (not (map? claims)))
+        (throw (ex-info "token-claims must return a map or nil"
+                        {:returned (type claims)})))
+      (not-empty claims))))
 
 (defn token-hook-secret
   "TOKEN_HOOK_SECRET, or nil when unset. A function so a test can stand in
@@ -571,9 +562,9 @@
 (defn token-hook
   "POST /auth/token-hook -- Ory Hydra token webhook (OAUTH2_TOKEN_HOOK_URL).
    Injects the SMART `patient` launch claim into the access token when Keto
-   authorizes it, and `breeze` realm/role claims for first-party clients;
-   rejects issuance otherwise. When TOKEN_HOOK_SECRET is set, requires a
-   matching X-Token-Hook-Secret header."
+   authorizes it, and the host's `:token-claims` (see [[host-claims]]) for an
+   end user; rejects issuance otherwise. When TOKEN_HOOK_SECRET is set,
+   requires a matching X-Token-Hook-Secret header."
   [req]
   (let [secret (token-hook-secret)]
     (if (and secret (not (secret-matches? secret (get-in req [:headers "x-token-hook-secret"]))))
@@ -583,22 +574,20 @@
             client-id (or (get-in payload [:request :client_id])
                           (get-in payload [:session :client_id]))
             subject (end-user-subject payload)
-            first-party? (and subject (contains? (first-party-client-ids) client-id))
             decision (resolve-launch-patient payload
                                              #(granted-patients keto %)
                                              #(launch-authorized? keto %1 %2))
-            breeze (when (and first-party? (not (:deny decision)))
-                     (breeze-claims-for keto subject))]
+            extra (when-not (:deny decision)
+                    (host-claims (:fhir/token-claims req) keto subject client-id payload))]
         (t/event! :grant/token-hook
                   {:data {:client-id client-id
                           :decision decision
-                          :first-party (boolean first-party?)}})
+                          :host-claims (vec (sort (map name (keys extra))))}})
         (cond
           (:deny decision) {:status 403 :body {:error (:deny decision)}}
           :else
-          (let [ext (cond-> {}
-                      (:patient decision) (assoc :patient (:patient decision))
-                      breeze (assoc :breeze breeze))]
+          (let [ext (cond-> (or extra {})
+                      (:patient decision) (assoc :patient (:patient decision)))]
             (if (empty? ext)
               {:status 200 :body {}}
               {:status 200 :body {:session {:access_token ext}}})))))))

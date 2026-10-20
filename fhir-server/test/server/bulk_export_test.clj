@@ -431,7 +431,7 @@
       (is (after? t0 {:id "no-meta"})))))
 
 (deftest requested-types-resolution
-  (let [resolve @#'be/requested-types
+  (let [resolve (partial @#'be/requested-types compartment/compartment-definitions)
         regs    {"Patient" :r "Observation" :r "Location" :r}]
     (testing "_type narrows to the listed types for any kind"
       (is (= ["Patient" "Observation"]
@@ -442,7 +442,12 @@
     (testing ":patient/:group default to registered Patient-compartment members
               (Patient + Observation), excluding non-members like Location"
       (is (= #{"Patient" "Observation"} (set (resolve :patient {} regs))))
-      (is (= #{"Patient" "Observation"} (set (resolve :group {} regs)))))))
+      (is (= #{"Patient" "Observation"} (set (resolve :group {} regs)))))
+    (testing "members follow the compartment definitions in force"
+      (is (= #{"Patient" "Observation" "Location"}
+             (set (@#'be/requested-types
+                   (compartment/with-overrides {"Patient" {"Location" ["subject"]}})
+                   :patient {} regs)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Snapshot enumeration + streaming filters (collect-type)
@@ -470,7 +475,9 @@
                   "Observation" [{:resourceType "Observation" :id "o1" :subject {:reference "Patient/p1"}}
                                  {:resourceType "Observation" :id "o2" :subject {:reference "Patient/p2"}}
                                  {:resourceType "Observation" :id "o3" :subject {:reference "Patient/p3"}}]})
-        collect @#'be/collect-type
+        collect (fn [store tenant basis & more]
+                  (apply @#'be/collect-type store tenant basis
+                         compartment/compartment-definitions more))
         basis   (db/current-basis store "default")
         owners  #{"p1" "p2"}]
     (testing "owner Patient rows are confined to the subject set by id"
@@ -491,7 +498,9 @@
                               :meta {:lastUpdated (java.time.Instant/parse "2026-06-01T00:00:00Z")}}
                              {:resourceType "Patient" :id "old-f" :gender "female"
                               :meta {:lastUpdated (java.time.Instant/parse "2025-06-01T00:00:00Z")}}]})
-        collect @#'be/collect-type
+        collect (fn [store tenant basis & more]
+                  (apply @#'be/collect-type store tenant basis
+                         compartment/compartment-definitions more))
         basis   (db/current-basis store "default")
         t0      (java.time.Instant/parse "2026-01-01T00:00:00Z")]
     (testing "_typeFilter narrows the streamed set (in-memory equality)"
