@@ -255,7 +255,12 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   then runs alone. Any other failure leaves the commit unknown, so the group's
   entries fail without a retry rather than risk writing a POST twice. A group
   never holds two writes to one resource (they would share a versionId), and
-  a GET of a resource the open group writes closes it first.
+  a GET of a resource the open group writes closes it first. A lifecycle's
+  `:db` reads of OTHER resources see the state before the group, as in a
+  transaction Bundle, so an entry no longer sees an earlier entry's commit
+  there (FHIR forbids interdependent batch entries). A transport failure
+  with an unknown outcome fails the whole group (up to 1000 entries) rather
+  than one entry.
 - `vread`'s `vid` is the FHIR versionId, the `fhir_version` column, as in the
   mock and datomic stores. It is matched across `FOR ALL SYSTEM_TIME`, never
   read `AS OF` a time; point-in-time reads are `$as-of`.
