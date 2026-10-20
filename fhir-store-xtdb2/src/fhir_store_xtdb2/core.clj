@@ -2609,8 +2609,10 @@
 ;; one its verb gives, against the state the group left.
 ;;
 ;; A group never holds two entries naming the same resource, and a GET of a
-;; resource the open group writes closes it first, so each entry sees what
-;; the entries before it wrote, as when they ran one by one.
+;; resource the open group writes closes it first, so a GET or write sees
+;; what the entries before it wrote to that resource. A lifecycle's reads of
+;; OTHER resources see the state before the group, as a transaction Bundle
+;; entry's do: FHIR forbids interdependent batch entries.
 ;; ---------------------------------------------------------------------------
 
 (def ^:private batch-group-max-entries 1000)

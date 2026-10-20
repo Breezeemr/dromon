@@ -68,7 +68,12 @@
      :db             the store's read handle for this write. Datomic: the db
                      value the tx data is built from (inside a transaction
                      Bundle, the one db every entry is built from). xtdb2:
-                     the node or jdbc connection being written through.
+                     the node or jdbc connection being written through;
+                     inside a batch Bundle it reads the state before the
+                     entry's group, so a read of ANOTHER resource does not
+                     see an earlier entry of that group (FHIR forbids
+                     interdependent batch entries; send those as a
+                     transaction).
                      mock: the tenant's immutable state value the write is
                      computed from, before the write; inside a transaction
                      Bundle, before the whole Bundle, as Datomic's. Where the
