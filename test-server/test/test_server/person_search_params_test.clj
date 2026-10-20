@@ -8,7 +8,10 @@
    generated `breeze.capability.v1-0-0.Person/capability`. Nothing at runtime
    reads the authored JSON for parameters, so the declaration is not the risk.
 
-   The twentieth, `_text`, is the exception to everything below: it is
+   Two more are authored in the CapabilityStatement. `active` is a breeze
+   SearchParameter (`person-active`, expression `Person.active`), since R4B's
+   Person declares none; it resolves like any R4B parameter and is pinned
+   with them. `_text` is the exception to everything below: it is
    authored in the CapabilityStatement, its SearchParameter (Resource-text)
    has no expression, so the registry can never resolve it, and the search
    handler grants it from the store (`fhir-store.protocol/ITextSearchStore`)
@@ -35,7 +38,7 @@
 
 (def ^:private declared-params
   "Every parameter `breeze.capability.v1-0-0.Person/capability` declares."
-  #{"_text"
+  #{"_text" "active"
     "address" "address-city" "address-country" "address-postalcode"
     "address-state" "address-use" "birthdate" "email" "gender" "identifier"
     "link" "name" "organization" "patient" "phone" "phonetic" "practitioner"
@@ -52,11 +55,11 @@
 (def ^:private person-search-minimum
   "The subset person-search grows into. Called out separately from the pinned
    set so a failure says which page breaks, not just that a set changed."
-  #{"name" "birthdate" "gender" "identifier" "telecom" "address"})
+  #{"name" "birthdate" "gender" "identifier" "telecom" "address" "active"})
 
-(deftest person-declares-twenty-search-params
+(deftest person-declares-twenty-one-search-params
   (let [declared (into #{} (map :name) (:search-params (person-properties)))]
-    (is (= 20 (count declared)))
+    (is (= 21 (count declared)))
     (is (= declared-params declared)
         "the generated capability's declared set changed; regenerate expectations
          only after confirming the base-R4B merge really did change")))
@@ -72,7 +75,7 @@
       (is (= person-search-params (set (keys registry)))
           (str "declared but dropped: "
                (pr-str (vec (sort (remove (set (keys registry)) declared-params))))))
-      (is (= 19 (count registry)))
+      (is (= 20 (count registry)))
       (is (not (contains? registry "_text"))
           "_text is a store capability, not a registry entry; a registry that
            resolved it would let a store without an index run it unfiltered"))
@@ -99,7 +102,11 @@
                :fixed {:system "email"}}]
              (:columns (get registry "email"))))
       (is (= [{:col "telecom" :fhir-type "ContactPoint" :array? true}]
-             (:columns (get registry "telecom")))))))
+             (:columns (get registry "telecom")))))
+
+    (testing "active is the breeze SearchParameter over the boolean Person.active"
+      (is (= [{:col "active" :fhir-type "boolean" :array? false}]
+             (:columns (get registry "active")))))))
 
 (deftest person-rejects-parameters-r4b-does-not-define-for-person
   (let [registry (person-registry)]
@@ -110,6 +117,12 @@
               the page must search on `name`"
       (is (= ["family"] (sr/unsupported-filter-params registry {"family" "smith"})))
       (is (= ["given"] (sr/unsupported-filter-params registry {"given" "ann"}))))
+
+    (testing "active is accepted alone and beside _text, the one filter the
+              entity index takes with it"
+      (is (= [] (sr/unsupported-filter-params registry {"identifier" "1" "active" "true"})))
+      (is (= [] (sr/unsupported-filter-params registry {"_text" "smith" "active" "true"}
+                                              {:text-search? true}))))
 
     (testing "_text is refused by the registry alone and granted only with the
               store's say-so"
