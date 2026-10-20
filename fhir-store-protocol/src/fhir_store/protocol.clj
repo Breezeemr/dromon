@@ -303,11 +303,13 @@
      reports the status of each input entry in the original order.
 
      `opts` may contain:
-     - :tx-metadata — the SAME stamp applied to each entry's own
-       transaction. A batch is many transactions, so the map is written
-       many times; entries that fail commit nothing and are stamped
-       nowhere, which is the correct reading of a stamp: it exists only
-       for a write that landed.")
+     - :tx-metadata — the SAME stamp applied to each transaction the
+       batch commits: one per entry, or one per group where a store
+       commits several entries together (fhir-store-xtdb2 does). A batch
+       is many transactions, so the map is written many times; entries
+       that fail commit nothing and are stamped nowhere, which is the
+       correct reading of a stamp: it exists only for a write that
+       landed.")
   (resource-deleted? [this tenant-id resource-type id]
     "Returns true if the resource was previously created and then deleted,
      false if it exists or was never created.")

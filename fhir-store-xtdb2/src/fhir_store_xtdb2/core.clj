@@ -2583,6 +2583,320 @@
   (not-empty (cond-> (dissoc opts :if-match)
                if-match (assoc :if-match if-match))))
 
+(defn- put-op
+  "The op that writes `resource` (already prepared) as `id`, for `query-mode`."
+  [query-mode resource-type id resource storage-encoders]
+  (if (= query-mode :xtql)
+    [:put-docs (keyword resource-type)
+     (doc->put-doc (encode-resource-doc resource-type id resource storage-encoders))]
+    (let [[sql args] (extract-and-build-sql resource-type id resource storage-encoders)]
+      [:sql sql args])))
+
+(defn- delete-op [query-mode resource-type id]
+  (if (= query-mode :xtql)
+    [:delete-docs (keyword resource-type) id]
+    [:sql (format "DELETE FROM %s WHERE _id = ?" (table-name resource-type)) [id]]))
+
+;; ---------------------------------------------------------------------------
+;; Batch Bundles.
+;;
+;; A batch's entries are independent: one that fails must not affect the
+;; others. Running each through its own write verb gives that, but costs one
+;; transaction, and one log round trip, per entry. So consecutive writes are
+;; committed together in one transaction, a group, and an entry that fails
+;; inside it is taken out and run on its own through its write verb once the
+;; rest has committed. Every response a failing entry gets is therefore the
+;; one its verb gives, against the state the group left.
+;;
+;; A group never holds two entries naming the same resource, and a GET of a
+;; resource the open group writes closes it first, so each entry sees what
+;; the entries before it wrote, as when they ran one by one.
+;; ---------------------------------------------------------------------------
+
+(def ^:private batch-group-max-entries 1000)
+
+(def ^:private batch-group-max-aborts
+  "Entries a group may lose to a failed op before the rest run one by one: a
+   lost entry costs a resubmission of the whole group."
+  3)
+
+(defn- batch-entry-response
+  "One batch entry run through the store's own verbs, failures included, as
+   its batch-response entry."
+  [store tenant-id opts entry]
+  (try
+    (let [req-map (:request entry)
+          method (some-> (:method req-map) str/upper-case)
+          url (:url req-map)
+          parts (when url (str/split url #"/"))
+          resource-type (first parts)
+          id (second parts)
+          resource (:resource entry)
+          ;; update-sql/delete-sql normalize the ETag spellings
+          ;; themselves; this only decides whether the entry
+          ;; carries a precondition at all.
+          entry-if-match (or (:ifMatch req-map) (get req-map "ifMatch"))]
+      (case method
+        "POST"
+        (let [new-id (str (java.util.UUID/randomUUID))
+              res (fp/create-resource store tenant-id (keyword resource-type) new-id resource
+                                      (assoc (entry-opts opts nil) :id-minted? true))
+              vid (get-in res [:meta :versionId])
+              last-mod (str (get-in res [:meta :lastUpdated]))]
+          {:resource res
+           :response (cond-> {:status "201 Created"}
+                       vid (assoc :etag (str "W/\"" vid "\"")
+                                  :location (str "/" tenant-id "/fhir/" resource-type "/" (:id res) "/_history/" vid))
+                       last-mod (assoc :lastModified last-mod))})
+
+        "PUT"
+        (let [res (if-let [o (entry-opts opts entry-if-match)]
+                    (fp/update-resource store tenant-id (keyword resource-type) id resource o)
+                    (fp/update-resource store tenant-id (keyword resource-type) id resource))
+              vid (get-in res [:meta :versionId])
+              last-mod (str (get-in res [:meta :lastUpdated]))]
+          {:resource res
+           :response (cond-> {:status "200 OK"}
+                       vid (assoc :etag (str "W/\"" vid "\""))
+                       last-mod (assoc :lastModified last-mod))})
+
+        "DELETE"
+        (do (if-let [o (entry-opts opts entry-if-match)]
+              (fp/delete-resource store tenant-id (keyword resource-type) id o)
+              (fp/delete-resource store tenant-id (keyword resource-type) id))
+            {:response {:status "204 No Content"}})
+
+        "GET"
+        (let [res (fp/read-resource store tenant-id (keyword resource-type) id)]
+          (if res
+            (let [vid (get-in res [:meta :versionId])
+                  last-mod (str (get-in res [:meta :lastUpdated]))]
+              {:resource res
+               :response (cond-> {:status "200 OK"}
+                           vid (assoc :etag (str "W/\"" vid "\""))
+                           last-mod (assoc :lastModified last-mod))})
+            {:response {:status "404 Not Found"
+                        :outcome {:resourceType "OperationOutcome"
+                                  :issue [{:severity "error"
+                                           :code "not-found"
+                                           :diagnostics (str resource-type "/" id " not found")}]}}}))
+
+        {:response {:status "400 Bad Request"
+                    :outcome {:resourceType "OperationOutcome"
+                              :issue [{:severity "error"
+                                       :code "invalid"
+                                       :diagnostics (str "Unsupported method: " method)}]}}}))
+    (catch Exception e
+      (let [{:fhir/keys [expression location]}
+            (some #(when (:fhir/status (ex-data %)) (ex-data %))
+                  (take-while some? (iterate ex-cause e)))]
+        {:response {:status "400 Bad Request"
+                    :outcome {:resourceType "OperationOutcome"
+                              :issue [(cond-> {:severity "error"
+                                               :code "exception"
+                                               :diagnostics (str "Entry failed: " (ex-message e))}
+                                        (seq expression) (assoc :expression expression)
+                                        (seq location) (assoc :location location))]}}}))))
+
+(defn- classify-batch-entry
+  "How the batch runs `entry`: :group for a write a group can carry, :read for
+   one that writes nothing (a GET, an unsupported method), :alone for a write
+   only its own verb can judge (no type, no id, no body). :key names the
+   resource it touches."
+  [idx entry]
+  (let [req (:request entry)
+        method (when (string? (:method req)) (str/upper-case (:method req)))
+        [resource-type id] (when (string? (:url req)) (str/split (:url req) #"/"))
+        if-match (or (:ifMatch req) (get req "ifMatch"))
+        base {:idx idx :entry entry :method method :resource-type resource-type :id id
+              :key [resource-type id] :if-match if-match}]
+    (case method
+      ("POST" "PUT" "DELETE")
+      (if (and (not (str/blank? resource-type))
+               (or (= "POST" method) (not (str/blank? id)))
+               (or (= "DELETE" method) (map? (:resource entry))))
+        (cond-> (assoc base :run :group)
+          ;; A POST's id is minted, so it collides with nothing.
+          (= "POST" method) (assoc :key nil))
+        (assoc base :run :alone))
+      (assoc base :run :read))))
+
+(defn- batch-segments
+  "Splits classified entries, in order, into segments run one after another:
+   {:group [...] :reads [...]} or {:alone entry}. A group's reads run before
+   it commits, so each must not name a resource the group writes before it."
+  [classified]
+  (let [close (fn [{:keys [segs open]}]
+                {:segs (cond-> segs (or (seq (:group open)) (seq (:reads open))) (conj open))
+                 :open {:group [] :reads [] :keys #{}}})
+        state (reduce
+               (fn [{:keys [open] :as st} {:keys [run key] :as e}]
+                 (case run
+                   :group (let [st (if (or (contains? (:keys open) key)
+                                           (>= (count (:group open)) batch-group-max-entries))
+                                     (close st)
+                                     st)]
+                            (-> st
+                                (update-in [:open :group] conj e)
+                                (update-in [:open :keys] (fn [ks] (cond-> ks key (conj key))))))
+                   :read (let [st (if (contains? (:keys open) key) (close st) st)]
+                           (update-in st [:open :reads] conj e))
+                   :alone (-> (close st) (update :segs conj {:alone e}))))
+               {:segs [] :open {:group [] :reads [] :keys #{}}}
+               classified)]
+    (:segs (close state))))
+
+(defn- plan-batch-write
+  "The ops and lifecycle write for one :group entry, built against `db`, the
+   handle the group commits through. Throws whatever the entry's own verb
+   would refuse it for before sending anything; the caller then runs it alone.
+   `versions` maps [type id] to the current version, read for guarded entries."
+  [store tenant-id opts db versions
+   {:keys [method resource-type id if-match entry] :as e}]
+  (let [{:keys [query-mode storage-encoders]} store
+        id (if (= "POST" method) (str (java.util.UUID/randomUUID)) id)
+        _ (refuse-unencodable-input! {:resource-type resource-type :id id})
+        guard (when if-match
+                (entry-if-match {:if-match (fp/normalize-if-match if-match)
+                                 :resource-type resource-type :id id}
+                                (get versions [resource-type id])))
+        assert-ops (cond-> [] guard (conj (version-assert-op resource-type id guard)))]
+    (if (= "DELETE" method)
+      (assoc e :id id :ops (conj assert-ops (delete-op query-mode resource-type id)))
+      (let [;; As the entry's own verb: a POST takes no If-Match.
+            lc-opts (entry-opts opts (when (= "PUT" method) if-match))
+            write (lifecycle-write (lifecycle-ctx store tenant-id lc-opts)
+                                   db
+                                   (if (= "POST" method) :create :update)
+                                   resource-type id (:resource entry))
+            own-ops (conj assert-ops (put-op query-mode resource-type id (:resource write)
+                                             storage-encoders))]
+        (assoc e :id id :write write
+               :ops (into own-ops (lifecycle-tx-ops write)))))))
+
+(defn- blamed-plan
+  "The plan whose op `e`, a failed execute-tx of `plans`' ops, names."
+  [plans e]
+  (when-let [idx (:tx-op-idx (ex-data e))]
+    (reduce (fn [start p]
+              (let [end (+ start (count (:ops p)))]
+                (if (< idx end) (reduced p) end)))
+            0 plans)))
+
+(defn- tx-refused-unsent?
+  "True when execute-tx refused the transaction before the log took it (a
+   statement that does not parse, a doc without an id): nothing committed, and
+   no op is named."
+  [e]
+  (and (nil? (:tx-op-idx (ex-data e)))
+       (= :cognitect.anomalies/incorrect (:cognitect.anomalies/category (ex-data e)))))
+
+(defn- execute-batch-group!
+  "Commits `plans` in one transaction, taking out each one a failed op names
+   and resubmitting the rest. Returns {:tx-key :landed :alone} with :alone the
+   plans to run alone; or, when a failure leaves the commit unknown,
+   {:error e :failed plans} so that no entry is written twice."
+  [db plans]
+  (loop [pending plans aborts 0 alone []]
+    (if (empty? pending)
+      {:landed [] :alone alone}
+      (let [r (try {:tx-key (xt/execute-tx db (into [] (mapcat :ops) pending))}
+                   (catch Exception e {:error e}))]
+        (if-let [tx-key (:tx-key r)]
+          {:tx-key tx-key :landed pending :alone alone}
+          (let [e (:error r)
+                blamed (blamed-plan pending e)]
+            (cond
+              (and blamed (< aborts batch-group-max-aborts))
+              (recur (filterv #(not= (:idx %) (:idx blamed)) pending)
+                     (inc aborts) (conj alone blamed))
+
+              (or blamed (tx-refused-unsent? e))
+              {:landed [] :alone (into alone pending)}
+
+              :else
+              {:landed [] :alone alone :error e :failed pending})))))))
+
+(defn- run-batch-group!
+  "Plans and commits one group's entries through one handle; returns
+   {:responses {idx response} :alone [entries to run alone]}."
+  [store tenant-id opts group]
+  (let [{:keys [node pool] :as tenant} (get-or-create-entry store tenant-id)
+        run (fn [db]
+              (let [;; Guarded entries read the version they replace in one
+                    ;; query per type, as a transaction Bundle's PUTs do.
+                    versions (->> (filter :if-match group)
+                                  (group-by :resource-type)
+                                  (reduce (fn [acc [rt es]]
+                                            (try
+                                              (ensure-declared! tenant rt)
+                                              (into acc (map (fn [[id v]] [[rt id] v]))
+                                                    (current-versions-bulk db rt (map :id es)))
+                                              ;; Planning then refuses each guard,
+                                              ;; and the entries run alone.
+                                              (catch Exception _ acc)))
+                                          {}))
+                    planned (mapv (fn [e]
+                                    (try
+                                      (ensure-declared! tenant (:resource-type e))
+                                      (plan-batch-write store tenant-id opts db versions e)
+                                      (catch Exception _ (assoc e :unplanned? true))))
+                                  group)
+                    {:keys [tx-key landed alone error failed]}
+                    (ftrace/trace!
+                     {:id :store/transact-bundle.group
+                      :data {:entry-count (count group)}}
+                     (execute-batch-group! db (filterv (complement :unplanned?) planned)))
+                    vid (when tx-key (version-of-system-time (:system-time tx-key)))]
+                (doseq [{:keys [write]} landed :when write]
+                  (fire-after-commit! (lifecycle-ctx store tenant-id opts) [write] tx-key))
+                {:responses
+                 (into {}
+                       (concat
+                        (for [{:keys [idx method resource-type id write]} landed]
+                          [idx (if (= "DELETE" method)
+                                 {:response {:status "204 No Content"}}
+                                 (let [res (committed (:resource write) id vid tx-key)
+                                       last-mod (str (get-in res [:meta :lastUpdated]))]
+                                   {:resource res
+                                    :response (cond-> {:status (if (= "POST" method) "201 Created" "200 OK")
+                                                       :etag (str "W/\"" vid "\"")}
+                                                (= "POST" method)
+                                                (assoc :location (str "/" tenant-id "/fhir/" resource-type
+                                                                      "/" id "/_history/" vid))
+                                                true (assoc :lastModified last-mod))}))])
+                        (for [{:keys [idx]} failed]
+                          [idx {:response {:status "400 Bad Request"
+                                           :outcome {:resourceType "OperationOutcome"
+                                                     :issue [{:severity "error"
+                                                              :code "exception"
+                                                              :diagnostics (str "Entry failed: " (ex-message error))}]}}}])))
+                 :alone (sort-by :idx (concat (filter :unplanned? planned) alone))}))]
+    (if (= :xtql (:query-mode store))
+      (run node)
+      (with-conn [conn pool] (run conn)))))
+
+(defn- batch-response-entries
+  "The batch-response entries for `entries`, in input order."
+  [store tenant-id opts entries]
+  (let [alone! (fn [acc {:keys [idx entry]}]
+                 (assoc acc idx (batch-entry-response store tenant-id opts entry)))
+        responses
+        (reduce
+         (fn [acc seg]
+           (if-let [e (:alone seg)]
+             (alone! acc e)
+             (let [acc (reduce alone! acc (:reads seg))]
+               (if (seq (:group seg))
+                 ;; The handle is given back before any entry runs alone, so
+                 ;; a pool of one connection still serves them.
+                 (let [{:keys [responses alone]} (run-batch-group! store tenant-id opts (:group seg))]
+                   (reduce alone! (merge acc responses) alone))
+                 acc))))
+         {}
+         (batch-segments (map-indexed classify-batch-entry entries)))]
+    (mapv responses (range (count entries)))))
+
 (defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode pool-opts]
   IFHIRStore
 
@@ -2814,26 +3128,14 @@
           ;; pathway emits [:put-docs table doc] / [:delete-docs table id],
           ;; bypassing the INSERT planner entirely. execute-tx accepts both
           ;; shapes (and a mix with [:sql ASSERT ...]) in one atomic call.
-          xtql-mode? (= query-mode :xtql)
           lc-ctx (lifecycle-ctx this tenant-id opts)
           ;; `resource` is the lifecycle-PREPARED body for POST/PUT, never
           ;; the entry's submitted one.
           emit-write-op
           (fn [{:keys [method resource-type id] :as _em} resource _vid]
             (case method
-              ("POST" "PUT")
-              (if xtql-mode?
-                [:put-docs (keyword resource-type)
-                 (doc->put-doc
-                  (encode-resource-doc resource-type id resource storage-encoders))]
-                (let [[sql args] (extract-and-build-sql
-                                   resource-type id resource storage-encoders)]
-                  [:sql sql args]))
-              "DELETE"
-              (if xtql-mode?
-                [:delete-docs (keyword resource-type) id]
-                [:sql (format "DELETE FROM %s WHERE _id = ?" (table-name resource-type))
-                 [id]])))
+              ("POST" "PUT") (put-op query-mode resource-type id resource storage-encoders)
+              "DELETE" (delete-op query-mode resource-type id)))
           ;; POST/PUT entries run the lifecycle here, once each id is chosen
           ;; and before anything is encoded. Their tx-ops are collected per
           ;; entry and appended after ALL of the bundle's own write ops.
@@ -2956,93 +3258,16 @@
     (fp/transact-bundle this tenant-id entries nil))
 
   (transact-bundle [this tenant-id entries opts]
-    ;; Batch semantics: each entry is processed independently via the
-    ;; single-resource CRUD methods on this store. Per-entry failures
-    ;; are captured as OperationOutcome responses and do NOT affect
-    ;; other entries. Returns a batch-response Bundle in input order.
+    ;; Batch semantics: entries are independent, and a failing one is
+    ;; answered with an OperationOutcome without affecting the others. See
+    ;; batch-response-entries for how they share transactions. Returns a
+    ;; batch-response Bundle in input order.
     (ftrace/trace!
      {:id :store/transact-bundle
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
-     (let [results
-           (mapv
-            (fn [entry]
-              (try
-                (let [req-map (:request entry)
-                      method (some-> (:method req-map) str/upper-case)
-                      url (:url req-map)
-                      parts (when url (str/split url #"/"))
-                      resource-type (first parts)
-                      id (second parts)
-                      resource (:resource entry)
-                      ;; update-sql/delete-sql normalize the ETag spellings
-                      ;; themselves; this only decides whether the entry
-                      ;; carries a precondition at all.
-                      entry-if-match (or (:ifMatch req-map) (get req-map "ifMatch"))]
-                  (case method
-                    "POST"
-                    (let [new-id (str (java.util.UUID/randomUUID))
-                          res (fp/create-resource this tenant-id (keyword resource-type) new-id resource
-                                                  (assoc (entry-opts opts nil) :id-minted? true))
-                          vid (get-in res [:meta :versionId])
-                          last-mod (str (get-in res [:meta :lastUpdated]))]
-                      {:resource res
-                       :response (cond-> {:status "201 Created"}
-                                   vid (assoc :etag (str "W/\"" vid "\"")
-                                              :location (str "/" tenant-id "/fhir/" resource-type "/" (:id res) "/_history/" vid))
-                                   last-mod (assoc :lastModified last-mod))})
-
-                    "PUT"
-                    (let [res (if-let [o (entry-opts opts entry-if-match)]
-                                (fp/update-resource this tenant-id (keyword resource-type) id resource o)
-                                (fp/update-resource this tenant-id (keyword resource-type) id resource))
-                          vid (get-in res [:meta :versionId])
-                          last-mod (str (get-in res [:meta :lastUpdated]))]
-                      {:resource res
-                       :response (cond-> {:status "200 OK"}
-                                   vid (assoc :etag (str "W/\"" vid "\""))
-                                   last-mod (assoc :lastModified last-mod))})
-
-                    "DELETE"
-                    (do (if-let [o (entry-opts opts entry-if-match)]
-                          (fp/delete-resource this tenant-id (keyword resource-type) id o)
-                          (fp/delete-resource this tenant-id (keyword resource-type) id))
-                        {:response {:status "204 No Content"}})
-
-                    "GET"
-                    (let [res (fp/read-resource this tenant-id (keyword resource-type) id)]
-                      (if res
-                        (let [vid (get-in res [:meta :versionId])
-                              last-mod (str (get-in res [:meta :lastUpdated]))]
-                          {:resource res
-                           :response (cond-> {:status "200 OK"}
-                                       vid (assoc :etag (str "W/\"" vid "\""))
-                                       last-mod (assoc :lastModified last-mod))})
-                        {:response {:status "404 Not Found"
-                                    :outcome {:resourceType "OperationOutcome"
-                                              :issue [{:severity "error"
-                                                       :code "not-found"
-                                                       :diagnostics (str resource-type "/" id " not found")}]}}}))
-
-                    {:response {:status "400 Bad Request"
-                                :outcome {:resourceType "OperationOutcome"
-                                          :issue [{:severity "error"
-                                                   :code "invalid"
-                                                   :diagnostics (str "Unsupported method: " method)}]}}}))
-                (catch Exception e
-                  (let [{:fhir/keys [expression location]}
-                        (some #(when (:fhir/status (ex-data %)) (ex-data %))
-                              (take-while some? (iterate ex-cause e)))]
-                    {:response {:status "400 Bad Request"
-                                :outcome {:resourceType "OperationOutcome"
-                                          :issue [(cond-> {:severity "error"
-                                                           :code "exception"
-                                                           :diagnostics (str "Entry failed: " (ex-message e))}
-                                                    (seq expression) (assoc :expression expression)
-                                                    (seq location) (assoc :location location))]}}}))))
-            entries)]
-       {:resourceType "Bundle"
-        :type "batch-response"
-        :entry results})))
+     {:resourceType "Bundle"
+      :type "batch-response"
+      :entry (batch-response-entries this tenant-id opts entries)}))
 
   (create-tenant [this tenant-id]
     (fp/create-tenant this tenant-id nil))

@@ -244,6 +244,18 @@ XTDB facts verified against 2.2.0-beta1, worth not rediscovering:
   java.time value. Prefer an `Instant`: a `LocalDate` bound through the pool
   (pgwire) is cast in the JVM's default zone, while the same value passed to
   the node's `xt/q` is cast as UTC.
+- A batch Bundle commits consecutive writes in ONE transaction, up to 1000
+  entries, since a transaction per entry costs a log round trip each (10x
+  slower than a transaction Bundle at 1000 entries). An op failure names its
+  op in `:tx-op-idx` (also through pgwire); the store resubmits the group
+  without that entry and then runs the entry alone through its own verb, so
+  its response, and a conflict with a sibling's lifecycle ops, are as when
+  entries ran one by one. Submit-time refusals (SQL that does not parse, a doc
+  without `_id`) carry no `:tx-op-idx` and an `incorrect` anomaly; every entry
+  then runs alone. Any other failure leaves the commit unknown, so the group's
+  entries fail without a retry rather than risk writing a POST twice. A group
+  never holds two writes to one resource (they would share a versionId), and
+  a GET of a resource the open group writes closes it first.
 - `vread`'s `vid` is the FHIR versionId, the `fhir_version` column, as in the
   mock and datomic stores. It is matched across `FOR ALL SYSTEM_TIME`, never
   read `AS OF` a time; point-in-time reads are `$as-of`.
@@ -362,8 +374,10 @@ Rules that are easy to get wrong:
   arity has no such method, so unconditional forwarding turns every plain
   write into an `AbstractMethodError`.
 - **One stamp per TRANSACTION.** A transaction Bundle carries one for the
-  whole Bundle; a batch Bundle applies the same map to each entry's own
-  transaction. Entries that fail commit nothing and are stamped nowhere.
+  whole Bundle; a batch Bundle applies the same map to each transaction it
+  commits (one per entry, or per group of entries where the store groups
+  them, as fhir-store-xtdb2 does). Entries that fail commit nothing and are
+  stamped nowhere.
 - **A stamp never goes into a span's `:data`** -- it carries usernames and
   practitioner ids. Log key presence only, same rule as `fhir-store.trace`.
 - **dromon's own handlers stamp only through a host producer.** The router's
