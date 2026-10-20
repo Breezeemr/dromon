@@ -31,5 +31,3 @@ log: !Kafka
 storage: !Local
   path: "/var/lib/xtdb/storage"
 
-indexer:
-  pipelinedReplicaAppends: true

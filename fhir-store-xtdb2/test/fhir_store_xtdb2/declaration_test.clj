@@ -1,5 +1,5 @@
 (ns fhir-store-xtdb2.declaration-test
-  "Table and column declarations, and node-start settings, for XTDB 2.2.0-beta3.
+  "Table and column declarations, and node-start settings, for XTDB 2.2.0-rc2.
 
    From 2.2.0-rc0 a read, DELETE, ASSERT or :delete-docs that names a table or
    column nothing has ever written fails at planning (\"Table not found\" /
@@ -544,57 +544,17 @@
       (finally (delete-recursive! (java.io.File. base))))))
 
 ;; ---------------------------------------------------------------------------
-;; Pipelined replica-log appends
+;; Pipelined replica-log appends: always on from XTDB 2.2.0-rc2
 ;; ---------------------------------------------------------------------------
 
-(defn- pipelined?
-  "Whether the node's log processor pipelines replica-log appends. Reads the
-   private field xtdb.indexer.LogProcessor.pipelinedReplicaAppends (XTDB
-   2.2.0-beta3); the next release removes the flag, and this test with it."
-  [node]
-  (let [lp (-> (:db-cat node) (.databaseOrThrow "xtdb") .getPartitions first .getLogProcessor)
-        field (try (.getDeclaredField (class lp) "pipelinedReplicaAppends")
-                   (catch NoSuchFieldException e
-                     (throw (ex-info (str "xtdb.indexer.LogProcessor has no pipelinedReplicaAppends "
-                                          "field: if this XTDB always pipelines, delete this test "
-                                          "and the :pipelined-replica-appends? option")
-                                     {:class (class lp)} e))))]
-    (.setAccessible field true)
-    (.get field lp)))
-
-(defn- write-and-read [node]
-  (xt/execute-tx node [[:sql "INSERT INTO probe (_id, n) VALUES (?, ?)" ["a" 1]]])
-  (:n (first (xt/q node ["SELECT n FROM probe WHERE _id = ?" "a"]))))
-
-(deftest start-node-sets-pipelining
-  (testing "the config the store builds"
-    (is (true? (.getPipelinedReplicaAppends (.getIndexer (core-db/->xtdb-config {} {})))))
-    (is (false? (.getPipelinedReplicaAppends
-                 (.getIndexer (core-db/->xtdb-config {} {:pipelined-replica-appends? false})))))
-    (let [cfg (core-db/->xtdb-config {:indexer {:rows-per-block 1234}} {})]
-      (is (= 1234 (.getRowsPerBlock (.getIndexer cfg))) "the map's own :indexer keys still apply")
-      (is (true? (.getPipelinedReplicaAppends (.getIndexer cfg))))))
-
-  (testing "a started node carries the flag either way, and works"
-    (with-open [node (core-db/start-node {})]
-      (is (true? (pipelined? node)))
-      (is (= 1 (write-and-read node))))
-    (with-open [node (core-db/start-node {} {:pipelined-replica-appends? false})]
-      (is (false? (pipelined? node)))
-      (is (= 1 (write-and-read node))))))
-
-(deftest store-tenant-nodes-pipeline-by-default
-  (doseq [[opts expected] [[{} true]
-                           [{:pipelined-replica-appends? true} true]
-                           [{:pipelined-replica-appends? false} false]]]
-    (testing (pr-str opts)
-      (let [store (core-db/create-xtdb-store (assoc opts :resource/schemas schemas))
-            tenant "decl-pipe"]
-        (try
-          (db/create-resource store tenant :Patient "p1" {:resourceType "Patient" :active true})
-          (is (= expected (pipelined? (node-of store tenant))))
-          (is (= true (:active (db/read-resource store tenant :Patient "p1"))))
-          (finally (close-store-nodes! store)))))))
+(deftest the-removed-pipelining-option-is-refused
+  ;; rc2 has no setting for it, so a config that still names it is reported.
+  (doseq [v [true false]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"pipelined-replica-appends\? was removed"
+                          (core-db/create-xtdb-store {:resource/schemas schemas
+                                                      :pipelined-replica-appends? v}))))
+  (testing "the map's own :indexer keys still apply to the node config"
+    (is (= 1234 (.getRowsPerBlock (.getIndexer (core-db/->xtdb-config {:indexer {:rows-per-block 1234}} {})))))))
 
 (deftest node-start-declaration-failure-names-the-tenant
   (let [store (-> (core-db/create-xtdb-store {})

@@ -32,9 +32,6 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no :node-config"
                           (core-db/create-xtdb-store {:server server :transport :pgwire
                                                       :node-config {:log [:local {:path "x"}]}})))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"server\s+owns it"
-                          (core-db/create-xtdb-store {:server server :transport :pgwire
-                                                      :pipelined-replica-appends? true})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot use the :adbc transport"
                           (core-db/create-xtdb-store {:server server :transport :adbc})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs the server's :flight-sql-port"

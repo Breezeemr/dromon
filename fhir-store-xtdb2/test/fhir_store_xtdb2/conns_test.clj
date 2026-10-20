@@ -80,9 +80,10 @@
               (.close ^java.lang.AutoCloseable pool)
               (.close ^java.lang.AutoCloseable node))))))))
 
-;; XTDB 2.2.0-beta3's FlightSQL server loads result pages into the declared
-;; result type by position (see fhir-store-xtdb2.conns). These pin that a
-;; session's reads come back as the node's own xt/q returns them anyway.
+;; XTDB 2.2.0-beta3's FlightSQL server loaded result pages into the declared
+;; result type by position (see fhir-store-xtdb2.conns); rc2 fixes that
+;; (xtdb#6215, #6222). These pin that a session's reads come back as the
+;; node's own xt/q returns them, whichever is underneath.
 
 (defn- pool-on [node]
   (conns/flight-sql-pool {:port (.getFlightSqlPort node) :max-size 2 :connection-timeout-ms 5000}))
@@ -104,9 +105,12 @@
       (let [sql "SELECT _id, vq FROM obs ORDER BY _id DESC LIMIT 7 OFFSET 3"]
         (is (= (xt/q node [sql]) (with-conn [c pool] (xt/q c [sql]))))))
     (testing "a statement that is not a query is sent as is"
+      ;; A database-level SHOW: from XTDB 2.2.0-rc2 each FlightSQL call from a
+      ;; cookieless client runs in a session of its own, so session state such
+      ;; as SHOW LATEST_SUBMITTED_TX no longer carries from one call to the next.
       (is (seq (with-conn [c pool]
                  (xt/execute-tx c [[:sql "INSERT INTO t (_id) VALUES (1)"]])
-                 (xt/q c ["SHOW LATEST_SUBMITTED_TX"])))))))
+                 (xt/q c ["SHOW LATEST_SUBMITTED_MSG_IDS"])))))))
 
 (deftest flight-sql-reads-struct-fields-in-another-order-than-the-jvm-saw-first
   ;; A JVM that has seen a struct's fields in one order declares that order for

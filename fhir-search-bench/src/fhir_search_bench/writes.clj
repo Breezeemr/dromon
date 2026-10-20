@@ -600,8 +600,6 @@
   "Benchmark one backend's writes and transactions. Options:
    - :backend       result label, e.g. :xtdb2 (required); names the result file
    - :store-fn      as in fhir-search-bench.bench/run
-   - :xtdb-pipelined? pipelined replica-log appends on the built-in xtdb2 store
-                    (default true; not with :xtdb-server)
    - :xtdb-server   \"host:port\" of a standalone XTDB server for the xtdb2
                     store (see fhir-search-bench.bench/make-store)
    - :transport     the xtdb2 store's :transport, :pgwire (default), :adbc or
@@ -631,11 +629,11 @@
                     :tx :mixed :rollback :contention} (default all)
    - :synthea-dir   Synthea fhir bundle dir (default synthea-output/fhir)
    - :out           result file (default target/writes-<backend>.edn)"
-  [{:keys [backend store-fn xtdb-pipelined? preload n warmup repeats concurrency concurrent-n
+  [{:keys [backend store-fn preload n warmup repeats concurrency concurrent-n
            tx-sizes mixed-rounds rollback-rounds contention-threads contention-attempts
            synthea-dir out edit-n only xtdb-server minted-creates? transport xtdb-flight-sql-port
            xtdb-attach-template warmup-repeats]
-    :or   {warmup-repeats 0 transport :pgwire minted-creates? true edit-n 200 xtdb-pipelined? true preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
+    :or   {warmup-repeats 0 transport :pgwire minted-creates? true edit-n 200 preload 100000 n 200 warmup 50 repeats 3 concurrency [1 4 16]
            concurrent-n 400 tx-sizes [1 10 100 1000] mixed-rounds 50 rollback-rounds 20
            contention-threads 8 contention-attempts 25 synthea-dir "synthea-output/fhir"}}]
   (when-not (keyword? backend)
@@ -645,8 +643,7 @@
         inputs (dataset/build {:dir synthea-dir :max-resources 60000 :skip-files (:files-used base)})
         _      (log "Preload" (:total base) "resources; write inputs" (:total inputs)
                     "from" (count (:bundles inputs)) "further bundle(s)")
-        store  (bench/make-store backend store-fn {:xtdb-pipelined? xtdb-pipelined?
-                                                   :xtdb-server xtdb-server
+        store  (bench/make-store backend store-fn {:xtdb-server xtdb-server
                                                    :transport transport
                                                    :xtdb-flight-sql-port xtdb-flight-sql-port
                                                    :xtdb-attach-template xtdb-attach-template})]
@@ -697,8 +694,6 @@
                                :contention-threads contention-threads
                                :contention-attempts contention-attempts
                                :edit-n edit-n :only only :minted-creates? minted-creates?
-                               :xtdb-pipelined? (when (and (= :xtdb2 backend) (not xtdb-server))
-                                                  xtdb-pipelined?)
                                :xtdb-server xtdb-server
                                :transport (when-not store-fn transport)
                                :xtdb-flight-sql-port xtdb-flight-sql-port
@@ -798,7 +793,7 @@
             (when (some? (get-in r [:options :xtdb-pipelined?]))
               (str "; pipelined replica appends " (get-in r [:options :xtdb-pipelined?])))
             (when-let [srv (get-in r [:options :xtdb-server])]
-              (str "; standalone XTDB server " srv " (pipelining set by the server's config)"))
+              (str "; standalone XTDB server " srv))
             (when-let [t (get-in r [:options :transport])]
               (str "; transport " (name t)
                    (when-let [fp (get-in r [:options :xtdb-flight-sql-port])]
