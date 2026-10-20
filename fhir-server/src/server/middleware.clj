@@ -148,10 +148,10 @@
 (def ^:private allow-headers
   "Request headers a browser may send cross-origin.
 
-   `Authorization` carries jib3's dev-token (`Token <jwt>`) and any Bearer
-   token. `Cookie` and `X-Breeze-Client` are the BFF cookie-mode pair: the
-   opaque session cookie and the CSRF header that proves the request came from
-   jib3 rather than from a cross-site form.
+   `Authorization` carries a bearer token (or buddy's `Token <jwt>` dev
+   scheme). `Cookie` serves a host that authenticates a session cookie in
+   front of dromon. A host whose clients send a header of their own (a CSRF
+   header, say) adds it with `wrap-cors`'s `extra-allow-headers`.
 
    `traceparent` (W3C trace context) and `b3` (Zipkin B3 single header) are what
    an instrumented browser client attaches to a cross-origin request. Refusing
@@ -159,7 +159,14 @@
    a curl-invisible failure, since only a browser sends a preflight."
   (str "Content-Type, Authorization, Accept, X-Request-Id, If-Match, "
        "If-None-Match, If-Modified-Since, Prefer, If-None-Exist, Cookie, "
-       "X-Breeze-Client, traceparent, b3"))
+       "traceparent, b3"))
+
+(defn- allow-headers-with
+  "[[allow-headers]] followed by `extra`, a collection of header names."
+  [extra]
+  (if (seq extra)
+    (str allow-headers ", " (str/join ", " extra))
+    allow-headers))
 
 (def ^:private expose-headers
   "The response headers a cross-origin script may read. `Retry-After` is not
@@ -181,37 +188,44 @@
    grant credentials; see `origin-credentialed?`.
 
    `Vary: Origin` accompanies every reflected origin so a shared cache cannot
-   hand one origin's response, and its allow-origin header, to another."
+   hand one origin's response, and its allow-origin header, to another.
+
+   `extra-allow-headers` is a collection of request header names appended to
+   the preflight's `Access-Control-Allow-Headers`, for headers a host's own
+   clients send."
   ([handler]
-   (wrap-cors handler nil))
+   (wrap-cors handler nil nil))
   ([handler allowed-origins]
-   (fn [request]
-     (let [origin (get-in request [:headers "origin"])
-           credentialed? (origin-credentialed? allowed-origins origin)]
-       (if (and (= :options (:request-method request)) origin)
-         ;; Preflight response
-         (if (origin-allowed? allowed-origins origin)
-           {:status 204
-            :headers (cond-> {"Access-Control-Allow-Origin" origin
-                              "Access-Control-Allow-Methods" "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-                              "Access-Control-Allow-Headers" allow-headers
-                              "Access-Control-Expose-Headers" expose-headers
-                              "Access-Control-Max-Age" "86400"
-                              "Vary" "Origin"}
-                       credentialed? (assoc "Access-Control-Allow-Credentials" "true"))
-            :body nil}
-           {:status 403
-            :headers {}
-            :body nil})
-         ;; Normal response with CORS headers
-         (let [response (handler request)]
-           (if (and origin (origin-allowed? allowed-origins origin))
-             (update response :headers merge
-                     (cond-> {"Access-Control-Allow-Origin" origin
-                              "Access-Control-Expose-Headers" expose-headers
-                              "Vary" "Origin"}
-                       credentialed? (assoc "Access-Control-Allow-Credentials" "true")))
-             response)))))))
+   (wrap-cors handler allowed-origins nil))
+  ([handler allowed-origins extra-allow-headers]
+   (let [allow-headers (allow-headers-with extra-allow-headers)]
+     (fn [request]
+       (let [origin (get-in request [:headers "origin"])
+             credentialed? (origin-credentialed? allowed-origins origin)]
+         (if (and (= :options (:request-method request)) origin)
+           ;; Preflight response
+           (if (origin-allowed? allowed-origins origin)
+             {:status 204
+              :headers (cond-> {"Access-Control-Allow-Origin" origin
+                                "Access-Control-Allow-Methods" "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+                                "Access-Control-Allow-Headers" allow-headers
+                                "Access-Control-Expose-Headers" expose-headers
+                                "Access-Control-Max-Age" "86400"
+                                "Vary" "Origin"}
+                         credentialed? (assoc "Access-Control-Allow-Credentials" "true"))
+              :body nil}
+             {:status 403
+              :headers {}
+              :body nil})
+           ;; Normal response with CORS headers
+           (let [response (handler request)]
+             (if (and origin (origin-allowed? allowed-origins origin))
+               (update response :headers merge
+                       (cond-> {"Access-Control-Allow-Origin" origin
+                                "Access-Control-Expose-Headers" expose-headers
+                                "Vary" "Origin"}
+                         credentialed? (assoc "Access-Control-Allow-Credentials" "true")))
+               response))))))))
 
 (defn wrap-pretty-print
   "When _pretty=true, serializes map bodies to pretty-printed JSON, taking

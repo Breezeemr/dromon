@@ -26,6 +26,8 @@
       :params           request query params map
       :basis            pinned point-in-time store basis (db/current-basis)
       :owner-ids        set of subject Patient ids (patient/group), else nil
+      :compartment-definitions the compartment definitions in force at kickoff,
+                        so the files stream under the same membership
       :status           #{:in-progress :complete :error :cancelled}
       :transaction-time ISO-8601 instant string derived from the basis
       :request-url      absolute kickoff URL string

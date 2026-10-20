@@ -1,6 +1,7 @@
 (ns server.grant-test
   (:require [clojure.test :refer [deftest is testing]]
             [hato.client :as hc]
+            [server.compartment :as compartment]
             [server.grant :as grant]))
 
 (deftest grant-tuples-shape
@@ -61,9 +62,15 @@
     (is (nil? (grant/launch-object->patient "r1/Observation")))
     (is (nil? (grant/launch-object->patient "system")))))
 
-(deftest task-is-a-granted-member-type
-  (let [tuples (grant/grant-tuples nil "client-1" ["pa"] ["read"] false)]
-    (testing "Task joined the Patient compartment, so it gets a type-level tuple"
+(def ^:private task-defs
+  (compartment/with-overrides {"Patient" {"Task" ["requester"]}}))
+
+(deftest type-level-tuples-follow-the-compartment-definitions
+  (testing "R4B: Task is not a Patient member, so it gets no type-level tuple"
+    (is (not-any? #(= (:object %) "Task")
+                  (grant/grant-tuples nil "client-1" ["pa"] ["read"] false))))
+  (let [tuples (grant/grant-tuples task-defs nil "client-1" ["pa"] ["read"] false)]
+    (testing "a member the host's definitions add gets a type-level tuple"
       (is (some #(= % {:namespace "fhir" :object "Task"
                        :relation "read" :subject_id "client-1"}) tuples)))
     (testing "Patient is still instance-confined, with no type-level tuple"
@@ -238,35 +245,6 @@
                 (constantly [])
                 (constantly true))))))
 
-(deftest resolve-first-party-claims-shape
-  (let [role-tuples [{:object "pgoa/physcian"} {:object "pgoa/admin"}
-                     {:object "demo/admin"} {:object "no-practitioner/admin"}]
-        practitioner-tuples [{:object "pgoa/9f9e6bd2-0000-4000-8000-000000000001"}
-                             {:object "demo/aaaa6bd2-0000-4000-8000-000000000002"}
-                             {:object "no-role-realm/bbbb6bd2-0000-4000-8000-000000000003"}]
-        claims (grant/resolve-first-party-claims role-tuples practitioner-tuples)]
-    (is (= ["demo" "pgoa"] (:realms claims))
-        "realms are the role/practitioner intersection, mast's legacy rule")
-    (is (= {"pgoa" ["admin" "physcian"] "demo" ["admin"]
-            "no-practitioner" ["admin"]}
-           (:roles claims))
-        "roles keep every granted realm; the intersection only shapes :realms")
-    (is (= {"pgoa" "9f9e6bd2-0000-4000-8000-000000000001"
-            "demo" "aaaa6bd2-0000-4000-8000-000000000002"
-            "no-role-realm" "bbbb6bd2-0000-4000-8000-000000000003"}
-           (:practitioners claims)))))
-
-(deftest resolve-first-party-claims-edge-shapes
-  (is (= {:realms [] :roles {} :practitioners {}}
-         (grant/resolve-first-party-claims [] []))
-      "a subject with no relations gets empty claims, not a denial")
-  (is (= {:realms [] :roles {"pgoa" ["admin"]} :practitioners {}}
-         (grant/resolve-first-party-claims [{:object "pgoa/admin"}] []))
-      "roles without a practitioner identity grant no realm")
-  (is (= {:realms [] :roles {} :practitioners {}}
-         (grant/resolve-first-party-claims [{:object "malformed"}] [{:object nil}]))
-      "objects without a realm/value split are ignored"))
-
 (deftest end-user-subject-extraction
   (testing "client_credentials payloads have no end user"
     (is (nil? (grant/end-user-subject
@@ -382,3 +360,61 @@
                              (assoc keto-request
                                     :headers {"x-token-hook-secret" "s3cret"}
                                     :body-params {:request {:client_id "c1"}})))))))))
+
+(deftest the-grant-handlers-use-the-request's-compartment-definitions
+  (testing "a grant writes type-level tuples for the request's members"
+    (with-recorded-keto [calls []]
+      (let [written (captured-tuples
+                     #(grant/create-grant
+                       (assoc keto-request
+                              :fhir/compartment-definitions task-defs
+                              :body-params {:subject "c1" :patients ["pa"] :realm "r1"})))]
+        (is (some #(= "r1/Task" (:object %)) written)))))
+  (testing "a revoke sweeps R4B's members and the request's, so neither is left behind"
+    (let [deleted (atom [])]
+      (with-redefs [grant/list-tuples (fn [_ q] (when (= "fhir" (get q "namespace")) []))
+                    grant/granted-patients (constantly [])]
+        (with-redefs-fn {#'grant/delete-tuples! (fn [_ q] (swap! deleted conj (get q "object")))}
+          #(grant/delete-grant (assoc keto-request
+                                      :fhir/compartment-definitions task-defs
+                                      :body-params {:subject "c1" :patients ["pa"]}))))
+      (is (some #{"Task"} @deleted))
+      (is (some #{"Observation"} @deleted)))))
+
+;; ---------------------------------------------------------------------------
+;; Host claims (:token-claims)
+;; ---------------------------------------------------------------------------
+
+(defn- hook-request [payload token-claims]
+  (assoc keto-request :body-params payload :fhir/token-claims token-claims))
+
+(deftest the-token-hook-merges-the-host's-claims-for-an-end-user
+  (let [seen (atom nil)
+        claims (fn [m] (reset! seen (dissoc m :payload)) {:realms ["r1"] :patient "forged"})]
+    (with-recorded-keto [_ [{:object "r1/Patient/pa"}]]
+      (is (= {:status 200 :body {:session {:access_token {:realms ["r1"] :patient "pa"}}}}
+             (grant/token-hook (hook-request (authorization-code-payload "user-1" "c1") claims)))
+          "the launch decision's patient wins over a host claim of the same name"))
+    (is (= {:keto (grant/keto-endpoints keto-request) :subject "user-1" :client-id "c1"}
+           @seen))))
+
+(deftest the-token-hook-calls-no-host-claims-without-an-end-user-or-after-a-deny
+  (let [called (atom 0)
+        claims (fn [_] (swap! called inc) {:x 1})]
+    (with-recorded-keto [_ []]
+      (testing "client_credentials: no end-user subject"
+        (is (= {:status 200 :body {}}
+               (grant/token-hook (hook-request {:request {:client_id "c1"}} claims)))))
+      (testing "a denied issuance"
+        (is (= 403 (:status (grant/token-hook
+                             (hook-request (assoc-in (authorization-code-payload "user-1" "c1")
+                                                     [:request :granted_scopes]
+                                                     ["launch/patient.px" "patient/*.read"])
+                                           claims)))))))
+    (is (zero? @called))))
+
+(deftest the-token-hook-refuses-host-claims-that-are-not-a-map
+  (with-recorded-keto [_ []]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"token-claims must return a map"
+          (grant/token-hook (hook-request (authorization-code-payload "user-1" "c1")
+                                          (constantly ["r1"])))))))

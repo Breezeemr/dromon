@@ -18,6 +18,7 @@
             [reitit.core :as r]
             [reitit.ring :as ring]
             [server.auth :as auth]
+            [server.compartment :as compartment]
             [server.core :as sc]
             [server.middleware :as middleware]
             [server.router :as router]
@@ -282,6 +283,8 @@
    ::router/terminology
    ::router/narrative
    ::router/bulk-job-store
+   ::router/compartment-definitions
+   ::router/token-claims
    ::router/oauth-base-url
    ::router/keto-url
    ::router/jwt-auth
@@ -625,6 +628,40 @@
     (is (= :jobs (:bulk-job-store opts)))
     (is (= `presenting-lifecycle (:lifecycle opts))
         ":lifecycle is carried through unresolved; default-middleware resolves it")))
+
+(deftest resolve-options-host-extensions
+  (testing "with none given: R4B compartments, no extra headers, no host claims"
+    (let [opts (router/resolve-options {})]
+      (is (= compartment/compartment-definitions (:compartment-definitions opts)))
+      (is (= [] (:cors-allow-headers opts)))
+      (is (nil? (:token-claims opts)))))
+  (testing "given: overrides resolved, headers and claims carried through"
+    (let [claims (fn [_] nil)
+          opts (router/resolve-options
+                {:compartment-overrides {"Patient" {"Task" ["requester"]}}
+                 :cors-allow-headers ["X-Host-Csrf"]
+                 :token-claims claims})]
+      (is (= ["requester"] (get-in opts [:compartment-definitions "Patient" "Task"])))
+      (is (= ["X-Host-Csrf"] (:cors-allow-headers opts)))
+      (is (identical? claims (:token-claims opts)))))
+  (testing "a malformed override fails at startup"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (router/resolve-options {:compartment-overrides {"Patient" {"Task" "requester"}}})))))
+
+(deftest host-extensions-reach-the-request
+  (let [seen (atom nil)
+        claims (fn [_] nil)
+        opts (router/resolve-options {:compartment-overrides {"Patient" {"Task" ["requester"]}}
+                                      :token-claims claims})
+        handler (reduce (fn [h {:keys [name wrap]}]
+                          (if (#{::router/compartment-definitions ::router/token-claims} name)
+                            (wrap h)
+                            h))
+                        (fn [req] (reset! seen req) {:status 200})
+                        (reverse (router/default-middleware nil opts)))]
+    (handler {})
+    (is (= (:compartment-definitions opts) (:fhir/compartment-definitions @seen)))
+    (is (identical? claims (:fhir/token-claims @seen)))))
 
 (deftest resolve-options-service-url-defaults
   (testing "each service URL falls back to its environment variable, then to

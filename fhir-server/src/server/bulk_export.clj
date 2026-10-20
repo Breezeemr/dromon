@@ -280,12 +280,12 @@
    _typeFilter spec, satisfy _since, and have a not-yet-seen id (global dedup
    within this stream). Create a fresh one per stream/collect; it closes over a
    mutable seen-id set."
-  [kind owner-ids resource-type registry param-maps since]
+  [defs kind owner-ids resource-type registry param-maps since]
   (let [seen (java.util.HashSet.)
         in-compartment? (if (= kind :system)
                           (constantly true)
                           (fn [r] (compartment/resource-in-any-compartment?
-                                   "Patient" owner-ids resource-type r registry)))]
+                                   defs "Patient" owner-ids resource-type r registry)))]
     (filter (fn [r]
               (let [id (:id r)]
                 (and (in-compartment? r)
@@ -304,9 +304,9 @@
    of `basis`, applying compartment confinement, _typeFilter, _since and
    id-dedup. Retained for the enumeration unit tests; the download path streams
    the same set via stream-output! and never materializes the whole type."
-  [store tenant-id basis kind owner-ids resource-type registry param-maps since]
+  [store tenant-id basis defs kind owner-ids resource-type registry param-maps since]
   (into []
-        (export-filter-xf kind owner-ids resource-type registry param-maps since)
+        (export-filter-xf defs kind owner-ids resource-type registry param-maps since)
         (scan-type store tenant-id resource-type basis)))
 
 (defn- confined-count
@@ -317,8 +317,8 @@
    the count equals the streamed line count and empty-in-compartment types are
    omitted from :output (the unfiltered count-as-of would overcount a
    compartment and list empty files that the Bulk Data validator rejects)."
-  [store tenant-id basis kind owner-ids resource-type registry param-maps since]
-  (transduce (export-filter-xf kind owner-ids resource-type registry param-maps since)
+  [store tenant-id basis defs kind owner-ids resource-type registry param-maps since]
+  (transduce (export-filter-xf defs kind owner-ids resource-type registry param-maps since)
              (completing (fn [n _] (inc n)))
              0
              (scan-type store tenant-id resource-type basis)))
@@ -359,10 +359,10 @@
    batch. Peak memory is one store page: scan-type-as-of pulls the next page
    only after the reducing fn returns, and a backpressured socket pauses that
    pull."
-  [store tenant-id basis kind owner-ids resource-type registry param-maps since encode
+  [store tenant-id basis defs kind owner-ids resource-type registry param-maps since encode
    ^OutputStream out]
   (let [w (writer-on out)]
-    (transduce (export-filter-xf kind owner-ids resource-type registry param-maps since)
+    (transduce (export-filter-xf defs kind owner-ids resource-type registry param-maps since)
                (writing-rf w encode)
                0
                (scan-type store tenant-id resource-type basis))))
@@ -407,13 +407,13 @@
   "Resolve which resource types this export enumerates. `_type` narrows the
    set; otherwise :system exports every registered type and :patient/:group
    export every registered Patient-compartment member type (including Patient)."
-  [kind params all-registries]
+  [defs kind params all-registries]
   (let [type-param (get-param params "_type")]
     (if (not-empty type-param)
       (vec (str/split type-param #","))
       (if (= kind :system)
         (vec (keys all-registries))
-        (into [] (filter #(compartment/member? "Patient" %)) (keys all-registries))))))
+        (into [] (filter #(compartment/member? defs "Patient" %)) (keys all-registries))))))
 
 (defn- build-job-files
   "Compute the export's output/error file descriptors at kickoff WITHOUT
@@ -427,7 +427,7 @@
    :patient/:group (equal to what the stream will emit). A type with zero
    resources tenant-wide is skipped before any confined scan. Returns
    {:outputs [{:type :file-id :count}...] :errors [{:type :file-id :diagnostics}...]}."
-  [store tenant-id basis kind owner-ids all-registries types since type-filters]
+  [store tenant-id basis defs kind owner-ids all-registries types since type-filters]
   (reduce
    (fn [acc rt]
      (let [registry (get all-registries rt)]
@@ -437,7 +437,7 @@
                  {:type "OperationOutcome" :file-id (str (random-uuid))
                   :diagnostics (str "Unknown or unsupported resource type: " rt)})
 
-         (and (not= kind :system) (not (compartment/member? "Patient" rt)))
+         (and (not= kind :system) (not (compartment/member? defs "Patient" rt)))
          (update acc :errors conj
                  {:type "OperationOutcome" :file-id (str (random-uuid))
                   :diagnostics (str rt " is not a Patient-compartment member; "
@@ -452,7 +452,7 @@
              acc
              (let [cnt (if (= kind :system)
                          tenant-cnt
-                         (confined-count store tenant-id basis kind owner-ids rt
+                         (confined-count store tenant-id basis defs kind owner-ids rt
                                          registry (filters-for type-filters rt) since))]
                (if (pos? (long (or cnt 0)))
                  (update acc :outputs conj
@@ -562,10 +562,11 @@
                             :system  nil
                             :patient (patient-ids-in-tenant store tenant-id basis)
                             :group   (set (group-patient-ids store tenant-id group-id)))
-             types        (requested-types kind params all-registries)
+             defs         (compartment/request-definitions req)
+             types        (requested-types defs kind params all-registries)
              since        (:since since-param)
              type-filters (parse-type-filters params)
-             files        (build-job-files store tenant-id basis kind owner-ids
+             files        (build-job-files store tenant-id basis defs kind owner-ids
                                            all-registries types since type-filters)
              now          (System/currentTimeMillis)
              base-job    {:id               job-id
@@ -575,6 +576,7 @@
                           :params           params
                           :basis            basis
                           :owner-ids        owner-ids
+                          :compartment-definitions defs
                           :status           :complete
                           :transaction-time txn-time
                           :request-url      (request-url req)
@@ -692,7 +694,7 @@
    then writes each surviving resource as `(present type resource)`; an :error
    descriptor writes a single OperationOutcome line."
   [job-store job store all-registries encoders present descriptor token]
-  (let [{:keys [kind basis owner-ids params]} job
+  (let [{:keys [kind basis owner-ids params compartment-definitions]} job
         {:keys [type diagnostics]} descriptor
         ;; Presented after the export filter, which must judge the stored
         ;; resource, and before the wire encoding.
@@ -709,7 +711,7 @@
             :data {:tenant (:tenant job) :job-id (:id job) :type type}}
            (if (= :error (:kind descriptor))
              (stream-error! diagnostics out)
-             (stream-output! store (:tenant job) basis kind owner-ids type registry
+             (stream-output! store (:tenant job) basis compartment-definitions kind owner-ids type registry
                              (filters-for type-filters type) since encode out)))
           (finally
             (bjs/release-stream! job-store token)))))))

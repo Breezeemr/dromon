@@ -1,5 +1,6 @@
 (ns server.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
             [jsonista.core :as json]
             [malli.core :as m]
             [server.core :as sc]))
@@ -56,3 +57,56 @@
                                :bogus 1}))))
     (testing "request-side cap-schema is unchanged"
       (is (false? (m/validate cap-schema {:resourceType "Widget" :extra 1}))))))
+
+
+;; ---------------------------------------------------------------------------
+;; Schema overlays declared on the classpath
+;; ---------------------------------------------------------------------------
+
+(defn tag-overlay
+  "A test overlay: marks the schema so the test can see it ran."
+  [schema]
+  (m/-update-properties schema assoc ::overlaid true))
+
+(defn- with-overlay-resources
+  "Calls `f` with a context classloader that sees one
+   `dromon/schema-overlays.edn` per entry of `contents`."
+  [contents f]
+  (let [dirs (mapv (fn [content]
+                     (let [dir (.toFile (java.nio.file.Files/createTempDirectory
+                                         "overlays" (make-array java.nio.file.attribute.FileAttribute 0)))
+                           file (io/file dir sc/schema-overlays-resource)]
+                       (io/make-parents file)
+                       (spit file content)
+                       dir))
+                   contents)
+        thread (Thread/currentThread)
+        before (.getContextClassLoader thread)]
+    (try
+      (.setContextClassLoader thread (java.net.URLClassLoader.
+                                      (into-array java.net.URL (map #(.toURL (.toURI %)) dirs))
+                                      before))
+      (f)
+      (finally
+        (.setContextClassLoader thread before)))))
+
+(deftest declared-overlays-are-collected-from-every-resource
+  (let [already (count (@#'sc/declared-schema-overlays))]
+    (with-overlay-resources ["[server.core-test/tag-overlay]" "[server.core-test/tag-overlay]"]
+      (fn []
+        (let [overlays (@#'sc/declared-schema-overlays)]
+          (is (= (+ already 2) (count overlays))
+              "one per resource, beside any a schema package on the classpath declares")
+          (is (= [tag-overlay tag-overlay] (take-last 2 overlays))))))))
+
+(deftest a-declared-overlay-that-does-not-resolve-throws
+  (with-overlay-resources ["[server.core-test/no-such-overlay]"]
+    (fn []
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not resolve"
+            (@#'sc/declared-schema-overlays))))))
+
+(deftest a-malformed-overlay-resource-throws
+  (with-overlay-resources ["{:not :a-vector}"]
+    (fn []
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"vector of qualified symbols"
+            (@#'sc/declared-schema-overlays))))))

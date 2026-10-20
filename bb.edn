@@ -175,9 +175,9 @@
                (System/exit (if (pos? (+ fail error)) 1 0))))}
 
   check-domains
-  {:doc "Fails when a tracked file names a production domain or a consuming host's development hostnames. This repository's fixtures, docs and defaults read localhost."
+  {:doc "Fails when a tracked file names a production domain, a consuming host's development hostnames, or a consuming host's own systems not listed in bb/check-domains-baseline.edn, and when a baseline entry matches nothing. --prune first removes the entries that match nothing."
    :requires ([server.check-domains :as cd])
-   :task (System/exit (cd/-main))}
+   :task (System/exit (apply cd/-main *command-line-args*))}
 
   check-domains-test
   {:doc "Unit tests for check-domains, run against throwaway git repositories."

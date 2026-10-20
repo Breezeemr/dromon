@@ -1253,8 +1253,8 @@
    link parameters via server.compartment/confine. Returns the matching
    resources, or [] when the type is a member with no registered link parameter
    (fail closed)."
-  [store tenant-id compartment-type compartment-id rt params registry]
-  (let [outcome (compartment/confine compartment-type compartment-id rt params registry)]
+  [defs store tenant-id compartment-type compartment-id rt params registry]
+  (let [outcome (compartment/confine defs compartment-type compartment-id rt params registry)]
     (cond
       (= :passthrough outcome) []
       (= :deny outcome) []
@@ -1264,8 +1264,9 @@
 (defn compartment-search
   "Handler for GET /:tenant-id/fhir/:compartment-type/:compartment-id/:target-type
    Searches for resources of target-type that belong to the given compartment.
-   Membership is the UNION of the link parameters the R4B CompartmentDefinition
-   lists for each type (e.g. Observation via subject OR performer)."
+   Membership is the UNION of the link parameters the compartment definitions
+   in force list for each type (R4B by default; e.g. Observation via subject OR
+   performer)."
   [req]
   (let [store            (:fhir/store req)
         tenant-id        (-> req :path-params :tenant-id)
@@ -1273,7 +1274,8 @@
         compartment-id   (-> req :path-params :compartment-id)
         target-type      (-> req :path-params :target-type)
         all-registries   (:fhir/all-registries req)
-        compartment-map  (get compartment/compartment-definitions compartment-type)]
+        defs             (compartment/request-definitions req)
+        compartment-map  (get defs compartment-type)]
     (cond
       ;; Unknown compartment type
       (nil? compartment-map)
@@ -1298,7 +1300,7 @@
                             (fn [[rt _params]]
                               (when-let [registry (get all-registries rt)]
                                 (let [results (compartment-confined-search
-                                                store tenant-id compartment-type compartment-id rt
+                                                defs store tenant-id compartment-type compartment-id rt
                                                 (assoc params :_count 50 :_skip 0) registry)]
                                   (mapv (fn [res]
                                           {:fullUrl  (str (fhir-base req) "/" rt "/" (:id res))
@@ -1314,7 +1316,7 @@
 
       ;; Specific target resource type
       :else
-      (if (nil? (compartment/compartment-link-params compartment-type target-type))
+      (if (nil? (compartment/compartment-link-params defs compartment-type target-type))
         {:status 400
          :body {:resourceType "OperationOutcome"
                 :issue [{:severity "error"
@@ -1332,7 +1334,7 @@
                 skip  (if (string? skip-param)  (parse-long skip-param)  skip-param)
                 results (if registry
                           (compartment-confined-search
-                            store tenant-id compartment-type compartment-id target-type
+                            defs store tenant-id compartment-type compartment-id target-type
                             (assoc params :_count limit :_skip skip) registry)
                           [])
                 base-url (str (fhir-base req) "/" compartment-type "/" compartment-id "/" target-type)

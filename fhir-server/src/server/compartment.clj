@@ -29,8 +29,14 @@
    CompartmentDefinitions:
    https://hl7.org/fhir/R4B/compartmentdefinition-{patient,practitioner,encounter,relatedperson,device}.json
    The owner self-entry (and the non-searchable `{def}` placeholder) is omitted
-   from each table; the owner type is handled by `_id`. One entry (Patient/Task)
-   is a documented forward-port from R5; see the comment at its site."
+   from each table; the owner type is handled by `_id`.
+
+   A host whose data model needs different membership passes
+   `:compartment-overrides` to `server.router/resolve-options`; see
+   [[with-overrides]]. The resolved definitions ride on the request as
+   `:fhir/compartment-definitions`, and every membership question (search,
+   read, write, history, compartment search, bulk export, grants) is answered
+   from that one map, so they cannot disagree."
   (:require [clojure.string :as str]
             [fhir-store.protocol :as db]
             [server.scope :as scope]
@@ -58,19 +64,8 @@
     "Claim"                        ["patient" "payee"]
     "ClaimResponse"                ["patient"]
     "ClinicalImpression"           ["subject"]
-    ;; Narrowed from R4B: `subject` is not a link, so a Communication about a
-    ;; patient between staff stays out of patient reach. A patient-message
-    ;; thread names its patient as `sender` (patient-started) or in
-    ;; `recipient` after the owner (staff-started), and each message as
-    ;; `sender` or `recipient` (docs/patient-messaging.md in master-at-arms2).
-    "Communication"                ["sender" "recipient"]
-    ;; Narrowed from R4B, as Task is below. Breeze's CommunicationRequests are
-    ;; staff call-back work (refill requests, phone consults, report reviews)
-    ;; with staff notes: they name the patient as subject and often as
-    ;; recipient, with a Practitioner as requester and sender. R4B's
-    ;; `subject`, `sender` and `recipient` would expose all of them to a
-    ;; patient token, so only `requester` marks a request the patient filed.
-    "CommunicationRequest"         ["requester"]
+    "Communication"                ["subject" "sender" "recipient"]
+    "CommunicationRequest"         ["subject" "sender" "recipient" "requester"]
     "Composition"                  ["subject" "author" "attester"]
     "Condition"                    ["patient" "asserter"]
     "Consent"                      ["patient"]
@@ -119,14 +114,6 @@
     "Specimen"                     ["subject"]
     "SupplyDelivery"               ["patient"]
     "SupplyRequest"                ["subject"]
-    ;; Deliberate forward-port from R5, narrowed. R4B's Patient
-    ;; CompartmentDefinition omits Task (R5 adds it with patient, subject,
-    ;; owner and requester). Breeze files patient-authored Tasks (demographic
-    ;; change requests) with Task.for = the subject and Task.requester = the
-    ;; filing patient, and no owner. Staff workflow Tasks also point Task.for
-    ;; at the patient, so `patient`, `subject` and `owner` would expose them to
-    ;; a patient token. Only `requester` marks the authored case.
-    "Task"                         ["requester"]
     "VisionPrescription"           ["patient"]}
 
    "Practitioner"
@@ -286,6 +273,48 @@
   "Set of resource types that define FHIR compartments."
   (set (keys compartment-definitions)))
 
+(defn- check-links! [compartment-type member-type links]
+  (when-not (or (nil? links)
+                (and (vector? links) (seq links) (every? #(and (string? %) (not (str/blank? %))) links)))
+    (throw (ex-info (str "Compartment override for " compartment-type "/" member-type
+                         " must be nil or a non-empty vector of search parameter names")
+                    {:compartment-type compartment-type :member-type member-type :links links}))))
+
+(defn with-overrides
+  "The R4B [[compartment-definitions]] with `overrides` applied.
+
+   `overrides` is {compartment-type {member-type links}}. `links` is a
+   non-empty vector of search parameter names, which replaces the member's R4B
+   links (or adds a member R4B does not list), or nil, which removes the member.
+   A compartment type outside [[valid-compartment-types]] or a malformed
+   `links` throws, so a misspelled override fails at startup instead of
+   leaving R4B membership in force."
+  [overrides]
+  (reduce-kv
+   (fn [defs compartment-type members]
+     (when-not (contains? valid-compartment-types compartment-type)
+       (throw (ex-info (str "Unknown compartment type in overrides: " compartment-type)
+                       {:compartment-type compartment-type :known valid-compartment-types})))
+     (when-not (map? members)
+       (throw (ex-info (str "Compartment overrides for " compartment-type " must be a map")
+                       {:compartment-type compartment-type :members members})))
+     (reduce-kv
+      (fn [defs member-type links]
+        (check-links! compartment-type member-type links)
+        (if (nil? links)
+          (update defs compartment-type dissoc member-type)
+          (assoc-in defs [compartment-type member-type] links)))
+      defs
+      members))
+   compartment-definitions
+   (or overrides {})))
+
+(defn request-definitions
+  "The compartment definitions in force for `request`: what
+   `server.router/wrap-compartment-definitions` injected, else R4B."
+  [request]
+  (or (:fhir/compartment-definitions request) compartment-definitions))
+
 (def ^:const compartment-search-param
   "Reserved synthetic search parameter name used to inject the compartment
    union predicate. Underscore-prefixed so it cannot collide with a real FHIR
@@ -297,20 +326,25 @@
 ;; ---------------------------------------------------------------------------
 
 (defn compartment-link-params
-  "The R4B search parameter names that link `fhir-type` to `compartment-type`,
-   or nil when `fhir-type` is not a member."
-  [compartment-type fhir-type]
-  (get-in compartment-definitions [compartment-type fhir-type]))
+  "The search parameter names that link `fhir-type` to `compartment-type` in
+   `defs` (default R4B), or nil when `fhir-type` is not a member."
+  ([compartment-type fhir-type]
+   (compartment-link-params compartment-definitions compartment-type fhir-type))
+  ([defs compartment-type fhir-type]
+   (get-in defs [compartment-type fhir-type])))
 
 (defn member?
-  "True when `fhir-type` belongs to `compartment-type` (the owner resource is a
-   member of its own compartment, confined by id)."
-  [compartment-type fhir-type]
-  (boolean (or (= fhir-type compartment-type)
-               (compartment-link-params compartment-type fhir-type))))
+  "True when `fhir-type` belongs to `compartment-type` in `defs` (default R4B).
+   The owner resource is a member of its own compartment, confined by id."
+  ([compartment-type fhir-type]
+   (member? compartment-definitions compartment-type fhir-type))
+  ([defs compartment-type fhir-type]
+   (boolean (or (= fhir-type compartment-type)
+                (compartment-link-params defs compartment-type fhir-type)))))
 
-(defn patient-compartment-member? [fhir-type]
-  (member? "Patient" fhir-type))
+(defn patient-compartment-member?
+  ([fhir-type] (member? "Patient" fhir-type))
+  ([defs fhir-type] (member? defs "Patient" fhir-type)))
 
 (defn compartment-descriptor
   "A synthetic `reference` search-parameter descriptor whose columns are the
@@ -319,11 +353,13 @@
    registered for this type (so callers can fail closed). Passing this descriptor
    under `compartment-search-param` makes the store OR the predicate across all
    columns in a single query."
-  [compartment-type fhir-type registry]
-  (let [params (compartment-link-params compartment-type fhir-type)
-        columns (->> params (keep #(get registry %)) (mapcat :columns) distinct vec)]
-    (when (seq columns)
-      {:type "reference" :target [compartment-type] :columns columns})))
+  ([compartment-type fhir-type registry]
+   (compartment-descriptor compartment-definitions compartment-type fhir-type registry))
+  ([defs compartment-type fhir-type registry]
+   (let [params (compartment-link-params defs compartment-type fhir-type)
+         columns (->> params (keep #(get registry %)) (mapcat :columns) distinct vec)]
+     (when (seq columns)
+       {:type "reference" :target [compartment-type] :columns columns}))))
 
 (defn confine
   "Computes how to confine a query on `fhir-type` to the
@@ -333,19 +369,21 @@
                               _include target); run unchanged,
      :deny                  — `fhir-type` is a member but no link parameter is
                               registered; the caller must fail closed."
-  [compartment-type compartment-id fhir-type params registry]
-  (cond
-    (= fhir-type compartment-type)
-    [:run (assoc params "_id" compartment-id) registry]
+  ([compartment-type compartment-id fhir-type params registry]
+   (confine compartment-definitions compartment-type compartment-id fhir-type params registry))
+  ([defs compartment-type compartment-id fhir-type params registry]
+   (cond
+     (= fhir-type compartment-type)
+     [:run (assoc params "_id" compartment-id) registry]
 
-    (not (member? compartment-type fhir-type))
-    :passthrough
+     (not (member? defs compartment-type fhir-type))
+     :passthrough
 
-    :else
-    (if-let [desc (compartment-descriptor compartment-type fhir-type registry)]
-      [:run (assoc params compartment-search-param (str compartment-type "/" compartment-id))
-            (assoc registry compartment-search-param desc)]
-      :deny)))
+     :else
+     (if-let [desc (compartment-descriptor defs compartment-type fhir-type registry)]
+       [:run (assoc params compartment-search-param (str compartment-type "/" compartment-id))
+             (assoc registry compartment-search-param desc)]
+       :deny))))
 
 (declare reference-matches?)
 
@@ -361,21 +399,24 @@
    `_compartment` push-down that `confine` applies to `db/search`, but evaluated
    locally against an already-read resource so it can be applied while streaming
    a `scan-type-as-of` snapshot."
-  [compartment-type owner-ids fhir-type resource registry]
-  (cond
-    (= fhir-type compartment-type)
-    (contains? owner-ids (:id resource))
+  ([compartment-type owner-ids fhir-type resource registry]
+   (resource-in-any-compartment? compartment-definitions compartment-type owner-ids
+                                 fhir-type resource registry))
+  ([defs compartment-type owner-ids fhir-type resource registry]
+   (cond
+     (= fhir-type compartment-type)
+     (contains? owner-ids (:id resource))
 
-    (not (member? compartment-type fhir-type))
-    false
+     (not (member? defs compartment-type fhir-type))
+     false
 
-    :else
-    (boolean
-     (when-let [desc (compartment-descriptor compartment-type fhir-type registry)]
-       (let [cols (:columns desc)]
-         (some (fn [owner-id]
-                 (reference-matches? resource cols (str compartment-type "/" owner-id)))
-               owner-ids))))))
+     :else
+     (boolean
+      (when-let [desc (compartment-descriptor defs compartment-type fhir-type registry)]
+        (let [cols (:columns desc)]
+          (some (fn [owner-id]
+                  (reference-matches? resource cols (str compartment-type "/" owner-id)))
+                owner-ids)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Patient launch context and scope restriction
@@ -442,17 +483,17 @@
    A type outside the compartment is never inside it: REST refuses a `patient/`
    token those types before the store is reached, and a Bundle entry or an
    operation must not reach further than the same request issued alone."
-  [all-registries patient-id resource-type id resource]
+  [defs all-registries patient-id resource-type id resource]
   (let [ft (name resource-type)]
     (cond
       (= ft "Patient")
       (= (or id (:id resource)) patient-id)
 
-      (not (member? "Patient" ft))
+      (not (member? defs "Patient" ft))
       false
 
       :else
-      (let [desc (compartment-descriptor "Patient" ft (get all-registries ft))]
+      (let [desc (compartment-descriptor defs "Patient" ft (get all-registries ft))]
         (and desc (reference-matches? resource (:columns desc) (str "Patient/" patient-id)))))))
 
 (defn- links-another-patient?
@@ -462,7 +503,7 @@
    compartment links no patient, and neither does a nil `resource`. A member
    type with no registered link parameter cannot be judged, so it is assumed
    to link one."
-  [all-registries patient-id resource-type resource]
+  [defs all-registries patient-id resource-type resource]
   (let [ft (name resource-type)
         own (str "Patient/" patient-id)]
     (boolean
@@ -471,11 +512,11 @@
          (= ft "Patient")
          (not= (:id resource) patient-id)
 
-         (not (member? "Patient" ft))
+         (not (member? defs "Patient" ft))
          false
 
          :else
-         (if-let [desc (compartment-descriptor "Patient" ft (get all-registries ft))]
+         (if-let [desc (compartment-descriptor defs "Patient" ft (get all-registries ft))]
            (some (fn [column]
                    (some #(let [r (:reference %)]
                             (and (string? r) (str/starts-with? r "Patient/") (not= r own)))
@@ -506,13 +547,13 @@
    the post-image nor the resource it replaces may link another patient: an
    exemption lets an operation write shared or server-owned records, never
    reach into another patient's chart."
-  [{:keys [base patient-id all-registries exempt-write-types] :as store}
+  [{:keys [base patient-id all-registries exempt-write-types definitions] :as store}
    tenant-id method resource-type id resource]
   (let [ft (name resource-type)
         existing (when id (db/read-resource base tenant-id resource-type id))]
     (if (contains? exempt-write-types ft)
-      (if (or (links-another-patient? all-registries patient-id ft resource)
-              (links-another-patient? all-registries patient-id ft existing))
+      (if (or (links-another-patient? definitions all-registries patient-id ft resource)
+              (links-another-patient? definitions all-registries patient-id ft existing))
         outside-compartment
         (do (t/event! :authz/patient-compartment.exempt-write
                       {:data {:resource-type ft :method method}})
@@ -520,7 +561,7 @@
       (let [readable? (fn [] (some? (db/read-resource store tenant-id resource-type id)))]
         (case method
           :delete (when-not (and id (readable?)) outside-compartment)
-          (when-not (and (write-in-compartment? all-registries patient-id ft id resource)
+          (when-not (and (write-in-compartment? definitions all-registries patient-id ft id resource)
                          (or (nil? existing) (readable?)))
             outside-compartment))))))
 
@@ -587,17 +628,18 @@
   "Whether an already-read version of `resource-type` belongs to the launch
    patient's compartment, for confining history and vread. A type outside the
    compartment is linked context and passes, as it does for reads."
-  [{:keys [patient-id all-registries]} resource-type resource]
+  [{:keys [patient-id all-registries definitions]} resource-type resource]
   (let [ft (name resource-type)]
-    (or (not (member? "Patient" ft))
-        (resource-in-any-compartment? "Patient" #{patient-id} ft resource
+    (or (not (member? definitions "Patient" ft))
+        (resource-in-any-compartment? definitions "Patient" #{patient-id} ft resource
                                       (get all-registries ft)))))
 
-(defrecord CompartmentFilteringStore [base patient-id all-registries exempt-write-types]
+(defrecord CompartmentFilteringStore [base patient-id all-registries exempt-write-types
+                                      definitions]
   db/IFHIRStore
   (search [_ tenant-id resource-type params search-registry]
     (let [registry (or search-registry (get all-registries (name resource-type)))
-          outcome (confine "Patient" patient-id (name resource-type) params registry)]
+          outcome (confine definitions "Patient" patient-id (name resource-type) params registry)]
       (cond
         (= :passthrough outcome) (db/search base tenant-id resource-type params registry)
         (= :deny outcome) []
@@ -605,7 +647,7 @@
 
   (count-resources [_ tenant-id resource-type params search-registry]
     (let [registry (or search-registry (get all-registries (name resource-type)))
-          outcome (confine "Patient" patient-id (name resource-type) params registry)]
+          outcome (confine definitions "Patient" patient-id (name resource-type) params registry)]
       (cond
         (= :passthrough outcome) (db/count-resources base tenant-id resource-type params registry)
         (= :deny outcome) 0
@@ -618,11 +660,11 @@
         (= ft "Patient")
         (when (= id patient-id) (db/read-resource base tenant-id resource-type id))
 
-        (not (member? "Patient" ft))
+        (not (member? definitions "Patient" ft))
         (db/read-resource base tenant-id resource-type id)
 
         :else
-        (when-let [desc (compartment-descriptor "Patient" ft registry)]
+        (when-let [desc (compartment-descriptor definitions "Patient" ft registry)]
           (first (db/search base tenant-id resource-type
                             {"_id" id
                              compartment-search-param (str "Patient/" patient-id)
@@ -631,7 +673,7 @@
 
   ;; The current version being readable does not make every version readable:
   ;; one from before the resource entered the compartment (refiled from
-  ;; another chart, a Task whose requester changed) is judged on its own, as
+  ;; another chart, a link that was re-pointed) is judged on its own, as
   ;; history judges it, and reads as absent.
   (vread-resource [this tenant-id resource-type id vid]
     (when (db/read-resource this tenant-id resource-type id)
@@ -751,10 +793,12 @@
 (defn filtering-store
   "Wraps `base` store so every query and write is confined to `patient-id`'s
    Patient compartment. `exempt-write-types` is a collection of resource type
-   names the caller may write outside it; see `write-refusal`."
-  [base {:keys [patient-id all-registries exempt-write-types]}]
+   names the caller may write outside it; see `write-refusal`. `definitions`
+   is the compartment definitions map (default R4B; see [[with-overrides]])."
+  [base {:keys [patient-id all-registries exempt-write-types definitions]}]
   (->CompartmentFilteringStore base patient-id all-registries
-                               (set (map name exempt-write-types))))
+                               (set (map name exempt-write-types))
+                               (or definitions compartment-definitions)))
 
 ;; ---------------------------------------------------------------------------
 ;; Enforcement middleware
@@ -783,7 +827,8 @@
    For a patient-restricted token it requires a launch patient, denies access
    to resource types outside the Patient compartment, and installs a
    CompartmentFilteringStore so every query the handler issues is confined to
-   the launch patient's compartment (the UNION of the R4B link parameters).
+   the launch patient's compartment (the UNION of the link parameters in
+   [[request-definitions]]).
    On a compartment-search route it permits only the launch patient's own
    Patient compartment (the handler then confines by compartment id).
 
@@ -808,11 +853,13 @@
               compartment-id (get-in request [:path-params :id])
               pid            (launch-patient request)
               all-registries (:fhir/all-registries route-data)
+              defs           (request-definitions request)
               wrap-store     (fn [req]
                                (assoc req :fhir/store
                                       (filtering-store (:fhir/store req)
                                                        {:patient-id pid
                                                         :all-registries all-registries
+                                                        :definitions defs
                                                         :exempt-write-types
                                                         (:compartment/exempt-write-types route-data)})))]
           (cond
@@ -840,7 +887,7 @@
             (handler (wrap-store request))
 
             ;; Deny patient/ access to types outside the Patient compartment.
-            (not (patient-compartment-member? fhir-type))
+            (not (patient-compartment-member? defs fhir-type))
             (forbidden (str fhir-type " is not part of the Patient compartment; "
                             "a patient/ scope cannot access it."))
 
