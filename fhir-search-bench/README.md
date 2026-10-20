@@ -249,6 +249,7 @@ dromon's draft client-side workaround for bugs 1 and 2 is
 ```bash
 bb flightsql-repro-nightly                       # ghcr.io/xtdb/xtdb:nightly
 bb flightsql-repro-beta3                         # ghcr.io/xtdb/xtdb:2.2.0-beta3
+bb flightsql-repro-release :version 2.2.0-rc2    # any published release: ghcr.io images + Maven Central client
 bb flightsql-repro-nightly :focused-only true    # focused cases only, ~3 min
 bb flightsql-repro-nightly :preload 20000 :repeats 1   # smaller benchmark
 bb flightsql-repro-nightly :bench-only true :storage :kafka   # one storage variant (:disk, :kafka, :all)
@@ -330,6 +331,12 @@ container with an in-memory log and storage:
      `COMPARISON-<storage>.md` pools every measured repeat's p50 per
      transport across the rounds, and gives the ratio per round. It marks a workload "within
      noise" when the two transports' ranges of repeat p50s overlap.
+
+`flightsql-repro-release :version <v>` runs against a published release. The
+server images are `ghcr.io/xtdb/xtdb:<v>` and `ghcr.io/xtdb/xtdb-aws:<v>`; the
+client JVMs get `com.xtdb/xtdb-core` and `xtdb-api` `<v>` from Maven Central.
+It checks that the client artifacts exist and pulls the images before anything
+runs, and stops with a message naming whichever is not published.
 
 A nightly server needs the nightly client: XTDB after 2.2.0-beta3 refuses the
 beta3 client's BEGIN/COMMIT over FlightSQL. So `flightsql-repro-nightly` runs
@@ -479,6 +486,53 @@ How to read these:
 
 The full tables are in `COMPARISON-disk.md` and `COMPARISON-kafka.md`, with
 per-run memory and Kafka offsets in `summary.txt` and the server logs.
+
+### 2.2.0-rc2 (2026-10-20)
+
+`bb flightsql-repro-release :version 2.2.0-rc2` was run on dromon main
+(`bc3e12e`) and exited 0: **every case and all 8 benchmark runs PASS, and no
+bug reproduces.**
+- **Build:** server `ghcr.io/xtdb/xtdb:2.2.0-rc2` (`sha256:5b0406ad...`) and
+  `xtdb-aws:2.2.0-rc2`, plus client `com.xtdb/xtdb-core 2.2.0-rc2`. All three
+  are revision `4d86aab7b`.
+- **Fixes in it:** rc2 carries upstream's squash-merge of #6222 (`69fdbb26a`,
+  bugs 1 and 2) and its own empty-list offsets fix for the shared empty buffer
+  (`7d299a523`, #6231); #6233 was closed unmerged.
+- **Focused cases:** bugs 1 and 2 PASS with FlightSQL equal to pgwire, and
+  bug 3 PASSes: 8 readers x 20 s, 0 bad of 124752 reads.
+- **Benchmarks:** disk and Kafka, 2 ABBA rounds each, under the memory limits
+  (page cache 12-18% of the data on disk, 0 OOM kills). Contention had 0
+  errors besides 412s and 0 lost updates in every run.
+- **The store's read path is not the same as in the earlier runs.** main
+  includes #141, so every FlightSQL read here also goes through the store's
+  `MaterializingSession` wrapper (`ROW_NUMBER() ... ORDER BY`). The wrapper
+  would hide bugs 1 and 2 from the benchmark, which is why the focused cases,
+  which bypass the store, are the evidence for them.
+
+Median p50 in ms, with flight-sql / pgwire per round:
+
+| workload | disk: flight-sql / pgwire | disk x | kafka: flight-sql / pgwire | kafka x |
+|---|---:|---|---:|---|
+| single create | 3.98 / 3.28 | 1.21, 1.22 | 7.91 / 7.22 | 1.10, 1.10 |
+| single update-if-match | 10.1 / 7.87 | 1.31, 1.26 | 13.4 / 12.2 | 0.98, 1.17 |
+| create x16 threads | 8.25 / 8.27 | 1.00, 1.00 | 4.14 / 2.81 | 1.19, 1.49 |
+| transaction 100 entries | 78.8 / 39.2 | 2.03, 2.01 | 84.4 / 47.0 | 1.73, 1.97 |
+| transaction 1000 entries | 730 / 345 | 2.11, 2.11 | 721 / 377 | 1.66, 2.15 |
+| batch 1000 entries | 4219 / 3452 | 1.23, 1.23 | 8049 / 7280 | 1.07, 1.11 |
+| mixed tx | 19.9 / 12.5 | 1.53, 1.53 | 22.3 / 17.5 | 1.10, 1.27 |
+| contention | 36.5 / 25.6 | 1.46, 1.40 | 27.3 / 23.0 | 1.01, 1.26 |
+| preload, 100121 resources | 29.5-30.1 s / 13.1-14.6 s | | 29.8-32.9 s / 15.8-17.8 s | |
+
+The write gap is the same as on the local #6222 + #6233 build: about 1.1x for
+single writes on Kafka and 2x for large transactions. As measured above, it
+comes from FlightSQL's per-statement calls, not from serde.
+
+For comparison:
+- On 2.2.0-beta3 and nightly (2026-10-16) all three bugs reproduce, and the
+  FlightSQL benchmark stops at bug 1 right after the preload (see Observed
+  above). Those runs predate #141 and were not repeated on main.
+- On rc2 FlightSQL is correct, including under concurrent streams, but still
+  slower than pgwire for writes.
 
 ### From a git commit
 
