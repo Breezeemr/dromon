@@ -6,6 +6,8 @@
    docs/proposals/bulk-data-export-and-backend-services.md.
 
      - kickoff  GET  /:tenant-id/fhir/$export
+     - kickoff  GET|POST /:tenant-id/fhir/Patient/$export (optional `patient`)
+     - kickoff  GET  /:tenant-id/fhir/Group/:id/$export
      - status   GET  /:tenant-id/fhir/$export-status/:job-id
      - cancel   DELETE .../$export-status/:job-id
      - file     GET  /:tenant-id/fhir/$export-file/:job-id/:file-id
@@ -40,6 +42,7 @@
             [server.handlers :as handlers]
             [server.keto :as keto]
             [server.narrative :as narrative]
+            [server.scope :as scope]
             [server.temporal :as tmp]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace])
@@ -130,6 +133,73 @@
                  (str "Subject " (get-in req [:identity :sub])
                       " is not authorized for bulk export against the system object."))))
 
+;; A caller without the system tuple may still export named patients: the
+;; patient themself (a patient-restricted SMART token whose launch patient is
+;; the one requested) or a user who may read each of them, which is how a
+;; single-patient EHI export (45 CFR 170.315(b)(10)(i)) reaches the same
+;; machinery. Each requested Patient is checked exactly the way
+;; wrap-keto-authorization checks GET Patient/<id>, and the export is narrowed
+;; to the types the token's SMART scopes may read, because these :public?
+;; routes skip the scope and compartment middleware that would otherwise do
+;; both. Without named patients only the system tuple will do: a Patient-level
+;; export with no `patient` parameter is every patient in the tenant.
+
+(defn- patient-read-authorized?
+  "Whether the request's subject holds `read` on Patient/`patient-id` in the
+   realm in the path, asked as wrap-keto-authorization asks for a read of that
+   Patient. Overridable per-request via :fhir/patient-read-authorized? (a
+   (fn [subject-id patient-id] -> boolean), used by tests)."
+  [req patient-id]
+  (let [subject-id (get-in req [:identity :sub])]
+    (if-let [pred (:fhir/patient-read-authorized? req)]
+      (boolean (pred subject-id patient-id))
+      (keto/relation-allowed? (:fhir/keto-url req)
+                              (keto/request-objects
+                               (get-in req [:path-params :tenant-id]) "Patient" patient-id
+                               (:fhir/keto-legacy-realm-blind-fallback? req
+                                 keto/default-legacy-realm-blind-fallback?))
+                              "read"
+                              subject-id))))
+
+(defn- subject-scopes
+  "The parsed SMART scopes a caller without the system tuple exports under,
+   when it may export every one of `patient-ids`; nil otherwise. A
+   patient-restricted token may name only its own launch patient."
+  [req patient-ids]
+  (let [scopes (scope/request-scopes req)]
+    (when (and (seq patient-ids)
+               (or (not (compartment/token-patient-restricted? scopes))
+                   (= #{(compartment/launch-patient req)} (set patient-ids)))
+               (every? #(patient-read-authorized? req %) patient-ids))
+      scopes)))
+
+(defn- client-id
+  "The OAuth client a token was issued to (RFC 9068 `client_id`), or nil for a
+   session without one."
+  [req]
+  (get-in req [:identity :client_id]))
+
+(defn- requester
+  "Who started a job, recorded so that only they can poll, download or cancel
+   it."
+  [req]
+  {:sub (get-in req [:identity :sub]) :client-id (client-id req)})
+
+(defn- visible-job
+  "`job` when this request may see it, else nil (answered 404, so a job id
+   says nothing to anyone else). A system job is visible to holders of the
+   system tuple. A subject job is visible only to the subject and client that
+   started it, and only while that subject may still read every exported
+   Patient, so revoking access also ends a download in progress."
+  [req job]
+  (when job
+    (if (= :subject (:access job))
+      (when (and (= (requester req) (:owner job))
+                 (subject-scopes req (:patient-ids job)))
+        job)
+      (when (system-authorized? req)
+        job))))
+
 ;; ---------------------------------------------------------------------------
 ;; URL helpers
 ;; ---------------------------------------------------------------------------
@@ -193,6 +263,56 @@
       (nil? v)        []
       (sequential? v) (vec v)
       :else           [v])))
+
+(defn- parameter-value
+  "The value of one Parameters.parameter entry: a valueReference's reference,
+   or whichever value[x] it carries."
+  [parameter]
+  (or (get-in parameter [:valueReference :reference])
+      (some (fn [[k v]] (when (str/starts-with? (name k) "value") v)) parameter)))
+
+(defn- parameters-body->params
+  "String-keyed kickoff params from a POST kickoff's Parameters body (the Bulk
+   Data IG's POST form); a repeated name collects into a vector, as Ring
+   collects a repeated query parameter."
+  [body]
+  (reduce (fn [acc parameter]
+            (let [k (:name parameter)
+                  v (parameter-value parameter)]
+              (if (and (string? k) (some? v))
+                (update acc k (fn [prev]
+                                (cond (nil? prev)    v
+                                      (vector? prev) (conj prev v)
+                                      :else          [prev v])))
+                acc)))
+          {}
+          (:parameter body)))
+
+(defn- request-params
+  "Kickoff params from the query string, a form body, or a POST Parameters
+   body. Returns {:invalid diagnostics} for a POST body that is not a
+   Parameters resource."
+  [req]
+  (let [body (when (= :post (:request-method req)) (:body-params req))]
+    (if (and (some? body) (not= "Parameters" (:resourceType body)))
+      {:invalid "A POST kickoff body must be a Parameters resource."}
+      (merge (or (:form-params req) {})
+             (or (:query-params req) {})
+             (when body (parameters-body->params body))))))
+
+(defn- requested-patient-ids
+  "The bare Patient ids the `patient` parameter names, as a distinct vector, or
+   {:invalid value} for a value that is not a `Patient/<id>` reference. A GET
+   may also list several separated by commas."
+  [params]
+  (reduce (fn [ids raw]
+            (let [ref (str/trim (str raw))
+                  id  (when (str/starts-with? ref "Patient/") (subs ref (count "Patient/")))]
+              (if (or (str/blank? id) (str/includes? id "/"))
+                (reduced {:invalid ref})
+                (if (some #{id} ids) ids (conj ids id)))))
+          []
+          (mapcat #(str/split (str %) #",") (get-param-values params "patient"))))
 
 (defn- parse-query-params
   "Parse an inner `param=value&param2=value2` query string (as carried inside a
@@ -299,6 +419,67 @@
   [store tenant-id resource-type basis]
   (db/scan-type-as-of store tenant-id (keyword resource-type) basis))
 
+(def ^:private compartment-page-size
+  "Resources fetched per compartment search page."
+  1000)
+
+(defn- preserving-reduced
+  "Wrap `rf` so a reduced result survives an inner `reduce`, which would
+   otherwise unwrap it and keep the outer loop going."
+  [rf]
+  (fn [acc x]
+    (let [ret (rf acc x)]
+      (if (reduced? ret) (reduced ret) ret))))
+
+(defn- compartment-scan
+  "Reducible of the `resource-type` resources in the Patient compartment of
+   any of `owner-ids` as of `basis`, found by searching each compartment's
+   link parameters (server.compartment/confine) at that basis rather than by
+   scanning the type across the tenant, so a one-patient export reads that
+   patient's records and no one else's. Holds one search page at a time, and
+   every page is asked of the same pinned snapshot. A resource in two owners'
+   compartments comes back twice; the export filter drops the repeat. A member
+   type without a registered link parameter yields nothing (fail closed, as
+   compartment search does)."
+  [store tenant-id resource-type basis defs owner-ids registry]
+  (reify clojure.lang.IReduceInit
+    (reduce [_ f init]
+      (let [f' (preserving-reduced f)]
+        (loop [owners (seq owner-ids) acc init]
+          (if (or (nil? owners) (reduced? acc))
+            (unreduced acc)
+            (let [outcome (compartment/confine defs "Patient" (first owners) resource-type {} registry)]
+              (recur
+               (next owners)
+               (if (vector? outcome)
+                 (let [[_ params search-registry] outcome]
+                   (loop [skip 0 acc acc]
+                     (let [page (db/search-as-of store tenant-id (keyword resource-type)
+                                                 (assoc params :_count compartment-page-size :_skip skip)
+                                                 search-registry basis)
+                           acc  (reduce f' acc page)]
+                       (if (or (reduced? acc) (< (count page) compartment-page-size))
+                         acc
+                         (recur (+ skip compartment-page-size) acc)))))
+                 acc)))))))))
+
+(defn- scan-mode
+  "How an export enumerates each type: :compartment (search each named
+   patient's compartment as of the basis) when the patients are named and the
+   store can search as of a basis, :type (scan the whole type) otherwise."
+  [store patient-ids]
+  (if (and (seq patient-ids) (satisfies? db/ITemporalReadStore store))
+    :compartment
+    :type))
+
+(defn- export-source
+  "Reducible of the candidate `resource-type` resources for one export, before
+   the export filter."
+  [store tenant-id basis defs mode owner-ids resource-type registry]
+  (if (= :compartment mode)
+    (compartment-scan store tenant-id resource-type basis defs owner-ids registry)
+    (scan-type store tenant-id resource-type basis)))
+
 (defn- collect-type
   "Fully realize (into a vector) the export's resources for `resource-type` as
    of `basis`, applying compartment confinement, _typeFilter, _since and
@@ -317,11 +498,11 @@
    the count equals the streamed line count and empty-in-compartment types are
    omitted from :output (the unfiltered count-as-of would overcount a
    compartment and list empty files that the Bulk Data validator rejects)."
-  [store tenant-id basis defs kind owner-ids resource-type registry param-maps since]
+  [store tenant-id basis defs mode kind owner-ids resource-type registry param-maps since]
   (transduce (export-filter-xf defs kind owner-ids resource-type registry param-maps since)
              (completing (fn [n _] (inc n)))
              0
-             (scan-type store tenant-id resource-type basis)))
+             (export-source store tenant-id basis defs mode owner-ids resource-type registry)))
 
 ;; ---------------------------------------------------------------------------
 ;; NDJSON streaming (write-body-to-stream)
@@ -359,13 +540,13 @@
    batch. Peak memory is one store page: scan-type-as-of pulls the next page
    only after the reducing fn returns, and a backpressured socket pauses that
    pull."
-  [store tenant-id basis defs kind owner-ids resource-type registry param-maps since encode
+  [store tenant-id basis defs mode kind owner-ids resource-type registry param-maps since encode
    ^OutputStream out]
   (let [w (writer-on out)]
     (transduce (export-filter-xf defs kind owner-ids resource-type registry param-maps since)
                (writing-rf w encode)
                0
-               (scan-type store tenant-id resource-type basis))))
+               (export-source store tenant-id basis defs mode owner-ids resource-type registry))))
 
 (defn- stream-error!
   "Stream a single-line OperationOutcome NDJSON error to `out` (the manifest
@@ -427,7 +608,7 @@
    :patient/:group (equal to what the stream will emit). A type with zero
    resources tenant-wide is skipped before any confined scan. Returns
    {:outputs [{:type :file-id :count}...] :errors [{:type :file-id :diagnostics}...]}."
-  [store tenant-id basis defs kind owner-ids all-registries types since type-filters]
+  [store tenant-id basis defs mode kind owner-ids all-registries types since type-filters]
   (reduce
    (fn [acc rt]
      (let [registry (get all-registries rt)]
@@ -452,7 +633,7 @@
              acc
              (let [cnt (if (= kind :system)
                          tenant-cnt
-                         (confined-count store tenant-id basis defs kind owner-ids rt
+                         (confined-count store tenant-id basis defs mode kind owner-ids rt
                                          registry (filters-for type-filters rt) since))]
                (if (pos? (long (or cnt 0)))
                  (update acc :outputs conj
@@ -520,19 +701,31 @@
 
    Fronted by server.auth/wrap-require-auth in routing so a tokenless request
    returns 401 (not the Keto 403). When the number of active download streams
-   is at or above max-concurrent-streams, returns 429 with a Retry-After."
-  [req kind group-id]
+   is at or above max-concurrent-streams, returns 429 with a Retry-After.
+
+   `access` says what the caller was authorized as: {:access :system}, or
+   {:access :subject :scopes parsed-scopes} for a caller exporting named
+   patients without the system tuple, whose export is narrowed to the types its
+   scopes may read (a `_type` naming any other is refused). `patient-ids`, when
+   given, are the only owners of a Patient-level export."
+  [req kind group-id {:keys [access scopes patient-ids]}]
   (let [tenant-id      (-> req :path-params :tenant-id)
         store          (:fhir/store req)
         job-store      (:fhir/bulk-job-store req)
         all-registries (:fhir/all-registries req)
-        params         (merge (or (:form-params req) {}) (or (:query-params req) {}))
+        params         (request-params req)
         output-format  (get-param params "_outputFormat")
         since-param    (tmp/parse-since params)
         cfg            (bjs/config job-store)
-        max-streams    (long (:max-concurrent-streams cfg))]
+        max-streams    (long (:max-concurrent-streams cfg))
+        defs           (compartment/request-definitions req)
+        types          (requested-types defs kind params all-registries)
+        readable?      (fn [rt] (or (= :system access) (scope/permitted? scopes rt :read)))]
     (sweep-expired! job-store)
     (cond
+      (:invalid params)
+      (oo-response 400 "invalid" (:invalid params))
+
       (not (valid-output-format? output-format))
       (oo-response 400 "invalid"
                    (str "Unsupported _outputFormat: '" output-format
@@ -544,6 +737,11 @@
       (oo-response 400 "invalid"
                    (str "Invalid value for _since: '" (:invalid since-param) "' — "
                         tmp/temporal-value-expectation))
+
+      (and (not-empty (get-param params "_type")) (not-every? readable? types))
+      (oo-response 403 "forbidden"
+                   (str "The granted scopes do not permit reading "
+                        (str/join ", " (remove readable? types)) "."))
 
       (>= (bjs/active-stream-count job-store) max-streams)
       (oo-response 429 "throttled"
@@ -560,14 +758,16 @@
              txn-time     (str (:system-time basis))
              owner-ids    (case kind
                             :system  nil
-                            :patient (patient-ids-in-tenant store tenant-id basis)
+                            :patient (if (seq patient-ids)
+                                       (set patient-ids)
+                                       (patient-ids-in-tenant store tenant-id basis))
                             :group   (set (group-patient-ids store tenant-id group-id)))
-             defs         (compartment/request-definitions req)
-             types        (requested-types defs kind params all-registries)
+             mode         (scan-mode store patient-ids)
              since        (:since since-param)
              type-filters (parse-type-filters params)
-             files        (build-job-files store tenant-id basis defs kind owner-ids
-                                           all-registries types since type-filters)
+             files        (build-job-files store tenant-id basis defs mode kind owner-ids
+                                           all-registries (filterv readable? types)
+                                           since type-filters)
              now          (System/currentTimeMillis)
              base-job    {:id               job-id
                           :tenant           tenant-id
@@ -577,6 +777,10 @@
                           :basis            basis
                           :owner-ids        owner-ids
                           :compartment-definitions defs
+                          :scan-mode        mode
+                          :access           access
+                          :patient-ids      (not-empty (vec patient-ids))
+                          :owner            (requester req)
                           :status           :complete
                           :transaction-time txn-time
                           :request-url      (request-url req)
@@ -597,16 +801,43 @@
    middleware); an authenticated caller lacking the system read tuple -> 403."
   [req]
   (or (authorize-system req)
-      (start-export! req :system nil)))
+      (start-export! req :system nil {:access :system})))
 
 (defn patient-export
-  "GET /:tenant-id/fhir/Patient/$export — patient-level export kickoff. The
-   subject set is every Patient in the tenant; each requested type is confined
-   to the union of those Patients' compartments while streaming. Authorized
-   against the 'system' Keto object (see kickoff)."
+  "GET|POST /:tenant-id/fhir/Patient/$export — patient-level export kickoff.
+
+   Without a `patient` parameter the subject set is every Patient in the
+   tenant, which only a holder of the 'system' Keto tuple may export (see
+   kickoff). With one (the Bulk Data IG's POST Parameters form, or a GET
+   query parameter) the subject set is exactly the named Patients, and the
+   caller needs either the system tuple or read access to every one of them
+   (see subject-scopes): this is the single-patient export a patient or a
+   clinician runs. Each requested type is confined to the union of the
+   subjects' compartments while streaming."
   [req]
-  (or (authorize-system req)
-      (start-export! req :patient nil)))
+  (let [params (request-params req)
+        ids    (when-not (:invalid params) (requested-patient-ids params))]
+    (cond
+      (:invalid params)
+      (oo-response 400 "invalid" (:invalid params))
+
+      (map? ids)
+      (oo-response 400 "invalid"
+                   (str "Invalid value for patient: '" (:invalid ids)
+                        "' — expected a Patient/<id> reference."))
+
+      (system-authorized? req)
+      (start-export! req :patient nil {:access :system :patient-ids ids})
+
+      :else
+      (if-let [scopes (subject-scopes req ids)]
+        (start-export! req :patient nil {:access :subject :scopes scopes :patient-ids ids})
+        (oo-response 403 "forbidden"
+                     (if (empty? ids)
+                       (str "Subject " (get-in req [:identity :sub])
+                            " may export only named patients; pass the patient parameter.")
+                       (str "Subject " (get-in req [:identity :sub])
+                            " is not authorized to export the requested patients.")))))))
 
 (defn group-export
   "GET /:tenant-id/fhir/Group/:id/$export — group-level export kickoff. Reads
@@ -624,7 +855,7 @@
                            (catch Throwable _ nil))]
         (if (nil? group)
           (oo-response 404 "not-found" (str "Group/" group-id " not found"))
-          (start-export! req :group group-id)))))
+          (start-export! req :group group-id {:access :system})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Status / cancel
@@ -636,13 +867,13 @@
    :complete    -> 200 application/json manifest (pre-serialized at kickoff).
    :in-progress -> 202 with X-Progress + Retry-After.
    :error       -> 500 OperationOutcome.
-   :cancelled / unknown -> 404."
+   :cancelled / unknown / another requester's job -> 404."
   [req]
   (let [tenant-id (-> req :path-params :tenant-id)
         job-id    (-> req :path-params :job-id)
         job-store (:fhir/bulk-job-store req)
         _         (sweep-expired! job-store)
-        job       (bjs/get-job job-store tenant-id job-id)]
+        job       (visible-job req (bjs/get-job job-store tenant-id job-id))]
     (case (:status job)
       :complete
       (str-response 200 "application/json" (:manifest job))
@@ -664,13 +895,13 @@
 (defn cancel
   "DELETE /:tenant-id/fhir/$export-status/:job-id — cancel a job (202). There is
    no on-disk content to reclaim; the job metadata is flipped to :cancelled and
-   TTL-swept later."
+   TTL-swept later. Another requester's job is a 404, as in `status`."
   [req]
   (let [tenant-id (-> req :path-params :tenant-id)
         job-id    (-> req :path-params :job-id)
         job-store (:fhir/bulk-job-store req)
         _         (sweep-expired! job-store)
-        job       (bjs/get-job job-store tenant-id job-id)]
+        job       (visible-job req (bjs/get-job job-store tenant-id job-id))]
     (if job
       (do
         (bjs/update-job! job-store tenant-id job-id
@@ -694,7 +925,7 @@
    then writes each surviving resource as `(present type resource)`; an :error
    descriptor writes a single OperationOutcome line."
   [job-store job store all-registries encoders present descriptor token]
-  (let [{:keys [kind basis owner-ids params compartment-definitions]} job
+  (let [{:keys [kind basis owner-ids params compartment-definitions scan-mode]} job
         {:keys [type diagnostics]} descriptor
         ;; Presented after the export filter, which must judge the stored
         ;; resource, and before the wire encoding.
@@ -711,7 +942,8 @@
             :data {:tenant (:tenant job) :job-id (:id job) :type type}}
            (if (= :error (:kind descriptor))
              (stream-error! diagnostics out)
-             (stream-output! store (:tenant job) basis compartment-definitions kind owner-ids type registry
+             (stream-output! store (:tenant job) basis compartment-definitions
+                             (or scan-mode :type) kind owner-ids type registry
                              (filters-for type-filters type) since encode out)))
           (finally
             (bjs/release-stream! job-store token)))))))
@@ -720,40 +952,41 @@
   "GET /:tenant-id/fhir/$export-file/:job-id/:file-id — download one NDJSON
    output (or error) file by STREAMING it from the store as of the job's pinned
    basis. The :public? route yields 401 for a tokenless request
-   (wrap-require-auth) and this handler then gates on the system Keto tuple
-   (manifest requiresAccessToken is true): a token without the system read tuple
-   -> 403. Acquires one of max-concurrent-streams slots (429 when saturated) and
-   returns a StreamableResponseBody with an explicit Content-Type so muuntaja
-   leaves it untouched."
+   (wrap-require-auth); the manifest's requiresAccessToken is true, and the
+   handler then serves only a job this request may see (see visible-job): a
+   system job to a holder of the system tuple, a subject job to the requester
+   that started it. Anything else is a 404. Acquires one of
+   max-concurrent-streams slots (429 when saturated) and returns a
+   StreamableResponseBody with an explicit Content-Type so muuntaja leaves it
+   untouched."
   [req]
-  (or (authorize-system req)
-      (let [tenant-id      (-> req :path-params :tenant-id)
-            job-id         (-> req :path-params :job-id)
-            file-id        (-> req :path-params :file-id)
-            job-store      (:fhir/bulk-job-store req)
-            store          (:fhir/store req)
-            all-registries (:fhir/all-registries req)
-            encoders       (:fhir/resource-encoders req)
-            ;; The job was found under this request's tenant, so the read map
-            ;; `present-response` builds from `req` names the job's tenant.
-            present        (fn [resource-type resource]
-                             (narrative/present-response req :bulk-export resource-type resource))
-            _              (sweep-expired! job-store)
-            job            (bjs/get-job job-store tenant-id job-id)
-            descriptor     (get-in job [:files file-id])
-            max-streams    (long (:max-concurrent-streams (bjs/config job-store)))]
-        (cond
-          (or (nil? descriptor) (not= :complete (:status job)))
-          (oo-response 404 "not-found"
-                       (str "Export file " file-id " not found for job " job-id))
+  (let [tenant-id      (-> req :path-params :tenant-id)
+        job-id         (-> req :path-params :job-id)
+        file-id        (-> req :path-params :file-id)
+        job-store      (:fhir/bulk-job-store req)
+        store          (:fhir/store req)
+        all-registries (:fhir/all-registries req)
+        encoders       (:fhir/resource-encoders req)
+        ;; The job was found under this request's tenant, so the read map
+        ;; `present-response` builds from `req` names the job's tenant.
+        present        (fn [resource-type resource]
+                         (narrative/present-response req :bulk-export resource-type resource))
+        _              (sweep-expired! job-store)
+        job            (visible-job req (bjs/get-job job-store tenant-id job-id))
+        descriptor     (get-in job [:files file-id])
+        max-streams    (long (:max-concurrent-streams (bjs/config job-store)))]
+    (cond
+      (or (nil? descriptor) (not= :complete (:status job)))
+      (oo-response 404 "not-found"
+                   (str "Export file " file-id " not found for job " job-id))
 
-          :else
-          (if-let [token (bjs/acquire-stream! job-store max-streams)]
-            {:status  200
-             :headers {"Content-Type" "application/fhir+ndjson"}
-             :body    (output-stream-body job-store job store all-registries encoders present
-                                          descriptor token)}
-            (oo-response 429 "throttled"
-                         (str "Too many concurrent export streams (limit " max-streams
-                              "). Retry after the indicated delay.")
-                         {"Retry-After" "120"}))))))
+      :else
+      (if-let [token (bjs/acquire-stream! job-store max-streams)]
+        {:status  200
+         :headers {"Content-Type" "application/fhir+ndjson"}
+         :body    (output-stream-body job-store job store all-registries encoders present
+                                      descriptor token)}
+        (oo-response 429 "throttled"
+                     (str "Too many concurrent export streams (limit " max-streams
+                          "). Retry after the indicated delay.")
+                     {"Retry-After" "120"})))))

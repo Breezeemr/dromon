@@ -126,9 +126,10 @@
 
 (deftest route-data-carries-keto-relation-and-public-flags
   (let [{:keys [status-route file-route]} (system-route-handlers {} {})]
-    (testing "status/cancel gate on the system read tuple"
-      (is (= "read" (:keto/relation status-route)))
-      (is (not (:public? status-route))))
+    (testing "status/cancel are public + auth-fronted and authorize against the
+              job, since a job's owner need not hold the system tuple"
+      (is (true? (:public? status-route)))
+      (is (nil? (:keto/relation status-route))))
     (testing "file download is public + auth-fronted (401 tokenless), gating on
               the system tuple inline rather than via the Keto middleware"
       (is (true? (:public? file-route)))
@@ -143,16 +144,20 @@
     (is (= 401 (:status resp))
         "tokenless file download must be 401 (Inferno wants 400/401), not 403")))
 
-(deftest file-authenticated-without-system-tuple-returns-403
+(deftest file-authenticated-without-system-tuple-returns-404
   (let [{:keys [file]} (system-route-handlers {} {})
+        job-store (bjs/create-store)
+        _    (bjs/put-job! job-store "default"
+                           {:id "j" :tenant "default" :status :complete :access :system
+                            :files {"f" {:kind :output :type "Patient"}}})
         resp (file (merge {:request-method :get
                            :path-params {:tenant-id "default" :job-id "j" :file-id "f"}
                            :headers {}
                            :identity {:sub "tester"}
-                           :fhir/bulk-job-store (bjs/create-store)}
+                           :fhir/bulk-job-store job-store}
                           unauthorized))]
-    (is (= 403 (:status resp))
-        "authenticated caller without the system tuple must be 403")))
+    (is (= 404 (:status resp))
+        "a system job is invisible to a caller without the system tuple")))
 
 (deftest kickoff-authz-gap-closed-403-without-system-tuple
   (testing "an authenticated token without the system read tuple cannot start a
@@ -361,9 +366,11 @@
 (deftest status-in-progress-returns-202-with-progress-headers
   (let [job-store (bjs/create-store)]
     (bjs/put-job! job-store "default" {:id "j" :tenant "default" :status :in-progress})
-    (let [resp (be/status {:path-params {:tenant-id "default" :job-id "j"}
-                           :headers {"host" "h"}
-                           :fhir/bulk-job-store job-store})]
+    (let [resp (be/status (merge {:path-params {:tenant-id "default" :job-id "j"}
+                                  :headers {"host" "h"}
+                                  :identity {:sub "tester"}
+                                  :fhir/bulk-job-store job-store}
+                                 authorized))]
       (is (= 202 (:status resp)))
       (is (= "1" (get-in resp [:headers "Retry-After"])))
       (is (some? (get-in resp [:headers "X-Progress"]))))))
@@ -378,15 +385,19 @@
 (deftest cancel-flips-to-cancelled-and-status-then-404s
   (let [job-store (bjs/create-store)]
     (bjs/put-job! job-store "default" {:id "j" :tenant "default" :status :in-progress})
-    (let [cancel-resp (be/cancel {:path-params {:tenant-id "default" :job-id "j"}
-                                  :headers {"host" "h"}
-                                  :fhir/bulk-job-store job-store})]
+    (let [cancel-resp (be/cancel (merge {:path-params {:tenant-id "default" :job-id "j"}
+                                         :headers {"host" "h"}
+                                         :identity {:sub "tester"}
+                                         :fhir/bulk-job-store job-store}
+                                        authorized))]
       (is (= 202 (:status cancel-resp)))
       (is (= :cancelled (:status (bjs/get-job job-store "default" "j"))))
       (testing "a cancelled job's status endpoint 404s"
-        (let [status-resp (be/status {:path-params {:tenant-id "default" :job-id "j"}
-                                      :headers {"host" "h"}
-                                      :fhir/bulk-job-store job-store})]
+        (let [status-resp (be/status (merge {:path-params {:tenant-id "default" :job-id "j"}
+                                             :headers {"host" "h"}
+                                             :identity {:sub "tester"}
+                                             :fhir/bulk-job-store job-store}
+                                            authorized))]
           (is (= 404 (:status status-resp))))))))
 
 ;; ---------------------------------------------------------------------------
@@ -919,3 +930,254 @@
              (:definition (find-export "Group")))))
     (testing "non-bulk resources get no injected export operation"
       (is (nil? (find-export "Observation"))))))
+
+;; ---------------------------------------------------------------------------
+;; Named-patient export without the system tuple (170.315(b)(10)(i))
+;;
+;; A patient exporting their own record, or a clinician exporting a patient they
+;; may read. These routes are :public?, so the handler is the only thing
+;; between a token and another patient's record; every refusal below is the
+;; handler's own.
+;; ---------------------------------------------------------------------------
+
+(defn- temporal-search-store
+  "fake-search-store's data behind ITemporalReadStore too: search-as-of honors
+   `_id`, the synthetic compartment param, `_count` and `_skip`. `calls`
+   records each scan-type-as-of and search-as-of type, so a test can tell a
+   compartment search from a tenant-wide scan."
+  [data calls]
+  (let [base (fake-search-store data)]
+    (reify
+      db/IFHIRStore
+      (search [_ t rt params reg] (db/search base t rt params reg))
+      (read-resource [_ t rt id] (db/read-resource base t rt id))
+      (current-basis [_ t] (db/current-basis base t))
+      (count-as-of [_ t rt b] (db/count-as-of base t rt b))
+      (scan-type-as-of [_ t rt b]
+        (swap! calls conj [:scan (name rt)])
+        (db/scan-type-as-of base t rt b))
+      db/ITemporalReadStore
+      (search-as-of [_ t rt params reg _basis]
+        (swap! calls conj [:search (name rt)])
+        (let [skip  (long (get params :_skip 0))
+              limit (long (get params :_count 50))]
+          (->> (db/search base t rt (dissoc params :_skip :_count) reg)
+               (drop skip)
+               (take limit)
+               vec))))))
+
+(def ^:private two-patient-data
+  {"Patient"     [{:resourceType "Patient" :id "p1"}
+                  {:resourceType "Patient" :id "p2"}]
+   "Observation" [{:resourceType "Observation" :id "o1" :subject {:reference "Patient/p1"}}
+                  {:resourceType "Observation" :id "o2" :subject {:reference "Patient/p2"}}]})
+
+(def ^:private member-registries
+  {"Patient" {} "Observation" obs-registry})
+
+(defn- patient-token
+  "Identity of a patient-restricted SMART token for launch patient `pid`."
+  [sub pid scope]
+  {:sub sub :client_id "portal" :scope scope :patient pid})
+
+(defn- named-patient-req
+  "A POST Patient/$export request naming `refs`, from `identity`, allowed to
+   read only the Patients in `readable`."
+  [store job-store identity readable refs]
+  (merge {:path-params {:tenant-id "default"}
+          :uri "/default/fhir/Patient/$export"
+          :request-method :post
+          :body-params {:resourceType "Parameters"
+                        :parameter (mapv (fn [r] {:name "patient" :valueReference {:reference r}})
+                                         refs)}
+          :headers {"host" "fhir.local:3001"}
+          :scheme :https
+          :identity identity
+          :fhir/store store
+          :fhir/bulk-job-store job-store
+          :fhir/all-registries member-registries
+          :fhir/resource-encoders {}
+          :fhir/patient-read-authorized? (fn [_sub pid] (contains? readable pid))}
+         unauthorized))
+
+(defn- output-ids
+  "{type #{id ...}} streamed by every output file of `job-id`, downloaded by `req`."
+  [req job-store job-id]
+  (let [{:keys [file]} (system-route-handlers member-registries {})
+        job (bjs/get-job job-store "default" job-id)]
+    (into {}
+          (map (fn [{:keys [type file-id]}]
+                 (let [resp (file (assoc req :request-method :get
+                                         :path-params {:tenant-id "default"
+                                                       :job-id job-id :file-id file-id}))]
+                   [type (set (map #(get (json->clj %) "id")
+                                   (remove str/blank?
+                                           (str/split-lines (stream-body->string (:body resp))))))])))
+          (:output job))))
+
+(deftest patient-exports-their-own-record-by-compartment-search
+  (let [calls     (atom [])
+        store     (temporal-search-store two-patient-data calls)
+        job-store (bjs/create-store)
+        req       (named-patient-req store job-store
+                                     (patient-token "kratos-a" "p1" "patient/*.read launch/patient")
+                                     #{"p1"} ["Patient/p1"])
+        resp      (be/patient-export req)
+        job-id    (content-location-job-id resp)]
+    (is (= 202 (:status resp)))
+    (testing "only the named patient's compartment is exported"
+      (is (= {"Patient" #{"p1"} "Observation" #{"o1"}} (output-ids req job-store job-id))))
+    (testing "each type is found by compartment search, never by a tenant-wide scan"
+      (is (not-any? #(= :scan (first %)) @calls))
+      (is (some #(= [:search "Observation"] %) @calls)))
+    (testing "the job records its requester"
+      (is (= {:sub "kratos-a" :client-id "portal"}
+             (:owner (bjs/get-job job-store "default" job-id)))))))
+
+(deftest patient-token-cannot-export-anyone-else
+  (let [store     (temporal-search-store two-patient-data (atom []))
+        job-store (bjs/create-store)
+        identity  (patient-token "kratos-a" "p1" "patient/*.read")]
+    (testing "another patient, even one Keto would let it read"
+      (is (= 403 (:status (be/patient-export
+                           (named-patient-req store job-store identity #{"p1" "p2"}
+                                              ["Patient/p2"]))))))
+    (testing "its own patient plus another"
+      (is (= 403 (:status (be/patient-export
+                           (named-patient-req store job-store identity #{"p1" "p2"}
+                                              ["Patient/p1" "Patient/p2"]))))))
+    (testing "no patient parameter is a whole-tenant export, which needs the system tuple"
+      (is (= 403 (:status (be/patient-export
+                           (named-patient-req store job-store identity #{"p1" "p2"} []))))))
+    (testing "its own patient without Keto read on it"
+      (is (= 403 (:status (be/patient-export
+                           (named-patient-req store job-store identity #{} ["Patient/p1"]))))))
+    (is (empty? (bjs/all-jobs job-store)) "no refused kickoff leaves a job")))
+
+(deftest clinician-exports-patients-they-may-read
+  (let [store     (temporal-search-store two-patient-data (atom []))
+        job-store (bjs/create-store)
+        identity  {:sub "kratos-staff" :scope "user/*.*"}]
+    (testing "a patient the clinician may not read is refused"
+      (is (= 403 (:status (be/patient-export
+                           (named-patient-req store job-store identity #{"p1"}
+                                              ["Patient/p1" "Patient/p2"]))))))
+    (testing "patients the clinician may read are exported"
+      (let [req  (named-patient-req store job-store identity #{"p1" "p2"}
+                                    ["Patient/p1" "Patient/p2"])
+            resp (be/patient-export req)]
+        (is (= 202 (:status resp)))
+        (is (= {"Patient" #{"p1" "p2"} "Observation" #{"o1" "o2"}}
+               (output-ids req job-store (content-location-job-id resp))))))))
+
+(deftest a-subject-job-is-invisible-to-everyone-else
+  (let [store     (temporal-search-store two-patient-data (atom []))
+        job-store (bjs/create-store)
+        {:keys [status cancel file]} (system-route-handlers member-registries {})
+        owner     (named-patient-req store job-store
+                                     (patient-token "kratos-a" "p1" "patient/*.read")
+                                     #{"p1"} ["Patient/p1"])
+        job-id    (content-location-job-id (be/patient-export owner))
+        file-id   (:file-id (first (:output (bjs/get-job job-store "default" job-id))))
+        poll      (fn [req] (:status (status (assoc req :request-method :get
+                                                    :path-params {:tenant-id "default"
+                                                                  :job-id job-id}))))
+        fetch     (fn [req] (:status (file (assoc req :request-method :get
+                                                  :path-params {:tenant-id "default"
+                                                                :job-id job-id
+                                                                :file-id file-id}))))]
+    (is (= 200 (poll owner)) "the owner polls its own job")
+    (doseq [[label req] [["another subject"
+                          (assoc owner :identity (patient-token "kratos-b" "p1" "patient/*.read"))]
+                         ["the same subject through another client"
+                          (assoc-in owner [:identity :client_id] "other-app")]
+                         ["the owner once its read on the patient is revoked"
+                          (assoc owner :fhir/patient-read-authorized? (constantly false))]
+                         ["a holder of the system tuple"
+                          (merge (assoc owner :identity {:sub "backend"}) authorized)]]]
+      (testing label
+        (is (= 404 (poll req)))
+        (is (= 404 (fetch req)))
+        (is (= 404 (:status (cancel (assoc req :request-method :delete
+                                           :path-params {:tenant-id "default"
+                                                         :job-id job-id})))))))
+    (testing "the owner asking under another tenant"
+      (is (= 404 (:status (status (assoc owner :request-method :get
+                                         :path-params {:tenant-id "other" :job-id job-id}))))))
+    (is (= 200 (fetch owner)) "nothing above disturbed the owner's job")))
+
+(deftest a-narrow-scope-exports-only-the-types-it-may-read
+  (let [store     (temporal-search-store two-patient-data (atom []))
+        job-store (bjs/create-store)
+        identity  (patient-token "kratos-a" "p1" "patient/Patient.read")
+        req       (named-patient-req store job-store identity #{"p1"} ["Patient/p1"])]
+    (testing "types outside the scopes are left out"
+      (let [resp (be/patient-export req)]
+        (is (= 202 (:status resp)))
+        (is (= {"Patient" #{"p1"}} (output-ids req job-store (content-location-job-id resp))))))
+    (testing "a _type naming one is refused"
+      (is (= 403 (:status (be/patient-export
+                           (update req :body-params update :parameter conj
+                                   {:name "_type" :valueString "Patient,Observation"}))))))))
+
+(deftest a-system-caller-may-name-patients
+  (let [calls     (atom [])
+        store     (temporal-search-store two-patient-data calls)
+        job-store (bjs/create-store)
+        req       (merge (named-patient-req store job-store {:sub "backend"} #{} ["Patient/p2"])
+                         authorized)
+        resp      (be/patient-export req)]
+    (is (= 202 (:status resp)))
+    (is (= {"Patient" #{"p2"} "Observation" #{"o2"}}
+           (output-ids req job-store (content-location-job-id resp))))
+    (is (= :system (:access (bjs/get-job job-store "default" (content-location-job-id resp)))))))
+
+(deftest named-patient-kickoff-validation
+  (let [store     (temporal-search-store two-patient-data (atom []))
+        job-store (bjs/create-store)
+        req       (named-patient-req store job-store {:sub "kratos-staff" :scope "user/*.*"}
+                                     #{"p1"} ["Patient/p1"])]
+    (testing "a patient value that is not a Patient reference"
+      (doseq [bad ["p1" "Group/g1" "Patient/" "Patient/p1/_history/2"]]
+        (is (= 400 (:status (be/patient-export
+                             (assoc-in req [:body-params :parameter]
+                                       [{:name "patient" :valueReference {:reference bad}}]))))
+            bad)))
+    (testing "a POST body that is not a Parameters resource"
+      (is (= 400 (:status (be/patient-export
+                           (assoc req :body-params {:resourceType "Patient" :id "p1"}))))))
+    (testing "the GET query form names patients too"
+      (is (= 202 (:status (be/patient-export
+                           (assoc req :request-method :get :body-params nil
+                                  :query-params {"patient" "Patient/p1"}))))))))
+
+(deftest compartment-search-pages-through-a-large-compartment
+  (let [n         2500
+        data      {"Patient"     [{:resourceType "Patient" :id "p1"}]
+                   "Observation" (vec (for [i (range n)]
+                                        {:resourceType "Observation" :id (str "o" i)
+                                         :subject {:reference "Patient/p1"}}))}
+        store     (temporal-search-store data (atom []))
+        job-store (bjs/create-store)
+        req       (named-patient-req store job-store {:sub "kratos-staff" :scope "user/*.*"}
+                                     #{"p1"} ["Patient/p1"])
+        job-id    (content-location-job-id (be/patient-export req))
+        obs       (first (filter #(= "Observation" (:type %))
+                                 (:output (bjs/get-job job-store "default" job-id))))]
+    (is (= n (:count obs)) "the manifest counts every page")
+    (is (= n (count (get (output-ids req job-store job-id) "Observation")))
+        "the stream writes every page")))
+
+(deftest named-patient-export-follows-the-requests-compartment-definitions
+  (let [calls     (atom [])
+        store     (temporal-search-store two-patient-data calls)
+        job-store (bjs/create-store)
+        defs      (update compartment/compartment-definitions "Patient" dissoc "Observation")
+        req       (assoc (named-patient-req store job-store {:sub "kratos-staff" :scope "user/*.*"}
+                                            #{"p1"} ["Patient/p1"])
+                         :fhir/compartment-definitions defs)
+        resp      (be/patient-export req)]
+    (is (= 202 (:status resp)))
+    (is (= {"Patient" #{"p1"}} (output-ids req job-store (content-location-job-id resp)))
+        "a type the host removed from the compartment is not exported")
+    (is (not-any? #(= [:search "Observation"] %) @calls))))
