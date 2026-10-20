@@ -15,12 +15,10 @@
 
    All three are `xtdb.protocols/Connectable`s, so the store's queries and
    transactions are the same SQL on every transport."
-  (:require [clojure.string :as str]
-            [taoensso.telemere :as t]
+  (:require [taoensso.telemere :as t]
             [xtdb.api :as xt]
             [xtdb.flight-sql :as flight-sql]
-            [xtdb.protocols :as xtp]
-            [xtdb.serde :as serde])
+            [xtdb.protocols :as xtp])
   (:import [clojure.lang IReduceInit]
            [java.nio.channels ClosedByInterruptException]
            [java.util.concurrent LinkedBlockingDeque Semaphore TimeUnit]
@@ -28,7 +26,6 @@
            [org.apache.arrow.flight CallOption CloseSessionRequest FlightRuntimeException]
            [org.apache.arrow.flight.sql FlightSqlClient]
            [xtdb.api Xtdb Xtdb$Connection]
-           [xtdb.api.query IKeyFn]
            [xtdb.flight_sql FlightSqlConn]))
 
 (defprotocol ConnSource
@@ -119,57 +116,15 @@
 
 (def ^:private no-call-opts (make-array CallOption 0))
 
-;; XTDB 2.2.0-beta3's FlightSQL server streams a query by loading each result
-;; page into an Arrow root of the query's declared result type with
-;; VectorLoader, which matches buffers by position, not by name. A page that
-;; lacks a struct field or union leg the declared type has fails with "no more
-;; buffers for field ..." (typical once blocks have flushed); a page whose
-;; struct fields come in another order than the declared type's is sent with
-;; each field's buffers under another field's name (wrong values, or a client
-;; JVM crash decoding them). A sort at the top of the plan copies every row, by
-;; name, into vectors of the declared type before that load, so each page
-;; leaves the cursor in the declared layout. ROW_NUMBER() OVER () keeps the
-;; query's own row order through that sort.
-
-(def ^:private row-number-col
-  "The column a materialized read sorts on; stripped from every row."
-  "_xt_flight_row")
-
-(defn- materializable? [sql]
-  (boolean (and (string? sql) (re-find #"(?i)^\s*(SELECT|WITH)\b" sql))))
-
-(defn ^:no-doc materialized-sql
-  "`sql`, a query, wrapped so the server sorts its rows into the declared
-   result layout before streaming them (see above)."
-  [sql]
-  (format "SELECT * FROM (SELECT *, ROW_NUMBER() OVER () AS %s FROM (%s) AS _xt_flight_rows) AS _xt_flight_sorted ORDER BY %s"
-          row-number-col (str/replace sql #"[\s;]+$" "") row-number-col))
-
-(deftype MaterializingSession [^FlightSqlConn conn]
-  xtp/Connectable
-  (-plan-q [_ sql args opts]
-    (if (materializable? sql)
-      (let [row-key (.denormalize ^IKeyFn (serde/read-key-fn (or (:key-fn opts) :kebab-case-keyword))
-                                  row-number-col)
-            plan (xtp/-plan-q conn (materialized-sql sql) args opts)]
-        (reify IReduceInit
-          (reduce [_ f start]
-            (reduce (fn [acc row] (f acc (dissoc row row-key))) start plan))))
-      (xtp/-plan-q conn sql args opts)))
-  (-submit-tx [_ tx-ops opts] (xtp/-submit-tx conn tx-ops opts))
-  (-execute-tx [_ tx-ops opts] (xtp/-execute-tx conn tx-ops opts))
-  (-status [_] (xtp/-status conn)))
-
 (defn- close-flight-conn!
   "Ends the server-side session (and the connection the server holds for it)
    before closing the client: FlightSqlConn's own close only drops the channel,
    which leaves the session on the server."
-  [^MaterializingSession session]
-  (let [^FlightSqlConn conn (.-conn session)]
-    (try
-      (.closeSession ^FlightSqlClient (.-client conn) (CloseSessionRequest.) no-call-opts)
-      (catch Throwable _ nil))
-    (try (.close ^java.io.Closeable conn) (catch Throwable _ nil))))
+  [^FlightSqlConn conn]
+  (try
+    (.closeSession ^FlightSqlClient (.-client conn) (CloseSessionRequest.) no-call-opts)
+    (catch Throwable _ nil))
+  (try (.close ^java.io.Closeable conn) (catch Throwable _ nil)))
 
 (declare flight-plan-q)
 
@@ -183,7 +138,7 @@
       (throw (ex-info (str "No FlightSQL connection free after " timeout-ms " ms")
                       {:dbname (:dbname conn-opts) :max-size (:max-size conn-opts)})))
     (try
-      (or (.pollFirst idle) (->MaterializingSession (flight-sql/open-conn conn-opts)))
+      (or (.pollFirst idle) (flight-sql/open-conn conn-opts))
       (catch Throwable e
         (.release permits)
         (throw e))))
