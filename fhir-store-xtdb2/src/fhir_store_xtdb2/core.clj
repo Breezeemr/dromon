@@ -1662,35 +1662,21 @@
   (when node (try (close-node! node) (catch Throwable _ nil))))
 
 ;; ---------------------------------------------------------------------------
-;; Node start: pipelined replica-log appends and table declarations.
+;; Node start: node config and table declarations.
 ;; ---------------------------------------------------------------------------
 
 (defn ->xtdb-config
   "The xtdb.api.Xtdb$Config a store node starts from: `node-config` (a node
-   config map, or an Xtdb$Config, which is then modified in place) with
-   pipelined replica-log appends set from `:pipelined-replica-appends?`
-   (on unless it is false).
+   config map, or an Xtdb$Config, which is then modified in place).
 
-   Pipelining (XTDB 2.2.0-beta3) lets the log leader send the next replica-log
-   append without waiting for the previous one; beta3 leaves it off so
-   mixed-version clusters can roll, and the next release turns it on
-   unconditionally. The node config map has no key for it, so it is set on
-   the config's IndexerConfig after the map's own :indexer keys are applied.
-   The store sets it explicitly either way, so XTDB_PIPELINED_REPLICA_APPENDS
-   has no effect on the nodes it starts.
-
-   Every node this store starts is a single in-process node on its own local
-   or in-memory log, always its own leader, so the beta3 caveat about older
-   nodes reading a pipelining leader's log cannot arise. Pass false only for a
-   deployment that must roll back below beta3: turn it off on every node, wait
-   for a block to be written, then downgrade.
+   Pipelined replica-log appends need no setting: from XTDB 2.2.0-rc2 a log
+   leader always pipelines, and the beta3 switch (IndexerConfig's
+   pipelinedReplicaAppends, XTDB_PIPELINED_REPLICA_APPENDS) is gone.
 
    `:flight-sql?` starts the node's FlightSQL server on a free loopback port,
    unless `node-config` already configures one."
-  ^xtdb.api.Xtdb$Config [node-config {:keys [pipelined-replica-appends? flight-sql?]}]
+  ^xtdb.api.Xtdb$Config [node-config {:keys [flight-sql?]}]
   (let [cfg (xtn/->config node-config)]
-    (.pipelinedReplicaAppends ^xtdb.api.IndexerConfig (.getIndexer cfg)
-                              (not (false? pipelined-replica-appends?)))
     (when (and flight-sql? (nil? (.getFlightSql cfg)))
       ;; No-arg ctor plus setters: XTDB after 2.2.0-beta3 dropped the
       ;; (host, port) constructor.
@@ -1728,8 +1714,8 @@
 ;; ATTACHed to the server's primary `xtdb` database, reached over pgwire
 ;; through xt/client; its log and storage come from :attach-template (by
 ;; default a Kafka topic on the server's `kafkaCluster` and a local path). The
-;; server owns every node-level setting, pipelined replica-log appends
-;; included, so the store takes none of them in this mode.
+;; server owns every node-level setting, so the store takes none of them in
+;; this mode.
 ;; ---------------------------------------------------------------------------
 
 (def ^:no-doc default-attach-template
@@ -1924,8 +1910,7 @@
   (let [node (if-let [server (:server store)]
                (remote-tenant-node store server tid)
                (start-node (:node-config store)
-                           {:pipelined-replica-appends? (:pipelined-replica-appends? store)
-                            :flight-sql? (= :flight-sql (:transport store))}))]
+                           {:flight-sql? (= :flight-sql (:transport store))}))]
     (try
       (let [declarations (:declared-columns store)
             on-node (columns-on-node node (node-db-name store tid))]
@@ -3305,10 +3290,9 @@
    - :resource/lifecycle — a write lifecycle (qualified symbol, value, or
      constructor fn of this config map); resolved once here and kept on the
      store under :resource/lifecycle. See fhir-store.lifecycle.
-   - :pipelined-replica-appends? — pipelined replica-log appends on every
-     node the store starts (default: on; only false turns it off). false is
-     the opt-out for a deployment that must roll back below XTDB 2.2.0-beta3;
-     see ->xtdb-config.
+   - :pipelined-replica-appends? — refused. XTDB 2.2.0-rc2 always pipelines
+     replica-log appends and has no switch for it (see ->xtdb-config), so a
+     config that still sets it is reported rather than silently ignored.
    - :server            — run against a standalone XTDB server instead of
      starting nodes: {:host :port :user :password} for xt/client, plus
      :database-prefix (default \"fhir_\", see tenant-db-name),
@@ -3319,9 +3303,9 @@
      attached-database list still go over pgwire). Each tenant is a database attached
      to the server; create-tenant's :replace and delete-tenant's
      :close-storage? detach it. Requires :sql query-mode, and refuses
-     :node-config and :pipelined-replica-appends?, which the server owns
-     (an ATTACH config has no indexer section, so every tenant database
-     takes the server's node-wide indexer settings).
+     :node-config, which the server owns (an ATTACH config has no indexer
+     section, so every tenant database takes the server's node-wide indexer
+     settings).
      Assumes ONE server node: xt/client's pooled connections carry no
      await token, so a read sees the store's own writes only because the
      node that committed a write also serves the read. Against a cluster
@@ -3340,6 +3324,10 @@
     :as config}]
   (assert (contains? #{:sql :xtql} query-mode)
           (str "query-mode must be :sql or :xtql, got " query-mode))
+  (when (some? pipelined-replica-appends?)
+    (throw (ex-info (str ":pipelined-replica-appends? was removed: XTDB 2.2.0-rc2 always pipelines "
+                         "replica-log appends and has no setting for it")
+                    {:pipelined-replica-appends? pipelined-replica-appends?})))
   (let [transport (or transport *default-transport*)]
     (when-not (contains? transports transport)
       (throw (ex-info (str "transport must be one of " transports ", got " transport)
@@ -3355,11 +3343,7 @@
       (throw (ex-info "A :server store supports only :sql query-mode" {:query-mode query-mode})))
     (when (seq node-config)
       (throw (ex-info "A :server store starts no node, so it takes no :node-config"
-                      {:node-config-keys (keys node-config)})))
-    (when (some? pipelined-replica-appends?)
-      (throw (ex-info (str "A :server store cannot set :pipelined-replica-appends?: the server "
-                           "owns it (indexer.pipelinedReplicaAppends in its config)")
-                      {}))))
+                      {:node-config-keys (keys node-config)}))))
   (let [storage-encoders (xf/build-storage-encoders schemas)
         read-decoders    (xf/build-read-decoders schemas)
         store (->XTDBStore (atom {}) node-config storage-encoders read-decoders query-mode
@@ -3368,7 +3352,6 @@
            :declared-columns (schema-declarations schemas)
            :server server
            :transport (or transport *default-transport*)
-           :pipelined-replica-appends? (not (false? pipelined-replica-appends?))
            :operations {:valueset-expand xtdb-valueset-expand
                         :valueset-lookup xtdb-valueset-lookup}
            :resource/lifecycle (lc/resolve-lifecycle lifecycle config))))

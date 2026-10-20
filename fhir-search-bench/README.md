@@ -125,10 +125,9 @@ wall time; entries/s for transactions), and each repeat's p50 so a difference
 can be weighed against run-to-run spread.
 
 ```bash
-# xtdb2 (pipelined replica appends on by default; the store sets the flag
-# itself, so XTDB_PIPELINED_REPLICA_APPENDS has no effect).
+# xtdb2 (replica-log appends always pipeline from XTDB 2.2.0-rc2; the
+# :xtdb-pipelined? option and XTDB_PIPELINED_REPLICA_APPENDS are gone).
 bb bench-writes-xtdb
-bb bench-writes-xtdb :xtdb-pipelined? false :out '"target/writes-xtdb2-nopipe.edn"'
 
 # Datomic, from master-at-arms2/dromon-datomic (shared dev transactor on :4334).
 bb bench-writes
@@ -153,7 +152,7 @@ the benchmark's tenant a database attached to that server with its own Kafka
 topic, under a fresh `fhirbench_<hex>_` prefix.
 
 ```bash
-bb xtdb-kafka-up                 # podman pod: Apache Kafka 3.9.1 + XTDB 2.2.0-beta3 (xtdb-aws image)
+bb xtdb-kafka-up                 # podman pod: Apache Kafka 3.9.1 + XTDB 2.2.0-rc2 (xtdb-aws image)
 bb bench-writes-xtdb-server      # -> target/writes-xtdb2-server.edn
 bb bench-xtdb-server :max-resources 100000   # -> target/bench-xtdb2-server.edn
 bb xtdb-kafka-topics             # the tenant's topic and -replica topic, with offsets
@@ -193,10 +192,10 @@ transactions of 100 and 1000 entries 1.5-1.6x, and 16-thread creates and
 updates 1.3x.
 
 The server's config is `docker/xtdb-kafka/config.yaml`: a Kafka log for the
-primary database, local storage in the container, and
-`indexer.pipelinedReplicaAppends: true` (the server's YAML decoder refuses an
-unknown key, so the setting is known to be read; `XTDB_PIPELINED_REPLICA_APPENDS`
-is set as well). The server runs with `-Xmx8g`; Kafka with its image default.
+primary database and local storage in the container. Replica-log appends
+always pipeline from 2.2.0-rc2, which refuses the beta3
+`indexer.pipelinedReplicaAppends` key at startup. The server runs with
+`-Xmx8g`; Kafka with its image default.
 
 XTDB writes each transaction as one Kafka message, so Kafka's 1 MiB default
 refuses large transactions: a 1000-entry Synthea transaction serializes to

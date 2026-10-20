@@ -13,8 +13,7 @@
                 *command-line-args*)}
 
   bench-writes-xtdb
-  {:doc "Run the write/transaction benchmark against the xtdb2 backend. Pass
-         :xtdb-pipelined? false to turn pipelined replica appends off."
+  {:doc "Run the write/transaction benchmark against the xtdb2 backend."
    :task (apply shell
                 "clojure" "-X:xtdb" "fhir-search-bench.writes/run" ":backend" ":xtdb2"
                 *command-line-args*)}
@@ -25,10 +24,10 @@
    :task (apply shell "clojure" "-X" "fhir-search-bench.writes/report" *command-line-args*)}
 
   xtdb-kafka-up
-  {:doc "Starts a standalone XTDB 2.2.0-beta3 server on a Kafka log in the podman
+  {:doc "Starts a standalone XTDB 2.2.0-rc2 server on a Kafka log in the podman
          pod fhirbench-xtdb (Apache Kafka 3.9.1, KRaft, one broker): pgwire on
          127.0.0.1:15432, FlightSQL on :19832, healthz on :18090, Kafka on :19092. Config in
-         docker/xtdb-kafka/config.yaml (pipelined replica appends on). Replaces
+         docker/xtdb-kafka/config.yaml. Replaces
          a running pod, so every start has empty topics and storage."
    :requires ([babashka.fs :as fs])
    :task (let [cfg (str (fs/absolutize "docker/xtdb-kafka/config.yaml"))
@@ -46,10 +45,10 @@
            ;; topics XTDB auto-creates take the broker default.
            (shell "podman exec fhirbench-kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --entity-type brokers --entity-default --alter --add-config message.max.bytes=33554432")
            (shell "podman" "run" "-d" "--pod" "fhirbench-xtdb" "--name" "fhirbench-xtdb-server"
-                  "-e" "XTDB_LOG_TOPIC=xtdb-primary" "-e" "XTDB_PIPELINED_REPLICA_APPENDS=true"
+                  "-e" "XTDB_LOG_TOPIC=xtdb-primary"
                   "-e" "JAVA_TOOL_OPTIONS=-Xmx8g"
                   "-v" (str cfg ":/usr/local/lib/xtdb/config.yaml:ro,Z")
-                  "ghcr.io/xtdb/xtdb-aws:2.2.0-beta3")
+                  "ghcr.io/xtdb/xtdb-aws:2.2.0-rc2")
            (wait "XTDB" (fn [] (zero? (:exit (shell {:continue true :out nil :err nil}
                                                     "curl -sf http://127.0.0.1:18090/healthz/alive"))))))}
 

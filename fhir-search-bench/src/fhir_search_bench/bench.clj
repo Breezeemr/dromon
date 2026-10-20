@@ -38,15 +38,12 @@
 
 (defn ^:no-doc make-store
   "Construct a fresh store: `(store-fn)` when given, else the built-in xtdb2
-   store, whose on-disk node directory is wiped first. `opts` may carry
-   `:xtdb-pipelined?` (default true, the store's own default), which sets the
-   xtdb2 store's pipelined replica-log appends; the store sets that itself, so
-   XTDB_PIPELINED_REPLICA_APPENDS has no effect on it.
+   store, whose on-disk node directory is wiped first. Replica-log appends
+   always pipeline (XTDB 2.2.0-rc2 has no switch for it).
 
    With `:xtdb-server` (\"host:port\"), the xtdb2 store runs against that
    standalone XTDB server instead of an embedded node, its tenant a database
-   under a fresh `fhirbench_<hex>_` prefix; the server owns pipelining, so
-   `:xtdb-pipelined?` does not apply.
+   under a fresh `fhirbench_<hex>_` prefix.
 
    `:transport` (:pgwire, the default, :adbc or :flight-sql) is the xtdb2
    store's :transport; with `:xtdb-server` and :flight-sql it needs
@@ -55,9 +52,9 @@
    database (default a Kafka log on the server's `kafkaCluster`), e.g.
    \"log: !InMemory\\nstorage: !InMemory\" for a server without Kafka."
   ([backend store-fn] (make-store backend store-fn {}))
-  ([backend store-fn {:keys [xtdb-pipelined? xtdb-server transport xtdb-flight-sql-port
+  ([backend store-fn {:keys [xtdb-server transport xtdb-flight-sql-port
                              xtdb-attach-template]
-                      :or {xtdb-pipelined? true transport :pgwire}}]
+                      :or {transport :pgwire}}]
   (cond
     store-fn
     ((requiring-resolve store-fn))
@@ -81,7 +78,6 @@
       (create {:resource/schemas            @schema/schemas
                :query-mode                  :sql
                :transport                   transport
-               :pipelined-replica-appends?  (boolean xtdb-pipelined?)
                :node-config                 {:log     [:local {:path (str dir "/log")}]
                                              :storage [:local {:path (str dir "/storage")}]}}))
 
