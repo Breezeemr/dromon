@@ -98,6 +98,15 @@
    :requires ([flightsql-repro :as fr])
    :task (fr/repro! :beta3 *command-line-args*)}
 
+  flightsql-repro-release
+  {:doc "As flightsql-repro-nightly, against a published XTDB release:
+         `bb flightsql-repro-release :version 2.2.0-rc2`. Server images
+         ghcr.io/xtdb/xtdb:<v> and xtdb-aws:<v>; client com.xtdb/xtdb-core and
+         xtdb-api <v> from Maven Central. Fails up front if any is not
+         published. Evidence in target/flightsql-repro/<v>/."
+   :requires ([flightsql-repro :as fr])
+   :task (fr/repro-release! *command-line-args*)}
+
   flightsql-repro-from-sha
   {:doc "As flightsql-repro-nightly, against XTDB built from a git commit:
          `bb flightsql-repro-from-sha :sha <40-char sha>` (or a branch, tag or

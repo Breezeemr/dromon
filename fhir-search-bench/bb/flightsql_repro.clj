@@ -38,6 +38,12 @@
              :client "2.2.0-SNAPSHOT" :client-repo snapshot-repo}
    :beta3   {:image "ghcr.io/xtdb/xtdb:2.2.0-beta3" :kafka-image "ghcr.io/xtdb/xtdb-aws:2.2.0-beta3"}})
 
+(defn- release-version
+  "A published XTDB release: its ghcr.io images, and the same version of
+   xtdb-core and xtdb-api from Maven Central as the client."
+  [v]
+  {:image (str "ghcr.io/xtdb/xtdb:" v) :kafka-image (str "ghcr.io/xtdb/xtdb-aws:" v) :client v})
+
 (def ^:private kafka-broker-image "docker.io/apache/kafka:3.9.1")
 
 ;; Bench servers: a fixed heap, so no run times heap resizing, and a cgroup
@@ -268,7 +274,7 @@
   [{:keys [client client-repo]} jvm-opts exec-flag]
   (concat ["clojure"]
           (when client
-            ["-Sdeps" (pr-str {:mvn/repos {"xtdb-client" {:url client-repo}}
+            ["-Sdeps" (pr-str {:mvn/repos (if client-repo {"xtdb-client" {:url client-repo}} {})
                                :aliases   {:xtdb-client {:override-deps
                                                          {'com.xtdb/xtdb-core {:mvn/version client}
                                                           'com.xtdb/xtdb-api  {:mvn/version client}}}}})])
@@ -691,7 +697,7 @@
 ;; ── Task ────────────────────────────────────────────────────────────────────
 
 (def ^:private own-options #{:focused-only :bench-only :race-secs :timeout-min :sha :repo :rebuild :rounds
-                              :storage})
+                              :storage :version})
 
 (defn- storage-keys
   "The write-benchmark variants `:storage` asks for: :disk, :kafka or :all
@@ -704,7 +710,7 @@
     (throw (ex-info "Pass :storage :disk, :kafka or :all" {:storage (:storage own)}))))
 
 ;; Read as plain strings, so `:sha 9f8553ce2c3c...` needs no EDN quoting.
-(def ^:private string-options #{:sha :repo})
+(def ^:private string-options #{:sha :repo :version})
 
 (defn- parse-args
   "Splits `args` (key/value pairs, as for clojure -X) into this task's own
@@ -821,18 +827,51 @@
     (fs/create-dirs dir)
     parsed))
 
+(defn- pull-images!
+  "Pulls the images the run needs, failing with a clear message when one is
+   not published."
+  [version parsed]
+  (let [kafka? (and (not (get-in parsed [:own :focused-only]))
+                    (some #{:kafka} (storage-keys (:own parsed))))]
+    (doseq [image (cond-> [(:image version)] kafka? (conj (:kafka-image version) kafka-broker-image))]
+      (println "Pulling" image)
+      (when-not (zero? (:exit (p/shell {:continue true} "podman" "pull" image)))
+        (throw (ex-info (str image " could not be pulled: is it published?") {:image image}))))))
+
+(defn- check-maven-client!
+  "Fails unless xtdb-core and xtdb-api `v` are on Maven Central."
+  [v]
+  (doseq [artifact ["xtdb-core" "xtdb-api"]
+          :let [url (str "https://repo1.maven.org/maven2/com/xtdb/" artifact "/" v "/" artifact "-" v ".pom")
+                status (try (:status (http/head url {:throw false :timeout 20000}))
+                            (catch Exception _ nil))]]
+    (when-not (= 200 status)
+      (throw (ex-info (str "com.xtdb/" artifact " " v " is not on Maven Central (" url " answered " status ")")
+                      {:artifact artifact :version v})))))
+
 (defn repro!
   "Entry point of `bb flightsql-repro-nightly` and `-beta3`."
   [version-key args]
   (let [version (or (versions version-key) (throw (ex-info "Unknown XTDB version" {:version version-key})))
         dir     (str "target/flightsql-repro/" (name version-key))
-        parsed  (prepare! args dir)
-        kafka?  (and (not (get-in parsed [:own :focused-only]))
-                     (some #{:kafka} (storage-keys (:own parsed))))]
-    (doseq [image (cond-> [(:image version)] kafka? (conj (:kafka-image version) kafka-broker-image))]
-      (println "Pulling" image)
-      (p/shell "podman" "pull" image))
+        parsed  (prepare! args dir)]
+    (pull-images! version parsed)
     (run-repro! (name version-key) version dir parsed)))
+
+(defn repro-release!
+  "Entry point of `bb flightsql-repro-release :version <v>`: the repro against a
+   published XTDB release, server images from ghcr.io and client from Maven
+   Central, both at `v`."
+  [args]
+  (let [v (get-in (parse-args args) [:own :version])]
+    (when (str/blank? v)
+      (throw (ex-info "Pass :version, e.g. bb flightsql-repro-release :version 2.2.0-rc2" {})))
+    (check-maven-client! v)
+    (let [version (release-version v)
+          dir     (str "target/flightsql-repro/" v)
+          parsed  (prepare! args dir)]
+      (pull-images! version parsed)
+      (run-repro! v version dir parsed))))
 
 (defn repro-from-sha!
   "Entry point of `bb flightsql-repro-from-sha :sha <sha>`: builds XTDB at
