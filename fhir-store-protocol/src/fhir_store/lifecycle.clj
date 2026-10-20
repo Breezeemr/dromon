@@ -33,7 +33,8 @@
         blobs, from the prepared resource.
      5. The transaction commits.
      6. `after-commit` fires ONCE for the transaction; a transaction Bundle
-        fires once with all its writes, a batch once per entry that landed.
+        fires once with all its writes, a batch once per entry that landed,
+        also where a store commits several batch entries in one transaction.
 
    A write refused at 1 or 2, or whose tx fails at 5 (a 409 or 412 lost
    race, a schema rejection), must leave nothing moved. That is why `prepare`
