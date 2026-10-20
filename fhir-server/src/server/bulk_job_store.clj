@@ -28,6 +28,10 @@
       :owner-ids        set of subject Patient ids (patient/group), else nil
       :compartment-definitions the compartment definitions in force at kickoff,
                         so the files stream under the same membership
+      :patient-ids      the Patient ids a `patient` parameter named, else nil
+      :scan-mode        #{:type :compartment} how each type is enumerated
+      :access           #{:system :subject} what the requester was authorized as
+      :owner            {:sub :client-id} of the requester
       :status           #{:in-progress :complete :error :cancelled}
       :transaction-time ISO-8601 instant string derived from the basis
       :request-url      absolute kickoff URL string

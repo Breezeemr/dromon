@@ -306,9 +306,13 @@
      ;; segment is the real "Patient" type, so (like the system kickoff) the
      ;; route is `:public?` + wrap-require-auth to yield 401 (not the Keto 403
      ;; on the "Patient" object) for a tokenless request while still honoring a
-     ;; valid backend-services token that only holds the "system" tuple.
+     ;; valid backend-services token that only holds the "system" tuple. POST
+     ;; carries the IG's Parameters body; its `patient` parameter narrows the
+     ;; export to named patients, which a patient or clinician without the
+     ;; system tuple may run (server.bulk-export/patient-export authorizes it).
      ["/:tenant-id/fhir/Patient/$export"
       {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/patient-export)))
+       :post    (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/patient-export)))
        :public? true}]
      ;; Group-level export: resolve Group.member.entity Patient refs and union
      ;; their compartments. Placed in the system routes (ahead of the resource
@@ -316,15 +320,15 @@
      ["/:tenant-id/fhir/Group/:id/$export"
       {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/group-export)))
        :public? true}]
-     ;; Status polling + cancel gate on the already-granted "system" Keto
-     ;; object (see the $export-status exclusion in server.keto/server.scope).
-     ;; :keto/relation "read" pins both GET (poll) and DELETE (cancel) to the
-     ;; system read tuple the backend-services token already holds; cancel
-     ;; writes no clinical data, so gating it on read is intentional.
+     ;; Status polling + cancel. `:public?` + wrap-require-auth like the
+     ;; kickoff: a job belongs to whoever started it, which is not always a
+     ;; holder of the "system" tuple (a patient exporting their own record), so
+     ;; the handlers authorize against the job itself
+     ;; (server.bulk-export/visible-job) and answer 404 for anyone else's.
      ["/:tenant-id/fhir/$export-status/:job-id"
-      {:get           (wrap-bulk (resolve-handler 'server.bulk-export/status))
-       :delete        (wrap-bulk (resolve-handler 'server.bulk-export/cancel))
-       :keto/relation "read"}]
+      {:get     (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/status)))
+       :delete  (require-auth (wrap-bulk (resolve-handler 'server.bulk-export/cancel)))
+       :public? true}]
      ;; File download (manifest requiresAccessToken true). Like the kickoff
      ;; routes it is `:public?` + wrap-require-auth so a tokenless request
      ;; returns 401 (Inferno's ndjson no-auth check wants 400/401) rather than
