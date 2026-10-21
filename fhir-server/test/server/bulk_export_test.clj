@@ -19,6 +19,7 @@
             [server.bulk-job-store :as bjs]
             [server.compartment :as compartment]
             [server.handlers :as handlers]
+            [server.router :as router]
             [server.routing :as routing])
   (:import [java.io ByteArrayOutputStream]
            [java.nio.charset StandardCharsets]))
@@ -1181,3 +1182,59 @@
     (is (= {"Patient" #{"p1"}} (output-ids req job-store (content-location-job-id resp)))
         "a type the host removed from the compartment is not exported")
     (is (not-any? #(= [:search "Observation"] %) @calls))))
+
+;; ---------------------------------------------------------------------------
+;; The host's manifest extension, and Expires on the completed status
+;; ---------------------------------------------------------------------------
+
+(def ^:private format-extension
+  {"formatDocumentation" "https://docs.example.test/export-format/"})
+
+(deftest the-manifest-carries-the-hosts-extension
+  (let [job {:id "j" :tenant "default" :transaction-time "2026-10-21T00:00:00Z"
+             :request-url "https://h/default/fhir/Patient/$export" :output [] :error []}
+        req {:path-params {:tenant-id "default"} :headers {"host" "h"} :scheme :https}]
+    (is (= format-extension
+           (:extension (be/build-manifest (assoc req :fhir/bulk-manifest-extension format-extension) job))))
+    (testing "none is no extension key at all"
+      (is (not (contains? (be/build-manifest req job) :extension)))
+      (is (not (contains? (be/build-manifest (assoc req :fhir/bulk-manifest-extension {}) job) :extension))))))
+
+(deftest the-completed-status-says-when-the-export-expires
+  (let [job-store (bjs/create-store {:ttl-ms 3600000})
+        ;; Whole seconds a minute ago: an HTTP-date has no milliseconds, and a job
+        ;; older than the TTL would be swept before the poll.
+        finished  (* 1000 (quot (- (System/currentTimeMillis) 60000) 1000))
+        expected  (be/expires-header {:finished-at finished} 3600000)]
+    (bjs/put-job! job-store "default" {:id "j" :tenant "default" :status :complete :access :system
+                                       :manifest "{}" :created-at finished :finished-at finished})
+    (let [resp (be/status (merge {:path-params {:tenant-id "default" :job-id "j"}
+                                  :headers {"host" "h"}
+                                  :identity {:sub "tester"}
+                                  :fhir/bulk-job-store job-store}
+                                 authorized))]
+      (is (= 200 (:status resp)))
+      (is (= expected (get-in resp [:headers "Expires"]))
+          "the TTL sweep removes the job an hour after it finished")
+      (is (re-matches #"\w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT" (get-in resp [:headers "Expires"]))
+          "an HTTP-date, in GMT"))))
+
+(deftest expires-is-an-imf-fixdate
+  (is (= "Thu, 01 Oct 2026 01:00:00 GMT"
+         (be/expires-header {:finished-at (.toEpochMilli (java.time.Instant/parse "2026-10-01T00:00:00Z"))}
+                            3600000))
+      "a one-digit day is written with two digits"))
+
+(deftest the-router-takes-a-manifest-extension
+  (is (= format-extension
+         (:bulk-manifest-extension (router/resolve-options {:bulk-manifest-extension format-extension}))))
+  (is (nil? (:bulk-manifest-extension (router/resolve-options {}))))
+  (doseq [bad ["https://docs.example.test/" {:formatDocumentation "x"} [["k" "v"]]]]
+    (is (thrown? clojure.lang.ExceptionInfo (router/resolve-options {:bulk-manifest-extension bad}))
+        (pr-str bad)))
+  (testing "the middleware puts it on the request"
+    (let [seen (atom nil)
+          handler (router/wrap-bulk-job-store #(reset! seen %) :store format-extension)]
+      (handler {})
+      (is (= format-extension (:fhir/bulk-manifest-extension @seen)))
+      (is (= :store (:fhir/bulk-job-store @seen))))))

@@ -50,7 +50,10 @@
            [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
            [com.fasterxml.jackson.databind SerializationFeature]
            [java.io OutputStream OutputStreamWriter BufferedWriter Writer]
-           [java.nio.charset StandardCharsets]))
+           [java.nio.charset StandardCharsets]
+           [java.time Instant ZoneOffset ZonedDateTime]
+           [java.time.format DateTimeFormatter]
+           [java.util Locale]))
 
 (def ^:private json-mapper
   "Jackson mapper that renders java.time values (e.g. meta.lastUpdated
@@ -657,21 +660,40 @@
 (defn build-manifest
   "Build the completed-export status manifest map for `job`. Output and error
    file URLs are made absolute from `req` so they are reachable by the client
-   that received them. requiresAccessToken is true: the file routes are gated on
-   the system Keto tuple (see server.routing)."
+   that received them. requiresAccessToken is true: a file is served only to a
+   request that may see the job (see `visible-job`). The host's
+   :fhir/bulk-manifest-extension, when set, is the manifest's `extension`
+   object, the one name the IG reserves for servers."
   [req job]
   (let [tenant-id (:tenant job)
         job-id    (:id job)
-        ->url     (fn [o] (file-url req tenant-id job-id (:file-id o)))]
-    {:transactionTime     (:transaction-time job)
-     :request             (:request-url job)
-     :requiresAccessToken true
-     :output              (mapv (fn [o] {:type  (:type o)
-                                         :count (:count o)
-                                         :url   (->url o)})
-                                (:output job))
-     :error               (mapv (fn [o] {:type (:type o) :url (->url o)})
-                                (:error job))}))
+        ->url     (fn [o] (file-url req tenant-id job-id (:file-id o)))
+        extension (not-empty (:fhir/bulk-manifest-extension req))]
+    (cond-> {:transactionTime     (:transaction-time job)
+             :request             (:request-url job)
+             :requiresAccessToken true
+             :output              (mapv (fn [o] {:type  (:type o)
+                                                 :count (:count o)
+                                                 :url   (->url o)})
+                                        (:output job))
+             :error               (mapv (fn [o] {:type (:type o) :url (->url o)})
+                                        (:error job))}
+      extension (assoc :extension extension))))
+
+(def ^:private http-date
+  "IMF-fixdate (RFC 9110 5.6.7), the HTTP-date a sender generates. Not
+   DateTimeFormatter/RFC_1123_DATE_TIME, which writes a one-digit day as one
+   digit."
+  (DateTimeFormatter/ofPattern "EEE, dd MMM yyyy HH:mm:ss 'GMT'" Locale/US))
+
+(defn expires-header
+  "The HTTP-date at which `job` leaves the store under `ttl-ms`, for the
+   completion response's Expires header: the TTL sweep removes the job then,
+   and its status and file URLs answer 404."
+  [job ttl-ms]
+  (let [since (long (or (:finished-at job) (:created-at job) (System/currentTimeMillis)))]
+    (.format ^DateTimeFormatter http-date
+             (ZonedDateTime/ofInstant (Instant/ofEpochMilli (+ since (long ttl-ms))) ZoneOffset/UTC))))
 
 ;; ---------------------------------------------------------------------------
 ;; TTL eviction (lazy sweep on each bulk request)
@@ -864,7 +886,9 @@
 (defn status
   "GET /:tenant-id/fhir/$export-status/:job-id — poll job status.
 
-   :complete    -> 200 application/json manifest (pre-serialized at kickoff).
+   :complete    -> 200 application/json manifest (pre-serialized at kickoff),
+                   with Expires: when the job's TTL sweep removes it, after
+                   which the status and file URLs answer 404.
    :in-progress -> 202 with X-Progress + Retry-After.
    :error       -> 500 OperationOutcome.
    :cancelled / unknown / another requester's job -> 404."
@@ -876,7 +900,9 @@
         job       (visible-job req (bjs/get-job job-store tenant-id job-id))]
     (case (:status job)
       :complete
-      (str-response 200 "application/json" (:manifest job))
+      (str-response 200 "application/json"
+                    {"Expires" (expires-header job (:ttl-ms (bjs/config job-store)))}
+                    (:manifest job))
 
       :in-progress
       (str-response 202 "application/json"
