@@ -278,17 +278,44 @@
                                  (str "Unsupported format: " fmt ". Only JSON is supported."))))
         (handler request)))))
 
+(defn- accepted-media-types
+  "The media types an Accept header names, lower-cased, without parameters or
+   quality values."
+  [accept]
+  (into #{}
+        (keep (fn [range]
+                (let [media-type (str/lower-case (str/trim (first (str/split range #";"))))]
+                  (when-not (str/blank? media-type) media-type))))
+        (str/split accept #",")))
+
+(defn- produced-type-accepted?
+  "Whether `accept` names one of the media types the matched route declares it
+   produces under `:fhir/produces` route data."
+  [request accept]
+  (when-some [produces (seq (get-in request [:reitit.core/match :data :fhir/produces]))]
+    (boolean (some (into #{} (map str/lower-case) produces) (accepted-media-types accept)))))
+
 (defn wrap-not-acceptable
   "Returns 406 Not Acceptable when the Accept header specifies a format the server cannot produce.
    Allows requests with no Accept header, */* , JSON-compatible types, or the
    FHIR bulk-data NDJSON types (application/fhir+ndjson, application/ndjson)
-   that the $export file download requests."
+   that the $export file download requests.
+
+   A route may also produce other media types. It names them under
+   `:fhir/produces` route data (a collection of media type strings), and an
+   Accept naming one of them passes: an operation that answers a raw body, such
+   as a PDF it streams, instead of a base64 Binary. The handler then answers
+   that body with its own Content-Type. Muuntaja leaves a body that is not a
+   collection unencoded, and the response-shaping middleware acts on map bodies
+   only, so the bytes reach the client as the handler wrote them. An error the
+   handler answers as an OperationOutcome map is still encoded as FHIR JSON."
   [handler]
   (fn [request]
     (let [accept (get-in request [:headers "accept"])]
       (if (and accept
                (not (str/blank? accept))
-               (not (re-find #"(?i)application/(fhir\+)?(nd)?json|application/json-patch\+json|\*/\*" accept)))
+               (not (re-find #"(?i)application/(fhir\+)?(nd)?json|application/json-patch\+json|\*/\*" accept))
+               (not (produced-type-accepted? request accept)))
         (json-error-response 406 "error" "not-supported"
                              (str "Not Acceptable: server only supports application/fhir+json. Received Accept: " accept))
         (handler request)))))
