@@ -160,11 +160,14 @@
 
 (defn wrap-bulk-job-store
   "Inject the Bulk Data Access ($export) job registry into each request,
-   mirroring wrap-fhir-store. The bulk-export handlers read it from
-   :fhir/bulk-job-store."
-  [handler bulk-job-store]
-  (fn [req]
-    (handler (assoc req :fhir/bulk-job-store bulk-job-store))))
+   mirroring wrap-fhir-store, and the host's manifest extension (see
+   `:bulk-manifest-extension` in [[resolve-options]]). The bulk-export handlers
+   read them from :fhir/bulk-job-store and :fhir/bulk-manifest-extension."
+  ([handler bulk-job-store] (wrap-bulk-job-store handler bulk-job-store nil))
+  ([handler bulk-job-store manifest-extension]
+   (fn [req]
+     (handler (cond-> (assoc req :fhir/bulk-job-store bulk-job-store)
+                manifest-extension (assoc :fhir/bulk-manifest-extension manifest-extension))))))
 
 (defn wrap-keto-url
   "Inject the configured Keto read API URL so the :public? bulk-data handlers,
@@ -239,7 +242,8 @@
    Accepts `:jwks-url`, `:keto-url`, `:keto-admin-url`, `:oauth-base-url`,
    `:terminology`, `:cors-allowed-origins`, `:cors-allow-headers`,
    `:compartment-overrides`, `:token-claims`,
-   `:enforce-smart-scopes?`, `:bulk-job-store`, `:login-url`, `:lifecycle`,
+   `:enforce-smart-scopes?`, `:bulk-job-store`, `:bulk-manifest-extension`,
+   `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
    `:jwt-issuer`, `:jwt-audiences` and `:jwt-access-tokens-only?`; unknown keys
    are ignored. `:lifecycle`
@@ -289,6 +293,12 @@
    - :compartment-definitions -- `server.compartment/with-overrides` of the
                                `:compartment-overrides` argument: R4B when
                                none is given. A malformed override throws here.
+   - :bulk-manifest-extension -- argument only: a map the Bulk Data status
+                               manifest carries as its `extension` object (the
+                               IG reserves that name for servers), such as a
+                               host's link to its export format documentation.
+                               nil for none; anything but a map with string
+                               keys throws here.
    - :token-claims          -- argument only: the host's extra access-token
                                claims for the token hook
                                (`server.grant/token-hook`), or nil.
@@ -297,9 +307,14 @@
                                SDK is not required on the default classpath."
   [{:keys [jwks-url keto-url keto-admin-url oauth-base-url terminology cors-allowed-origins
            cors-allow-headers compartment-overrides token-claims
-           enforce-smart-scopes? bulk-job-store login-url lifecycle tx-metadata
-           temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences
+           enforce-smart-scopes? bulk-job-store bulk-manifest-extension login-url lifecycle
+           tx-metadata temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences
            jwt-access-tokens-only?]}]
+  (when-not (or (nil? bulk-manifest-extension)
+                (and (map? bulk-manifest-extension)
+                     (every? string? (keys bulk-manifest-extension))))
+    (throw (ex-info ":bulk-manifest-extension must be a map with string keys"
+                    {:bulk-manifest-extension bulk-manifest-extension})))
   {:jwks-url              (or jwks-url
                               (System/getenv "JWKS_URL")
                               (when-not (System/getenv "JWT_DEV_SECRET")
@@ -335,7 +350,8 @@
    :lifecycle             lifecycle
    :tx-metadata           tx-metadata
    :temporal-canonicals   (temporal/check-canonicals temporal-canonicals)
-   :bulk-job-store        bulk-job-store})
+   :bulk-job-store        bulk-job-store
+   :bulk-manifest-extension (not-empty bulk-manifest-extension)})
 
 ;; ---------------------------------------------------------------------------
 ;; Middleware stack
@@ -439,7 +455,8 @@
        401 and 403 -- do reach the group, which is why
        `server.middleware/wrap-summary` and `wrap-elements` skip non-2xx and
        OperationOutcome bodies themselves rather than relying on position."
-  [store {:keys [trace-tap cors-origins cors-allow-headers terminology bulk-job-store keto-url
+  [store {:keys [trace-tap cors-origins cors-allow-headers terminology bulk-job-store
+                 bulk-manifest-extension keto-url
                  keto-admin-url oauth-base-url jwks-url jwt-issuer jwt-audiences
                  jwt-access-tokens-only? enforce-smart-scopes? login-url
                  narrative lifecycle tx-metadata temporal-canonicals
@@ -492,7 +509,7 @@
 
     :always
     (into [{:name ::bulk-job-store
-            :wrap (fn [handler] (wrap-bulk-job-store handler bulk-job-store))}
+            :wrap (fn [handler] (wrap-bulk-job-store handler bulk-job-store bulk-manifest-extension))}
            {:name ::compartment-definitions
             :wrap (fn [handler] (wrap-compartment-definitions handler compartment-definitions))}
            {:name ::token-claims
