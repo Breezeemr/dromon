@@ -756,3 +756,48 @@
     (is (= ["Patient"] (keys matched)))
     (is (identical? (get-in opts [:data :fhir/all-registries]) matched)
         "the object router-options built, not a copy rebuilt by the merge")))
+
+;; ---------------------------------------------------------------------------
+;; Produced media types
+;; ---------------------------------------------------------------------------
+
+(deftest a-route-that-produces-a-media-type-answers-it-raw
+  (let [pdf      (.getBytes "%PDF-1.4\n%%EOF\n" "ISO-8859-1")
+        shaping  #{::router/parameters ::router/format-override ::router/not-acceptable
+                   ::router/unsupported-media-type ::router/format-negotiate ::router/format-response
+                   ::router/fhir-exceptions ::router/pretty-print ::router/prefer ::router/elements
+                   ::router/summary ::router/fhir-response-headers ::router/format-request}
+        mw       (filterv (comp shaping :name) (router/default-middleware nil resolved-opts))
+        handler  (fn [request]
+                   (cond
+                     (= "missing" (get-in request [:path-params :id]))
+                     {:status 404 :body {:resourceType "OperationOutcome"
+                                         :issue [{:severity "error" :code "not-found"}]}}
+
+                     (= "application/pdf" (get-in request [:headers "accept"]))
+                     {:status 200 :headers {"Content-Type" "application/pdf"} :body (ByteArrayInputStream. pdf)}
+
+                     :else
+                     {:status 200 :body {:resourceType "Binary" :contentType "application/pdf" :data "JVBERi0="}}))
+        app      (ring/ring-handler
+                  (ring/router [["/t/fhir/Patient/:id/$print" {:post handler :fhir/produces ["application/pdf"]}]
+                                ["/t/fhir/Patient/:id/$other" {:post handler}]]
+                               {:data {:muuntaja router/muuntaja-instance :middleware mw}}))
+        call     (fn [uri accept]
+                   (app {:request-method :post :uri uri :headers {"accept" accept}}))
+        bytes-of (fn [resp] (let [b (:body resp)] (if (instance? InputStream b) (.readAllBytes ^InputStream b) b)))]
+    (testing "the produced type is answered as the handler wrote it"
+      (let [resp (call "/t/fhir/Patient/p1/$print" "application/pdf")]
+        (is (= 200 (:status resp)))
+        (is (= "application/pdf" (get-in resp [:headers "Content-Type"])))
+        (is (= (seq pdf) (seq (bytes-of resp))))))
+    (testing "an OperationOutcome the handler answers is still FHIR JSON"
+      (let [resp (call "/t/fhir/Patient/missing/$print" "application/pdf")]
+        (is (= 404 (:status resp)))
+        (is (= "OperationOutcome" (get (json/read-value (bytes-of resp)) "resourceType")))))
+    (testing "FHIR JSON is still answered to a JSON Accept"
+      (let [resp (call "/t/fhir/Patient/p1/$print" "application/fhir+json")]
+        (is (= 200 (:status resp)))
+        (is (= "Binary" (get (json/read-value (bytes-of resp)) "resourceType")))))
+    (testing "a route that produces nothing else refuses the type"
+      (is (= 406 (:status (call "/t/fhir/Patient/p1/$other" "application/pdf")))))))

@@ -286,6 +286,22 @@
       (let [resp (wrapped {:headers {"accept" "application/fhir+xml"}})]
         (is (= 406 (:status resp)))))))
 
+(deftest wrap-not-acceptable-honours-the-route's-produced-types
+  (let [handler  (fn [_] {:status 200 :body "OK"})
+        wrapped  (middleware/wrap-not-acceptable handler)
+        produces (fn [accept types]
+                   {:headers             {"accept" accept}
+                    :reitit.core/match   {:data {:fhir/produces types}}})]
+    (testing "an Accept naming a produced type passes, whatever its case or parameters"
+      (is (= 200 (:status (wrapped (produces "application/pdf" ["application/pdf"])))))
+      (is (= 200 (:status (wrapped (produces "Application/PDF; q=0.9" ["application/pdf"])))))
+      (is (= 200 (:status (wrapped (produces "text/html, application/pdf;q=0.8" ["application/pdf"]))))))
+    (testing "a type the route does not produce is still a 406"
+      (is (= 406 (:status (wrapped (produces "image/png" ["application/pdf"])))))
+      (is (= 406 (:status (wrapped (produces "application/pdf" []))))))
+    (testing "a route that declares nothing refuses the type"
+      (is (= 406 (:status (wrapped {:headers {"accept" "application/pdf"}})))))))
+
 ;; --- wrap-unsupported-media-type tests ---
 
 (deftest wrap-unsupported-media-type-test
