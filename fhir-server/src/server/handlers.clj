@@ -600,6 +600,24 @@
   (cond-> (dissoc params "_since" :_since)
     since (assoc "_since" since)))
 
+(def history-max-count
+  "The largest page an instance `_history` request is answered with, and the
+   page size when `_count` is absent. A larger `_count` is lowered to this
+   (FHIR lets a server return fewer than asked) and the `next` link pages on.
+   Every version on a page is a full resource read, so this bounds the work a
+   single request can make."
+  20)
+
+(defn- history-versions
+  "{:total n :versions [...]} for one page of an instance history: from the
+   store's `history-page` when it answers one, else by paging over `history`."
+  [store tenant-id resource-type id since skip limit]
+  (or (db/paged-history store tenant-id resource-type id
+                        {:since since :skip skip :count limit})
+      (let [all (versions-since since (db/history store tenant-id resource-type id))]
+        {:total (count all)
+         :versions (->> all (drop skip) (take limit) vec)})))
+
 (defn history-instance
   "Handler for GET /[type]/:id/_history RESTful interaction."
   [req]
@@ -608,7 +626,7 @@
         resource-type (:fhir/resource-type req)
         id (-> req :path-params :id)
         params (or (:query-params req) {})
-        count-param (or (get params "_count") (get params :_count) "50")
+        count-param (or (get params "_count") (get params :_count) (str history-max-count))
         skip-param (or (get params "_skip") (get params :_skip) "0")
         limit (parse-non-negative-int "_count" (str count-param))
         skip (parse-non-negative-int "_skip" (str skip-param))
@@ -616,9 +634,9 @@
     (if-let [err (or (:error limit) (:error skip) (:error since-param))]
       err
       (let [since (:since since-param)
-        all-results (versions-since since (db/history store tenant-id (keyword resource-type) id))
-        total (count all-results)
-        results (->> all-results (drop skip) (take limit) vec)
+        limit (min limit history-max-count)
+        {total :total results :versions}
+        (history-versions store tenant-id (keyword resource-type) id since skip limit)
         entries (narrative/present-entries
                  req :history-instance
                  (mapv (partial history-entry (fhir-base req) resource-type) results))
@@ -629,7 +647,7 @@
                    (str base-url "?_count=" limit "&_skip=" skip
                         (when since (str "&_since=" since))))
         self-link {:relation "self" :url (page-url skip)}
-        next-link (when (< (+ skip limit) total)
+        next-link (when (and (pos? limit) (< (+ skip limit) total))
                     {:relation "next" :url (page-url (+ skip limit))})
         prev-link (when (> skip 0)
                     {:relation "previous" :url (page-url (max 0 (- skip limit)))})

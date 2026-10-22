@@ -668,3 +668,48 @@
   [store]
   (boolean (and (satisfies? ITxMetadataStore store)
                 (tx-metadata-supported? store))))
+
+;; ---------------------------------------------------------------------------
+;; Paged instance-history extension protocol.
+;;
+;; `history` returns every version of a resource, fully read, and the
+;; handler pages over that vector afterwards. For a resource with hundreds of
+;; versions that is hundreds of full reads to answer a page of a few, and on a
+;; single-replica host it held the request long enough to fail the liveness
+;; probe. A store that can count its versions cheaply and read only the ones a
+;; page shows implements this, and the handler asks it first.
+;;
+;; Optional, and separate from IFHIRStore, because a store that answers it
+;; must apply `_since`, skip and count itself; a decorator that filters
+;; versions (CompartmentFilteringStore) cannot without reading them all, so it
+;; does not implement it and the handler falls back to `history`.
+;;
+;;   host stores        a host store that can list version ids without
+;;                      reading the versions, and the decorators over it by
+;;                      delegation to their base (`paged-history`)
+;;   fhir-store-mock, fhir-store-xtdb2, fhir-store-http, CompartmentFilteringStore
+;;                      not implemented
+;; ---------------------------------------------------------------------------
+
+(defprotocol IHistoryPageStore
+  "One page of an instance history, read without reading the rest."
+  (history-page [this tenant-id resource-type id opts]
+    "One page of the versions of one resource, NEWEST FIRST.
+
+     `opts` is {:since <java.time.Instant or nil> :skip <n> :count <n>}. A
+     version qualifies when its lastUpdated is at or after `:since` (all
+     versions when nil). Returns {:total <qualifying versions> :versions [...]}
+     where `:versions` holds at most `:count` of them after skipping `:skip`.
+     A store that lists deletions in `history` lists them here as well.
+
+     May return nil to decline, in which case the caller falls back to
+     `history`; a decorator returns what its base answers through
+     `paged-history`."))
+
+(defn paged-history
+  "`history-page` of `store`, or nil when `store` does not implement
+   `IHistoryPageStore` or declines. Decorators forward through this so a base
+   without the protocol is a fallback rather than an IllegalArgumentException."
+  [store tenant-id resource-type id opts]
+  (when (satisfies? IHistoryPageStore store)
+    (history-page store tenant-id resource-type id opts)))
