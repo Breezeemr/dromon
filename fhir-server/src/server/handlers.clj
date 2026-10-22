@@ -601,12 +601,18 @@
     since (assoc "_since" since)))
 
 (def history-max-count
-  "The largest page an instance `_history` request is answered with, and the
-   page size when `_count` is absent. A larger `_count` is lowered to this
-   (FHIR lets a server return fewer than asked) and the `next` link pages on.
-   Every version on a page is a full resource read, so this bounds the work a
-   single request can make."
+  "The largest page a `_history` request (instance, type or system) is answered
+   with, and the page size when `_count` is absent. A larger `_count` is
+   lowered to this (FHIR lets a server return fewer than asked) and the `next`
+   link pages on. Every version on a page is a full resource read, so this
+   bounds the work a single request can make."
   20)
+
+(defn- page-of
+  "{:total n :versions [...]} for the page `skip`/`limit` of `versions`."
+  [versions skip limit]
+  {:total (count versions)
+   :versions (->> versions (drop skip) (take limit) vec)})
 
 (defn- history-versions
   "{:total n :versions [...]} for one page of an instance history: from the
@@ -614,34 +620,27 @@
   [store tenant-id resource-type id since skip limit]
   (or (db/paged-history store tenant-id resource-type id
                         {:since since :skip skip :count limit})
-      (let [all (versions-since since (db/history store tenant-id resource-type id))]
-        {:total (count all)
-         :versions (->> all (drop skip) (take limit) vec)})))
+      (page-of (versions-since since (db/history store tenant-id resource-type id))
+               skip limit)))
 
-(defn history-instance
-  "Handler for GET /[type]/:id/_history RESTful interaction."
-  [req]
-  (let [store (:fhir/store req)
-        tenant-id (-> req :path-params :tenant-id)
-        resource-type (:fhir/resource-type req)
-        id (-> req :path-params :id)
-        params (or (:query-params req) {})
-        count-param (or (get params "_count") (get params :_count) (str history-max-count))
+(defn- history-paging
+  "`_count`, `_skip` and `_since` of a history request as {:limit :skip :since},
+   `_count` capped at `history-max-count`, or {:error <400>}."
+  [params]
+  (let [count-param (or (get params "_count") (get params :_count) (str history-max-count))
         skip-param (or (get params "_skip") (get params :_skip) "0")
         limit (parse-non-negative-int "_count" (str count-param))
         skip (parse-non-negative-int "_skip" (str skip-param))
         since-param (parse-since params)]
     (if-let [err (or (:error limit) (:error skip) (:error since-param))]
-      err
-      (let [since (:since since-param)
-        limit (min limit history-max-count)
-        {total :total results :versions}
-        (history-versions store tenant-id (keyword resource-type) id since skip limit)
-        entries (narrative/present-entries
-                 req :history-instance
-                 (mapv (partial history-entry (fhir-base req) resource-type) results))
-        base-url (str (fhir-base req) "/" resource-type "/" id "/_history")
-        ;; The Instant's own rendering is UTC and needs no URL encoding; the
+      {:error err}
+      {:limit (min limit history-max-count) :skip skip :since (:since since-param)})))
+
+(defn- history-bundle
+  "The history Bundle for one page: `entries` with self, next and previous
+   links over `base-url`."
+  [base-url {:keys [limit skip since]} total entries]
+  (let [;; The Instant's own rendering is UTC and needs no URL encoding; the
         ;; raw value could carry a '+' offset, which a query string reads as a space.
         page-url (fn [skip]
                    (str base-url "?_count=" limit "&_skip=" skip
@@ -650,14 +649,40 @@
         next-link (when (and (pos? limit) (< (+ skip limit) total))
                     {:relation "next" :url (page-url (+ skip limit))})
         prev-link (when (> skip 0)
-                    {:relation "previous" :url (page-url (max 0 (- skip limit)))})
-        links (filterv some? [self-link next-link prev-link])]
+                    {:relation "previous" :url (page-url (max 0 (- skip limit)))})]
     {:status 200
      :body {:resourceType "Bundle"
             :type "history"
             :total total
-            :link links
-            :entry entries}}))))
+            :link (filterv some? [self-link next-link prev-link])
+            :entry entries}}))
+
+(defn history-instance
+  "Handler for GET /[type]/:id/_history RESTful interaction."
+  [req]
+  (let [store (:fhir/store req)
+        tenant-id (-> req :path-params :tenant-id)
+        resource-type (:fhir/resource-type req)
+        id (-> req :path-params :id)
+        {:keys [limit skip since error] :as paging} (history-paging (or (:query-params req) {}))]
+    (or error
+        (let [{total :total results :versions}
+              (history-versions store tenant-id (keyword resource-type) id since skip limit)]
+          (history-bundle (str (fhir-base req) "/" resource-type "/" id "/_history")
+                          paging total
+                          (narrative/present-entries
+                           req :history-instance
+                           (mapv (partial history-entry (fhir-base req) resource-type) results)))))))
+
+(defn- history-type-versions
+  "{:total n :versions [...]} for one page of a type history: from the store's
+   `history-type-page` when it answers one, else by paging over `history-type`."
+  [store tenant-id resource-type params since skip limit]
+  (or (db/paged-history-type store tenant-id resource-type
+                             {:since since :skip skip :count limit})
+      (page-of (versions-since since (db/history-type store tenant-id resource-type
+                                                      (with-parsed-since params since)))
+               skip limit)))
 
 (defn history-type
   "Handler for GET /[type]/_history RESTful interaction."
@@ -666,18 +691,16 @@
         tenant-id (-> req :path-params :tenant-id)
         resource-type (:fhir/resource-type req)
         params (or (:query-params req) {})
-        {:keys [since error]} (parse-since params)]
+        {:keys [limit skip since error] :as paging} (history-paging params)]
     (or error
-        (let [results (versions-since since (db/history-type store tenant-id (keyword resource-type)
-                                                             (with-parsed-since params since)))
-              entries (narrative/present-entries
-                       req :history-type
-                       (mapv (partial history-entry (fhir-base req) resource-type) results))]
-          {:status 200
-           :body {:resourceType "Bundle"
-                  :type "history"
-                  :total (count results)
-                  :entry entries}}))))
+        (let [{total :total results :versions}
+              (history-type-versions store tenant-id (keyword resource-type) params
+                                     since skip limit)]
+          (history-bundle (str (fhir-base req) "/" resource-type "/_history")
+                          paging total
+                          (narrative/present-entries
+                           req :history-type
+                           (mapv (partial history-entry (fhir-base req) resource-type) results)))))))
 
 (defn- parse-query-string
   "Parse a URL query string into a map of string key-value pairs."
@@ -1725,37 +1748,50 @@
                                         "sso-openid-connect" "context-passthrough-banner"
                                         "permission-offline" "permission-patient" "permission-user"]}}))))
 
-(defn system-history [req]
+(defn- system-history-entry [base default-type res]
+  (let [rt (or (:resourceType res) default-type)]
+    (if (db/deleted-version? res)
+      (history-entry base rt res)
+      {:fullUrl (str base "/" rt "/" (:id res))
+       :resource res
+       :request {:method "PUT"
+                 :url (str rt "/" (:id res))}
+       :response {:status "200"}})))
+
+(defn- system-history-versions
+  "{:total n :versions [...]} for one page of the system history: from the
+   store's `history-system-page` when it answers one, else by paging over each
+   type's `history-type` in turn."
+  [store tenant-id types params since skip limit]
+  (or (db/paged-history-system store tenant-id (mapv keyword types)
+                               {:since since :skip skip :count limit})
+      (let [type-params (with-parsed-since params since)]
+        (page-of (into []
+                       (mapcat (fn [resource-type]
+                                 (map #(cond-> % (nil? (:resourceType %))
+                                         (assoc :resourceType (name resource-type)))
+                                      (versions-since since (db/history-type store tenant-id
+                                                                             (keyword resource-type)
+                                                                             type-params)))))
+                       types)
+                 skip limit))))
+
+(defn system-history
+  "Handler for GET /_history, paged as `history-type` is."
+  [req]
   (let [store (:fhir/store req)
         tenant-id (-> req :path-params :tenant-id)
-        all-registries (:fhir/all-registries req)
+        types (keys (:fhir/all-registries req))
         params (or (:query-params req) {})
-        {:keys [since error]} (parse-since params)
-        types (keys all-registries)]
+        {:keys [limit skip since error] :as paging} (history-paging params)]
     (or error
-        (let [type-params (with-parsed-since params since)
-              all-entries (narrative/present-entries
+        (let [{total :total results :versions}
+              (system-history-versions store tenant-id types params since skip limit)]
+          (history-bundle (str (fhir-base req) "/_history")
+                          paging total
+                          (narrative/present-entries
                            req :system-history
-                           (vec
-                            (mapcat
-                              (fn [resource-type]
-                                (let [results (versions-since since (db/history-type store tenant-id (keyword resource-type) type-params))]
-                                  (mapv (fn [res]
-                                          (let [rt (or (:resourceType res) resource-type)]
-                                            (if (db/deleted-version? res)
-                                              (history-entry (fhir-base req) rt res)
-                                              {:fullUrl (str (fhir-base req) "/" rt "/" (:id res))
-                                               :resource res
-                                               :request {:method "PUT"
-                                                         :url (str rt "/" (:id res))}
-                                               :response {:status "200"}})))
-                                        results)))
-                              types)))]
-          {:status 200
-           :body {:resourceType "Bundle"
-                  :type "history"
-                  :total (count all-entries)
-                  :entry all-entries}}))))
+                           (mapv (partial system-history-entry (fhir-base req) nil) results)))))))
 
 (defn system-search
   "Handler for GET|POST /_search — search across every resource type.

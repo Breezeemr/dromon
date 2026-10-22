@@ -461,6 +461,96 @@
     (is (every? #(= (java.time.Instant/parse "2026-10-01T13:44:26.06645Z") (get % "_since"))
                 @received))))
 
+;; GET /[type]/_history and GET /_history page as instance history does.
+
+(deftest history-type-caps-count
+  (let [store (history-stub-store (numbered-versions 45) (atom []))]
+    (testing "a _count above the cap is answered with a page of the cap, and a next link"
+      (let [resp (handlers/history-type (base-request store :params {"_count" "1000"}))]
+        (is (= 45 (get-in resp [:body :total])))
+        (is (= (mapv str (range 45 25 -1)) (version-ids resp)))
+        (is (= "/default/fhir/Patient/_history?_count=20&_skip=20"
+               (get (links-of resp) "next")))))
+    (testing "an absent _count pages at the cap"
+      (is (= 20 (count (version-ids (handlers/history-type (base-request store)))))))
+    (testing "the last page has no next link and links back"
+      (let [resp (handlers/history-type
+                  (base-request store :params {"_count" "20" "_skip" "40"}))]
+        (is (= ["5" "4" "3" "2" "1"] (version-ids resp)))
+        (is (nil? (get (links-of resp) "next")))
+        (is (= "/default/fhir/Patient/_history?_count=20&_skip=20"
+               (get (links-of resp) "previous")))))
+    (testing "a bad _count is a 400"
+      (is (= 400 (:status (handlers/history-type
+                           (base-request store :params {"_count" "-1"}))))))))
+
+(deftest history-type-reads-one-page-from-a-paging-store
+  (let [asked (atom [])
+        store (reify
+                db/IFHIRStore
+                (history-type [_ _ _ _]
+                  (throw (ex-info "history-type must not be read when a page is answered" {})))
+                db/IHistoryTypePageStore
+                (history-type-page [_ _ rt opts]
+                  (swap! asked conj [rt opts])
+                  {:total 300
+                   :versions (->> (numbered-versions 300) (drop (:skip opts))
+                                  (take (:count opts)) vec)}))
+        resp  (handlers/history-type
+               (base-request store :params {"_count" "500" "_skip" "40"
+                                            "_since" "2026-10-01T00:00:00Z"}))]
+    (is (= [[:Patient {:since (java.time.Instant/parse "2026-10-01T00:00:00Z") :skip 40 :count 20}]]
+           @asked))
+    (is (= 300 (get-in resp [:body :total])))
+    (is (= (mapv str (range 260 240 -1)) (version-ids resp)))
+    (is (= "/default/fhir/Patient/_history?_count=20&_skip=60&_since=2026-10-01T00:00:00Z"
+           (get (links-of resp) "next")))))
+
+(deftest history-type-falls-back-when-the-store-declines-a-page
+  (let [store (reify
+                db/IFHIRStore
+                (history-type [_ _ _ _] (numbered-versions 3))
+                db/IHistoryTypePageStore
+                (history-type-page [_ _ _ _] nil))]
+    (is (= ["3" "2" "1"] (version-ids (handlers/history-type (base-request store)))))))
+
+(deftest system-history-caps-count-over-every-type
+  (let [store (history-stub-store (numbered-versions 15) (atom []))
+        req   #(assoc (base-request store :params %)
+                      :fhir/all-registries {"Patient" {} "Observation" {}})
+        types (fn [resp] (mapv #(get-in % [:resource :resourceType]) (get-in resp [:body :entry])))]
+    (testing "the first page holds the cap, across the types in turn"
+      (let [resp (handlers/system-history (req {"_count" "1000"}))]
+        (is (= 30 (get-in resp [:body :total])))
+        (is (= 20 (count (version-ids resp))))
+        (is (= "/default/fhir/_history?_count=20&_skip=20" (get (links-of resp) "next")))))
+    (testing "the last page is the rest, with no next link"
+      (let [resp (handlers/system-history (req {"_skip" "20"}))]
+        (is (= 10 (count (version-ids resp))))
+        (is (= 1 (count (distinct (types resp)))))
+        (is (nil? (get (links-of resp) "next")))))))
+
+(deftest system-history-reads-one-page-from-a-paging-store
+  (let [asked (atom [])
+        store (reify
+                db/IFHIRStore
+                (history-type [_ _ _ _]
+                  (throw (ex-info "history-type must not be read when a page is answered" {})))
+                db/IHistoryTypePageStore
+                (history-system-page [_ _ types opts]
+                  (swap! asked conj [(set types) opts])
+                  {:total 500
+                   :versions [{:resourceType "Observation" :id "o1" :meta {:versionId "7"}}
+                              {:resourceType "Patient" :id "p1" :meta {:versionId "3"}}]}))
+        resp  (handlers/system-history
+               (assoc (base-request store :params {"_count" "50"})
+                      :fhir/all-registries {"Patient" {} "Observation" {}}))]
+    (is (= [[#{:Patient :Observation} {:since nil :skip 0 :count 20}]] @asked))
+    (is (= 500 (get-in resp [:body :total])))
+    (is (= ["/default/fhir/Observation/o1" "/default/fhir/Patient/p1"]
+           (mapv :fullUrl (get-in resp [:body :entry]))))
+    (is (= "/default/fhir/_history?_count=20&_skip=20" (get (links-of resp) "next")))))
+
 ;; ---------------------------------------------------------------------------
 ;; compartment-search (GET /:compartment-type/:id/:target-type)
 ;; ---------------------------------------------------------------------------
