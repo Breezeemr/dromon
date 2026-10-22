@@ -327,6 +327,74 @@
       (is (= "/default/fhir/Patient/p1/_history?_count=2&_skip=0&_since=2026-10-01T13:44:26.066Z"
              (get links "self"))))))
 
+(defn- numbered-versions
+  "`n` versions of Patient p1, newest first."
+  [n]
+  (mapv (fn [v] {:resourceType "Patient" :id "p1"
+                 :meta {:versionId (str v)
+                        :lastUpdated (str (.plusSeconds (java.time.Instant/parse "2026-10-01T13:00:00Z") v))}})
+        (range n 0 -1)))
+
+(defn- links-of [resp]
+  (into {} (map (juxt :relation :url)) (get-in resp [:body :link])))
+
+(deftest history-instance-caps-count
+  (let [store (history-stub-store (numbered-versions 45) (atom []))]
+    (testing "a _count above the cap is answered with a page of the cap, and a next link"
+      (let [resp (handlers/history-instance
+                  (base-request store :id "p1" :params {"_count" "1000"}))]
+        (is (= 20 handlers/history-max-count))
+        (is (= 45 (get-in resp [:body :total])))
+        (is (= (mapv str (range 45 25 -1)) (version-ids resp)))
+        (is (= "/default/fhir/Patient/p1/_history?_count=20&_skip=20"
+               (get (links-of resp) "next")))))
+    (testing "an absent _count pages at the cap"
+      (is (= 20 (count (version-ids (handlers/history-instance
+                                     (base-request store :id "p1")))))))
+    (testing "the last page has no next link"
+      (let [resp (handlers/history-instance
+                  (base-request store :id "p1" :params {"_count" "1000" "_skip" "40"}))]
+        (is (= ["5" "4" "3" "2" "1"] (version-ids resp)))
+        (is (nil? (get (links-of resp) "next")))))
+    (testing "_count=0 answers the total with no next link"
+      (let [resp (handlers/history-instance
+                  (base-request store :id "p1" :params {"_count" "0"}))]
+        (is (= 45 (get-in resp [:body :total])))
+        (is (= [] (version-ids resp)))
+        (is (nil? (get (links-of resp) "next")))))))
+
+(deftest history-instance-reads-one-page-from-a-paging-store
+  (let [asked (atom [])
+        store (reify
+                db/IFHIRStore
+                (history [_ _ _ _]
+                  (throw (ex-info "history must not be read when a page is answered" {})))
+                db/IHistoryPageStore
+                (history-page [_ _ _ _ opts]
+                  (swap! asked conj opts)
+                  {:total 300
+                   :versions (->> (numbered-versions 300) (drop (:skip opts))
+                                  (take (:count opts)) vec)}))
+        resp  (handlers/history-instance
+               (base-request store :id "p1"
+                             :params {"_count" "1000" "_skip" "20"
+                                      "_since" "2026-10-01T00:00:00Z"}))]
+    (is (= [{:since (java.time.Instant/parse "2026-10-01T00:00:00Z") :skip 20 :count 20}]
+           @asked))
+    (is (= 300 (get-in resp [:body :total])))
+    (is (= (mapv str (range 280 260 -1)) (version-ids resp)))
+    (is (= "/default/fhir/Patient/p1/_history?_count=20&_skip=40&_since=2026-10-01T00:00:00Z"
+           (get (links-of resp) "next")))))
+
+(deftest history-instance-falls-back-when-the-store-declines-a-page
+  (let [store (reify
+                db/IFHIRStore
+                (history [_ _ _ _] (numbered-versions 3))
+                db/IHistoryPageStore
+                (history-page [_ _ _ _ _] nil))]
+    (is (= ["3" "2" "1"] (version-ids (handlers/history-instance
+                                        (base-request store :id "p1")))))))
+
 (deftest history-instance-since-reads-instant-last-updated
   (testing "the mock store stamps lastUpdated as an Instant, not a string"
     (let [store  (make-store)
