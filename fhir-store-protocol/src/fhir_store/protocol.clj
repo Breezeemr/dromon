@@ -713,3 +713,48 @@
   [store tenant-id resource-type id opts]
   (when (satisfies? IHistoryPageStore store)
     (history-page store tenant-id resource-type id opts)))
+
+;; ---------------------------------------------------------------------------
+;; Paged type- and system-history extension protocol.
+;;
+;; `history-type` returns every version of every resource of a type, fully
+;; read. `GET /[type]/_history` and system `_history` paged over that afterwards,
+;; so a busy type cost a full read of each of its versions to answer one page.
+;; Same split as `IHistoryPageStore`, for the same reason: a store that answers
+;; must apply `_since`, skip and count itself, so a filtering decorator does not
+;; implement it and the handler falls back to `history-type`.
+;;
+;;   host stores        a host store that can list (resource, version) pairs
+;;                      without reading the versions, and the decorators over
+;;                      it by delegation (`paged-history-type`,
+;;                      `paged-history-system`)
+;;   fhir-store-mock, fhir-store-xtdb2, fhir-store-http, CompartmentFilteringStore
+;;                      not implemented
+;; ---------------------------------------------------------------------------
+
+(defprotocol IHistoryTypePageStore
+  "One page of a type or system history, read without reading the rest."
+  (history-type-page [this tenant-id resource-type opts]
+    "One page of the versions of every resource of `resource-type`, NEWEST
+     FIRST. `opts` and the answer are as for `history-page`: {:since :skip
+     :count} in, {:total <qualifying versions> :versions [...]} out. The
+     versions qualifying are those `history-type` lists. May return nil to
+     decline, in which case the caller falls back to `history-type`.")
+  (history-system-page [this tenant-id resource-types opts]
+    "As `history-type-page`, over the versions of every resource of any of
+     `resource-types`, newest first across all of them. Each version carries
+     its `:resourceType`. May return nil to decline."))
+
+(defn paged-history-type
+  "`history-type-page` of `store`, or nil when `store` does not implement
+   `IHistoryTypePageStore` or declines."
+  [store tenant-id resource-type opts]
+  (when (satisfies? IHistoryTypePageStore store)
+    (history-type-page store tenant-id resource-type opts)))
+
+(defn paged-history-system
+  "`history-system-page` of `store`, or nil when `store` does not implement
+   `IHistoryTypePageStore` or declines."
+  [store tenant-id resource-types opts]
+  (when (satisfies? IHistoryTypePageStore store)
+    (history-system-page store tenant-id resource-types opts)))
