@@ -865,7 +865,7 @@
   [args]
   (let [v (get-in (parse-args args) [:own :version])]
     (when (str/blank? v)
-      (throw (ex-info "Pass :version, e.g. bb flightsql-repro-release :version 2.2.0-rc2" {})))
+      (throw (ex-info "Pass :version, e.g. bb flightsql-repro-release :version 2.2.0" {})))
     (check-maven-client! v)
     (let [version (release-version v)
           dir     (str "target/flightsql-repro/" v)
