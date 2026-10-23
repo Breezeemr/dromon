@@ -533,6 +533,61 @@ For comparison:
 - On rc2 FlightSQL is correct, including under concurrent streams, but still
   slower than pgwire for writes.
 
+### 2.2.0 (2026-10-23)
+
+2.2.0 is rc2 rebuilt. Its `xtdb-core` and `xtdb-api` jars differ from rc2's only
+in `META-INF/MANIFEST.MF`, and every file inside the `xtdb.jar` of the `xtdb`,
+`xtdb-aws` and `xtdb-google-cloud` images is identical to rc2's, on the same
+Temurin 25.0.4.1. Any difference between the two versions below is run-to-run
+noise.
+
+`bb flightsql-repro-release :version 2.2.0` was run on dromon `cce9184` and
+exited 0: **every case and all 8 benchmark runs PASS, and no bug reproduces.**
+- **Build:** server `ghcr.io/xtdb/xtdb:2.2.0` and `xtdb-aws:2.2.0`, plus client
+  `com.xtdb/xtdb-core 2.2.0`, all revision `c6c19623d`.
+- **Focused cases:** bugs 1 and 2 PASS with FlightSQL equal to pgwire; bug 3
+  PASSes: 8 readers x 20 s, 0 bad of 131258 reads.
+- **Benchmarks:** disk and Kafka, 2 ABBA rounds each, under the memory limits
+  (page cache 13-21% of the data on disk, 0 OOM kills). Contention had 0
+  errors besides 412s and 0 lost updates in every run.
+
+Median p50 in ms, with flight-sql / pgwire per round:
+
+| workload | disk: flight-sql / pgwire | disk x | kafka: flight-sql / pgwire | kafka x |
+|---|---:|---|---:|---|
+| single create | 3.94 / 3.31 | 1.21, 1.17 | 7.92 / 7.26 | 1.15, 1.05 |
+| single update-if-match | 9.26 / 7.33 | 1.20, 1.38 | 12.6 / 11.0 | 1.14, 1.15 |
+| create x16 threads | 8.28 / 8.20 | 1.01, 1.01 | 4.13 / 2.78 | 1.43, 1.50 |
+| transaction 100 entries | 75.5 / 36.0 | 2.13, 2.07 | 81.0 / 41.6 | 1.94, 1.97 |
+| transaction 1000 entries | 705 / 332 | 2.15, 2.05 | 722 / 342 | 2.12, 2.11 |
+| batch 1000 entries | 669 / 288 | 2.26, 2.35 | 680 / 300 | 2.30, 2.25 |
+| mixed tx | 17.2 / 12.7 | 1.38, 1.34 | 21.1 / 16.4 | 1.30, 1.27 |
+| contention | 29.1 / 25.4 | 1.12, 1.17 | 24.0 / 21.8 | 1.10, 1.09 |
+| preload, 100121 resources | 29.1-33.6 s / 12.8-13.2 s | | 29.3-29.6 s / 13.4-13.7 s | |
+
+These numbers do not compare with the rc2 table above version for version. That
+run was on `bc3e12e`, before #146 removed the FlightSQL read wrapper and #147
+committed a batch Bundle's entries in one transaction per group (batch 1000 is
+6-24x faster here on both transports). The transport gap is unchanged: about
+1.1x for single writes on Kafka and 2x for transactions of 100+ entries.
+
+The version comparison was run embedded, on `cce9184`, the `:xtdb` alias on
+2.2.0 against the same alias with `xtdb-core`/`xtdb-api` overridden to rc2, in
+ABBA order with 2 runs each:
+- `bb bench-writes-xtdb` (100121 preloaded, 3 repeats): all 25 workloads are
+  within noise, 2.2.0/rc2 0.96-1.06 on the median p50. Preload 11.3-11.8 s on
+  both. No errors besides contention 412s, 0 lost updates, every write visible
+  on return.
+- `bb bench-xtdb :max-resources 100000`: all 27 queries return the same hits
+  and page order on both versions. 2.2.0/rc2 is 0.94-1.05; the five queries
+  whose two runs do not overlap moved 2-5%, three faster and two slower.
+  Load 11.2-12.6 s.
+
+Every run, rc2 included and on either transport, reports the mixed
+transaction's response with the DELETE first (request order 0/10). That is the
+store's transaction-response order, not the XTDB version; the 2026-10-17 run
+on beta3 shows it too.
+
 ### From a git commit
 
 `bb flightsql-repro-from-sha :sha <commit>` runs the same repro against XTDB
