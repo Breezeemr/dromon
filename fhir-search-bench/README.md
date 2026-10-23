@@ -152,7 +152,7 @@ the benchmark's tenant a database attached to that server with its own Kafka
 topic, under a fresh `fhirbench_<hex>_` prefix.
 
 ```bash
-bb xtdb-kafka-up                 # podman pod: Apache Kafka 3.9.1 + XTDB 2.2.0-rc2 (xtdb-aws image)
+bb xtdb-kafka-up                 # podman pod: Apache Kafka 3.9.1 + XTDB 2.2.0 (xtdb-aws image)
 bb bench-writes-xtdb-server      # -> target/writes-xtdb2-server.edn
 bb bench-xtdb-server :max-resources 100000   # -> target/bench-xtdb2-server.edn
 bb xtdb-kafka-topics             # the tenant's topic and -replica topic, with offsets
@@ -248,7 +248,7 @@ dromon's draft client-side workaround for bugs 1 and 2 is
 ```bash
 bb flightsql-repro-nightly                       # ghcr.io/xtdb/xtdb:nightly
 bb flightsql-repro-beta3                         # ghcr.io/xtdb/xtdb:2.2.0-beta3
-bb flightsql-repro-release :version 2.2.0-rc2    # any published release: ghcr.io images + Maven Central client
+bb flightsql-repro-release :version 2.2.0        # any published release: ghcr.io images + Maven Central client
 bb flightsql-repro-nightly :focused-only true    # focused cases only, ~3 min
 bb flightsql-repro-nightly :preload 20000 :repeats 1   # smaller benchmark
 bb flightsql-repro-nightly :bench-only true :storage :kafka   # one storage variant (:disk, :kafka, :all)
