@@ -24,7 +24,7 @@
    :task (apply shell "clojure" "-X" "fhir-search-bench.writes/report" *command-line-args*)}
 
   xtdb-kafka-up
-  {:doc "Starts a standalone XTDB 2.2.0-rc2 server on a Kafka log in the podman
+  {:doc "Starts a standalone XTDB 2.2.0 server on a Kafka log in the podman
          pod fhirbench-xtdb (Apache Kafka 3.9.1, KRaft, one broker): pgwire on
          127.0.0.1:15432, FlightSQL on :19832, healthz on :18090, Kafka on :19092. Config in
          docker/xtdb-kafka/config.yaml. Replaces
@@ -48,7 +48,7 @@
                   "-e" "XTDB_LOG_TOPIC=xtdb-primary"
                   "-e" "JAVA_TOOL_OPTIONS=-Xmx8g"
                   "-v" (str cfg ":/usr/local/lib/xtdb/config.yaml:ro,Z")
-                  "ghcr.io/xtdb/xtdb-aws:2.2.0-rc2")
+                  "ghcr.io/xtdb/xtdb-aws:2.2.0")
            (wait "XTDB" (fn [] (zero? (:exit (shell {:continue true :out nil :err nil}
                                                     "curl -sf http://127.0.0.1:18090/healthz/alive"))))))}
 
@@ -99,7 +99,7 @@
 
   flightsql-repro-release
   {:doc "As flightsql-repro-nightly, against a published XTDB release:
-         `bb flightsql-repro-release :version 2.2.0-rc2`. Server images
+         `bb flightsql-repro-release :version 2.2.0`. Server images
          ghcr.io/xtdb/xtdb:<v> and xtdb-aws:<v>; client com.xtdb/xtdb-core and
          xtdb-api <v> from Maven Central. Fails up front if any is not
          published. Evidence in target/flightsql-repro/<v>/."
