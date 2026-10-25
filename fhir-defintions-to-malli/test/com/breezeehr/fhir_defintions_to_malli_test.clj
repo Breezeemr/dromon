@@ -6,7 +6,8 @@
             [com.breezeehr.fhir-primitives :as fp]
             [malli.core :as m]
             [malli.registry :as mr]
-            [malli.util :as mu]))
+            [malli.util :as mu]
+            [clojure.string :as str]))
 
 (deftest representation-props-test
   (testing "xmlAttr"
@@ -969,3 +970,675 @@
       (is (m/validate sch {:f "x"}))))
   (testing "min 0 leaves it optional"
     (is (not (tree-contains? (nested-min-scenario 0) {:optional false})))))
+
+;; ---------------------------------------------------------------------------
+;; Inherited slicings (doc/inherited-slices-and-slice-counts.md section 3)
+;;
+;; Synthetic logical models are generated through structure-definition->schema,
+;; one after the other, and each emitted form is compiled before the next
+;; definition reads it, so a derived profile restates a slice of a slicing that
+;; its base really compiled.
+;; ---------------------------------------------------------------------------
+
+(def ^:private inh-version "1.0")
+
+(defn- inh-url [n] (str "http://t.example/StructureDefinition/" n))
+
+(defn- inh-kw [n] (fdm/uri->kw2 (inh-url n) inh-version))
+
+(defn- inh-type [n] [{:code (inh-url n)}])
+
+(defn- inh-sd
+  "A logical-model StructureDefinition rooted at `n`. Elements are [id attrs]
+   pairs; each becomes an ElementDefinition whose path is its id without slice
+   names."
+  [n base-n elements]
+  {:url (inh-url n) :version inh-version :name n :kind "logical" :type n
+   :baseDefinition (when base-n (inh-url base-n))
+   :differential
+   {:element (mapv (fn [[id attrs]]
+                     (merge {:id id
+                             :path (str/replace id #":[^.]+" "")}
+                            attrs))
+                   elements)}})
+
+(defn- inh-str [id & {:as attrs}]
+  [id (merge {:type [{:code "string"}] :min 0 :max "1"} attrs)])
+
+(defn- inh-profile-hook
+  "Stands in for the CDA templateId driver: a section is recognised by its :tid
+   string. Declines, as the real hook does, when any arm names a profile it has
+   no id for."
+  [table]
+  (fn [{:keys [type path arms]}]
+    (when (= "profile" type)
+      (let [entries (reduce (fn [acc {:keys [dispatch-value profiles]}]
+                              (let [cands (or (seq profiles) [dispatch-value])
+                                    tids (mapv table cands)]
+                                (if (every? some? tids)
+                                  (conj acc [(set tids) dispatch-value])
+                                  (reduced nil))))
+                            []
+                            arms)]
+        (when (seq entries)
+          `(~'fn [~'m]
+            (~'let [~'tid (~'get-in ~'m ~(conj (vec path) :tid))]
+             (~'some (~'fn [[~'tids ~'v]] (~'when (~'contains? ~'tids ~'tid) ~'v))
+              ~entries))))))))
+
+(defn- generate-inherited
+  "Generate `sds` in order with the rebuild gate `rebuild?` (and the count gate
+   when `:counts?`), compiling each emitted form. Returns {:schema {name compiled-schema} :entry {name entry}
+   :options <registry options holding every schema> :uncompiled [...]}."
+  [rebuild? hook sds & {:keys [counts?]}]
+  (let [element-kw :org.hl7.fhir.StructureDefinition.Element/v1-0
+        element-sch (m/schema [:map {:closed false}] fp/fhir-registry-options)
+        sa (atom {element-kw {:sch element-sch}})
+        uncompiled (atom [])
+        compiled (atom {element-kw element-sch})
+        options (fn [] (update fp/fhir-registry-options :registry
+                               #(mr/composite-registry % (mr/registry @compiled))))
+        out (atom {})]
+    (binding [fdm/*schema-atom* sa
+              fdm/*honor-child-type-profile* true
+              fdm/*rebuild-inherited-slicings* rebuild?
+              fdm/*compile-slice-counts* (boolean counts?)
+              fdm/*discriminator-dispatch-fn* hook
+              fdm/*uncompiled-slices* uncompiled]
+      (doseq [{n :name :as sd} sds]
+        ((fdm/structure-definition->schema sa) sd)
+        (let [kw (inh-kw n)
+              entry (get @sa kw)
+              base-fns (into [] (mapcat (fn [[fn-name base-kw]]
+                                          [(symbol fn-name) `(~'fn [] (~'get ~'schemas ~base-kw))]))
+                             (:base-refs entry))
+              f (binding [*ns* (the-ns 'com.breezeehr.fhir-defintions-to-malli)]
+                  (eval `(~'fn [~'options ~'schemas]
+                          (~'let [~@base-fns] ~(:form entry)))))
+              sch (f (options) @compiled)]
+          (swap! compiled assoc kw sch)
+          (swap! sa assoc-in [kw :sch] sch)
+          (swap! out assoc-in [:schema n] sch)
+          (swap! out assoc-in [:entry n] entry))))
+    (assoc @out :options (options) :uncompiled @uncompiled)))
+
+(defn- inh-multi
+  "The :multi at `path` (keys and 0 indexes) of a compiled schema."
+  [sch path]
+  (reduce (fn [s k] (m/deref (mu/get s k))) sch path))
+
+(defn- inh-arm-keys [multi] (mapv first (m/children multi)))
+
+(defn- inh-errors
+  "Explain errors of `instance` as [in-path message-key] pairs."
+  [sch options instance]
+  (some->> (m/explain sch instance)
+           :errors
+           (mapv :in)))
+
+;; Section models: Section is the plain type, SecA..SecX profiles over it.
+(defn- section-sds []
+  [(inh-sd "Section" nil [(inh-str "Section.tid") (inh-str "Section.title") (inh-str "Section.note")])
+   (inh-sd "SecA" "Section" [(inh-str "Section.title" :min 1)])
+   (inh-sd "SecB" "Section" [(inh-str "Section.note" :min 1)])
+   (inh-sd "SecAN" "SecA" [(inh-str "Section.note" :min 1)])
+   (inh-sd "SecBN" "SecB" [(inh-str "Section.title" :min 1)])
+   (inh-sd "SecX" "SecA" [(inh-str "Section.note" :min 1)])
+   (inh-sd "SecR" "Section" [(inh-str "Section.note" :min 1) (inh-str "Section.title" :min 1)])
+   (inh-sd "Entry" nil [["Entry.act" {:type (inh-type "Section") :min 0 :max "1"}]])
+   (inh-sd "Component" nil [["Component.section" {:type (inh-type "Section") :min 0 :max "1"}]])
+   (inh-sd "Body" nil [["Body.component" {:type (inh-type "Component") :min 0 :max "*"}]])])
+
+(def ^:private section-table
+  {(inh-url "SecA") "tidA" (inh-url "SecB") "tidB" (inh-url "SecAN") "tidAN"
+   (inh-url "SecBN") "tidBN" (inh-url "SecR") "tidR"})
+
+(defn- slice-child
+  "A slice `slice` of `path` whose `child` is a Section under `profile`."
+  [path slice child profile & [attrs]]
+  [[(str path ":" slice) (merge {:sliceName slice :min 1 :max "1"} attrs)]
+   [(str path ":" slice "." child) {:type [{:code (inh-url "Section") :profile [(inh-url profile)]}]}]])
+
+(defn- slice-section [path slice profile & [attrs]]
+  (slice-child path slice "section" profile attrs))
+
+(defn- nested-base-sds []
+  (into (section-sds)
+        [(inh-sd "DocBase" nil
+                 (into [["DocBase.body" {:type (inh-type "Body") :min 0 :max "1"}]
+                        ["DocBase.body.component"
+                         {:slicing {:discriminator [{:type "profile" :path "section"}] :rules "open"}}]]
+                       (concat (slice-section "DocBase.body.component" "a" "SecA")
+                               (slice-section "DocBase.body.component" "b" "SecB"))))]))
+
+(defn- derived-doc
+  "DocN restating the slices named in `restates` ([slice profile] pairs) of
+   DocBase.body.component."
+  [n base restates]
+  (inh-sd n base
+          (into [["DocBase.body.component" {}]]
+                (mapcat (fn [[slice profile]]
+                          (slice-section "DocBase.body.component" slice profile)))
+                restates)))
+
+(deftest restated-nested-slice-replaces-the-inherited-arm-test
+  (let [hook (inh-profile-hook section-table)
+        {:keys [schema options uncompiled]}
+        (generate-inherited true hook
+                            (conj (nested-base-sds)
+                                  (derived-doc "DocN" "DocBase" [["a" "SecAN"]])))
+        multi-path [:body :component 0]
+        base-multi (inh-multi (schema "DocBase") multi-path)
+        multi (inh-multi (schema "DocN") multi-path)
+        valid? (fn [n instance] (m/validate (schema n) instance options))
+        sec (fn [tid & {:as extra}] {:body {:component [{:section (merge {:tid tid} extra)}]}})]
+    (testing "the base routes by its own templateId table"
+      (is (= [(inh-url "SecA") (inh-url "SecB") :malli.core/default] (inh-arm-keys base-multi))))
+    (testing "the restated arm keeps the inherited key; no dead :section arm is added"
+      (is (= [(inh-url "SecA") (inh-url "SecB") :malli.core/default] (inh-arm-keys multi))))
+    (testing "an instance claiming the narrower profile reaches the restated arm"
+      (is (= (inh-url "SecA") ((:dispatch (m/properties multi)) {:section {:tid "tidAN"}})))
+      (is (nil? ((:dispatch (m/properties multi)) {:section {:tid "tidA"}}))
+          "the base-only templateId no longer reaches the slice: it falls to the default arm")
+      (is (not (valid? "DocN" (sec "tidAN" :title "t"))) "SecAN requires a note")
+      (is (valid? "DocN" (sec "tidAN" :title "t" :note "n")))
+      (is (= [[:body :component 0 :section :note]]
+             (inh-errors (schema "DocN") options (sec "tidAN" :title "t")))))
+    (testing "the unrestated slice is unchanged"
+      (is (valid? "DocN" (sec "tidB" :note "n")))
+      (is (not (valid? "DocN" (sec "tidB")))))
+    (testing "nothing was left uncompiled"
+      (is (empty? uncompiled)))))
+
+(defn- sheet-sds
+  "Sheet.entry sliced on the profile of `act`, slices p and q, at the root."
+  []
+  (conj (section-sds)
+        (inh-sd "SecR" "Section" [(inh-str "Section.note" :min 1) (inh-str "Section.title" :min 1)])
+        (inh-sd "Entry" nil [["Entry.act" {:type (inh-type "Section") :min 0 :max "1"}]])
+        (inh-sd "SheetRoot" nil [["SheetRoot.entry" {:type (inh-type "Entry") :min 0 :max "*"}]])
+        (inh-sd "Sheet" "SheetRoot"
+                (into [["Sheet.entry" {:slicing {:discriminator [{:type "profile" :path "act"}] :rules "open"}}]]
+                      (concat (slice-child "Sheet.entry" "p" "act" "SecA")
+                              (slice-child "Sheet.entry" "q" "act" "SecB"))))))
+
+(deftest restated-and-added-root-slices-test
+  (let [hook (inh-profile-hook section-table)
+        {:keys [schema options uncompiled]}
+        (generate-inherited
+         true hook
+         (conj (sheet-sds)
+               (inh-sd "SheetD" "Sheet"
+                       (into [["Sheet.entry" {}]]
+                             (concat (slice-child "Sheet.entry" "p" "act" "SecAN")
+                                     (slice-child "Sheet.entry" "r" "act" "SecR"))))))
+        multi (inh-multi (schema "SheetD") [:entry 0])
+        dispatch (:dispatch (m/properties multi))
+        valid? (fn [instance] (m/validate (schema "SheetD") instance options))
+        entry (fn [tid & {:as extra}] {:entry [{:act (merge {:tid tid} extra)}]})]
+    (testing "the restated arm keeps its inherited key, the added arm is keyed by its profile"
+      (is (= [(inh-url "SecA") (inh-url "SecB") (inh-url "SecR") :malli.core/default]
+             (inh-arm-keys multi))))
+    (testing "the rebuilt dispatch routes the narrower, the unchanged and the added templateId"
+      (is (= (inh-url "SecA") (dispatch {:act {:tid "tidAN"}})))
+      (is (= (inh-url "SecB") (dispatch {:act {:tid "tidB"}})))
+      (is (= (inh-url "SecR") (dispatch {:act {:tid "tidR"}}))))
+    (testing "each arm holds its instance to its own profile"
+      (is (not (valid? (entry "tidAN" :title "t"))))
+      (is (valid? (entry "tidAN" :title "t" :note "n")))
+      (is (not (valid? (entry "tidR" :title "t"))))
+      (is (valid? (entry "tidR" :title "t" :note "n")))
+      (is (not (valid? (entry "tidB"))))
+      (is (valid? (entry "tidB" :note "n"))))
+    (testing "an occurrence of no slice reaches the open default"
+      (is (valid? (entry "other"))))
+    (is (empty? uncompiled))))
+
+(deftest restated-value-tuple-slice-keeps-its-key-test
+  (let [fixed (fn [id v] [id {:type [{:code "string"}] :fixedString v :min 1 :max "1"}])
+        {:keys [schema options uncompiled]}
+        (generate-inherited
+         true nil
+         [(inh-sd "Part" nil [(inh-str "Part.cls") (inh-str "Part.sub") (inh-str "Part.extra")])
+          (inh-sd "PtRoot" nil [["PtRoot.part" {:type (inh-type "Part") :min 0 :max "*"}]])
+          (inh-sd "Pt" "PtRoot"
+                  [["Pt.part" {:slicing {:discriminator [{:type "value" :path "cls"}
+                                                         {:type "value" :path "sub"}]
+                                         :rules "open"}}]
+                   ["Pt.part:csm" {:sliceName "csm" :min 0 :max "*"}]
+                   (fixed "Pt.part:csm.cls" "CSM")
+                   (fixed "Pt.part:csm.sub" "MANU")])
+          (inh-sd "PtD" "Pt"
+                  [["Pt.part" {}]
+                   ["Pt.part:csm" {:sliceName "csm" :min 0 :max "*"}]
+                   (fixed "Pt.part:csm.cls" "CSM")
+                   (fixed "Pt.part:csm.sub" "MANU")
+                   (fixed "Pt.part:csm.extra" "MMAT")])])
+        multi (inh-multi (schema "PtD") [:part 0])
+        valid? (fn [instance] (m/validate (schema "PtD") instance options))]
+    (is (= [["CSM" "MANU"] :malli.core/default] (inh-arm-keys multi))
+        "the key stays the inherited pair, not the three values the differential states")
+    (is (valid? {:part [{:cls "CSM" :sub "MANU" :extra "MMAT"}]}))
+    (is (not (valid? {:part [{:cls "CSM" :sub "MANU" :extra "OTHER"}]}))
+        "the extra fixed value below the slice is enforced")
+    (is (valid? {:part [{:cls "CSM" :sub "OTHER" :extra "OTHER"}]})
+        "an occurrence that is not the slice is unconstrained")
+    (is (empty? uncompiled))))
+
+(deftest added-value-slice-is-keyed-in-discriminator-order-test
+  (let [fixed (fn [id v] [id {:type [{:code "string"}] :fixedString v :min 1 :max "1"}])
+        {:keys [schema options uncompiled]}
+        (generate-inherited
+         true nil
+         [(inh-sd "Ident" nil [(inh-str "Ident.root") (inh-str "Ident.extension") (inh-str "Ident.note")])
+          (inh-sd "IddRoot" nil [["IddRoot.ident" {:type (inh-type "Ident") :min 0 :max "*"}]])
+          (inh-sd "Idd" "IddRoot"
+                  [["Idd.ident" {:slicing {:discriminator [{:type "value" :path "root"}
+                                                           {:type "value" :path "extension"}]
+                                           :rules "open"}}]
+                   ["Idd.ident:one" {:sliceName "one" :min 1 :max "1"}]
+                   (fixed "Idd.ident:one.root" "1.1")
+                   (fixed "Idd.ident:one.extension" "e1")])
+          (inh-sd "IddD" "Idd"
+                  [["Idd.ident" {}]
+                   ["Idd.ident:two" {:sliceName "two" :min 1 :max "1"}]
+                   (fixed "Idd.ident:two.extension" "e2")
+                   (fixed "Idd.ident:two.root" "2.2")
+                   (inh-str "Idd.ident:two.note" :min 1)])])
+        multi (inh-multi (schema "IddD") [:ident 0])
+        valid? (fn [instance] (m/validate (schema "IddD") instance options))]
+    (is (= [["1.1" "e1"] ["2.2" "e2"] :malli.core/default] (inh-arm-keys multi))
+        "the added key follows the slicing's discriminators, not the differential's order")
+    (is (not (valid? {:ident [{:root "2.2" :extension "e2"}]})) "the added arm requires its note")
+    (is (valid? {:ident [{:root "2.2" :extension "e2" :note "n"}]}))
+    (is (valid? {:ident [{:root "1.1" :extension "e1"}]}) "the inherited slice is untouched")
+    (is (empty? uncompiled))))
+
+(deftest hook-declining-the-merged-group-falls-back-in-place-test
+  (let [hook (inh-profile-hook section-table)
+        ;; SecX has no templateId in the table, so the hook declines the
+        ;; rebuilt list: the restated arm still replaces the inherited one,
+        ;; under the inherited dispatch, and the added slice is dropped.
+        {:keys [schema options uncompiled]}
+        (generate-inherited true hook
+                            (conj (nested-base-sds)
+                                  (derived-doc "DocD" "DocBase" [["a" "SecX"] ["c" "SecR"]])))
+        multi (inh-multi (schema "DocD") [:body :component 0])
+        sec (fn [tid & {:as extra}] {:body {:component [{:section (merge {:tid tid} extra)}]}})]
+    (is (= [(inh-url "SecA") (inh-url "SecB") :malli.core/default] (inh-arm-keys multi)))
+    (is (= (inh-url "SecA") ((:dispatch (m/properties multi)) {:section {:tid "tidA"}}))
+        "the inherited dispatch still routes the base templateId")
+    (is (not (m/validate (schema "DocD") (sec "tidA" :title "t") options))
+        "and the replaced arm holds it to SecX, which requires a note")
+    (is (m/validate (schema "DocD") (sec "tidA" :title "t" :note "n") options))
+    (is (= #{[:dispatch-declined "c"] [:restated-unroutable "a"]}
+           (into #{} (map (juxt :reason :slice)) uncompiled)))
+    (is (every? #(= "DocBase.body.component" (:element %)) uncompiled))))
+
+(deftest grandchild-rebuilds-from-the-merged-record-test
+  (let [hook (inh-profile-hook section-table)
+        {:keys [schema options uncompiled entry]}
+        (generate-inherited true hook
+                            (conj (nested-base-sds)
+                                  (derived-doc "DocN" "DocBase" [["a" "SecAN"]])
+                                  (derived-doc "DocN2" "DocN" [["b" "SecBN"]])))
+        multi (inh-multi (schema "DocN2") [:body :component 0])
+        dispatch (:dispatch (m/properties multi))
+        valid? (fn [instance] (m/validate (schema "DocN2") {:body {:component [{:section instance}]}} options))]
+    (is (= [(inh-url "SecA") (inh-url "SecB") :malli.core/default] (inh-arm-keys multi)))
+    (is (= (inh-url "SecA") (dispatch {:section {:tid "tidAN"}})) "the first derivation's narrowing is kept")
+    (is (= (inh-url "SecB") (dispatch {:section {:tid "tidBN"}})) "the second one is added")
+    (is (nil? (dispatch {:section {:tid "tidB"}})))
+    (is (not (valid? {:tid "tidAN" :title "t"})))
+    (is (not (valid? {:tid "tidBN" :note "n"})) "SecBN requires a title")
+    (is (valid? {:tid "tidBN" :note "n" :title "t"}))
+    (is (empty? uncompiled))
+    (is (= [(inh-url "SecA") (inh-url "SecB")]
+           (mapv :key (:arms (get (:slicings (entry "DocN2")) "DocBase.body.component")))))))
+
+(deftest nested-body-is-computed-against-the-live-arm-test
+  ;; The inherited arm holds :section as a ref to SecA. A derived body that
+  ;; constrains below :section has to deref it, which only the live arm (not
+  ;; the core Component type the nested walk stands on) tells the generator.
+  (let [hook (inh-profile-hook section-table)
+        derived (inh-sd "DocBelow" "DocBase"
+                        [["DocBase.body.component" {}]
+                         ["DocBase.body.component:a" {:sliceName "a" :min 1 :max "1"}]
+                         ["DocBase.body.component:a.section" {}]
+                         ["DocBase.body.component:a.section.note" {:min 1}]])
+        {:keys [schema options uncompiled]}
+        (generate-inherited true hook (conj (nested-base-sds) derived))
+        sec (fn [tid & {:as extra}] {:body {:component [{:section (merge {:tid tid :title "t"} extra)}]}})]
+    (is (not (m/validate (schema "DocBelow") (sec "tidA") options)))
+    (is (= [[:body :component 0 :section :note]]
+           (inh-errors (schema "DocBelow") options (sec "tidA"))))
+    (is (m/validate (schema "DocBelow") (sec "tidA" :note "n") options))
+    (is (m/validate (schema "DocBelow") (sec "tidB" :note "n") options))
+    (is (empty? uncompiled))))
+
+(deftest gate-off-keeps-the-merged-arms-test
+  (let [hook (inh-profile-hook section-table)
+        nested (generate-inherited false hook
+                                   (conj (nested-base-sds)
+                                         (derived-doc "DocN" "DocBase" [["a" "SecAN"]])))
+        root (generate-inherited false hook
+                                 (conj (sheet-sds)
+                                       (inh-sd "SheetD" "Sheet"
+                                               (into [["Sheet.entry" {}]]
+                                                     (slice-child "Sheet.entry" "p" "act" "SecAN")))))
+        root-multi (inh-multi (get-in root [:schema "SheetD"]) [:entry 0])]
+    (testing "no record is kept"
+      (is (every? #(not (contains? % :slicings)) (vals (:entry nested))))
+      (is (every? #(not (contains? % :slicings)) (vals (:entry root)))))
+    (testing "nested: the restated slice never reaches the arm for its templateId"
+      (let [multi (inh-multi (get-in nested [:schema "DocN"]) [:body :component 0])]
+        (is (= [(inh-url "SecA") (inh-url "SecB") :malli.core/default] (inh-arm-keys multi)))
+        (is (nil? ((:dispatch (m/properties multi)) {:section {:tid "tidAN"}})))))
+    (testing "root: the restated slice is keyed by the derived profile, which the inherited table never returns"
+      (is (= [(inh-url "SecA") (inh-url "SecB") :malli.core/default (inh-url "SecAN")]
+             (inh-arm-keys root-multi)))
+      (is (nil? ((:dispatch (m/properties root-multi)) {:act {:tid "tidAN"}}))))
+    (is (empty? (:uncompiled nested)))))
+
+(deftest slices-the-rebuild-cannot-honor-are-reported-test
+  (let [hook (inh-profile-hook section-table)
+        body (fn [n rules slices]
+               (inh-sd n nil
+                       (into [["Doc.body" {:type (inh-type "Body") :min 0 :max "1"}]
+                              ["Doc.body.component"
+                               {:slicing {:discriminator [{:type "profile" :path "section"}]
+                                          :rules rules}}]]
+                             slices)))
+        closed (body "ClosedBase" "closed"
+                     (concat (slice-section "Doc.body.component" "a" "SecA")
+                             (slice-section "Doc.body.component" "b" "SecB")))]
+    (testing "an added slice on a closed slicing"
+      (let [{:keys [schema uncompiled]}
+            (generate-inherited true hook
+                                (conj (section-sds) closed
+                                      (inh-sd "ClosedD" "ClosedBase"
+                                              (into [["Doc.body.component" {}]]
+                                                    (slice-section "Doc.body.component" "c" "SecR")))))
+            multi (inh-multi (schema "ClosedD") [:body :component 0])]
+        (is (= [(inh-url "SecA") (inh-url "SecB")] (inh-arm-keys multi)) "no default arm, no new arm")
+        (is (= [{:reason :closed-slicing :slice "c" :element "Doc.body.component"}]
+               (mapv #(select-keys % [:reason :slice :element]) uncompiled)))))
+    (testing "a restated slice whose key another slice won"
+      (let [dup (body "DupBase" "open"
+                      (concat (slice-section "Doc.body.component" "a" "SecA")
+                              (slice-section "Doc.body.component" "a2" "SecA")))
+            {:keys [schema uncompiled entry]}
+            (generate-inherited true hook
+                                (conj (section-sds) dup
+                                      (inh-sd "DupD" "DupBase"
+                                              (into [["Doc.body.component" {}]]
+                                                    (slice-section "Doc.body.component" "a" "SecAN")))))]
+        (is (= [{:reason :collided-restated :slice "a"}]
+               (mapv #(select-keys % [:reason :slice]) uncompiled)))
+        (is (= [true false]
+               (mapv :collided? (:arms (get (:slicings (entry "DupBase")) "Doc.body.component")))))))
+    (testing "an added slice on a wildcard exists slicing"
+      (let [wild (inh-sd "WildBase" nil
+                         [["Doc.entry" {:type [{:code (inh-url "Entry2")} ] :min 0 :max "*"
+                                        :slicing {:discriminator [{:type "exists" :path "*"}] :rules "open"}}]
+                          ["Doc.entry:x" {:sliceName "x" :min 0 :max "*"}]
+                          ["Doc.entry:x.act" {:min 1}]
+                          ["Doc.entry:y" {:sliceName "y" :min 0 :max "*"}]
+                          ["Doc.entry:y.obs" {:min 1}]])
+            {:keys [uncompiled]}
+            (generate-inherited true hook
+                                [(inh-sd "Entry2" nil [(inh-str "Entry2.act") (inh-str "Entry2.obs")])
+                                 (inh-sd "WildRoot" nil [["Doc.entry" {:type (inh-type "Entry2") :min 0 :max "*"}]])
+                                 (assoc-in wild [:baseDefinition] (inh-url "WildRoot"))
+                                 (inh-sd "WildD" "WildBase"
+                                         [["Doc.entry" {}]
+                                          ["Doc.entry:z" {:sliceName "z" :min 0 :max "*"}]
+                                          ["Doc.entry:z.act" {:min 1}]
+                                          ["Doc.entry:z.obs" {:min 1}]])])]
+        (is (= [{:reason :wildcard-group :slice "z"}]
+               (mapv #(select-keys % [:reason :slice]) uncompiled)))))))
+
+(defn- updates-field?
+  "Whether a generated form contains a (mu/update <sch> field ...) step."
+  [form field]
+  (boolean (some #(and (seq? %) (= 'mu/update (first %)) (= field (second %)))
+                 (tree-seq coll? seq form))))
+
+(deftest declined-multi-is-threaded-only-on-a-field-that-does-not-repeat-test
+  (let [hook (constantly nil)
+        sec (fn [& {:as extra}] (merge {:tid "tidA" :title "t"} extra))
+        repeating (generate-inherited
+                   true hook
+                   (conj (nested-base-sds) (derived-doc "DocN" "DocBase" [["a" "SecAN"]])))
+        single-base (inh-sd "OneBase" nil
+                            [["OneBase.act" {:type (inh-type "Section") :min 0 :max "1"
+                                             :slicing {:discriminator [{:type "profile" :path "$this"}]
+                                                       :rules "open"}}]
+                             ["OneBase.act:a" {:sliceName "a" :type [{:code (inh-url "Section")
+                                                                      :profile [(inh-url "SecA")]}]
+                                               :min 0 :max "1"}]])
+        single (generate-inherited
+                true hook
+                (conj (section-sds) single-base
+                      (inh-sd "OneD" "OneBase"
+                              [["OneBase.act" {}]
+                               ["OneBase.act:a" {:sliceName "a" :min 0 :max "1"}]
+                               ["OneBase.act:a.note" {:type [{:code "string"}] :min 1 :max "1"}]])))]
+    (testing "a repeating field: the slice is reported and no threading form is emitted"
+      (is (= [{:reason :no-multi-repeating :slice "a" :element "DocBase.body.component"}]
+             (mapv #(select-keys % [:reason :slice :element]) (:uncompiled repeating))))
+      (is (m/validate (get-in repeating [:schema "DocN"])
+                      {:body {:component [{:section (sec)}]}} (:options repeating))
+          "an occurrence the slice would have constrained is left alone")
+      (is (not (updates-field? (get-in repeating [:entry "DocN" :form]) :section))))
+    (testing "a field that does not repeat keeps the direct threading"
+      (is (empty? (:uncompiled single)))
+      (is (updates-field? (get-in single [:entry "OneD" :form]) :act)
+          "the form updates the sliced field itself"))))
+
+;; ---------------------------------------------------------------------------
+;; Slice counts (doc/inherited-slices-and-slice-counts.md section 5)
+;; ---------------------------------------------------------------------------
+
+(def ^:private count-slices
+  "Slices a 1..1, b 0..1, c 1..*, z 0..0, each fixing `code`."
+  [["a" "1" "1"] ["b" "0" "1"] ["c" "1" "*"] ["z" "0" "0"]])
+
+(defn- fixed-code [id v]
+  [id {:type [{:code "string"}] :fixedString v :min 1 :max "1"}])
+
+(defn- counted-sds
+  "CRoot.ident (0..*) sliced by `code` in C, with the slices of `count-slices`;
+   a slice's fixed code is its name upcased."
+  [rules]
+  [(inh-sd "Ident" nil [(inh-str "Ident.code") (inh-str "Ident.note")])
+   (inh-sd "CRoot" nil [["CRoot.ident" {:type (inh-type "Ident") :min 0 :max "*"}]])
+   (inh-sd "C" "CRoot"
+           (into [["C.ident" {:slicing {:discriminator [{:type "value" :path "code"}] :rules rules}}]]
+                 (mapcat (fn [[n mn mx]]
+                           [[(str "C.ident:" n) {:sliceName n :min (parse-long mn) :max mx}]
+                            (fixed-code (str "C.ident:" n ".code") (str/upper-case n))])
+                         count-slices)))])
+
+(defn- entry-optional [sch k]
+  (let [[_ props] (first (filter #(= k (first %)) (m/children sch)))]
+    (get props :optional :absent)))
+
+(defn- ident [& codes] {:ident (mapv (fn [c] {:code c}) codes)})
+
+(defn- count-errors
+  "[in slice-name slice-id] of every count error `m/explain` reports."
+  [sch options instance]
+  (->> (:errors (m/explain sch instance options))
+       (keep (fn [{:keys [in schema]}]
+               (when-let [n (:fhir/slice-name (m/properties schema))]
+                 [in n (:fhir/slice-id (m/properties schema))])))
+       sort
+       vec))
+
+(deftest slice-counts-on-an-open-slicing-test
+  (let [{:keys [schema options uncompiled entry]} (generate-inherited true nil (counted-sds "open") :counts? true)
+        sch (schema "C")
+        field (mu/get sch :ident)
+        errs (partial count-errors sch options)
+        valid? #(m/validate sch % options)]
+    (testing "the field is a counted :and whose child 0 is the sequential of arms"
+      (is (= :and (m/type field)))
+      (is (= [["A" "a" 1 1] ["B" "b" 0 1] ["C" "c" 1 nil] ["Z" "z" 0 0]]
+             (:fhir/slice-counts (m/properties field))))
+      (is (= (conj ["A" "B" "C" "Z"] :malli.core/default)
+             (inh-arm-keys (inh-multi sch [:ident 0 0])))
+          "the routing arms are unchanged")
+      (is (fdm/counted-sequential field))
+      (is (= :multi (m/type (fdm/unwrap-sequential field)))))
+    (testing "a mandatory slice makes the key itself required"
+      (is (false? (entry-optional sch :ident)))
+      (is (not (valid? {})))
+      (is (some? (m/explain sch {}))))
+    (testing "zero occurrences of the 1..1 and the 1..* slice"
+      (is (= [[[:ident] "a" "C.ident:a"] [[:ident] "c" "C.ident:c"]]
+             (errs {:ident []}))
+          "one error per failing slice, at the sliced field, naming the slice and its element id"))
+    (testing "one occurrence of each mandatory slice, none of the optional ones"
+      (is (valid? (ident "A" "C"))))
+    (testing "two occurrences"
+      (is (= [[[:ident] "a" "C.ident:a"]] (errs (ident "A" "A" "C"))) "1..1")
+      (is (= [[[:ident] "b" "C.ident:b"]] (errs (ident "A" "B" "B" "C"))) "0..1")
+      (is (valid? (ident "A" "C" "C" "C")) "1..* is unbounded")
+      (is (= [[[:ident] "z" "C.ident:z"]] (errs (ident "A" "C" "Z"))) "max 0 rejects the first"))
+    (testing "occurrences of no slice reach the open default arm and are not counted"
+      (is (valid? (ident "A" "C" "other" "other"))))
+    (testing "a slice's own constraints still apply through its arm"
+      (is (not (m/validate sch {:ident [{:code "A" :note 1} {:code "C"}]} options))))
+    (is (empty? uncompiled))
+    (is (true? (get-in entry ["C" :slicings "C.ident" :counted?]))
+        "the record says the field is counted, for a derivation to unwrap")))
+
+(deftest slice-counts-on-a-closed-slicing-test
+  (let [{:keys [schema options uncompiled]} (generate-inherited true nil (counted-sds "closed") :counts? true)
+        sch (schema "C")
+        field (mu/get sch :ident)]
+    (is (= :and (m/type field)))
+    (is (= ["A" "B" "C" "Z"] (inh-arm-keys (inh-multi sch [:ident 0 0]))) "no default arm")
+    (is (m/validate sch (ident "A" "C") options))
+    (testing "an unmatched occurrence is rejected by the :multi, and the counts are unchanged"
+      (let [errs (:errors (m/explain sch (ident "A" "C" "other") options))]
+        (is (= [[:ident 2]] (mapv #(vec (take 2 (:in %))) errs)))
+        (is (empty? (count-errors sch options (ident "A" "C" "other"))))))
+    (is (= [[[:ident] "a" "C.ident:a"]] (count-errors sch options (ident "A" "A" "C"))))
+    (is (empty? uncompiled))))
+
+(deftest slice-counts-gate-off-emits-the-plain-sequential-test
+  (let [{:keys [schema]} (generate-inherited true nil (counted-sds "open"))
+        field (mu/get (schema "C") :ident)]
+    (is (= :sequential (m/type field)))
+    (is (nil? (fdm/counted-sequential field)))
+    (is (true? (entry-optional (schema "C") :ident)) "the field stays optional")))
+
+(deftest slice-counts-require-the-rebuild-gate-test
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires \*rebuild-inherited-slicings\*"
+                        (generate-inherited false nil (counted-sds "open") :counts? true))))
+
+(deftest slice-counts-follow-a-narrowed-restatement-test
+  (let [derived (fn [n base slices]
+                  (inh-sd n base
+                          (into [["C.ident" {}]]
+                                (mapcat (fn [[sn mn mx]]
+                                          [[(str "C.ident:" sn) {:sliceName sn :min mn :max mx}]
+                                           (fixed-code (str "C.ident:" sn ".code") (str/upper-case sn))]))
+                                slices)))
+        {:keys [schema options uncompiled entry]}
+        (generate-inherited true nil
+                            (conj (counted-sds "open")
+                                  (derived "CD" "C" [["b" 1 "1"]])
+                                  (derived "CDD" "CD" [["z" 0 "1"]]))
+                            :counts? true)
+        counts (fn [n] (:fhir/slice-counts (m/properties (mu/get (schema n) :ident))))]
+    (testing "0..1 narrowed to 1..1 is counted as 1..1, and the field is still counted"
+      (is (= [["A" "a" 1 1] ["B" "b" 1 1] ["C" "c" 1 nil] ["Z" "z" 0 0]] (counts "CD")))
+      (is (= :and (m/type (mu/get (schema "CD") :ident))))
+      (is (= [[[:ident] "b" "C.ident:b"]] (count-errors (schema "CD") options (ident "A" "C"))))
+      (is (m/validate (schema "CD") (ident "A" "B" "C") options))
+      (is (m/validate (schema "C") (ident "A" "C") options) "the base is untouched"))
+    (testing "a grandchild rebuilds from the merged record, counting from the snapshot-less differential"
+      (is (= [["A" "a" 1 1] ["B" "b" 1 1] ["C" "c" 1 nil] ["Z" "z" 0 1]] (counts "CDD")))
+      (is (m/validate (schema "CDD") (ident "A" "B" "C" "Z") options)))
+    (is (= (inh-arm-keys (inh-multi (schema "C") [:ident 0 0]))
+           (inh-arm-keys (inh-multi (schema "CD") [:ident 0 0]))))
+    (is (empty? uncompiled))))
+
+(deftest slice-counts-start_at_a_derivation-test
+  (let [{:keys [schema options entry]}
+        (generate-inherited
+         true nil
+         [(inh-sd "Ident" nil [(inh-str "Ident.code")])
+          (inh-sd "KRoot" nil [["KRoot.ident" {:type (inh-type "Ident") :min 0 :max "*"}]])
+          (inh-sd "K" "KRoot"
+                  [["K.ident" {:slicing {:discriminator [{:type "value" :path "code"}] :rules "open"}}]
+                   ["K.ident:p" {:sliceName "p" :min 0 :max "*"}]
+                   (fixed-code "K.ident:p.code" "P")])
+          (inh-sd "KD" "K"
+                  [["K.ident" {}]
+                   ["K.ident:p" {:sliceName "p" :min 1 :max "*"}]
+                   (fixed-code "K.ident:p.code" "P")])]
+         :counts? true)]
+    (is (= :sequential (m/type (mu/get (schema "K") :ident))) "0..* counts nothing")
+    (is (= :and (m/type (mu/get (schema "KD") :ident))) "the derived profile starts counting")
+    (is (not (m/validate (schema "KD") {:ident [{:code "other"}]} options)))
+    (is (m/validate (schema "KD") {:ident [{:code "P"} {:code "P"}]} options))
+    (is (false? (get-in entry ["K" :slicings "K.ident" :counted?])))
+    (is (true? (get-in entry ["KD" :slicings "K.ident" :counted?])))))
+
+(deftest slice-counts-skip-what-the-dispatch-cannot-count-test
+  (let [{:keys [schema options uncompiled]}
+        (generate-inherited
+         true nil
+         [(inh-sd "Ident" nil [(inh-str "Ident.code") (inh-str "Ident.note")])
+          (inh-sd "URoot" nil [["URoot.ident" {:type (inh-type "Ident") :min 0 :max "*"}]])
+          (inh-sd "U" "URoot"
+                  [["U.ident" {:slicing {:discriminator [{:type "value" :path "code"}] :rules "open"}}]
+                   ["U.ident:a" {:sliceName "a" :min 0 :max "*"}]
+                   (fixed-code "U.ident:a.code" "A")
+                   ;; no value at the discriminator's path: keyed :d, no dispatch can return it
+                   ["U.ident:d" {:sliceName "d" :min 1 :max "1"}]
+                   (inh-str "U.ident:d.note" :min 1)
+                   ;; two slices sharing a key
+                   ["U.ident:e" {:sliceName "e" :min 1 :max "1"}]
+                   (fixed-code "U.ident:e.code" "E")
+                   ["U.ident:e2" {:sliceName "e2" :min 0 :max "1"}]
+                   (fixed-code "U.ident:e2.code" "E")])]
+         :counts? true)
+        sch (schema "U")]
+    (is (= :sequential (m/type (mu/get sch :ident))) "nothing countable is left, so no :and")
+    (is (= #{[:count-unroutable-key "d"] [:count-collided-key "e"] [:count-collided-key "e2"]}
+           (into #{} (map (juxt :reason :slice)) uncompiled)))
+    (testing "an occurrence that lacks the discriminating value still validates"
+      (is (m/validate sch {:ident [{:note "n"}]} options))
+      (is (m/validate sch {} options) "no mandatory slice made the key required"))))
+
+(deftest nested-restatement-of-a-counted-field-keeps-it-counted-test
+  (let [{:keys [schema options]}
+        (generate-inherited
+         true nil
+         (conj (counted-sds "open")
+               (inh-sd "CN" "C" [["C.ident" {}] (inh-str "C.ident.note" :min 1)]))
+         :counts? true)
+        sch (schema "CN")]
+    (is (= :and (m/type (mu/get sch :ident))) "only entry properties were emitted")
+    (is (m/validate sch (ident "A" "C") options))
+    (is (= [:ident 0 :code]
+           (#'fdm/discriminator-path->get-in-path (schema "C") "ident.code"))
+        "a path through a counted field gets its 0 index")))
+
+(deftest slice-counts-decline-a-field-that-does-not-repeat-test
+  (let [arm {:slice-name "q" :min 1 :max "1" :key "Q" :routable? true}
+        run (fn [group]
+              (binding [fdm/*uncompiled-slices* (atom [])]
+                [(#'fdm/counted-arms group "X.one" any?)
+                 (mapv :reason @fdm/*uncompiled-slices*)]))]
+    (is (= [[arm] []] (run {:arms [arm] :multi? true :field-is-sequential? true})))
+    (is (= [[] [:count-non-repeating]] (run {:arms [arm] :multi? true :field-is-sequential? false}))
+        "a single value has no occurrences to count")
+    (is (= [[] [:count-no-multi]] (run {:arms [arm] :multi? false :field-is-sequential? true})))
+    (is (= [[] []] (run {:arms [(assoc arm :min 0 :max "*")] :multi? false}))
+        "a slice with no bound is not wanted, so nothing is reported")))
