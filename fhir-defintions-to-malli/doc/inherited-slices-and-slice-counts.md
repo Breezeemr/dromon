@@ -592,3 +592,78 @@ adds to, the design:
   slice the R2.1 SD states with a root the document lacks, as `templateId1` of the R2.1 Allergy -
   Intolerance Observation), and pins that state "counts are not compiled". They are the corpus
   pass-to-fail class section 8 asks to be examined one by one; they are not examined here.
+
+## Round 2: counts over matching occurrences (2026-10-25)
+
+### The defect
+
+Section 5.1 counted a slice's occurrences as the items for which the routing
+dispatch returned the slice's key, `(= key (dispatch x))`. The dispatch answers
+"which one arm validates this item" and returns one key per item. FHIR's count
+is over the items that MATCH the slice, and an item may match several. In CDA an
+occurrence claims every template it carries in `templateId`, and DECOR R1.1
+states a section's entries-optional variant as a `1..1` slice beside the
+entries-required variant (HL7's Discharge Summary 1 and HandP 1 samples carry
+both templateIds). The dispatch credited such a section to the first slice in
+slice order only, so the second slice reported a missing occurrence on a valid
+document. Routing is unchanged; only the count changes.
+
+### The match predicate
+
+`make-matcher-form` emits, once per counted slicing, `matcher`: `(fn [m] #{slice-name ...})`,
+the slices the occurrence `m` matches. The count `:fn` of a slice is then
+`min <= (count (filter #(contains? (matcher %) slice-name) xs)) <= max`, and an
+occurrence counts toward every slice it matches. A slice matches when every
+discriminator the dispatch kept agrees with the slice's component of its arm
+key; the components come from the same normalized discriminators and the same
+`dispatch-component` the dispatch is built from, so the two cannot disagree on
+what was kept. A nil component states nothing and agrees with any occurrence.
+
+| discriminator | slice matches when |
+|---|---|
+| `value`, `pattern`, `$this` | some value of the occurrence at the discriminator path equals the slice's; every element of a repeating step is examined, where the dispatch reads the first |
+| `exists` | the child's presence equals the slice's |
+| `profile`, `type` | the occurrence claims the slice's profile through `*discriminator-claims-fn*`, else the dispatch's value equals the slice's |
+
+`*discriminator-claims-fn*` is the companion of `*discriminator-dispatch-fn*`: the
+same argument map, and it returns a form `(fn [m] #{dispatch-value ...})` of every
+arm value the occurrence claims. ccda's hook answers with the templateIds the
+occurrence carries: an arm is claimed by an exact `[root extension]` pair, or by
+its root when no arm names that root with the claimed extension (version drift,
+as the dispatch absorbs it). The slice's own templateId pins reach the matcher
+through the `value` discriminators on `root` and `extension` of a templateId
+slicing, which are not hook-dispatched.
+
+Consequences:
+
+- A slice no longer needs a key of its own: two slices sharing a key (RiskConcernAct
+  declares the same entryRelationship under two slice names) are both counted;
+  `:count-collided-key` is gone. `:count-unroutable-key` stays: a slice that states no
+  value at any kept discriminator would match everything.
+- `:count-no-matcher` reports a counted slice whose matcher cannot be built (a kept
+  discriminator the hook no longer answers on a rebuild).
+- A rebuild (`flush-inherited-group`) rebuilds the matcher from the merged arms and
+  the record's kept discriminators even when it keeps the inherited dispatch, because
+  a cardinality narrowing can start a count; the claims hook is asked again.
+- The explain error is unchanged: `:in` the sliced field's value path, the slice name
+  and id in the `:fn` properties.
+
+### Tests (fdm)
+
+`slice-counts-count-every-matching-slice-test` (a repeating discriminated child, an
+occurrence matching two `1..1` slices satisfies both, a second one exceeds both, an
+occurrence matching neither is allowed by the open slicing);
+`slice-counts-claims-hook-test` (a stub profile hook with a claims companion, and the
+fallback to the dispatch value without one); the round-1 count tests pass, with the
+collided-key expectations of `slice-counts-skip-what-the-dispatch-cannot-count-test`
+changed to both slices being counted.
+
+### What the match semantics exposed in ccda
+
+See `ccda/target/fdm-regen/report.md`, "Round 2: counts". In short: with counts on for
+all six sets, real documents and fc output meet slice requirements that are defects of
+the published StructureDefinitions rather than of the count: a pin on a template
+revision newer than the release, a slice inherited through an inverted baseDefinition,
+a slice stated `1..1` beside text that says MAY. They are corrected in ccda's patch
+layer (never by turning counts off); documents that genuinely omit a required template
+or its version are reported.

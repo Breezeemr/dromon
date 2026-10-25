@@ -1609,12 +1609,14 @@
                    (fixed-code "U.ident:e2.code" "E")])]
          :counts? true)
         sch (schema "U")]
-    (is (= :sequential (m/type (mu/get sch :ident))) "nothing countable is left, so no :and")
-    (is (= #{[:count-unroutable-key "d"] [:count-collided-key "e"] [:count-collided-key "e2"]}
-           (into #{} (map (juxt :reason :slice)) uncompiled)))
-    (testing "an occurrence that lacks the discriminating value still validates"
-      (is (m/validate sch {:ident [{:note "n"}]} options))
-      (is (m/validate sch {} options) "no mandatory slice made the key required"))))
+    (is (= :and (m/type (mu/get sch :ident))) "the two slices sharing a key are still counted")
+    (is (= #{[:count-unroutable-key "d"]}
+           (into #{} (map (juxt :reason :slice)) uncompiled))
+        "a key two slices share is counted for both: a count is over the matches")
+    (testing "an occurrence that lacks the discriminating value still validates the arms"
+      (is (empty? (count-errors sch options {:ident [{:code "E"}]})))
+      (is (= #{"e" "e2"} (set (map second (count-errors sch options {:ident [{:code "E"} {:code "E"}]}))))
+          "two E occurrences exceed the 0..1 of e2 and the 1..1 of e"))))
 
 (deftest nested-restatement-of-a-counted-field-keeps-it-counted-test
   (let [{:keys [schema options]}
@@ -1642,3 +1644,118 @@
     (is (= [[] [:count-no-multi]] (run {:arms [arm] :multi? false :field-is-sequential? true})))
     (is (= [[] []] (run {:arms [(assoc arm :min 0 :max "*")] :multi? false}))
         "a slice with no bound is not wanted, so nothing is reported")))
+
+;; Round 2: a count is over the occurrences that MATCH a slice
+;; (doc/inherited-slices-and-slice-counts.md, Round 2).
+
+(defn- tag-sds
+  "TRoot.item (0..*) of Item, whose `tag` repeats, sliced by the value of tag:
+   a 1..1 and b 0..1 (open), c 1..1 (closed variant uses `rules`)."
+  [rules]
+  [(inh-sd "Item" nil [["Item.tag" {:type [{:code "string"}] :min 0 :max "*"}]])
+   (inh-sd "TRoot" nil [["TRoot.item" {:type (inh-type "Item") :min 0 :max "*"}]])
+   (inh-sd "T" "TRoot"
+           [["T.item" {:slicing {:discriminator [{:type "value" :path "tag"}] :rules rules}}]
+            ["T.item:a" {:sliceName "a" :min 1 :max "1"}]
+            ["T.item:a.tag" {:type [{:code "string"}] :fixedString "A" :min 1 :max "*"}]
+            ["T.item:b" {:sliceName "b" :min 1 :max "1"}]
+            ["T.item:b.tag" {:type [{:code "string"}] :fixedString "B" :min 1 :max "*"}]])])
+
+(defn- items [& tag-lists] {:item (mapv (fn [tags] {:tag (vec tags)}) tag-lists)})
+
+(deftest slice-counts-count-every-matching-slice-test
+  (let [{:keys [schema options]} (generate-inherited true nil (tag-sds "open") :counts? true)
+        sch (schema "T")
+        errs (partial count-errors sch options)]
+    (is (= :and (m/type (mu/get sch :item))))
+    (testing "one occurrence that matches two slices satisfies both 1..1 counts"
+      (is (empty? (errs (items ["B" "A"]))) "the dispatch routes it to one arm only")
+      (is (empty? (errs (items ["A" "B"])))))
+    (testing "the occurrence is counted for each slice it matches, so a second one exceeds both"
+      (is (= [[[:item] "a" "T.item:a"] [[:item] "b" "T.item:b"]]
+             (errs (items ["A" "B"] ["B" "A"])))))
+    (testing "an occurrence matching one slice counts for that slice only"
+      (is (= [[[:item] "b" "T.item:b"]] (errs (items ["A"]))))
+      (is (empty? (errs (items ["A"] ["B"])))))
+    (testing "open slicing: an occurrence matching no slice is allowed and counts for none"
+      (is (empty? (errs (items ["A"] ["B"] ["other"] [] ["other" "more"])))))))
+
+(deftest slice-counts-claims-hook-test
+  (let [table {(inh-url "SecP") "tidP" (inh-url "SecQ") "tidQ"}
+        paths (fn [path] (conj (vec path) :tids))
+        hook (fn [{:keys [type path arms]}]
+               (when (= "profile" type)
+                 (let [entries (mapv (fn [{:keys [dispatch-value profiles]}]
+                                       [(table (first (or (seq profiles) [dispatch-value]))) dispatch-value])
+                                     arms)]
+                   `(~'fn [~'m]
+                     (~'let [~'tids (set (~'get-in ~'m ~(paths path)))]
+                      (~'some (~'fn [[~'t ~'v]] (~'when (~'contains? ~'tids ~'t) ~'v)) ~entries))))))
+        claims (fn [{:keys [type path arms]}]
+                 (when (= "profile" type)
+                   (let [entries (mapv (fn [{:keys [dispatch-value profiles]}]
+                                         [(table (first (or (seq profiles) [dispatch-value]))) dispatch-value])
+                                       arms)]
+                     `(~'fn [~'m]
+                       (~'let [~'tids (set (~'get-in ~'m ~(paths path)))]
+                        (~'into #{} (~'keep (~'fn [[~'t ~'v]] (~'when (~'contains? ~'tids ~'t) ~'v))) ~entries))))))
+        sds [(inh-sd "Sec" nil [["Sec.tids" {:type [{:code "string"}] :min 0 :max "*"}]])
+             (inh-sd "SecP" "Sec" [])
+             (inh-sd "SecQ" "Sec" [])
+             (inh-sd "Comp" nil [["Comp.section" {:type (inh-type "Sec") :min 0 :max "1"}]])
+             (inh-sd "HRoot" nil [["HRoot.component" {:type (inh-type "Comp") :min 0 :max "*"}]])
+             (inh-sd "H" "HRoot"
+                     (into [["H.component" {:slicing {:discriminator [{:type "profile" :path "section"}]
+                                                      :rules "open"}}]]
+                           (mapcat (fn [n] (slice-section "H.component" (str/lower-case n) (str "Sec" n)))
+                                   ["P" "Q"])))]
+        run (fn [claims-fn]
+              (binding [fdm/*discriminator-claims-fn* claims-fn]
+                (generate-inherited true hook sds :counts? true)))
+        comp (fn [& tids] {:section {:tids (vec tids)}})]
+    (testing "a component claiming both templates satisfies both 1..1 counts"
+      (let [{:keys [schema options]} (run claims)
+            sch (schema "H")
+            errs (partial count-errors sch options)]
+        (is (empty? (errs {:component [(comp "tidP" "tidQ")]})))
+        (is (= [[[:component] "q" "H.component:q"]] (errs {:component [(comp "tidP")]})))
+        (is (= [[[:component] "p" "H.component:p"] [[:component] "q" "H.component:q"]]
+               (errs {:component [(comp "tidP" "tidQ") (comp "tidQ" "tidP")]})))
+        (is (empty? (errs {:component [(comp "tidP") (comp "tidQ") (comp "other")]}))
+            "open slicing allows a component claiming neither")))
+    (testing "without a claims hook the count falls back to the dispatch's value"
+      (let [{:keys [schema options]} (run nil)]
+        (is (seq (count-errors (schema "H") options {:component [(comp "tidP" "tidQ")]}))
+            "the dispatch picks one slice, so the other is missing")))))
+
+(deftest slice-counts-soft-discriminator-drift-test
+  (let [sds [(inh-sd "Tid" nil [(inh-str "Tid.root") (inh-str "Tid.ver")])
+             (inh-sd "DRoot" nil [["DRoot.tid" {:type (inh-type "Tid") :min 0 :max "*"}]])
+             (inh-sd "D" "DRoot"
+                     [["D.tid" {:slicing {:discriminator [{:type "value" :path "root"}
+                                                          {:type "value" :path "ver"}]
+                                          :rules "open"}}]
+                      ["D.tid:a" {:sliceName "a" :min 1 :max "1"}]
+                      (fixed-code "D.tid:a.root" "R")
+                      (fixed-code "D.tid:a.ver" "2")])]
+        run (fn [soft]
+              (binding [fdm/*count-soft-discriminator-fn* soft]
+                (generate-inherited true nil sds :counts? true)))
+        tids (fn [& pairs] {:tid (mapv (fn [[r v]] (cond-> {:root r} v (assoc :ver v))) pairs)})
+        soft (fn [{:keys [element-id path]}] (and (= "D.tid" element-id) (= "ver" path)))]
+    (testing "no soft discriminator: only the exact claim counts"
+      (let [{:keys [schema options]} (run nil)
+            errs (partial count-errors (schema "D") options)]
+        (is (empty? (errs (tids ["R" "2"]))))
+        (is (= [[[:tid] "a" "D.tid:a"]] (errs (tids ["R" "1"]))))))
+    (testing "a soft discriminator: a drifted claim counts once when no exact claim exists"
+      (let [{:keys [schema options]} (run soft)
+            errs (partial count-errors (schema "D") options)]
+        (is (empty? (errs (tids ["R" "2"]))) "exact")
+        (is (empty? (errs (tids ["R" "1"]))) "another revision")
+        (is (empty? (errs (tids ["R" nil]))) "unversioned")
+        (is (empty? (errs (tids ["R" "1"] ["R" nil]))) "two drifted claims are one claim")
+        (is (empty? (errs (tids ["R" "2"] ["R" nil]))) "the unversioned claim beside the exact one is not counted")
+        (is (= [[[:tid] "a" "D.tid:a"]] (errs (tids ["R" "2"] ["R" "2"]))) "two exact claims exceed 1..1")
+        (is (= [[[:tid] "a" "D.tid:a"]] (errs (tids ["S" "2"]))) "the hard discriminator still decides")
+        (is (= [[[:tid] "a" "D.tid:a"]] (errs {:tid []})))))))

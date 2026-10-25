@@ -365,6 +365,30 @@
    longer tell the arms apart."
   nil)
 
+(def ^:dynamic *discriminator-claims-fn*
+  "Optional companion of `*discriminator-dispatch-fn*` for slice counts. Called
+   with the same map, it returns a FORM evaluating to (fn [m] #{...}): EVERY
+   one of :arms' dispatch-values the occurrence `m` claims at this profile or
+   type discriminator, not only the first the dispatch picks. A CDA section may
+   claim several templates at once, so it matches several slices; FHIR counts
+   the occurrences that match a slice. Nil (or a nil result) makes the count
+   fall back to comparing the dispatch's value with the arm's.
+   See doc/inherited-slices-and-slice-counts.md, Round 2."
+  nil)
+
+(def ^:dynamic *count-soft-discriminator-fn*
+  "Optional predicate of {:element-id :path :type}, the sliced element's id and one
+   value or pattern discriminator of its slicing. True marks the discriminator
+   SOFT for slice counts: an occurrence that agrees with a slice on every other
+   discriminator but not on a soft one is a version drift of that slice. Drift
+   counts, as one occurrence, only when no occurrence of the field matches the
+   slice exactly, so a field carrying a template once unversioned and once
+   versioned still counts the versioned claim alone, and a field carrying only a
+   revision the slice does not pin is not rejected for it. Routing is not
+   affected. Nil (the default) softens nothing.
+   See doc/inherited-slices-and-slice-counts.md, Round 2 (drift)."
+  nil)
+
 (def ^:dynamic *rebuild-inherited-slicings*
   "When true, a derived profile that restates or adds a slice of a slicing its
    base declared rebuilds that slicing's :multi from the base's record of it
@@ -1230,13 +1254,24 @@
                            :discriminator disc
                            :arms arms
                            :base-sch base-sch}))]
-      (if fn-form {:fn-form fn-form} ::no-extraction))
+      (if fn-form
+        {:fn-form fn-form
+         :kind :hook
+         :claims-form (when-let [claims *discriminator-claims-fn*]
+                        (claims {:type disc-type
+                                 :path gpath
+                                 :discriminator disc
+                                 :arms arms
+                                 :base-sch base-sch}))}
+        ::no-extraction))
 
     "exists"
     (let [gpath (when (not= disc-path "$this")
                   (discriminator-path->get-in-path base-sch disc-path))]
       (if (seq gpath)
-        {:expr `(~'some? (~'get-in ~'m ~(vec gpath)))}
+        {:expr `(~'some? (~'get-in ~'m ~(vec gpath)))
+         :kind :exists
+         :path (vec gpath)}
         ::no-extraction))
 
     ;; value, pattern, and unknown types -- unchanged extraction
@@ -1244,7 +1279,9 @@
                   (resolve-this-discriminator-path slices)
                   (discriminator-path->get-in-path base-sch disc-path))]
       (if (seq gpath)
-        {:expr `(~'get-in ~'m ~(vec gpath))}
+        {:expr `(~'get-in ~'m ~(vec gpath))
+         :kind :value
+         :path (vec gpath)}
         ::no-extraction))))
 
 (defn- make-dispatch-form
@@ -1702,8 +1739,10 @@
      `finalize-dispatch-value` substituted the slice-name keyword (a slice that
      states no value at a kept discriminator path). Its arm is dead today and a
      count would turn that into a false rejection for every instance;
-   - two slices share a key after the last-wins dedupe, so an occurrence cannot
-     be told to belong to either.
+
+   Two slices sharing a key (the last-wins dedupe keeps one arm) are both
+   counted: a count is over the occurrences that match the slice, not over the
+   arm the dispatch picks.
 
    Occurrences that reach the default arm belong to no slice and count for
    none: in an open slicing they are allowed, and a closed slicing has no
@@ -1711,15 +1750,14 @@
   [{:keys [arms multi? field-is-sequential?]} element-id report?]
   (let [wanted? (fn [{mn :min mx :max}]
                   (or (some-> mn pos?) (boolean (and mx (not= "*" mx)))))
-        shared (frequencies (map :key arms))]
+        ]
     (into []
           (keep (fn [{:keys [slice-name key routable?] :as arm}]
                   (when (wanted? arm)
                     (let [reason (cond
                                    (not multi?) :count-no-multi
                                    (not field-is-sequential?) :count-non-repeating
-                                   (not routable?) :count-unroutable-key
-                                   (< 1 (shared key)) :count-collided-key)]
+                                   (not routable?) :count-unroutable-key)]
                       (if reason
                         (do (when (report? slice-name)
                               (report-uncompiled-slice! element-id slice-name reason))
@@ -1732,9 +1770,96 @@
   [mx]
   (when (and mx (not= "*" mx)) (parse-long mx)))
 
+(defn- make-matcher-form
+  "Form evaluating to (fn [m] #{slice-name ...}): the slices of `arms` the
+   occurrence `m` matches, which is what FHIR counts. A slice matches when every
+   kept discriminator agrees with the slice's component of its arm key; a nil
+   component states nothing and agrees with any occurrence.
+
+   - value, pattern, $this: some value of the occurrence at the discriminator's
+     path equals the slice's (every element of a repeating step is looked at,
+     where the dispatch reads the first);
+   - exists: the child's presence equals the slice's;
+   - profile, type: the occurrence claims the slice's profile through
+     `*discriminator-claims-fn*`, else its dispatch value equals the slice's.
+
+   `arms` is every arm of the slicing, which the hooks need whole; `counted`
+   the arms the matcher answers for. Nil when a kept discriminator can no longer
+   be evaluated. Unlike the
+   dispatch this is not a routing decision, so an occurrence may match several
+   slices. See doc/inherited-slices-and-slice-counts.md, Round 2."
+  [element-id discriminators base-sch arms counted keep-idx]
+  (let [n (count discriminators)
+        comps (mapv #(dispatch-component % n (nth discriminators %) base-sch arms) keep-idx)
+        soft? (if-let [f *count-soft-discriminator-fn*]
+                (into #{}
+                      (keep-indexed
+                       (fn [j i]
+                         (let [{:keys [type path]} (nth discriminators i)]
+                           (when (and (not= "$this" path)
+                                      (#{"value" "pattern"} type)
+                                      (f {:element-id element-id :path path :type type}))
+                             j))))
+                      keep-idx)
+                #{})]
+    (when (not-any? #(= ::no-extraction %) comps)
+      (let [slot-expr (fn [{:keys [kind path expr fn-form claims-form]}]
+                        (case kind
+                          :value `(~'into #{} (~'remove ~'nil?) (~'at ~'m ~path))
+                          :exists `(~'boolean (~'seq (~'remove ~'nil? (~'at ~'m ~path))))
+                          :hook (if claims-form `(~claims-form ~'m) `(~fn-form ~'m))))
+            set-slot? (fn [{:keys [kind claims-form]}] (or (= kind :value) (and (= kind :hook) claims-form)))
+            component (fn [dv i]
+                        (if (= n 1)
+                          dv
+                          (when (and (vector? dv) (= n (count dv))) (nth dv i))))
+            clauses (fn [hard-only? {:keys [dispatch-value]}]
+                      (into []
+                            (keep-indexed
+                             (fn [j c]
+                               (when-let [cv (and (not (and hard-only? (soft? j)))
+                                                  (component dispatch-value (nth keep-idx j)))]
+                                 (if (set-slot? c)
+                                   `(~'contains? (~'nth ~'vs ~j) ~cv)
+                                   `(= ~cv (~'nth ~'vs ~j))))))
+                            comps))
+            drift-arm? (fn [arm]
+                         (and (seq soft?)
+                              (some (fn [j] (component (:dispatch-value arm) (nth keep-idx j))) soft?)
+                              (seq (clauses true arm))))]
+        (with-meta
+        `(~'fn [~'m]
+          (~'let [~'at (~'fn ~'at [~'x ~'path]
+                        (~'if (~'empty? ~'path)
+                         [~'x]
+                         (~'let [~'p (~'first ~'path)]
+                          (~'cond
+                           (~'integer? ~'p) (~'if (~'sequential? ~'x)
+                                             (~'mapcat (~'fn [~'e] (~'at ~'e (~'rest ~'path))) ~'x)
+                                             (~'at ~'x (~'rest ~'path)))
+                           (~'map? ~'x) (~'at (~'get ~'x ~'p) (~'rest ~'path))
+                           :else nil))))
+                  ~'vs [~@(map slot-expr comps)]]
+           (~'cond-> #{}
+            ~@(mapcat (fn [{:keys [slice-name] :as arm}]
+                        (let [cs (clauses false arm)]
+                          (cond-> [(if (seq cs) `(~'and ~@cs) true)
+                                   `(~'conj ~slice-name)]
+                            (drift-arm? arm)
+                            (into [`(~'and ~@(clauses true arm))
+                                   `(~'conj [:drift ~slice-name])]))))
+                      counted))))
+        {:drift? (boolean (some drift-arm? counted))})))))
+
 (defn- slice-count-fn-form
-  [dispatch-key {:keys [key min max]}]
-  (let [n `(~'count (~'filter (~'fn [~'x] (= ~key (~dispatch-key ~'x))) ~'xs))]
+  [drift? {:keys [slice-name min max]}]
+  (let [exact `(~'count (~'filter (~'fn [~'x] (~'contains? (~'matcher ~'x) ~slice-name)) ~'xs))
+        n (if drift?
+            `(~'let [~'exact ~exact]
+              (~'if (~'pos? ~'exact)
+               ~'exact
+               (~'min 1 (~'count (~'filter (~'fn [~'x] (~'contains? (~'matcher ~'x) [:drift ~slice-name])) ~'xs)))))
+            exact)]
     `(~'fn [~'xs]
       (~'or (~'not (~'sequential? ~'xs))
        ~(if-let [mx (numeric-max max)]
@@ -1749,8 +1874,9 @@
    properties name the slice and the sliced element's id, which is what a
    consumer attributing a count error (it arrives at the field's value path,
    with no slice segment) can look up."
-  [dispatch-expr sequential-form counted element-id]
-  `(~'let [~'dispatch ~dispatch-expr]
+  [dispatch-expr sequential-form counted element-id matcher-expr]
+  `(~'let [~'dispatch ~dispatch-expr
+           ~'matcher ~matcher-expr]
     [:and {:fhir/slice-counts ~(mapv (fn [{:keys [key slice-name min max]}]
                                        [key slice-name (or min 0) (numeric-max max)])
                                      counted)}
@@ -1762,7 +1888,7 @@
                      :max ~(numeric-max max)
                      :error/message ~(str "slice " slice-name ": expected "
                                           (or min 0) ".." (or max "*") " occurrences")}
-                ~(slice-count-fn-form 'dispatch arm)])
+                ~(slice-count-fn-form (:drift? (meta matcher-expr)) arm)])
             counted)]))
 
 (defn- requires-field?
@@ -1916,13 +2042,21 @@
                record (slicing-record expanded (:discriminators group) keep-idx slices arm-keys)
                counted (when *compile-slice-counts*
                          (counted-arms record (:element-id group) any?))
+               matcher (when (seq counted)
+                         (make-matcher-form (:element-id group) discriminators base-sch (:arms record) counted keep-idx))
+               counted (if (or matcher (empty? counted))
+                         counted
+                         (do (doseq [{:keys [slice-name]} counted]
+                               (report-uncompiled-slice! (:element-id group) slice-name :count-no-matcher))
+                             []))
                multi-form (if (seq counted)
                             (counted-form dispatch-form
                                           `[:sequential
                                             [:multi {:dispatch ~'dispatch}
                                              ~@all-entries]]
                                           counted
-                                          (:element-id group))
+                                          (:element-id group)
+                                          matcher)
                             `[:sequential
                               [:multi {:dispatch ~dispatch-form}
                                ~@all-entries]])
@@ -2961,12 +3095,20 @@
                                        (~'some (~'fn [[~'k2 ~'_ ~'s2]] (~'when (= ~'kk ~'k2) ~'s2))
                                         (~'m/children ~'multi)))]
                          ~(if (seq counted)
-                            (counted-form dispatch-expr sequential-form counted element-id)
+                            (counted-form dispatch-expr sequential-form counted element-id (:matcher (meta counted)))
                             sequential-form))))))
-            counts-for (fn [arms*]
+            counts-for (fn [arms* keep-idx*]
                          (when *compile-slice-counts*
-                           (counted-arms {:arms arms* :multi? true :field-is-sequential? true}
-                                         element-id touched?)))
+                           (let [counted (counted-arms {:arms arms* :multi? true :field-is-sequential? true}
+                                                       element-id touched?)
+                                 matcher (when (seq counted)
+                                           (make-matcher-form element-id discriminators element-sch arms* counted keep-idx*))]
+                             (if (or matcher (empty? counted))
+                               (with-meta counted {:matcher matcher})
+                               (do (doseq [{:keys [slice-name]} counted]
+                                     (when (touched? slice-name)
+                                       (report-uncompiled-slice! element-id slice-name :count-no-matcher)))
+                                   [])))))
             with-required (fn [acc counted]
                             (cond-> acc
                               (and (requires-field? counted) (not required?))
@@ -2977,7 +3119,7 @@
           (let [merged (into (mapv #(dissoc % :changed?) base-arms)
                              (mapv (fn [a k] (assoc a :key k :routable? true :collided? false))
                                    added-arms new-ks))
-                counted (counts-for merged)]
+                counted (counts-for merged keep*)]
             (record-slicing! element-id
                              (assoc record
                                     :arms merged
@@ -2996,7 +3138,7 @@
             (doseq [s (vals restated) :when (:changed? s)] (report s :restated-unroutable))
             (if (empty? restated)
               acc
-              (let [counted (counts-for base-arms)]
+              (let [counted (counts-for base-arms keep-idx)]
                 (record-slicing! element-id
                                  (assoc record
                                         :arms (mapv #(dissoc % :changed?) base-arms)
