@@ -749,3 +749,10 @@ regenerated copy give
 The real `ccda/` and `ccda-fhir-roundtrip2/` of the qrda-definitions worktree were never
 run: `git diff 8612660924 HEAD -- ccda ccda-fhir-roundtrip2` and `git status --short --
 ccda ccda-fhir-roundtrip2` are empty.
+
+Re-run against the final commit `c580eae` (2026-10-26), because the run above predates the
+last edit: the same method in a fresh scratch tree (`target/ccda-proof-final/`, `run/` and
+`ref/` both from `git archive 8612660924 ccda`), plus `clojure -M:dispatch-index` for each
+set. All six runs exit 0; process 354 / 341 / 299 ok, 0 fail, unresolved 0; `diff -r -q`
+of the whole ccda tree, minus the gitignored `sds`, `staging`, `sources` and `.cpcache`,
+reports no difference.
