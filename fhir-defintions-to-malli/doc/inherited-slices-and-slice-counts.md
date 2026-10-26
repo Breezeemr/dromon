@@ -7,8 +7,10 @@ docs/plan.md 5.3 and the "P5c stage B3" records):
   declared gets an arm the inherited dispatch never selects.
 - GAP 2: slice `min`/`max` are not compiled; the `:multi` only routes.
 
-Both changes are gated (section 6), so the FHIR packages fdm also generates
-(r4b, uscore8) stay byte-identical until someone opts them in.
+Every new behaviour is off by default (section 6). A caller that binds none of the
+switches and hooks gets exactly origin/main 7eba52a's output: the FHIR packages fdm
+also generates (r4b, uscore8) and ccda are byte-identical until a driver opts in, and
+only the qrda-definitions driver does.
 
 ## 1. Measurements (2026-10-25, baseline generated trees and `ccda/sds`)
 
@@ -330,8 +332,12 @@ entry properties that tests read (roundtrip2 `cf/encounters_test` reads every en
 ## 6. Gates and diagnostics
 
 - `*rebuild-inherited-slicings*` (GAP 1) and `*compile-slice-counts*` (GAP 2), false by
-  default; ccda `generate!` binds both true. Gates off, output equals today's, pinned by
-  an fdm test.
+  default; the qrda-definitions driver binds both true. Every other new var is nil by
+  default (`*discriminator-claims-fn*`, `*count-soft-discriminator-fn*`,
+  `*uncompiled-slices*`, `*slicings*`, `*live-base-sch*`); the multi-profile union
+  (section 10) hangs off the rebuild switch. With nothing bound, output equals
+  origin/main's, pinned by `unbound-switches-reproduce-origin-main-test` against forms
+  printed by 7eba52a itself, and by the ccda regeneration of "ccda unaffected".
 - `*uncompiled-slices*`: an optional atom like `*suppressed-narrowings*`, collecting
   `{:definition :element :slice :reason}` for added slices the fallback could not route,
   restated slices not rebuilt (3.2) and slices left uncounted (5.1). ccda prints the count
@@ -627,7 +633,8 @@ what was kept. A nil component states nothing and agrees with any occurrence.
 
 `*discriminator-claims-fn*` is the companion of `*discriminator-dispatch-fn*`: the
 same argument map, and it returns a form `(fn [m] #{dispatch-value ...})` of every
-arm value the occurrence claims. ccda's hook answers with the templateIds the
+arm value the occurrence claims. nil by default, like `*count-soft-discriminator-fn*`;
+only a driver that counts supplies them. The qrda-definitions driver's hook answers with the templateIds the
 occurrence carries: an arm is claimed by an exact `[root extension]` pair, or by
 its root when no arm names that root with the claimed extension (version drift,
 as the dispatch absorbs it). The slice's own templateId pins reach the matcher
@@ -658,12 +665,87 @@ fallback to the dispatch value without one); the round-1 count tests pass, with 
 collided-key expectations of `slice-counts-skip-what-the-dispatch-cannot-count-test`
 changed to both slices being counted.
 
-### What the match semantics exposed in ccda
+### What the match semantics exposed in C-CDA
 
-See `ccda/target/fdm-regen/report.md`, "Round 2: counts". In short: with counts on for
-all six sets, real documents and fc output meet slice requirements that are defects of
-the published StructureDefinitions rather than of the count: a pin on a template
-revision newer than the release, a slice inherited through an inverted baseDefinition,
-a slice stated `1..1` beside text that says MAY. They are corrected in ccda's patch
-layer (never by turning counts off); documents that genuinely omit a required template
-or its version are reported.
+Measured in an earlier experiment that bound counts for all six sets from ccda's
+generator (since reverted: ccda is at its base and binds nothing). Real documents and
+fc output met slice requirements that are defects of the published
+StructureDefinitions rather than of the count: a pin on a template revision newer than
+the release, a slice inherited through an inverted baseDefinition, a slice stated
+`1..1` beside text that says MAY. Counting C-CDA sets again would need those corrected
+in a patch layer of the driver (never by turning counts off).
+
+## 10. Multi-profile slices (2026-10-26)
+
+A slice-position element whose type lists several profiles used to compile to the
+declared core type (`narrowed-child-profile-kw` never narrows an any-of list), so an
+instance in the slice was held to none of the profiles. QRDA III has one site
+(`PromotingInteroperabilityMeasureSection` `Section.entry:measure-reference.organizer`,
+2 profiles); the C-CDA 5.0.0 package has seven (CarePlanAct, HealthConcernAct), up to 23
+profiles.
+
+Under `*rebuild-inherited-slicings*` and `*honor-child-type-profile*`, an element
+that is a slice or hangs directly off a slice arm (a `:` in the last or the
+penultimate id segment) whose type lists several resolvable profiles compiles to the
+union of their schemas, own slice or restated alike (the restated body goes through
+the same element patch):
+
+- the driver's `*discriminator-dispatch-fn*` is called as for a `$this` profile
+  discriminator (`:path nil`, one arm per profile, `:profiles [url]`). When it answers,
+  the element is `[:multi {:dispatch <hook form> :fhir/profile-union true} [<url> [:ref
+  <kw>]] ... [:malli.core/default [:or [:ref <kw>] ...]]]`: an instance is held to the
+  profile its templateId names, and one that names none falls to the any-of default;
+- when the hook declines (or none is bound), the element is the `[:or [:ref <kw>] ...]`
+  alone.
+
+`:fhir/profile-union` makes `type-union-multi?` true, so no walk merges a slice arm
+into the union. Degradations keep the core type and are reported to
+`*uncompiled-slices*`: `:multi-profile-unresolved` (a profile no package defines; a
+union of the others would be narrower than any-of, and the profile also goes to
+`*unresolved-profiles*`) and `:multi-profile-with-constraints` (the slice constrains
+elements below it, which a union has no children to receive). A non-slice child with
+several profiles is still never narrowed. Tests:
+`multi-profile-slice-compiles-to-a-dispatched-union-test`,
+`multi-profile-slice-falls-back-to-or-without-a-dispatch-test`,
+`restated-multi-profile-slice-is-a-union-too-test`,
+`multi-profile-slice-degradations-are-reported-test`.
+
+## 11. ccda unaffected (proof, 2026-10-26)
+
+Claim: with the defaults of this branch (`4bd1223` plus the working-tree changes of
+sections 6 and 10), every set ccda generates is byte-identical to ccda's committed
+output at superproject base 8612660924.
+
+Method, all under qrda-definitions/target/ccda-proof/ (scratch, never in ccda):
+
+1. `git -C <qrda-fdm worktree> archive 8612660924 ccda` extracted twice: `archive/ccda`
+   (reference, untouched) and `ccda` (the working copy).
+2. `dromon/` next to them holding two symlinks, `fhir-defintions-to-malli` and
+   `fhir-primitives`, into this worktree, so the copy's `../dromon/...` roots resolve to
+   the new fdm.
+3. The gitignored input the R1.1 set needs, the pinned ART-DECOR file, copied from
+   `~/claude-docs/ccda-r11-sources/art-decor-ccda/ccda-project.decor.xml` to
+   `ccda/sources/art-decor/` (sha256 89fa9ad3957601b38db23e97796396b148ad9efd5ab3dce9cb8fc634b41e7ce0,
+   the pin in `decor_source.clj`; the other inputs are committed package tarballs).
+4. In `ccda/`, one JVM at a time: `clojure -M:generate default`, `clojure -M:generate r21`,
+   `clojure -M:generate r11`. ccda's driver binds none of the new vars.
+5. `diff -rq archive/ccda/<dir> ccda/<dir>` for `src`, `src-r21`, `src-r11` and `resources`,
+   and `diff -rq archive/ccda ccda` for the whole tree minus the generated scratch
+   (`sds`, `staging`, `sources`, `.cpcache`, `target`).
+
+Measured:
+
+| run | plan / process | output files | diff against the archive |
+|---|---|---|---|
+| default | 354 ok, 0 fail; unresolved 0; withheld 7 | `src` 364 | empty |
+| r21 | 341 ok, 0 fail; unresolved 0; withheld 7 | `src-r21` 220 | empty |
+| r11 | 299 ok, 0 fail; unresolved 0; withheld 0 | `src-r11` 178 | empty |
+
+`resources` (the three schema indexes the runs rewrite and the three dispatch indexes they do not touch, 6 files) is also identical,
+and so is the whole tree. Tree digest, `sha256sum` of every file of `src src-r21 src-r11
+resources` in sorted order, then `sha256sum` of that list: both the archive and the
+regenerated copy give
+`9535e90c008da32c6841630bc9934f930525505468447262941c384e1872afd5` (768 files).
+The real `ccda/` and `ccda-fhir-roundtrip2/` of the qrda-definitions worktree were never
+run: `git diff 8612660924 HEAD -- ccda ccda-fhir-roundtrip2` and `git status --short --
+ccda ccda-fhir-roundtrip2` are empty.

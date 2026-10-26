@@ -1,5 +1,7 @@
 (ns com.breezeehr.fhir-defintions-to-malli-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
             [com.breezeehr.fhir-defintions-to-malli :as fdm]
             [com.breezeehr.fhir-shape :as shape]
             [com.breezeehr.fhir-schema-gen :as gen]
@@ -1028,7 +1030,8 @@
 
 (defn- generate-inherited
   "Generate `sds` in order with the rebuild gate `rebuild?` (and the count gate
-   when `:counts?`), compiling each emitted form. Returns {:schema {name compiled-schema} :entry {name entry}
+   when `:counts?`), compiling each emitted form. A nil `rebuild?` binds none of
+   the switches, as a caller unaware of them would. Returns {:schema {name compiled-schema} :entry {name entry}
    :options <registry options holding every schema> :uncompiled [...]}."
   [rebuild? hook sds & {:keys [counts?]}]
   (let [element-kw :org.hl7.fhir.StructureDefinition.Element/v1-0
@@ -1039,12 +1042,12 @@
         options (fn [] (update fp/fhir-registry-options :registry
                                #(mr/composite-registry % (mr/registry @compiled))))
         out (atom {})]
-    (binding [fdm/*schema-atom* sa
-              fdm/*honor-child-type-profile* true
-              fdm/*rebuild-inherited-slicings* rebuild?
-              fdm/*compile-slice-counts* (boolean counts?)
-              fdm/*discriminator-dispatch-fn* hook
-              fdm/*uncompiled-slices* uncompiled]
+    (with-bindings (cond-> {#'fdm/*schema-atom* sa
+                            #'fdm/*honor-child-type-profile* true
+                            #'fdm/*discriminator-dispatch-fn* hook}
+                     (some? rebuild?) (assoc #'fdm/*rebuild-inherited-slicings* rebuild?
+                                             #'fdm/*compile-slice-counts* (boolean counts?)
+                                             #'fdm/*uncompiled-slices* uncompiled))
       (doseq [{n :name :as sd} sds]
         ((fdm/structure-definition->schema sa) sd)
         (let [kw (inh-kw n)
@@ -1759,3 +1762,161 @@
         (is (= [[[:tid] "a" "D.tid:a"]] (errs (tids ["R" "2"] ["R" "2"]))) "two exact claims exceed 1..1")
         (is (= [[[:tid] "a" "D.tid:a"]] (errs (tids ["S" "2"]))) "the hard discriminator still decides")
         (is (= [[[:tid] "a" "D.tid:a"]] (errs {:tid []})))))))
+
+;; ---------------------------------------------------------------------------
+;; Defaults: a caller that binds nothing gets origin/main's output
+;; ---------------------------------------------------------------------------
+
+(def ^:private origin-main-forms
+  "The emitted forms of the three scenarios of `default-scenarios`, printed by
+   origin/main 7eba52a (before the inherited-slicing and slice-count work) for
+   the same StructureDefinitions. Measured 2026-10-26: 3 scenarios, 14 forms,
+   byte-identical to this branch with no switch bound."
+  (edn/read-string (slurp (io/resource "com/breezeehr/origin_main_forms.edn"))))
+
+(defn- default-scenarios []
+  {"nested" (conj (nested-base-sds) (derived-doc "DocN" "DocBase" [["a" "SecAN"]]))
+   "root" (conj (sheet-sds)
+                (inh-sd "SheetD" "Sheet"
+                        (into [["Sheet.entry" {}]]
+                              (concat (slice-child "Sheet.entry" "p" "act" "SecAN")
+                                      (slice-child "Sheet.entry" "r" "act" "SecR")))))
+   "counted" (counted-sds "open")})
+
+(deftest unbound-switches-reproduce-origin-main-test
+  (let [hook (inh-profile-hook section-table)
+        forms (into {}
+                    (for [[scenario sds] (default-scenarios)
+                          [n entry] (:entry (generate-inherited nil hook sds))]
+                      [(str scenario "/" n) (:form entry)]))]
+    (testing "every new switch defaults off"
+      (is (false? fdm/*rebuild-inherited-slicings*))
+      (is (false? fdm/*compile-slice-counts*))
+      (is (nil? fdm/*discriminator-claims-fn*))
+      (is (nil? fdm/*count-soft-discriminator-fn*))
+      (is (nil? fdm/*uncompiled-slices*))
+      (is (nil? fdm/*slicings*)))
+    (testing "the restated, added and counted slices emit what origin/main emitted"
+      (is (= (set (keys origin-main-forms)) (set (keys forms))))
+      (doseq [[k f] forms]
+        (is (= (origin-main-forms k) f) k)))
+    (testing "no slicing record is kept"
+      (is (every? #(not (contains? % :slicings))
+                  (mapcat (fn [[_ sds]] (vals (:entry (generate-inherited nil hook sds))))
+                          (default-scenarios)))))))
+
+;; ---------------------------------------------------------------------------
+;; Slice-position elements whose type lists several profiles
+;; ---------------------------------------------------------------------------
+
+(defn- multi-slice-sds
+  "Sheet2.entry sliced on the fixed code of each entry; slice p holds an `act`
+   typed under `p-profiles`, slice q under SecR. `extra` are further elements."
+  [p-profiles & extra]
+  (let [slice-def (fn [slice code profiles]
+                    [[(str "Sheet2.entry:" slice) {:sliceName slice :min 0 :max "*"}]
+                     [(str "Sheet2.entry:" slice ".code")
+                      {:type [{:code "string"}] :fixedString code :min 1 :max "1"}]
+                     [(str "Sheet2.entry:" slice ".act")
+                      {:type [{:code (inh-url "Section") :profile (mapv inh-url profiles)}]}]])]
+    (conj (section-sds)
+          (inh-sd "Entry2" nil [(inh-str "Entry2.code")
+                                ["Entry2.act" {:type (inh-type "Section") :min 0 :max "1"}]])
+          (inh-sd "Root2" nil [["Root2.entry" {:type (inh-type "Entry2") :min 0 :max "*"}]])
+          (inh-sd "Sheet2" "Root2"
+                  (into [["Sheet2.entry" {:slicing {:discriminator [{:type "value" :path "code"}]
+                                                    :rules "open"}}]]
+                        (concat (slice-def "p" "P" p-profiles)
+                                (slice-def "q" "Q" ["SecR"])
+                                extra))))))
+
+(defn- entry2 [code tid & {:as extra}]
+  {:entry [{:code code :act (merge {:tid tid} extra)}]})
+
+(deftest multi-profile-slice-compiles-to-a-dispatched-union-test
+  (let [hook (inh-profile-hook section-table)
+        {:keys [schema options uncompiled]} (generate-inherited true hook (multi-slice-sds ["SecA" "SecB"]))
+        valid? (fn [instance] (m/validate (schema "Sheet2") instance options))
+        act (fn [sch] (mu/get (inh-multi sch [:entry 0]) :act))
+        p-arm (some (fn [[k _ s]] (when (= "P" k) s)) (m/children (inh-multi (schema "Sheet2") [:entry 0])))]
+    (testing "slice p's act is a profile union, not the core Section"
+      (is (= :multi (m/type (m/deref (mu/get p-arm :act)))))
+      (is (true? (:fhir/profile-union (m/properties (m/deref (mu/get p-arm :act)))))))
+    (testing "an instance is held to the profile its templateId names"
+      (is (valid? (entry2 "P" "tidA" :title "t")))
+      (is (not (valid? (entry2 "P" "tidA"))) "SecA requires a title")
+      (is (valid? (entry2 "P" "tidB" :note "n")))
+      (is (not (valid? (entry2 "P" "tidB"))) "SecB requires a note"))
+    (testing "an occurrence claiming no listed profile is held to any-of"
+      (is (valid? (entry2 "P" "other" :title "t")) "conforms to SecA")
+      (is (valid? (entry2 "P" "other" :note "n")) "conforms to SecB")
+      (is (not (valid? (entry2 "P" "other"))) "conforms to neither"))
+    (testing "the other slice and the open default are untouched"
+      (is (not (valid? (entry2 "Q" "tidR"))))
+      (is (valid? (entry2 "Q" "tidR" :title "t" :note "n")))
+      (is (valid? (entry2 "X" "tidB"))))
+    (is (empty? uncompiled))))
+
+(deftest multi-profile-slice-falls-back-to-or-without-a-dispatch-test
+  (let [hook (let [h (inh-profile-hook section-table)] (fn [m] (when (:path m) (h m))))
+        {:keys [schema options uncompiled]} (generate-inherited true hook (multi-slice-sds ["SecA" "SecB"]))
+        valid? (fn [instance] (m/validate (schema "Sheet2") instance options))
+        p-arm (some (fn [[k _ s]] (when (= "P" k) s)) (m/children (inh-multi (schema "Sheet2") [:entry 0])))]
+    (is (= :or (m/type (m/deref (mu/get p-arm :act)))))
+    (is (valid? (entry2 "P" "tidA" :title "t")))
+    (is (valid? (entry2 "P" "tidB" :note "n")))
+    (is (not (valid? (entry2 "P" "tidA"))) "neither profile holds")
+    (is (empty? uncompiled))))
+
+(deftest restated-multi-profile-slice-is-a-union-too-test
+  (let [hook (inh-profile-hook section-table)
+        sds (conj (multi-slice-sds ["SecA" "SecB"])
+                  (inh-sd "Sheet2D" "Sheet2"
+                          [["Sheet2.entry" {}]
+                           ["Sheet2.entry:p" {:sliceName "p" :min 0 :max "*"}]
+                           ["Sheet2.entry:p.act"
+                            {:type [{:code (inh-url "Section")
+                                     :profile [(inh-url "SecAN") (inh-url "SecBN")]}]}]]))
+        {:keys [schema options uncompiled]} (generate-inherited true hook sds)
+        valid? (fn [instance] (m/validate (schema "Sheet2D") instance options))]
+    (testing "the narrower profiles apply, dispatched by their templateIds"
+      (is (valid? (entry2 "P" "tidAN" :title "t" :note "n")))
+      (is (not (valid? (entry2 "P" "tidAN" :title "t"))) "SecAN requires a note")
+      (is (valid? (entry2 "P" "tidBN" :title "t" :note "n")))
+      (is (not (valid? (entry2 "P" "tidBN" :note "n"))) "SecBN requires a title"))
+    (testing "the unrestated slice is unchanged"
+      (is (not (valid? (entry2 "Q" "tidR"))))
+      (is (valid? (entry2 "Q" "tidR" :title "t" :note "n"))))
+    (is (empty? uncompiled))))
+
+(deftest multi-profile-slice-degradations-are-reported-test
+  (let [hook (inh-profile-hook section-table)
+        reasons (fn [uncompiled] (mapv :reason uncompiled))]
+    (testing "a profile no package defines keeps the core type and says so"
+      (let [{:keys [schema options uncompiled]}
+            (generate-inherited true hook
+                                (multi-slice-sds ["SecA" "Missing"]))]
+        (is (= [:multi-profile-unresolved] (reasons uncompiled)))
+        (is (m/validate (schema "Sheet2") (entry2 "P" "tidA") options)
+            "the element is the plain Section")))
+    (testing "constraints below the element keep the core type and say so"
+      (let [{:keys [uncompiled]}
+            (generate-inherited true hook
+                                (multi-slice-sds ["SecA" "SecB"]
+                                                 ["Sheet2.entry:p.act.title" {:min 1 :max "1"}]))]
+        (is (= [:multi-profile-with-constraints] (reasons uncompiled)))))
+    (testing "a non-slice child with several profiles is never narrowed"
+      (let [{:keys [schema options uncompiled]}
+            (generate-inherited true hook
+                                (conj (section-sds)
+                                      (inh-sd "Plain" nil
+                                              [["Plain.act" {:type [{:code (inh-url "Section")
+                                                                     :profile [(inh-url "SecA") (inh-url "SecB")]}]
+                                                             :min 1 :max "1"}]])))]
+        (is (m/validate (schema "Plain") {:act {:tid "tidA"}} options))
+        (is (empty? uncompiled))))
+    (testing "the rebuild switch off leaves the core type, reporting nothing"
+      (let [{:keys [schema options uncompiled]}
+            (generate-inherited false hook (multi-slice-sds ["SecA" "SecB"]))]
+        (is (m/validate (schema "Sheet2") (entry2 "P" "tidA") options))
+        (is (empty? uncompiled))))))

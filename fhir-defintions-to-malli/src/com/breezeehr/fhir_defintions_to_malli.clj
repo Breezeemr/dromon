@@ -1534,10 +1534,12 @@
      slice-name)))
 
 (defn- type-union-multi?
-  "Is this `:multi` a polymorphic slot rather than a slice union? The two
-   dispatch on different things, so a slice arm can never be merged into one."
+  "Is this `:multi` a polymorphic slot, or the profile union of a slice-position
+   element (`profile-union-patch`), rather than a slicing? Neither dispatches on
+   what a slice does, so a slice arm can never be merged into one."
   [sch]
-  (boolean (some-> sch m/properties :xml/type-union)))
+  (let [props (m/properties sch)]
+    (boolean (or (:xml/type-union props) (:fhir/profile-union props)))))
 
 (defn- as-sequential-multi
   "If sch is a SLICE :multi or [:sequential slice-multi], return
@@ -2253,6 +2255,74 @@
     old-sch (some-> old-sch m/type)
     :else nil))
 
+(defn- slice-position?
+  "Is the element at `path` a slice, or a child hanging directly off a slice
+   arm? Both are reached only through a slicing's dispatch."
+  [path]
+  (boolean (some #(and (string? %) (str/includes? % ":")) (take-last 2 path))))
+
+(defn- profile-union-patch
+  "The value schema form of a slice-position element whose type lists several
+   profiles, or nil when the element is not one or the union cannot be built.
+
+   type.profile is any-of, so the element is a union of the profile schemas:
+   a :multi dispatched by the driver's profile hook (called as for a $this
+   profile discriminator, one arm per profile) when the hook can tell the
+   profiles apart, whose default arm is the :or of them, else the :or alone.
+   The :multi carries `:fhir/profile-union` so no walk mistakes it for a slicing.
+
+   Only under `*rebuild-inherited-slicings*` and `*honor-child-type-profile*`.
+   Without them, or when the union cannot be built, the element keeps the
+   declared base type, as before. A degradation that matters is reported to
+   `*uncompiled-slices*`: a profile no package defines (the union would be
+   narrower than any-of), or constraints below the element (the union has no
+   children to patch)."
+  [{:keys [code profile]} sub-elements main-path]
+  (when (and *rebuild-inherited-slicings*
+             *honor-child-type-profile*
+             (> (count profile) 1)
+             (slice-position? main-path)
+             code
+             (not (fhir-primitives code))
+             (not= "Resource" code)
+             (not (str/starts-with? code "http://hl7.org/fhirpath/System.")))
+    (let [canonicals (into [] (comp (keep clean-profile-url) (distinct)) profile)
+          kws (mapv profile-canonical-kw canonicals)
+          element-id (str/join "." main-path)
+          slice-name (some #(when (and (string? %) (str/includes? % ":"))
+                              (subs % (inc (str/index-of % ":"))))
+                           (reverse main-path))]
+      (cond
+        (some nil? kws)
+        (do (doseq [[c kw] (map vector canonicals kws) :when (nil? kw)]
+              (when *unresolved-profiles*
+                (swap! *unresolved-profiles* conj
+                       {:profile c :from *current-definition* :degraded-to (lookup-schema-kw code)})))
+            (report-uncompiled-slice! element-id slice-name :multi-profile-unresolved)
+            nil)
+
+        (some #(> (count (:path %)) (count main-path)) sub-elements)
+        (do (report-uncompiled-slice! element-id slice-name :multi-profile-with-constraints)
+            nil)
+
+        :else
+        (do (doseq [kw kws] (swap! *references-atom* conj kw))
+            (let [refs (mapv (fn [kw] `[:ref ~kw]) (distinct kws))
+                  or-form (if (= 1 (count refs)) (first refs) `[:or ~@refs])
+                  dispatch (when (and (> (count canonicals) 1) (> (count refs) 1))
+                             (when-let [hook *discriminator-dispatch-fn*]
+                               (hook {:type "profile"
+                                      :path nil
+                                      :discriminator {:type "profile" :path "$this"}
+                                      :arms (mapv (fn [c] {:dispatch-value c :slice-name c :profiles [c]})
+                                                  canonicals)
+                                      :base-sch nil})))]
+              (if dispatch
+                `[:multi {:dispatch ~dispatch :fhir/profile-union true}
+                  ~@(map (fn [c kw] `[~c [:ref ~kw]]) canonicals kws)
+                  [:malli.core/default ~or-form]]
+                or-form)))))))
+
 (defn compute-element-patch
   [{old-sch :sch :as acc} id {:keys [code] :as attr-type} main-attr sub-elements main-path]
   (if-let [union (type-union-form attr-type)]
@@ -2262,6 +2332,8 @@
     ;; keeps it upstream of the has-deeper-sub? split, so it stays correct if a
     ;; package ever constrains a sub-element under such a slot.
     (assoc acc :sch nil :form [union])
+    (if-let [profile-union (profile-union-patch attr-type sub-elements main-path)]
+      (assoc acc :sch nil :form [profile-union])
     (let [field-info (:field-info acc)
           dispatch (if code
                      code
@@ -2310,7 +2382,7 @@
             (prim-or-ref acc attr-type
                          {:min  (or (get *element-min* main-path)
                                     (some-> (:min main-attr) str parse-long))
-                          :path main-path})))))))
+                          :path main-path}))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; attr->value-schema-patch
