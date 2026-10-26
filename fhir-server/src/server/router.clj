@@ -245,7 +245,8 @@
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:bulk-manifest-extension`,
    `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
-   `:jwt-issuer`, `:jwt-audiences` and `:jwt-access-tokens-only?`; unknown keys
+   `:jwt-issuer`, `:jwt-audiences`, `:jwt-access-tokens-only?` and
+   `:jwt-delegating-clients`; unknown keys
    are ignored. `:lifecycle`
    is carried through as given; [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
    producer, `(fn [request])` returning a stamp or nil; with none, writes carry
@@ -285,6 +286,10 @@
                                no environment fallback; nil leaves the
                                corresponding claim unchecked (see
                                `server.auth/wrap-jwt-auth`).
+   - :jwt-delegating-clients -- argument only: the client ids whose tokens for
+                               another subject are delegated
+                               (`server.auth/delegation`), a set; nil for
+                               none, so no token is delegated.
    - :cors-origins          -- [[parse-cors-origins]] of the argument, else of
                                `CORS_ALLOWED_ORIGINS`.
    - :cors-allow-headers    -- argument only: request header names added to
@@ -309,7 +314,7 @@
            cors-allow-headers compartment-overrides token-claims
            enforce-smart-scopes? bulk-job-store bulk-manifest-extension login-url lifecycle
            tx-metadata temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences
-           jwt-access-tokens-only?]}]
+           jwt-access-tokens-only? jwt-delegating-clients]}]
   (when-not (or (nil? bulk-manifest-extension)
                 (and (map? bulk-manifest-extension)
                      (every? string? (keys bulk-manifest-extension))))
@@ -322,6 +327,7 @@
    :jwt-issuer            jwt-issuer
    :jwt-audiences         jwt-audiences
    :jwt-access-tokens-only? jwt-access-tokens-only?
+   :jwt-delegating-clients (not-empty (set jwt-delegating-clients))
    :keto-url              (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
    :keto-admin-url        (or keto-admin-url (System/getenv "KETO_ADMIN_URL") "http://localhost:4467")
    :oauth-base-url        (or oauth-base-url (System/getenv "OAUTH_BASE_URL") "http://localhost:4444")
@@ -458,7 +464,7 @@
   [store {:keys [trace-tap cors-origins cors-allow-headers terminology bulk-job-store
                  bulk-manifest-extension keto-url
                  keto-admin-url oauth-base-url jwks-url jwt-issuer jwt-audiences
-                 jwt-access-tokens-only? enforce-smart-scopes? login-url
+                 jwt-access-tokens-only? jwt-delegating-clients enforce-smart-scopes? login-url
                  narrative lifecycle tx-metadata temporal-canonicals
                  legacy-realm-blind-fallback? compartment-definitions token-claims]
           :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?
@@ -524,7 +530,8 @@
             :wrap (fn [handler] (auth/wrap-jwt-auth handler {:jwks-url            jwks-url
                                                              :issuer              jwt-issuer
                                                              :audiences           jwt-audiences
-                                                             :access-tokens-only? jwt-access-tokens-only?}))}])
+                                                             :access-tokens-only? jwt-access-tokens-only?
+                                                             :delegating-clients  jwt-delegating-clients}))}])
 
     enforce-smart-scopes?
     (conj {:name ::smart-scope :wrap (fn [handler] (scope/wrap-smart-scope handler {}))}
