@@ -126,6 +126,15 @@
                       (request-objects realm nil nil legacy-realm-blind?)
                       "read" subject-id)))))
 
+(defn allowed?
+  "Whether `subject-id` holds `relation` on `object` in `namespace`, asked of
+   the Keto read API at `keto-url`. A nil or blank argument is never allowed,
+   and an unreachable Keto is a denial."
+  [keto-url namespace object relation subject-id]
+  (boolean
+   (and (every? #(and (string? %) (not (str/blank? %))) [namespace object relation subject-id])
+        (check-permission (or keto-url default-keto-url) namespace object relation subject-id))))
+
 (defn relation-allowed?
   "Whether `subject-id` holds `relation` on any of `objects` in the `fhir`
    namespace, asked exactly the way wrap-keto-authorization asks.
@@ -174,6 +183,9 @@
    BFF that authenticated a session cookie -- see `server.auth/wrap-jwt-auth`).
    Bypasses authorization if the route specifies `:public? true` in its match-data.
 
+   A delegated request (`:fhir/delegation`, see `server.auth/delegation`) is
+   checked as its client, not its `sub`.
+
    `:login-url` is advertised on the 401 a subject-less request receives; see
    `unauthenticated-response`.
 
@@ -188,7 +200,11 @@
       (if public?
         (handler request)
         (let [identity (:identity request)
-              subject-id (:sub identity)
+              delegation (:fhir/delegation request)
+              ;; A delegated token is checked as the client acting, never as
+              ;; the person: the client's tuples bound what it may do for
+              ;; anyone, and the person's own authority is the host's to check.
+              subject-id (if delegation (:client delegation) (:sub identity))
               uri (or (:uri request) "")
               parts (str/split uri #"/")
               ;; URI: /default/fhir/Patient/123 -> ["" "default" "fhir" "Patient" "123"]
@@ -230,7 +246,9 @@
                                        legacy-realm-blind-fallback?)
               object (request-object realm fhir-type resource-id)]
 
-          (log/info "Keto authz -> subject:" subject-id "relation:" relation "object:" object "uri:" uri)
+          (log/info "Keto authz -> subject:" subject-id
+                    (if delegation (str "(delegated by " (:subject delegation) ")") "")
+                    "relation:" relation "object:" object "uri:" uri)
           (if (not subject-id)
             (unauthenticated-response login-url)
             (let [allowed? (ftrace/trace!

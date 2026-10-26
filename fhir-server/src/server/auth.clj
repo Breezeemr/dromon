@@ -123,6 +123,25 @@
     (and access-tokens-only? (not (access-token-claims? claims)))
     :client_id))
 
+(defn delegation
+  "The two principals of a delegated access token, or nil.
+
+   A token is delegated when its `client_id` is one of `delegating-clients` and
+   its `sub` is a different, non-blank subject: the client obtained a token for
+   that person (an RFC 7523 JWT-bearer grant, whose `sub` is the assertion's and
+   whose `client_id` is the authenticated client), so the client acts and the
+   person is who it acts for (RFC 9068 section 2.2). Returns `{:subject
+   :client}`. A client's own `client_credentials` token has `sub` = `client_id`
+   and is not delegated; a token of any client not listed is not delegated
+   either, whatever its `sub`, so a person's own sign-in token never reads as
+   one."
+  [claims delegating-clients]
+  (let [{:keys [sub client_id]} claims
+        text? #(and (string? %) (not (str/blank? %)))]
+    (when (and (text? sub) (text? client_id) (not= sub client_id)
+               (contains? (set delegating-clients) client_id))
+      {:subject sub :client client_id})))
+
 (defn wrap-jwt-auth
   "Middleware that validates JWTs from the Authorization header using buddy-auth.
    Adds the :identity key to the request map if a valid token is provided.
@@ -139,12 +158,17 @@
    downstream authorization middleware answers 401. The HS256 :secret path
    ignores all three options.
 
+   `:delegating-clients` (a collection of client ids, default none) names the
+   clients whose tokens for another subject are delegated ([[delegation]]). Such
+   a request also carries `:fhir/delegation` `{:subject :client}`, which
+   `server.keto/wrap-keto-authorization` checks as the client.
+
    A request that already carries :identity is passed through untouched. That is
    the BFF seam: flotilla authenticates the opaque session cookie itself and
    injects {:identity {:sub subject}} before delegating here, and buddy's
    authentication-request would overwrite it with nil (no Authorization header
    accompanies a cookie-mode request)."
-  [handler {:keys [secret jwks-url issuer audiences access-tokens-only?]
+  [handler {:keys [secret jwks-url issuer audiences access-tokens-only? delegating-clients]
             :or {secret dev-secret}}]
   (when (and (nil? jwks-url) (nil? secret))
     (throw (ex-info "JWT auth requires either :jwks-url or :secret (set JWT_DEV_SECRET env var for dev)" {})))
@@ -187,7 +211,11 @@
                         reason (when-let [claims (and claim-checks (:identity req))]
                                  (claims-rejection claims claim-checks))]
                     (vreset! rejected reason)
-                    (vreset! authed (cond-> req reason (assoc :identity nil)))
+                    (vreset! authed
+                             (let [req (cond-> req reason (assoc :identity nil))
+                                   d   (some-> (:identity req) (delegation delegating-clients))]
+                               (cond-> (dissoc req :fhir/delegation)
+                                 d (assoc :fhir/delegation d))))
                     ::ok))]
           (when-let [reason @rejected]
             (log/info "Rejected a correctly signed JWT not issued for this server; claim:"

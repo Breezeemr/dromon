@@ -323,3 +323,29 @@
     (with-redefs [hc/get (recording-keto calls (fn [_ _] true))]
       (keto/relation-allowed? nil ["obj1"] "read" "user123")
       (is (= "http://localhost:4466/relation-tuples/check" (:url (first @calls)))))))
+
+(deftest a-delegated-request-is-checked-as-its-client
+  (let [asked (atom [])]
+    (with-redefs [hc/get (fn [_ opts]
+                           (swap! asked conj (get (:query-params opts) "subject_id"))
+                           {:status 200 :body {:allowed true}})]
+      (let [wrapped (keto/wrap-keto-authorization (fn [_] {:status 200}) {:keto-url "http://mock-keto"})
+            response (wrapped {:identity {:sub "person-1" :client_id "svc"}
+                               :fhir/delegation {:subject "person-1" :client "svc"}
+                               :request-method :post
+                               :path-params {:tenant-id "r1"}
+                               :fhir/resource-type "ClaimResponse"})]
+        (is (= 200 (:status response)))
+        (is (= ["svc"] (distinct @asked)) "never the person")))))
+
+(deftest allowed-asks-the-named-namespace
+  (with-redefs [hc/get (fn [_ opts]
+                         (is (= {"namespace" "ns" "object" "r1/role" "relation" "has"
+                                 "subject_id" "user:/p"}
+                                (:query-params opts)))
+                         {:status 200 :body {:allowed true}})]
+    (is (true? (keto/allowed? "http://mock-keto" "ns" "r1/role" "has" "user:/p"))))
+  (testing "a blank argument is never allowed and asks nothing"
+    (with-redefs [hc/get (fn [_ _] (throw (AssertionError. "asked")))]
+      (is (false? (keto/allowed? "http://mock-keto" "ns" "r1/role" "has" " ")))
+      (is (false? (keto/allowed? "http://mock-keto" "ns" nil "has" "user:/p"))))))

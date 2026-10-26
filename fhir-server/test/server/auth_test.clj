@@ -262,3 +262,43 @@
           token   (jwt/sign {:sub "token-user"} "test-secret" {:alg :hs256})]
       (wrapped {:headers {"authorization" (str "Token " token)}})
       (is (= {:sub "token-user"} @seen)))))
+
+(deftest delegation-test
+  (let [clients #{"svc"}]
+    (testing "a listed client's token for another subject is delegated"
+      (is (= {:subject "person-1" :client "svc"}
+             (auth/delegation {:sub "person-1" :client_id "svc"} clients))))
+    (testing "the client's own client_credentials token is not"
+      (is (nil? (auth/delegation {:sub "svc" :client_id "svc"} clients))))
+    (testing "a client that is not listed is not, whatever its sub"
+      (is (nil? (auth/delegation {:sub "person-1" :client_id "sign-in-app"} clients))))
+    (testing "no listed clients means no delegation"
+      (is (nil? (auth/delegation {:sub "person-1" :client_id "svc"} nil))))
+    (testing "a token with no client_id (an ID token) or a blank sub is not"
+      (is (nil? (auth/delegation {:sub "person-1"} clients)))
+      (is (nil? (auth/delegation {:sub " " :client_id "svc"} clients))))))
+
+(defn- delegation-seen
+  "Run `claims` through wrap-jwt-auth (JWKS path, `opts` merged) and return the
+   `:fhir/delegation` the inner handler saw. `extra` is merged into the request."
+  ([opts claims] (delegation-seen opts claims {}))
+  ([opts claims extra]
+   (with-redefs [auth/fetch-jwks (fn [_] {"mock-key-1" mock-public-key})]
+     (let [seen    (atom ::unset)
+           wrapped (auth/wrap-jwt-auth (fn [req] (reset! seen (:fhir/delegation req)) {:status 200})
+                                       (merge {:jwks-url "http://mock-hydra"} opts))]
+       (wrapped (merge {:headers {"authorization" (str "Bearer " (hydra-token claims))}} extra))
+       @seen))))
+
+(deftest wrap-jwt-auth-attaches-delegation
+  (testing "a delegated token carries both principals"
+    (is (= {:subject "person-1" :client "svc"}
+           (delegation-seen {:delegating-clients #{"svc"}} {:sub "person-1" :client_id "svc"}))))
+  (testing "without :delegating-clients nothing is delegated"
+    (is (nil? (delegation-seen {} {:sub "person-1" :client_id "svc"}))))
+  (testing "a token refused by a claim check carries no delegation"
+    (is (nil? (delegation-seen {:delegating-clients #{"svc"} :issuer "https://other"}
+                               {:sub "person-1" :client_id "svc" :iss "https://hydra"}))))
+  (testing "a caller cannot supply its own :fhir/delegation"
+    (is (nil? (delegation-seen {:delegating-clients #{"svc"}} {:sub "svc" :client_id "svc"}
+                               {:fhir/delegation {:subject "someone" :client "svc"}})))))

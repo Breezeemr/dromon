@@ -413,6 +413,7 @@ each backend's storage home, and the adoption order.
 ### Auth stack
 - **JWT**: `server.auth/wrap-jwt-auth` -- HS256 with `JWT_DEV_SECRET` env var (dev) or RS256 with JWKS from `JWKS_URL` (prod)
 - **Authorization**: `server.keto/wrap-keto-authorization` -- checks Ory Keto for instance-level permissions (GET->read, POST/PUT/PATCH->write, DELETE->delete)
+- **Delegated tokens**: with `:jwt-delegating-clients`, a token whose `client_id` is listed and whose `sub` is someone else (an RFC 7523 JWT-bearer grant) carries `:fhir/delegation {:subject :client}`; Keto checks the client, never the person, and the person's own authority is the host's to check (`server.keto/allowed?` asks any namespace)
 - **FHIR format**: `server.fhir-format` -- Malli encode/decode middleware for FHIR JSON wire format
 - **Host extensions** (`server.router/resolve-options`), so nothing host-specific lives here:
   `:compartment-overrides` (membership beyond the R4B CompartmentDefinitions, read by every
