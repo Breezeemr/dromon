@@ -290,6 +290,17 @@
      Any failure propagates as an exception that rolls back the whole
      transaction; there is no per-entry error handling.
 
+     A `HEAD` entry with `request.ifNoneMatch` `\"*\"` writes nothing and is
+     a precondition of the whole transaction: it commits only if no current
+     resource has that type and id once the transaction's own writes are
+     applied, and otherwise fails with a 412 (`:fhir/status 412`) and
+     commits nothing. A caller fences its writes on a resource another
+     writer creates (a fencing token): the create and the transaction are
+     ordered, so the transaction either commits before the create or fails.
+     Any other `ifNoneMatch` on a `GET` or `HEAD` entry is a 400, never
+     ignored. A store that cannot check the precondition atomically refuses
+     the entry rather than reading it outside the transaction.
+
      `opts` may contain:
      - :tx-metadata — ONE stamp for the WHOLE Bundle, because the whole
        Bundle is one transaction. There is no per-entry stamp here: a stamp

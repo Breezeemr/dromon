@@ -497,3 +497,24 @@
         (is (= ids (mapv :id (protocol/search tx-store "t" :Patient {} nil))))
         (is (= [(first ids)]
                (mapv :id (protocol/search tx-store "t" :Patient {"_count" "1"} nil))))))))
+
+(deftest a-head-if-none-match-fences-a-transaction
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        fence {:request {:method "HEAD" :url "Patient/token-2" :ifNoneMatch "*"}}
+        write (fn [id] {:request {:method "PUT" :url (str "Patient/" id)}
+                        :resource {:resourceType "Patient" :id id}})
+        status (fn [entries] (try (protocol/transact-transaction store tenant entries) 200
+                                  (catch Exception ex
+                                    (some #(:fhir/status (ex-data %)) (take-while some? (iterate ex-cause ex))))))]
+    (testing "absent: the transaction commits"
+      (is (= 200 (status [(write "w1") fence])))
+      (is (some? (protocol/read-resource store tenant "Patient" "w1"))))
+    (testing "present: 412, and nothing was written"
+      (protocol/create-resource store tenant "Patient" "token-2" {:resourceType "Patient"})
+      (is (= 412 (status [(write "w2") fence])))
+      (is (nil? (protocol/read-resource store tenant "Patient" "w2"))))
+    (testing "any other ifNoneMatch is refused, never ignored"
+      (is (= 400 (status [(write "w3") {:request {:method "HEAD" :url "Patient/x" :ifNoneMatch "W/\"1\""}}])))
+      (is (= 400 (status [(write "w3") {:request {:method "GET" :url "Patient/x" :ifNoneMatch "*"}}])))
+      (is (nil? (protocol/read-resource store tenant "Patient" "w3"))))))
