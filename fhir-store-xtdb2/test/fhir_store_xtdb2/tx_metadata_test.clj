@@ -15,11 +15,11 @@
 
 (def ^:private stamp
   {:principal {:credential "session" :altId "jdoe" :userId "6f1c2d3e-0000-4000-8000-000000000001"}
-   :device    {:name "purser" :versions {"purser" "abc123" "rcm-x12" "def456"}}
+   :device    {:name "example-service" :versions {"example-service" "abc123" "example-mapper" "def456"}}
    :x/undocumented [1 #{:a "b"} #uuid "6f1c2d3e-0000-4000-8000-000000000002"]})
 
 (def ^:private other-stamp
-  {:principal {:credential "token"} :device {:name "eligibility"}})
+  {:principal {:credential "token"} :device {:name "example-batch"}})
 
 (defn- close-store-nodes! [store]
   (doseq [[_ {:keys [node pool]}] @(:nodes store)]

@@ -19,8 +19,8 @@
    key. A delete has no row in the resource table but has its own stamp row,
    addressed by the delete's commit time.
 
-   The stamp is ONE edn string, exactly as fhir-store-datomic stores it on
-   its transaction entity: the map is open by contract, and a projection onto
+   The stamp is ONE edn string, as a Datomic-backed store keeps it on its
+   transaction entity: the map is open by contract, and a projection onto
    columns would drop keys it did not anticipate (and XTDB would hand back
    keyword keys as strings). The write-time rules are Datomic's -- a record,
    an unprintable value, or text that does not read back equal is refused

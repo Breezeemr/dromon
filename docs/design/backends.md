@@ -52,7 +52,7 @@ Where each backend keeps it:
 
 | backend | storage home | status |
 |---|---|---|
-| `fhir-store-datomic` | the transaction entity every write already names, which is also the value of `:fhir/version-id` | implemented (host repo) |
+| `fhir-store-datomic` | the transaction entity every write already names, which is also the value of `:fhir/version-id` | planned |
 | `fhir-store-xtdb2` | a `fhir_tx_metadata` row per written resource, keyed `<table>/<id>`, written by an extra op inside the *same* `xt/execute-tx`; its `_system_from` is the transaction's system time, which a commit-time versionId names | implemented |
 | `fhir-store-mock` | the per-version history record | planned |
 | `CompartmentFilteringStore` | delegates to its base | implemented |
