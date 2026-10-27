@@ -2,11 +2,19 @@
 
 ## Problem
 
-FHIR R4 §2.38.1 says `PUT /{type}/{id}` with header
-`If-None-Match: *` must create the resource only if no resource with
-that logical id already exists, and must return `412 Precondition
-Failed` if it does exist. This is the write counterpart to the
-`*`-wildcard If-None-Match used for conditional GETs.
+FHIR R4 and R4B define `If-None-Match` only for conditional read
+(http.html §3.1.0.1.7, a `304 Not Modified`); their `update` takes only
+`If-Match`. FHIR R5 adds it to conditional update (http.html §3.2.0.4.3):
+`PUT /{type}/{id}` with `If-None-Match: W/"<vid>"` updates only if that
+version does not already exist, and servers MAY support only the
+`If-None-Match: *` form, meaning no existing version. R5 names no status
+for a failed condition; RFC 9110 §13.1.2 answers a false `If-None-Match`
+on any method but GET and HEAD with `412 Precondition Failed`.
+
+A transaction Bundle's PUT entry already honours `request.ifNoneMatch`
+this way in fhir-store-xtdb2 and fhir-store-mock (`*` fails 412 when the
+resource exists, a version ETag fails 412 when that version exists,
+current or historical). The single-resource PUT below does not.
 
 Today, `fhir-server/src/server/handlers.clj` parses `If-None-Match`
 only on the read path (`not-modified?`, around line 74). The
@@ -51,6 +59,8 @@ pre-read — let the store throw 412.
 
 ## References
 
-- FHIR R4 §2.38.1: https://hl7.org/fhir/R4/http.html#cond-update
+- FHIR R5 conditional update: https://hl7.org/fhir/R5/http.html#cond-update
+- FHIR R4B conditional read (the only R4B use of `If-None-Match`): https://hl7.org/fhir/R4B/http.html#cread
+- RFC 9110 §13.1.2 If-None-Match: https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.2
 - `fhir-server/src/server/handlers.clj` — `update-resource` handler
 - Prior work: the If-Match CAS cascade across mock/xtdb2/datomic.

@@ -297,9 +297,19 @@
      commits nothing. A caller fences its writes on a resource another
      writer creates (a fencing token): the create and the transaction are
      ordered, so the transaction either commits before the create or fails.
-     Any other `ifNoneMatch` on a `GET` or `HEAD` entry is a 400, never
-     ignored. A store that cannot check the precondition atomically refuses
-     the entry rather than reading it outside the transaction.
+
+     A `PUT` entry's `request.ifNoneMatch` is FHIR R5's conditional update
+     (R4B defines `If-None-Match` for reads only): `\"*\"` writes only if
+     no current resource has that type and id, and a version ETag
+     (`W/\"<vid>\"`) writes only if no version of the resource with that
+     versionId exists, current or in its history. Either is checked against
+     the state the entries before it leave, and fails the whole transaction
+     with a 412 otherwise, as RFC 9110 §13.1.2 answers a false
+     `If-None-Match` on a write.
+
+     Any other `ifNoneMatch` on a `GET`, `HEAD` or `PUT` entry is a 400,
+     never ignored. A store that cannot check the precondition atomically
+     refuses the entry rather than reading it outside the transaction.
 
      `opts` may contain:
      - :tx-metadata — ONE stamp for the WHOLE Bundle, because the whole
