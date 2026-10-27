@@ -408,7 +408,10 @@
      No filtering is applied here beyond the snapshot: _type / _since /
      _typeFilter / compartment confinement and id-dedup are the export layer's
      responsibility, applied while consuming the stream. Deleted resources are
-     excluded (only live rows as of the basis are streamed).")
+     excluded (only live rows as of the basis are streamed).
+
+     A basis carrying :valid-time streams the rows true at that instant, on a
+     store with that axis; without it, the rows true now.")
   (count-as-of [this tenant-id resource-type basis]
     "Total number of live resources of `resource-type` as of `basis` (a token
      from `current-basis`). Unfiltered snapshot count, intended for manifest

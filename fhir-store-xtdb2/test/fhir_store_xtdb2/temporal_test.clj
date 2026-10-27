@@ -464,3 +464,25 @@
                      (db/transact-valid-time store tid [{:op :upsert :resource-type :Coverage :id "x"}]))
             "an unknown op is refused")
         (finally (close-store-nodes! store))))))
+
+(deftest scan-type-as-of-reads-the-valid-time-the-basis-names
+  (testing "a basis with :valid-time streams the rows true then; without it, the rows true now"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-scan-valid"
+          ids-at (fn [basis] (into #{} (map :id) (db/scan-type-as-of store tid :Coverage basis)))]
+      (try
+        (db/transact-valid-time
+         store tid
+         [{:op :put :resource-type :Coverage :id "past" :resource (coverage "aetna")
+           :vt {:valid-from prior-start :valid-to year-start}}
+          {:op :put :resource-type :Coverage :id "always" :resource (coverage "cigna")
+           :vt {:valid-from prior-start}}
+          {:op :put :resource-type :Coverage :id "future" :resource (coverage "humana")
+           :vt {:valid-from long-after}}])
+        (let [now (db/current-basis store tid)]
+          (is (= #{"always"} (ids-at now)))
+          (is (= #{"past" "always"} (ids-at (assoc now :valid-time prior-mid))))
+          (is (= #{"always" "future"} (ids-at (assoc now :valid-time (inst "2031-01-01T00:00:00Z")))))
+          (is (= #{"past" "always"} (ids-at (assoc now :valid-time (java.time.LocalDate/parse "2025-06-01"))))
+              "a LocalDate is its start in UTC"))
+        (finally (close-store-nodes! store))))))

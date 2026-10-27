@@ -2406,6 +2406,18 @@
       (some? st)                   (Instant/parse (str st))
       :else                        (Instant/now))))
 
+(defn ^:no-doc basis->valid-time
+  "A basis map's :valid-time as a java.time.Instant, or nil for valid now. A
+   LocalDate is its start in UTC."
+  [basis]
+  (let [vt (:valid-time basis)]
+    (cond
+      (nil? vt)                       nil
+      (instance? Instant vt)          vt
+      (instance? ZonedDateTime vt)    (.toInstant ^ZonedDateTime vt)
+      (instance? java.time.LocalDate vt) (.toInstant (.atStartOfDay ^java.time.LocalDate vt java.time.ZoneOffset/UTC))
+      :else                           (Instant/parse (str vt)))))
+
 (def ^:private ^:no-doc scan-page-size 1000)
 
 (defn ^:no-doc scan-type-as-of-reducible
@@ -2415,15 +2427,20 @@
    the next page only after the reducing fn returns for the current page, so a
    fn that blocks on a slow OutputStream bounds peak memory to one page. A
    `reduced` accumulator halts the scan without fetching further pages. The
-   pinned system-time makes keyset paging stable (no rows shift between pages)."
-  [pool resource-type ^java.time.Instant as-of read-decoders page-size]
+   pinned system-time makes keyset paging stable (no rows shift between pages).
+
+   With `valid-time`, rows true at that instant rather than now."
+  ([pool resource-type as-of read-decoders page-size]
+   (scan-type-as-of-reducible pool resource-type as-of nil read-decoders page-size))
+  ([pool resource-type ^java.time.Instant as-of valid-time read-decoders page-size]
   (reify clojure.lang.IReduceInit
     (reduce [_ f init]
       (with-conn [conn pool]
-        (let [q (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id > ? ORDER BY _id LIMIT ?"
-                        (table-name resource-type))]
+        (let [[clause clause-params] (basis->for-clause {:system-time as-of :valid-time valid-time})
+              q (format "SELECT *, _system_from FROM %s%s WHERE _id > ? ORDER BY _id LIMIT ?"
+                        (table-name resource-type) clause)]
           (loop [after "" acc init]
-            (let [rows (run-query conn [q as-of after page-size])
+            (let [rows (run-query conn (into (into [q] clause-params) [after page-size]))
                   n    (count rows)]
               (if (zero? n)
                 acc
@@ -2435,7 +2452,7 @@
                     @result
                     (if (< n page-size)
                       result
-                      (recur (str (row-id (nth rows (dec n)))) result))))))))))))
+                      (recur (str (row-id (nth rows (dec n)))) result)))))))))))))
 
 (defn ^:no-doc count-as-of-sql
   "COUNT(*) of `resource-type` as of `as-of` (an Instant)."
@@ -3495,7 +3512,7 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (scan-type-as-of-reducible pool resource-type (basis->system-time basis)
-                                  read-decoders scan-page-size))))
+                                  (basis->valid-time basis) read-decoders scan-page-size))))
 
   (count-as-of [this tenant-id resource-type basis]
     (refuse-unencodable-input! {:resource-type resource-type})
