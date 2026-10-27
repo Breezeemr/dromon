@@ -1141,3 +1141,33 @@
             (is (= 5 (count ids)) "no rows dropped or duplicated across pages")
             (is (= #{"p0" "p1" "p2" "p3" "p4"} (set ids))))))
       (finally (close-store-nodes! store)))))
+
+(deftest a-head-if-none-match-fences-a-transaction
+  (testing "a HEAD entry with ifNoneMatch * commits only while the resource is absent"
+    (let [store (core-db/create-xtdb-store {})
+          tenant-id "tenant-fence"
+          fence {:request {:method "HEAD" :url "Patient/token-2" :ifNoneMatch "*"}}
+          write (fn [id] {:request {:method "PUT" :url (str "Patient/" id)}
+                          :resource {:resourceType "Patient" :id id :active true}})]
+      (try
+        (db/create-resource store tenant-id :Patient "token-1" {:resourceType "Patient" :id "token-1"})
+        (let [response (db/transact-transaction store tenant-id [(write "w1") fence])]
+          (is (some? (db/read-resource store tenant-id :Patient "w1")) "absent: the transaction commits")
+          (is (= ["200 OK" "404 Not Found"] (mapv #(get-in % [:response :status]) (:entry response)))))
+        (db/create-resource store tenant-id :Patient "token-2" {:resourceType "Patient" :id "token-2"})
+        (let [e (try (db/transact-transaction store tenant-id [(write "w2") fence]) nil
+                     (catch Exception e e))]
+          (is (= 412 (:fhir/status (root-ex-data e))) "present: 412")
+          (is (nil? (db/read-resource store tenant-id :Patient "w2")) "and nothing was written"))
+        (testing "after a delete the resource is absent again"
+          (db/delete-resource store tenant-id :Patient "token-2")
+          (db/transact-transaction store tenant-id [(write "w3") fence])
+          (is (some? (db/read-resource store tenant-id :Patient "w3"))))
+        (testing "any other ifNoneMatch is refused, never ignored"
+          (doseq [entry [{:request {:method "HEAD" :url "Patient/token-9" :ifNoneMatch "W/\"1\""}}
+                         {:request {:method "GET" :url "Patient/token-9" :ifNoneMatch "*"}}]]
+            (let [e (try (db/transact-transaction store tenant-id [(write "w4") entry]) nil
+                         (catch Exception e e))]
+              (is (= 400 (:fhir/status (root-ex-data e))) (pr-str entry))))
+          (is (nil? (db/read-resource store tenant-id :Patient "w4"))))
+        (finally (close-store-nodes! store))))))

@@ -1008,7 +1008,23 @@
                                      "DELETE" (do (delete-with this tenant-id rt id
                                                                (entry-opts opts entry-if-match))
                                                   {:response {:status "204 No Content"}})
+                                     "HEAD" (let [inm (or (:ifNoneMatch req) (get req "ifNoneMatch"))
+                                                  res (protocol/read-resource this tenant-id rt id)]
+                                              (when-not (= "*" (some-> inm str str/trim))
+                                                (throw (ex-info (str "A transaction HEAD entry is supported only with "
+                                                                     "ifNoneMatch \"*\", not " (pr-str inm))
+                                                                {:fhir/status 400 :fhir/code "not-supported"
+                                                                 :method method :url url})))
+                                              (when res
+                                                (throw (ex-info (str "Precondition failed: " url " exists")
+                                                                {:fhir/status 412 :fhir/code "conflict"
+                                                                 :resource-type type :id id})))
+                                              {:response {:status "404 Not Found"}})
                                      "GET" (let [res (protocol/read-resource this tenant-id rt id)]
+                                             (when (or (:ifNoneMatch req) (get req "ifNoneMatch"))
+                                               (throw (ex-info "A transaction GET entry takes no ifNoneMatch"
+                                                               {:fhir/status 400 :fhir/code "not-supported"
+                                                                :method method :url url})))
                                              (if res
                                                (let [vid (get-in res [:meta :versionId])
                                                      last-mod (str (get-in res [:meta :lastUpdated]))]

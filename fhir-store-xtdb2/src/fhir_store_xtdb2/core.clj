@@ -475,6 +475,19 @@
                 (table-name resource-type) version-match-sql)
    (into [id] (version-match-args vid))])
 
+(defn- absent-assert-op
+  "The ASSERT of a transaction `HEAD` entry with `ifNoneMatch` `*`: the
+   transaction fails unless no current `resource-type`/`id` exists. Throws
+   400 for any other `ifNoneMatch`, or one on a `GET`."
+  [{:keys [method resource-type id if-none-match]}]
+  (when-not (and (= "HEAD" method) (= "*" (str/trim (str if-none-match))))
+    (throw (ex-info (str "A transaction entry's ifNoneMatch is supported only as \"*\" on HEAD, not "
+                         (pr-str if-none-match) " on " method)
+                    {:fhir/status 400 :fhir/code "not-supported"
+                     :resource-type resource-type :id id})))
+  [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" (table-name resource-type))
+   [id]])
+
 (defn- entry-if-match
   "The version a transaction PUT entry's `request.ifMatch` guards on, checked
    against the `current` version before the lifecycle sees the write: nil when
@@ -3090,7 +3103,9 @@
                                        :resource resource
                                        :if-match (fp/normalize-if-match
                                                   (or (:ifMatch request)
-                                                      (get request "ifMatch")))}))
+                                                      (get request "ifMatch")))
+                                       :if-none-match (or (:ifNoneMatch request)
+                                                          (get request "ifNoneMatch"))}))
                                   entries)
                             (sort-by #(method-order (:method %)))
                             vec)
@@ -3175,12 +3190,16 @@
                        ;; GET / HEAD inside a transaction: we still have to
                        ;; read the resource to satisfy the response. Defer
                        ;; these to the read-back phase by leaving :resource
-                       ;; nil on entry-results.
-                       (update acc :entry-results conj em)))
+                       ;; nil on entry-results. A HEAD with ifNoneMatch "*"
+                       ;; also asserts the resource absent at commit.
+                       (-> acc
+                           (cond-> (:if-none-match em)
+                             (update :tx-ops conj (absent-assert-op em)))
+                           (update :entry-results conj em))))
                    {:tx-ops [] :lifecycle-writes [] :entry-results []}
                    entry-metas))
           own-op-count (count tx-ops)
-          guarded? (some :if-match entry-metas)
+          guarded? (some #(or (:if-match %) (:if-none-match %)) entry-metas)
           tx-ops (into tx-ops (mapcat lifecycle-tx-ops) lifecycle-writes)]
       (let [tx-key (ftrace/trace!
                     {:id :store/transact-transaction.execute-tx
