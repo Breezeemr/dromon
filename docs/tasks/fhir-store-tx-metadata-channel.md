@@ -165,7 +165,7 @@ documented keys it can and MAY persist or ignore the rest.
 | backend | where the stamp lives |
 |---|---|
 | fhir-store-datomic | the transaction entity every write already names — it is also the value of `:fhir/version-id`, so version-id -> tx entity -> stamp is one lookup |
-| fhir-store-xtdb2 | a per-tenant `fhir_tx_metadata` row written as an extra op inside the SAME `xt/execute-tx` as the data, keyed by the transaction's system time |
+| fhir-store-xtdb2 | a `fhir_tx_metadata` row per written resource, keyed `<table>/<id>`, written as an extra op inside the SAME `xt/execute-tx` as the data; its `_system_from` is the transaction's system time (implemented; not `xt.txs.user_metadata`, which 2.2.0's FlightSQL client refuses) |
 | fhir-store-mock | the per-version history record |
 | decorators | delegation to base (CompartmentFilteringStore here, IndexedStore in the host repo) |
 | as-of stores, test stubs | nothing — they must not implement `ITxMetadataStore` |

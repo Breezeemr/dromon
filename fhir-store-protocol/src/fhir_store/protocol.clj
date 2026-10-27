@@ -597,8 +597,8 @@
 ;; MUST NOT implement it, and may still take the opts arity to honour
 ;; `:if-match`.
 ;;
-;;   fhir-store-xtdb2   planned: a per-tenant fhir_tx_metadata row written
-;;                      inside the same xt/execute-tx as the data
+;;   fhir-store-xtdb2   implemented: a fhir_tx_metadata row per written
+;;                      resource, inside the same xt/execute-tx as the data
 ;;   fhir-store-datomic planned: the transaction entity every write already
 ;;                      names, which is also the value of :fhir/version-id
 ;;   fhir-store-mock    planned: the per-version history record

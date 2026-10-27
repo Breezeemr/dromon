@@ -53,9 +53,14 @@ Where each backend keeps it:
 | backend | storage home | status |
 |---|---|---|
 | `fhir-store-datomic` | the transaction entity every write already names, which is also the value of `:fhir/version-id` | planned |
-| `fhir-store-xtdb2` | a per-tenant `fhir_tx_metadata` row written as an extra op inside the *same* `xt/execute-tx`, keyed by the transaction's system time | planned |
+| `fhir-store-xtdb2` | a `fhir_tx_metadata` row per written resource, keyed `<table>/<id>`, written by an extra op inside the *same* `xt/execute-tx`; its `_system_from` is the transaction's system time, which a commit-time versionId names | implemented |
 | `fhir-store-mock` | the per-version history record | planned |
-| `CompartmentFilteringStore` | delegates to its base | planned |
+| `CompartmentFilteringStore` | delegates to its base | implemented |
+
+`fhir-store-xtdb2` does not use XTDB's own `:metadata` tx option (`xt.txs.user_metadata`):
+XTDB 2.2.0's FlightSQL client refuses it, and the store supports that transport. A delete's
+stamp is addressed by the delete's commit time, `version-of-system-time` of the basis the
+delete returns, and is written only when the delete removed a current resource.
 
 A backend with no home for the stamp **must not implement `ITxMetadataStore`**. Accepting the
 key and discarding it is permitted — the opts arity still has `:if-match` to honour — but only
