@@ -15,6 +15,7 @@
             [fhir-store-xtdb2.conns :as conns :refer [with-conn]]
             [fhir-store-xtdb2.datetime :as dt]
             [fhir-store-xtdb2.transform :as xf]
+            [fhir-store-xtdb2.tx-metadata :as txm]
             [xtdb.serde :as serde])
   (:import [java.sql SQLException]
            [java.time LocalDate LocalDateTime Instant OffsetDateTime ZonedDateTime ZoneOffset LocalTime Year YearMonth]
@@ -467,6 +468,21 @@
   [e own-op-count]
   (when-let [idx (:tx-op-idx (ex-data e))]
     (>= idx own-op-count)))
+
+(defn ^:no-doc delete-tx-ops
+  "The ops of one delete: the guard, the stamp, then the DELETE, and the
+   index of the stamp op (nil without one). The stamp precedes the DELETE
+   because it is written only for a resource current at that point (see
+   txm/delete-op)."
+  [assert-op stamp-op delete-op]
+  (let [ops (cond-> [] assert-op (conj assert-op) stamp-op (conj stamp-op))]
+    [(conj ops delete-op) (when stamp-op (dec (count ops)))]))
+
+(defn ^:no-doc stamp-op-failure?
+  "True when execute-tx failed on the stamp op at `stamp-idx`. Rethrown as
+   is: it is no conflict of the resource's."
+  [e stamp-idx]
+  (and stamp-idx (= stamp-idx (:tx-op-idx (ex-data e)))))
 
 (defn ^:no-doc version-assert-op
   "The ASSERT that fails a transaction unless `id` still holds `vid`."
@@ -2222,7 +2238,7 @@
 ;; Write-side SQL impls.
 ;; ---------------------------------------------------------------------------
 
-(defn- create-sql [node resource-type id resource storage-encoders lc-ctx id-minted?]
+(defn- create-sql [node resource-type id resource storage-encoders lc-ctx id-minted? stamp]
   (let [rt-name (name resource-type)
         write (lifecycle-write lc-ctx node :create resource-type id resource)
         resource (:resource write)
@@ -2237,7 +2253,8 @@
                                       (table-name resource-type))
                          [id]])
                   true (conj [:sql sql args]))
-        tx-ops (into own-ops (lifecycle-tx-ops write))
+        tx-ops (cond-> (into own-ops (lifecycle-tx-ops write))
+                 stamp (conj (txm/write-op stamp [[resource-type id]])))
         tx-key (try
                  (xt/execute-tx node tx-ops)
                  (catch Exception e
@@ -2252,7 +2269,7 @@
     (fire-after-commit! lc-ctx [write] tx-key)
     (committed resource id (version-of-system-time (:system-time tx-key)) tx-key)))
 
-(defn- update-sql [node resource-type id resource opts storage-encoders lc-ctx]
+(defn- update-sql [node resource-type id resource opts storage-encoders lc-ctx stamp]
   (let [rt-name (table-name resource-type)
         supplied (fp/normalize-if-match (:if-match opts))
         ;; Only an If-Match reads first. Without one a PUT is last-writer-wins:
@@ -2277,7 +2294,8 @@
         own-ops (cond-> []
                   if-match (conj (version-assert-op resource-type id if-match))
                   true (conj [:sql sql args]))
-        tx-ops (into own-ops (lifecycle-tx-ops write))
+        tx-ops (cond-> (into own-ops (lifecycle-tx-ops write))
+                 stamp (conj (txm/write-op stamp [[resource-type id]])))
         tx-key (try
                  (xt/execute-tx node tx-ops)
                  (catch Exception e
@@ -2292,7 +2310,7 @@
     (fire-after-commit! lc-ctx [write] tx-key)
     (committed resource id (version-of-system-time (:system-time tx-key)) tx-key)))
 
-(defn- delete-sql [node resource-type id opts]
+(defn- delete-sql [node resource-type id opts stamp]
   (let [rt-name (table-name resource-type)
         supplied (fp/normalize-if-match (:if-match opts))
         current (when supplied (current-version node resource-type id))
@@ -2308,10 +2326,14 @@
         assert-op (when if-match
                     (version-assert-op resource-type id if-match))
         delete-op [:sql (format "DELETE FROM %s WHERE _id = ?" rt-name) [id]]
-        tx-ops (if assert-op [assert-op delete-op] [delete-op])
+        [tx-ops stamp-idx] (delete-tx-ops assert-op
+                                          (txm/delete-op stamp rt-name resource-type id)
+                                          delete-op)
         tx-key (try
                  (xt/execute-tx node tx-ops)
                  (catch Exception e
+                   (when (stamp-op-failure? e stamp-idx)
+                     (throw e))
                    (if if-match
                      (throw (ex-info (str "Version conflict: " (ex-message e))
                                      {:fhir/status 412 :fhir/code "conflict"
@@ -2765,8 +2787,10 @@
   "The ops and lifecycle write for one :group entry, built against `db`, the
    handle the group commits through. Throws whatever the entry's own verb
    would refuse it for before sending anything; the caller then runs it alone.
-   `versions` maps [type id] to the current version, read for guarded entries."
-  [store tenant-id opts db versions
+   `versions` maps [type id] to the current version, read for guarded entries.
+   `stamp` is the Bundle's stamp text: each plan carries its own stamp op, so
+   a plan taken out of the group takes its stamp with it."
+  [store tenant-id opts stamp db versions
    {:keys [method resource-type id if-match entry] :as e}]
   (let [{:keys [query-mode storage-encoders]} store
         id (if (= "POST" method) (str (java.util.UUID/randomUUID)) id)
@@ -2777,7 +2801,10 @@
                                 (get versions [resource-type id])))
         assert-ops (cond-> [] guard (conj (version-assert-op resource-type id guard)))]
     (if (= "DELETE" method)
-      (assoc e :id id :ops (conj assert-ops (delete-op query-mode resource-type id)))
+      (assoc e :id id :ops (first (delete-tx-ops (first assert-ops)
+                                                 (txm/delete-op stamp (table-name resource-type)
+                                                                resource-type id)
+                                                 (delete-op query-mode resource-type id))))
       (let [;; As the entry's own verb: a POST takes no If-Match.
             lc-opts (entry-opts opts (when (= "PUT" method) if-match))
             write (lifecycle-write (lifecycle-ctx store tenant-id lc-opts)
@@ -2787,7 +2814,8 @@
             own-ops (conj assert-ops (put-op query-mode resource-type id (:resource write)
                                              storage-encoders))]
         (assoc e :id id :write write
-               :ops (into own-ops (lifecycle-tx-ops write)))))))
+               :ops (cond-> (into own-ops (lifecycle-tx-ops write))
+                      stamp (conj (txm/write-op stamp [[resource-type id]]))))))))
 
 (defn- blamed-plan
   "The plan whose op `e`, a failed execute-tx of `plans`' ops, names."
@@ -2835,7 +2863,7 @@
 (defn- run-batch-group!
   "Plans and commits one group's entries through one handle; returns
    {:responses {idx response} :alone [entries to run alone]}."
-  [store tenant-id opts group]
+  [store tenant-id opts stamp group]
   (let [{:keys [node pool] :as tenant} (get-or-create-entry store tenant-id)
         run (fn [db]
               (let [;; Guarded entries read the version they replace in one
@@ -2854,7 +2882,7 @@
                     planned (mapv (fn [e]
                                     (try
                                       (ensure-declared! tenant (:resource-type e))
-                                      (plan-batch-write store tenant-id opts db versions e)
+                                      (plan-batch-write store tenant-id opts stamp db versions e)
                                       (catch Exception _ (assoc e :unplanned? true))))
                                   group)
                     {:keys [tx-key landed alone error failed]}
@@ -2892,8 +2920,9 @@
       (with-conn [conn pool] (run conn)))))
 
 (defn- batch-response-entries
-  "The batch-response entries for `entries`, in input order."
-  [store tenant-id opts entries]
+  "The batch-response entries for `entries`, in input order. `stamp` is
+   `opts`' stamp text; an entry run alone stamps through its own verb."
+  [store tenant-id opts stamp entries]
   (let [alone! (fn [acc {:keys [idx entry]}]
                  (assoc acc idx (batch-entry-response store tenant-id opts entry)))
         responses
@@ -2905,12 +2934,39 @@
                (if (seq (:group seg))
                  ;; The handle is given back before any entry runs alone, so
                  ;; a pool of one connection still serves them.
-                 (let [{:keys [responses alone]} (run-batch-group! store tenant-id opts (:group seg))]
+                 (let [{:keys [responses alone]} (run-batch-group! store tenant-id opts stamp (:group seg))]
                    (reduce alone! (merge acc responses) alone))
                  acc))))
          {}
          (batch-segments (map-indexed classify-batch-entry entries)))]
     (mapv responses (range (count entries)))))
+
+(defn- stamp-table-present?
+  "Whether the stamp table exists on the tenant's node. Nothing declares it,
+   so before the first stamped write it does not, and a SELECT naming it
+   fails at planning. Once seen it is remembered in the entry's `declared`
+   set, under its bare name, which no table-name spelling can equal."
+  [db {:keys [declared]}]
+  (or (contains? @declared txm/table)
+      (when (seq (run-query db [txm/exists-sql]))
+        (swap! declared conj txm/table)
+        true)))
+
+(defn ^:no-doc tx-metadata-sql
+  "The stamp version `vid` of `resource-type`/`id` was written under, or nil.
+
+   A commit-time versionId names the transaction's system time, which is the
+   stamp row's `_system_from`. Any other versionId is a stored counter, which
+   only an importer writes and which therefore never carries a stamp."
+  [db entry resource-type id vid]
+  (when-let [t (system-time-of-version vid)]
+    (when (stamp-table-present? db entry)
+      (when-some [text (some (fn [row] (or (:stamp row) (get row "stamp")))
+                             (run-query db [txm/read-sql (txm/stamp-key resource-type id) t]))]
+        (txm/read-stamp text {:tenant-id (:tenant-id entry)
+                              :resource-type (name resource-type)
+                              :id id
+                              :vid (str vid)})))))
 
 (defrecord XTDBStore [nodes node-config storage-encoders read-decoders query-mode pool-opts]
   IFHIRStore
@@ -2923,16 +2979,19 @@
     (ftrace/trace!
      {:id :store/create
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
+     (let [stamp (txm/stamp-text opts)
+           {:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (create-xtql node resource-type id resource storage-encoders
-                            (lifecycle-ctx this tenant-id (not-empty (dissoc opts :id-minted?))))
+                            (lifecycle-ctx this tenant-id (not-empty (dissoc opts :id-minted?)))
+                            stamp)
          (with-conn [conn pool]
            ;; :id-minted? is a hint to the store, not one of the host's
            ;; opts, so a lifecycle sees the opts without it.
            (create-sql conn resource-type id resource storage-encoders
                        (lifecycle-ctx this tenant-id (not-empty (dissoc opts :id-minted?)))
-                       (true? (:id-minted? opts))))))))
+                       (true? (:id-minted? opts))
+                       stamp))))))
 
   (read-resource [this tenant-id resource-type id]
     (refuse-unencodable-input! {:resource-type resource-type :id id})
@@ -2964,13 +3023,14 @@
     (ftrace/trace!
      {:id :store/update
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
+     (let [stamp (txm/stamp-text opts)
+           {:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
          :xtql (update-xtql node resource-type id resource opts storage-encoders
-                            (lifecycle-ctx this tenant-id opts))
+                            (lifecycle-ctx this tenant-id opts) stamp)
          (with-conn [conn pool]
            (update-sql conn resource-type id resource opts storage-encoders
-                       (lifecycle-ctx this tenant-id opts)))))))
+                       (lifecycle-ctx this tenant-id opts) stamp))))))
 
   (delete-resource [this tenant-id resource-type id]
     (fp/delete-resource this tenant-id resource-type id nil))
@@ -2980,11 +3040,12 @@
     (ftrace/trace!
      {:id :store/delete
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
-     (let [{:keys [node pool]} (entry-for this tenant-id resource-type)]
+     (let [stamp (txm/stamp-text opts)
+           {:keys [node pool]} (entry-for this tenant-id resource-type)]
        (case query-mode
-         :xtql (delete-xtql node resource-type id opts)
+         :xtql (delete-xtql node resource-type id opts stamp)
          (with-conn [conn pool]
-           (delete-sql conn resource-type id opts))))))
+           (delete-sql conn resource-type id opts stamp))))))
 
   (resource-deleted? [this tenant-id resource-type id]
     ;; A resource is "deleted" if it has history (existed in the past) but no current row
@@ -3079,7 +3140,8 @@
     (ftrace/trace!
      {:id :store/transact-transaction
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
-    (let [{:keys [pool] :as entry} (get-or-create-entry this tenant-id)]
+    (let [stamp (txm/stamp-text opts)
+          {:keys [pool] :as entry} (get-or-create-entry this tenant-id)]
      (with-conn [conn pool]
       (let [node conn
           entry-metas
@@ -3185,7 +3247,11 @@
                              (update :entry-results conj (assoc em :resource final :vid vid))))
                        "DELETE"
                        (-> acc
-                           (update :tx-ops conj (emit-write-op em nil nil))
+                           (update :tx-ops into
+                                   (first (delete-tx-ops nil
+                                                         (txm/delete-op stamp (table-name resource-type)
+                                                                        resource-type id)
+                                                         (emit-write-op em nil nil))))
                            (update :entry-results conj em))
                        ;; GET / HEAD inside a transaction: we still have to
                        ;; read the resource to satisfy the response. Defer
@@ -3200,7 +3266,14 @@
                    entry-metas))
           own-op-count (count tx-ops)
           guarded? (some #(or (:if-match %) (:if-none-match %)) entry-metas)
-          tx-ops (into tx-ops (mapcat lifecycle-tx-ops) lifecycle-writes)]
+          tx-ops (into tx-ops (mapcat lifecycle-tx-ops) lifecycle-writes)
+          ;; One stamp for the whole Bundle, recorded against each resource
+          ;; it writes. DELETE entries carry theirs inline (delete-tx-ops);
+          ;; an all-GET/HEAD Bundle writes nothing and so stamps nothing.
+          stamp-op (txm/write-op stamp (for [{:keys [method resource-type id]} entry-metas
+                                             :when (#{"POST" "PUT"} method)]
+                                         [resource-type id]))
+          tx-ops (cond-> tx-ops stamp-op (conj stamp-op))]
       (let [tx-key (ftrace/trace!
                     {:id :store/transact-transaction.execute-tx
                      :data {:op-count (count tx-ops)}}
@@ -3288,7 +3361,7 @@
       :data {:tenant-id (str tenant-id) :entry-count (count entries)}}
      {:resourceType "Bundle"
       :type "batch-response"
-      :entry (batch-response-entries this tenant-id opts entries)}))
+      :entry (batch-response-entries this tenant-id opts (txm/stamp-text opts) entries)}))
 
   (create-tenant [this tenant-id]
     (fp/create-tenant this tenant-id nil))
@@ -3403,6 +3476,25 @@
                       :data {:resource-type (name resource-type)
                              :error (.getMessage e)}})
            0)))))
+
+  fp/ITxMetadataStore
+
+  ;; Unconditionally true: the stamp table needs no declaration (the INSERT
+  ;; that writes the first stamp creates it), so every tenant can keep one
+  ;; on every transport and in both query modes.
+  (tx-metadata-supported? [_this] true)
+
+  (tx-metadata-of [this tenant-id resource-type id vid]
+    (refuse-unencodable-input! {:resource-type resource-type :id id :vid vid})
+    (ftrace/trace!
+     {:id :store/tx-metadata-of
+      :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id :vid vid}}
+     (let [{:keys [node pool] :as entry} (assoc (get-or-create-entry this tenant-id)
+                                                :tenant-id (str tenant-id))]
+       (case query-mode
+         :xtql (tx-metadata-sql node entry resource-type id vid)
+         (with-conn [conn pool]
+           (tx-metadata-sql conn entry resource-type id vid))))))
 
   fp/ITemporalReadStore
 

@@ -12,7 +12,8 @@
             [clojure.string :as str]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]
-            [fhir-store-xtdb2.core :as core]))
+            [fhir-store-xtdb2.core :as core]
+            [fhir-store-xtdb2.tx-metadata :as txm]))
 
 ;; ---------------------------------------------------------------------------
 ;; Simple reads
@@ -256,7 +257,7 @@
 ;; transaction, and this avoids translating the ASSERT into an XTQL predicate.
 ;; ---------------------------------------------------------------------------
 
-(defn create-xtql [node resource-type id resource storage-encoders lc-ctx]
+(defn create-xtql [node resource-type id resource storage-encoders lc-ctx stamp]
   (ftrace/trace!
    {:id :xtql/create
     :data {:resource-type (name resource-type) :id id}}
@@ -270,7 +271,8 @@
                     [id]]
          put-op [:put-docs (rt-kw resource-type) put-doc]
          own-ops [assert-op put-op]
-         tx-ops (into own-ops (core/lifecycle-tx-ops write))
+         tx-ops (cond-> (into own-ops (core/lifecycle-tx-ops write))
+                  stamp (conj (txm/write-op stamp [[resource-type id]])))
          tx-key (try
                   (xt/execute-tx node tx-ops)
                   (catch Exception e
@@ -283,7 +285,7 @@
      (core/fire-after-commit! lc-ctx [write] tx-key)
      (core/committed resource id (core/version-of-system-time (:system-time tx-key)) tx-key))))
 
-(defn update-xtql [node resource-type id resource opts storage-encoders lc-ctx]
+(defn update-xtql [node resource-type id resource opts storage-encoders lc-ctx stamp]
   (ftrace/trace!
    {:id :xtql/update
     :data {:resource-type (name resource-type) :id id}}
@@ -306,7 +308,8 @@
          own-ops (cond-> []
                    if-match (conj (core/version-assert-op resource-type id if-match))
                    true (conj put-op))
-         tx-ops (into own-ops (core/lifecycle-tx-ops write))
+         tx-ops (cond-> (into own-ops (core/lifecycle-tx-ops write))
+                  stamp (conj (txm/write-op stamp [[resource-type id]])))
          tx-key (try
                   (xt/execute-tx node tx-ops)
                   (catch Exception e
@@ -321,7 +324,7 @@
      (core/fire-after-commit! lc-ctx [write] tx-key)
      (core/committed resource id (core/version-of-system-time (:system-time tx-key)) tx-key))))
 
-(defn delete-xtql [node resource-type id opts]
+(defn delete-xtql [node resource-type id opts stamp]
   (ftrace/trace!
    {:id :xtql/delete
     :data {:resource-type (name resource-type) :id id}}
@@ -338,10 +341,15 @@
          assert-op (when if-match
                      (core/version-assert-op resource-type id if-match))
          delete-op [:delete-docs (rt-kw resource-type) id]
-         tx-ops (if assert-op [assert-op delete-op] [delete-op])
+         [tx-ops stamp-idx] (core/delete-tx-ops
+                             assert-op
+                             (txm/delete-op stamp (core/table-name resource-type) resource-type id)
+                             delete-op)
          tx-key (try
                   (xt/execute-tx node tx-ops)
                   (catch Exception e
+                    (when (core/stamp-op-failure? e stamp-idx)
+                      (throw e))
                     (if if-match
                       (throw (ex-info (str "Version conflict: " (ex-message e))
                                       {:fhir/status 412 :fhir/code "conflict"
