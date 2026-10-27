@@ -973,6 +973,45 @@
   (testing "min 0 leaves it optional"
     (is (not (tree-contains? (nested-min-scenario 0) {:optional false})))))
 
+(defn- max-on-sequence-scenario
+  "`field-sch`, the schema of an existing repeating `:f`, patched by a profile
+  element `TP.f` of maximum `max`, with `*max-on-sequence*` bound to `on?`."
+  [on? max field-sch]
+  (let [base (m/schema [:map {:closed true} [:f {:optional true} field-sch]] fp/fhir-registry-options)
+        form (binding [fdm/*schema-atom* (atom {})
+                       fdm/*referencing-definition* {:version "1.0"}
+                       fdm/*references-atom* (atom #{})
+                       fdm/*recursive-references* #{}
+                       fdm/*base-refs* (atom {})
+                       fdm/*max-on-sequence* on?]
+               (:form (fdm/element-definition->attribute
+                       {:sch base :shape {} :form []}
+                       ["TP"]
+                       [{:path ["TP" "f"] :max max :id "TP.f"}])))
+        patch (binding [*ns* (the-ns 'com.breezeehr.fhir-defintions-to-malli)]
+                (eval (list 'fn '[sch] (list* '-> 'sch form))))]
+    (patch base)))
+
+(deftest max-on-sequence-test
+  (testing "max 1 on a field that repeats bounds the :sequential"
+    (let [sch (max-on-sequence-scenario true "1" [:sequential :string])]
+      (is (m/validate sch {:f ["a"]}))
+      (is (not (m/validate sch {:f ["a" "b"]})) "a second occurrence fails")))
+  (testing "a numeric max above 1 bounds it too"
+    (let [sch (max-on-sequence-scenario true "2" [:sequential :string])]
+      (is (m/validate sch {:f ["a" "b"]}))
+      (is (not (m/validate sch {:f ["a" "b" "c"]})))))
+  (testing "a counted field is bounded on its :sequential, child 0 of the :and"
+    (let [sch (max-on-sequence-scenario true "1" [:and {:fhir/slice-counts {}} [:sequential :string] [:fn (constantly true)]])]
+      (is (m/validate sch {:f ["a"]}))
+      (is (not (m/validate sch {:f ["a" "b"]})))
+      (is (= {:max 1} (m/properties (mu/get (mu/get-in sch [:f]) 0))))))
+  (testing "max * adds no bound"
+    (is (m/validate (max-on-sequence-scenario true "*" [:sequential :string]) {:f ["a" "b"]})))
+  (testing "off by default, the bound is not on the :sequential and a second occurrence passes"
+    (is (false? fdm/*max-on-sequence*))
+    (is (m/validate (max-on-sequence-scenario false "1" [:sequential :string]) {:f ["a" "b"]}))))
+
 ;; ---------------------------------------------------------------------------
 ;; Inherited slicings (doc/inherited-slices-and-slice-counts.md section 3)
 ;;
@@ -1792,6 +1831,7 @@
     (testing "every new switch defaults off"
       (is (false? fdm/*rebuild-inherited-slicings*))
       (is (false? fdm/*compile-slice-counts*))
+      (is (false? fdm/*max-on-sequence*))
       (is (nil? fdm/*discriminator-claims-fn*))
       (is (nil? fdm/*count-soft-discriminator-fn*))
       (is (nil? fdm/*uncompiled-slices*))

@@ -413,6 +413,18 @@
    output. See doc/inherited-slices-and-slice-counts.md section 5."
   false)
 
+(def ^:dynamic *max-on-sequence*
+  "When true, a profile that narrows the numeric `max` of a field that already
+   repeats puts `{:max n}` on the field's :sequential, so an instance with more
+   occurrences is rejected. Without it the max lands on the item schema, where
+   it constrains nothing (a `max` on a map) or the item's length (a `max` on a
+   string), and a second occurrence passes.
+
+   Off by default, so a package generated without a driver that opts in keeps
+   byte-identical output. See doc/inherited-slices-and-slice-counts.md
+   section 12."
+  false)
+
 (def ^:dynamic *slicings*
   "While `*rebuild-inherited-slicings*` is on: an atom of {sliced-element-id
    record} for the definition being generated, seeded from its base's
@@ -2486,9 +2498,13 @@
         (-> old-acc
             (update :form conj `(~'mu/update-entry-properties ~k merge ~props)))
         old-acc)
-      (let [{_new-sub-sch :sch new-sub-form :form :as sub-acc}
+      (let [seq-max (when (and *max-on-sequence* is-seq?
+                               (not (contains? #{nil "*" "0"} (some-> (:max main-attr) str))))
+                      (parse-long (str (:max main-attr))))
+            {_new-sub-sch :sch new-sub-form :form :as sub-acc}
             (attr->value-schema-patch {:sch inner-sch, :form [], :field-info field-info, :new-field? false}
-                                      (:id main-attr) attr-type main-attr sub-elements main-path)
+                                      (:id main-attr) attr-type (cond-> main-attr seq-max (dissoc :max))
+                                      sub-elements main-path)
             ;; ref-kw: prefer shape, fall back to malli introspection
             ref-kw (or (:ref-kw field-info)
                        (when inner-sch
@@ -2552,7 +2568,11 @@
             acc2 (if-some [entry-props (entry-props-to-merge props (:fixed-enum? sub-acc))]
                    (update acc1 :form conj `(~'mu/update-entry-properties ~k merge ~entry-props))
                    acc1)]
-        acc2)
+        (cond-> acc2
+          seq-max (update :form conj
+                          (if (counted-sequential sub-sch)
+                            `(~'mu/update ~k (~'fn [~'sch] (~'mu/update ~'sch 0 (~'fn [~'seq-sch] (~'mu/update-properties ~'seq-sch ~'merge {:max ~seq-max})))))
+                            `(~'mu/update ~k (~'fn [~'sch] (~'mu/update-properties ~'sch ~'merge {:max ~seq-max})))))))
       (-> old-acc
           (update :form conj `(~'mu/dissoc ~k))
           (update :shape shape/dissoc-field k)))))))
