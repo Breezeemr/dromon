@@ -2617,6 +2617,26 @@
         tx-key (xt/execute-tx node [[:sql sql [valid-from valid-to id]]])]
     (with-basis {} tx-key)))
 
+(defn- valid-time-statement
+  "The SQL statement of one `transact-valid-time` op."
+  [{:keys [op resource-type id resource vt valid-from valid-to]} storage-encoders]
+  (case op
+    :put   (let [[sql args] (extract-and-build-sql resource-type id resource storage-encoders
+                                                   :valid-time vt)]
+             [:sql sql args])
+    :close (do (refuse-empty-portion! resource-type id valid-from valid-to)
+               [:sql (format "DELETE FROM %s FOR PORTION OF VALID_TIME FROM ? TO ? WHERE _id = ?"
+                             (table-name resource-type))
+                [valid-from valid-to id]])
+    (throw (ex-info (str "Unknown valid-time op " (pr-str op) "; expected :put or :close")
+                    {:fhir/status 400 :fhir/code "invalid" :op op}))))
+
+(defn- transact-valid-time-sql
+  [node ops storage-encoders]
+  (let [statements (mapv #(valid-time-statement % storage-encoders) ops)
+        tx-key (xt/execute-tx node statements)]
+    (with-basis {:count (count statements)} tx-key)))
+
 (defn- reject-xtql-temporal!
   "The XTQL pathway has no temporal clause construction. Fail loudly instead of
    silently answering the current-state question."
@@ -3581,7 +3601,22 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (with-conn [conn pool]
-         (close-valid-time-sql conn resource-type id valid-from valid-to))))))
+         (close-valid-time-sql conn resource-type id valid-from valid-to)))))
+
+  (transact-valid-time [this tenant-id ops]
+    (reject-xtql-temporal! query-mode)
+    (when (empty? ops)
+      (throw (ex-info "transact-valid-time needs at least one op"
+                      {:fhir/status 400 :fhir/code "invalid"})))
+    (doseq [{:keys [resource-type id]} ops]
+      (refuse-unencodable-input! {:resource-type resource-type :id id}))
+    (ftrace/trace!
+     {:id :store/transact-valid-time
+      :data {:tenant-id (str tenant-id) :ops (count ops)}}
+     (let [{:keys [pool]} (reduce (fn [_ rt] (entry-for this tenant-id rt))
+                                  nil (distinct (map :resource-type ops)))]
+       (with-conn [conn pool]
+         (transact-valid-time-sql conn ops storage-encoders))))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
   ;; In a real XTDB implementation, we'd query for codes using XTDB
