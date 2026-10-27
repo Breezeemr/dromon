@@ -615,6 +615,40 @@
         (finally
           (close-store-nodes! store))))))
 
+(deftest test-search-string-escaped-comma
+  (testing "A comma escaped as `\\,` is part of one string value (FHIR R4B
+            3.1.1.5.10); an unescaped comma still separates alternatives.
+            X12 CLP02 words carry a comma, as ClaimResponse.disposition does."
+    (let [cr-schema (m/schema [:map {:resourceType "ClaimResponse"}
+                               [:resourceType :string]
+                               [:disposition {:optional true} :string]])
+          store (core-db/create-xtdb-store {:resource/schemas [cr-schema]})
+          tenant "probe-str-comma"
+          reg {"disposition" {:type "string" :target nil
+                              :columns [{:col "disposition" :fhir-type "string" :array? false}]}}
+          mk (fn [id disposition]
+               (db/create-resource store tenant :ClaimResponse id
+                                   {:resourceType "ClaimResponse" :disposition disposition}))
+          ids (fn [params] (set (map :id (db/search store tenant :ClaimResponse params reg))))]
+      (try
+        (mk "primary" "Processed as Primary")
+        (mk "crossover" "Processed as Primary, Forwarded to Additional Payer(s)")
+        (mk "secondary" "Processed as Secondary")
+        (mk "secondary-crossover" "Processed as Secondary, Forwarded to Additional Payer(s)")
+        (mk "denied" "Denied")
+        (testing "an unescaped prefix matches both the plain and the forwarded words"
+          (is (= #{"primary" "crossover"} (ids {"disposition" "Processed as Primary"}))))
+        (testing "an escaped comma selects the forwarded words alone"
+          (is (= #{"crossover"} (ids {"disposition" "Processed as Primary\\, Forwarded"}))))
+        (testing "escaped alternatives OR together across an unescaped comma"
+          (is (= #{"crossover" "secondary-crossover"}
+                 (ids {"disposition" "Processed as Primary\\, Forwarded,Processed as Secondary\\, Forwarded"}))))
+        (testing "plain alternatives still OR"
+          (is (= #{"secondary" "secondary-crossover" "denied"}
+                 (ids {"disposition" "Processed as Secondary,Denied"}))))
+        (finally
+          (close-store-nodes! store))))))
+
 (deftest test-search-string-simple-and-struct
   (testing "Simple string columns, repeating string columns, and
             single-cardinality Address structs take the same case-insensitive

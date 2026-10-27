@@ -1388,64 +1388,80 @@
                (split-unescaped value-str \,)))
         ["FALSE" []])))
 
+(defn- split-or-values
+  "Splits a search value on each comma not escaped by a backslash and
+   unescapes `\\,` in the parts (FHIR R4B 3.1.1.5.10), so a value such as
+   `Processed as Primary\\, Forwarded` is one alternative. Trailing empty
+   parts are dropped, as `str/split` drops them."
+  [s]
+  (mapv #(str/replace % "\\," ",") (str/split s #"(?<!\\),")))
+
+(declare build-value-condition)
+
 (defn- build-condition-struct
   "Builds a parameterized SQL WHERE condition for a given FHIR search parameter.
    Returns [sql-fragment params-vector].
-   Handles comma-separated values as OR (per FHIR spec), and pipe-delimited
-   system|code token notation. When system|code format is used, both system
-   and code are matched in the SQL condition.
+   Handles comma-separated values as OR (per FHIR spec; `\\,` is a literal
+   comma inside one value), and pipe-delimited system|code token notation.
+   When system|code format is used, both system and code are matched in the
+   SQL condition.
    search-param is the enriched descriptor from the search registry (or nil)."
   [param-name param-value search-param]
-  (let [param-str (if (keyword? param-value) (name param-value) (str param-value))
-        comma-values (str/split param-str #",")]
-    (cond
+  (let [param-str (if (keyword? param-value) (name param-value) (str param-value))]
+    (if (:composite search-param)
       ;; A composite splits its own value: `,` and `$` may be escaped inside
-      ;; a part, which the plain split below does not honour.
-      (:composite search-param)
+      ;; a part.
       (build-composite-condition search-param param-str)
+      ;; Split once: an alternative is never split again, so an escaped comma
+      ;; stays inside its value.
+      (let [comma-values (split-or-values param-str)]
+        (if (> (count comma-values) 1)
+          (let [conditions (map #(build-value-condition param-name % % search-param) comma-values)
+                sqls (mapv first conditions)
+                params (into [] (mapcat second) conditions)]
+            [(str "(" (str/join " OR " sqls) ")") params])
+          (build-value-condition param-name param-value
+                                 (or (first comma-values) param-str) search-param))))))
 
-      (> (count comma-values) 1)
-      ;; Multiple comma-separated values: OR them together
-      (let [conditions (map #(build-condition-struct param-name % search-param) comma-values)
-            sqls (mapv first conditions)
-            params (into [] (mapcat second) conditions)]
-        [(str "(" (str/join " OR " sqls) ")") params])
+(defn- build-value-condition
+  "The condition for one alternative of a search value, already split from
+   its siblings and unescaped. `param-value` is the caller's value (a boolean
+   stays a boolean); `param-str` is the alternative as a string."
+  [param-name param-value param-str search-param]
+  (let [val-parts (str/split param-str #"\|")
+        v-str (last val-parts)
+        system-str (when (= 2 (count val-parts)) (first val-parts))
+        pname (name param-name)]
+    (cond
+      ;; Ahead of the boolean branch: a direct caller may pass true/false
+      ;; itself, and the parameter name is not a column here.
+      (:exists-not-false search-param)
+      (build-exists-not-false-condition (:exists-not-false search-param) param-str)
 
+      ;; Boolean values are not parameterized (SQL TRUE/FALSE literals)
+      (boolean? param-value)
+      [(format "\"%s\" = %s" pname (if param-value "TRUE" "FALSE")) []]
+
+      ;; Special case: _id is always direct equality
+      (= pname "_id")
+      ["_id = ?" [v-str]]
+
+      ;; Quantity: the number is the first pipe-segment (number|system|code),
+      ;; so parse from the raw single value rather than the token-style
+      ;; system|code split above.
+      (and search-param (= "quantity" (:type search-param)))
+      (or (build-quantity-condition search-param param-str)
+          [(format "\"%s\" = ?" pname) [v-str]])
+
+      ;; Use registry metadata when available
+      search-param
+      (or (build-typed-condition search-param v-str system-str)
+          ;; Fallback if typed condition returns nil
+          [(format "\"%s\" = ?" pname) [v-str]])
+
+      ;; No registry entry: fallback to direct column match
       :else
-      (let [val-parts (str/split param-str #"\|")
-            v-str (last val-parts)
-            system-str (when (= 2 (count val-parts)) (first val-parts))
-            pname (name param-name)]
-        (cond
-          ;; Ahead of the boolean branch: a direct caller may pass true/false
-          ;; itself, and the parameter name is not a column here.
-          (:exists-not-false search-param)
-          (build-exists-not-false-condition (:exists-not-false search-param) param-str)
-
-          ;; Boolean values are not parameterized (SQL TRUE/FALSE literals)
-          (boolean? param-value)
-          [(format "\"%s\" = %s" pname (if param-value "TRUE" "FALSE")) []]
-
-          ;; Special case: _id is always direct equality
-          (= pname "_id")
-          ["_id = ?" [v-str]]
-
-          ;; Quantity: the number is the first pipe-segment (number|system|code),
-          ;; so parse from the raw single value rather than the token-style
-          ;; system|code split above.
-          (and search-param (= "quantity" (:type search-param)))
-          (or (build-quantity-condition search-param param-str)
-              [(format "\"%s\" = ?" pname) [v-str]])
-
-          ;; Use registry metadata when available
-          search-param
-          (or (build-typed-condition search-param v-str system-str)
-              ;; Fallback if typed condition returns nil
-              [(format "\"%s\" = ?" pname) [v-str]])
-
-          ;; No registry entry: fallback to direct column match
-          :else
-          [(format "\"%s\" = ?" pname) [v-str]])))))
+      [(format "\"%s\" = ?" pname) [v-str]])))
 
 (defn- build-condition
   "Builds a parameterized SQL WHERE condition for a search parameter.
