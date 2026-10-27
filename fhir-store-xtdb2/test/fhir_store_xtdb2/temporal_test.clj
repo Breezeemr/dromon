@@ -408,3 +408,81 @@
               "and the retracted portion is still in the timeline, closed on the
                system axis rather than deleted"))
         (finally (close-store-nodes! store))))))
+
+;; ---------------------------------------------------------------------------
+;; Many valid-time writes in one transaction.
+;; ---------------------------------------------------------------------------
+
+(deftest transact-valid-time-commits-every-op-at-one-system-time
+  (testing "puts and closes in one call land together, each as its single-row verb would"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-batch"]
+      (try
+        (db/put-valid-time store tid :Coverage "cov-old" (coverage "aetna") {:valid-from year-start})
+        (let [ret (db/transact-valid-time
+                   store tid
+                   [{:op :put :resource-type :Coverage :id "cov-a" :resource (coverage "aetna")
+                     :vt {:valid-from year-start}}
+                    {:op :put :resource-type :Coverage :id "cov-b" :resource (coverage "cigna")
+                     :vt {:valid-from mar :valid-to jun}}
+                    {:op :close :resource-type :Coverage :id "cov-old" :valid-from apr :valid-to nil}])
+              basis (:fhir-store/basis (meta ret))]
+          (is (= {:count 3} ret))
+          (is (some? (:system-time basis)) "the one transaction's basis rides on the answer")
+          (is (= ["aetna"] (payors (db/read-as-of store tid :Coverage "cov-a" {:valid-time feb}))))
+          (is (= ["cigna"] (payors (db/read-as-of store tid :Coverage "cov-b" {:valid-time apr}))))
+          (is (nil? (db/read-as-of store tid :Coverage "cov-b" {:valid-time jul}))
+              "a bounded put is bounded")
+          (is (= ["aetna"] (payors (db/read-as-of store tid :Coverage "cov-old" {:valid-time feb}))))
+          (is (nil? (db/read-as-of store tid :Coverage "cov-old" {:valid-time jul}))
+              "the close in the same call took effect")
+          (testing "every op shares the transaction's system time"
+            (let [froms (for [id ["cov-a" "cov-b"]]
+                          (:system-from (last (db/resource-timeline store tid :Coverage id nil))))]
+              (is (apply = froms)))))
+        (finally (close-store-nodes! store))))))
+
+(deftest transact-valid-time-is-all-or-nothing
+  (testing "one refused op refuses the call, with nothing written"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-batch-refused"]
+      (try
+        (db/put-valid-time store tid :Coverage "cov" (coverage "aetna") {:valid-from year-start})
+        (let [failure (close-failure
+                       #(db/transact-valid-time
+                         store tid
+                         [{:op :put :resource-type :Coverage :id "cov-new" :resource (coverage "cigna")
+                           :vt {:valid-from year-start}}
+                          {:op :close :resource-type :Coverage :id "cov" :valid-from jun :valid-to mar}]))]
+          (is (some? failure))
+          (is (= :xtdb.indexer/invalid-valid-times (refusal-code failure)))
+          (is (nil? (db/read-as-of store tid :Coverage "cov-new" {:valid-time feb}))
+              "the put before the refused close was not written"))
+        (is (thrown? clojure.lang.ExceptionInfo (db/transact-valid-time store tid []))
+            "an empty call is refused")
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (db/transact-valid-time store tid [{:op :upsert :resource-type :Coverage :id "x"}]))
+            "an unknown op is refused")
+        (finally (close-store-nodes! store))))))
+
+(deftest scan-type-as-of-reads-the-valid-time-the-basis-names
+  (testing "a basis with :valid-time streams the rows true then; without it, the rows true now"
+    (let [store (core-db/create-xtdb-store {})
+          tid "t-scan-valid"
+          ids-at (fn [basis] (into #{} (map :id) (db/scan-type-as-of store tid :Coverage basis)))]
+      (try
+        (db/transact-valid-time
+         store tid
+         [{:op :put :resource-type :Coverage :id "past" :resource (coverage "aetna")
+           :vt {:valid-from prior-start :valid-to year-start}}
+          {:op :put :resource-type :Coverage :id "always" :resource (coverage "cigna")
+           :vt {:valid-from prior-start}}
+          {:op :put :resource-type :Coverage :id "future" :resource (coverage "humana")
+           :vt {:valid-from long-after}}])
+        (let [now (db/current-basis store tid)]
+          (is (= #{"always"} (ids-at now)))
+          (is (= #{"past" "always"} (ids-at (assoc now :valid-time prior-mid))))
+          (is (= #{"always" "future"} (ids-at (assoc now :valid-time (inst "2031-01-01T00:00:00Z")))))
+          (is (= #{"past" "always"} (ids-at (assoc now :valid-time (java.time.LocalDate/parse "2025-06-01"))))
+              "a LocalDate is its start in UTC"))
+        (finally (close-store-nodes! store))))))

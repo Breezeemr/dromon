@@ -418,7 +418,10 @@
      No filtering is applied here beyond the snapshot: _type / _since /
      _typeFilter / compartment confinement and id-dedup are the export layer's
      responsibility, applied while consuming the stream. Deleted resources are
-     excluded (only live rows as of the basis are streamed).")
+     excluded (only live rows as of the basis are streamed).
+
+     A basis carrying :valid-time streams the rows true at that instant, on a
+     store with that axis; without it, the rows true now.")
   (count-as-of [this tenant-id resource-type basis]
     "Total number of live resources of `resource-type` as of `basis` (a token
      from `current-basis`). Unfiltered snapshot count, intended for manifest
@@ -548,7 +551,23 @@
 
      History is preserved: reads at an earlier system time still see the
      retracted portion live, and reads valid-outside the portion still find
-     it."))
+     it.")
+  (transact-valid-time [this tenant-id ops]
+    "Apply `ops`, a non-empty sequence of valid-time writes, in ONE
+     transaction, in order: all of them commit, or none.
+
+       {:op :put   :resource-type <kw> :id <s> :resource <m> :vt <vt>}
+       {:op :close :resource-type <kw> :id <s> :valid-from <t> :valid-to <t-or-nil>}
+
+     Each op means exactly what `put-valid-time` or `close-valid-time` means
+     for it, refusals included: an empty or inverted close portion refuses
+     the whole call with nothing written. One system time covers every op, so
+     a reader sees all of them or none. This is the call for a write of many
+     rows that belong together, such as a fee schedule loaded at once, where
+     one transaction per row would cost a commit per row.
+
+     Returns `{:count <n>}` carrying the transaction's basis as
+     :fhir-store/basis metadata."))
 
 ;; ---------------------------------------------------------------------------
 ;; Full-text search extension protocol.

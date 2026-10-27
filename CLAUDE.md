@@ -182,7 +182,7 @@ write, so `satisfies?` is a real capability check:
 | protocol | verbs | implemented by |
 |---|---|---|
 | `ITemporalReadStore` | `temporal-axes`, `read-as-of`, `search-as-of`, `count-as-of-basis`, `resource-timeline` | fhir-store-xtdb2, fhir-store-datomic |
-| `IValidTimeStore` | `put-valid-time`, `close-valid-time` | fhir-store-xtdb2 |
+| `IValidTimeStore` | `put-valid-time`, `close-valid-time`, `transact-valid-time` (many puts and closes, one transaction) | fhir-store-xtdb2 |
 
 A *basis* is `{:system-time <Instant> :valid-time <Instant>}`; nil on an axis
 means that axis's default. On the wire the selectors are `_asOf` (system time,

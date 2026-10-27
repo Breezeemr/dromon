@@ -2424,6 +2424,18 @@
       (some? st)                   (Instant/parse (str st))
       :else                        (Instant/now))))
 
+(defn ^:no-doc basis->valid-time
+  "A basis map's :valid-time as a java.time.Instant, or nil for valid now. A
+   LocalDate is its start in UTC."
+  [basis]
+  (let [vt (:valid-time basis)]
+    (cond
+      (nil? vt)                       nil
+      (instance? Instant vt)          vt
+      (instance? ZonedDateTime vt)    (.toInstant ^ZonedDateTime vt)
+      (instance? java.time.LocalDate vt) (.toInstant (.atStartOfDay ^java.time.LocalDate vt java.time.ZoneOffset/UTC))
+      :else                           (Instant/parse (str vt)))))
+
 (def ^:private ^:no-doc scan-page-size 1000)
 
 (defn ^:no-doc scan-type-as-of-reducible
@@ -2433,15 +2445,20 @@
    the next page only after the reducing fn returns for the current page, so a
    fn that blocks on a slow OutputStream bounds peak memory to one page. A
    `reduced` accumulator halts the scan without fetching further pages. The
-   pinned system-time makes keyset paging stable (no rows shift between pages)."
-  [pool resource-type ^java.time.Instant as-of read-decoders page-size]
+   pinned system-time makes keyset paging stable (no rows shift between pages).
+
+   With `valid-time`, rows true at that instant rather than now."
+  ([pool resource-type as-of read-decoders page-size]
+   (scan-type-as-of-reducible pool resource-type as-of nil read-decoders page-size))
+  ([pool resource-type ^java.time.Instant as-of valid-time read-decoders page-size]
   (reify clojure.lang.IReduceInit
     (reduce [_ f init]
       (with-conn [conn pool]
-        (let [q (format "SELECT *, _system_from FROM %s FOR SYSTEM_TIME AS OF ? WHERE _id > ? ORDER BY _id LIMIT ?"
-                        (table-name resource-type))]
+        (let [[clause clause-params] (basis->for-clause {:system-time as-of :valid-time valid-time})
+              q (format "SELECT *, _system_from FROM %s%s WHERE _id > ? ORDER BY _id LIMIT ?"
+                        (table-name resource-type) clause)]
           (loop [after "" acc init]
-            (let [rows (run-query conn [q as-of after page-size])
+            (let [rows (run-query conn (into (into [q] clause-params) [after page-size]))
                   n    (count rows)]
               (if (zero? n)
                 acc
@@ -2453,7 +2470,7 @@
                     @result
                     (if (< n page-size)
                       result
-                      (recur (str (row-id (nth rows (dec n)))) result))))))))))))
+                      (recur (str (row-id (nth rows (dec n)))) result)))))))))))))
 
 (defn ^:no-doc count-as-of-sql
   "COUNT(*) of `resource-type` as of `as-of` (an Instant)."
@@ -2634,6 +2651,26 @@
                     (table-name resource-type))
         tx-key (xt/execute-tx node [[:sql sql [valid-from valid-to id]]])]
     (with-basis {} tx-key)))
+
+(defn- valid-time-statement
+  "The SQL statement of one `transact-valid-time` op."
+  [{:keys [op resource-type id resource vt valid-from valid-to]} storage-encoders]
+  (case op
+    :put   (let [[sql args] (extract-and-build-sql resource-type id resource storage-encoders
+                                                   :valid-time vt)]
+             [:sql sql args])
+    :close (do (refuse-empty-portion! resource-type id valid-from valid-to)
+               [:sql (format "DELETE FROM %s FOR PORTION OF VALID_TIME FROM ? TO ? WHERE _id = ?"
+                             (table-name resource-type))
+                [valid-from valid-to id]])
+    (throw (ex-info (str "Unknown valid-time op " (pr-str op) "; expected :put or :close")
+                    {:fhir/status 400 :fhir/code "invalid" :op op}))))
+
+(defn- transact-valid-time-sql
+  [node ops storage-encoders]
+  (let [statements (mapv #(valid-time-statement % storage-encoders) ops)
+        tx-key (xt/execute-tx node statements)]
+    (with-basis {:count (count statements)} tx-key)))
 
 (defn- reject-xtql-temporal!
   "The XTQL pathway has no temporal clause construction. Fail loudly instead of
@@ -3495,7 +3532,7 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (scan-type-as-of-reducible pool resource-type (basis->system-time basis)
-                                  read-decoders scan-page-size))))
+                                  (basis->valid-time basis) read-decoders scan-page-size))))
 
   (count-as-of [this tenant-id resource-type basis]
     (refuse-unencodable-input! {:resource-type resource-type})
@@ -3601,7 +3638,22 @@
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type) :id id}}
      (let [{:keys [pool]} (entry-for this tenant-id resource-type)]
        (with-conn [conn pool]
-         (close-valid-time-sql conn resource-type id valid-from valid-to))))))
+         (close-valid-time-sql conn resource-type id valid-from valid-to)))))
+
+  (transact-valid-time [this tenant-id ops]
+    (reject-xtql-temporal! query-mode)
+    (when (empty? ops)
+      (throw (ex-info "transact-valid-time needs at least one op"
+                      {:fhir/status 400 :fhir/code "invalid"})))
+    (doseq [{:keys [resource-type id]} ops]
+      (refuse-unencodable-input! {:resource-type resource-type :id id}))
+    (ftrace/trace!
+     {:id :store/transact-valid-time
+      :data {:tenant-id (str tenant-id) :ops (count ops)}}
+     (let [{:keys [pool]} (reduce (fn [_ rt] (entry-for this tenant-id rt))
+                                  nil (distinct (map :resource-type ops)))]
+       (with-conn [conn pool]
+         (transact-valid-time-sql conn ops storage-encoders))))))
 
 (defn- xtdb-valueset-expand [store tenant-id _params id]
   ;; In a real XTDB implementation, we'd query for codes using XTDB
