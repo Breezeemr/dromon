@@ -461,8 +461,8 @@ every existing test stays green (gates off where a test pins today's forms).
 - A schema walker outside 5.3 (FHIR serde, fhir-store code) breaks on `:and`; hence the
   gates default to off.
 - Not in scope: element `min > 1`, a `max` on a repeating element (`wrap-sequential-form`
-  puts `{:max n}` on the item; QRDA I F max-on-repeating 37) and a `max` on a string. If
-  done later, the `{:max n}` must target child 0 of a counted `:and`.
+  puts `{:max n}` on the item; QRDA I F max-on-repeating 37; done later behind its own
+  switch, section 12) and a `max` on a string.
 
 ## Critique (adversarial review, 2026-10-25)
 
@@ -756,3 +756,39 @@ last edit: the same method in a fresh scratch tree (`target/ccda-proof-final/`, 
 set. All six runs exit 0; process 354 / 341 / 299 ok, 0 fail, unresolved 0; `diff -r -q`
 of the whole ccda tree, minus the gitignored `sds`, `staging`, `sources` and `.cpcache`,
 reports no difference.
+
+## 12. A narrowed max on a repeating field (2026-10-27)
+
+**Mechanism.** A profile that narrows the `max` of a field the base already repeats (CDA
+`Observation.value` is 0..*, nearly every QRDA observation states 1..1) goes through
+`update-existing-child-schema`, which threads the element's patch onto the item:
+`(mu/update sch 0 (fn [inner-sch] ...))`. `attr->value-schema-patch` adds the max to that
+thread through `wrap-sequential-form`, so `(mu/update-properties merge {:max n})` lands on
+the item: a map ignores it and a string reads it as a length. When the field info is absent
+(below the root) it adds nothing at all. Either way a second occurrence passes.
+
+**Fix, `*max-on-sequence*` (default false).** When true and the existing field repeats,
+`update-existing-child-schema` takes a numeric `max` (not `*`, not `0`) off the element
+before it builds the item patch, and appends
+`(mu/update k (fn [sch] (mu/update-properties sch merge {:max n})))` after it, on the
+`:sequential` itself, or on child 0 of a counted `:and` (`counted-sequential`). A sliced
+field is not touched (its slices are counted by `*compile-slice-counts*`), nor is a new
+field, which `wrap-sequential-form` already wraps as `[:sequential {:max n} ...]`.
+
+**Tests.** `max-on-sequence-test`: a max of 1 and of 2 bound the sequence, a counted field is
+bounded on child 0, `*` adds nothing, and with the switch off a second occurrence still
+passes. `unbound-switches-reproduce-origin-main-test` checks the default. 58 tests, 362
+assertions, 0 failures.
+
+**ccda unaffected.** The method of section 11 with this commit: `git archive 8612660924 ccda`
+twice (`run/`, `ref/`) in a scratch directory, `run/dromon/` symlinked to this worktree (the
+cached classpath names it), the pinned ART-DECOR file copied in, then `clojure -M:generate` and
+`clojure -M:dispatch-index` for `default`, `r21` and `r11`, one JVM at a time. All six exit 0;
+process 354 / 341 / 299 ok, 0 fail. `diff -r -q` of the whole tree minus `sds`, `staging`,
+`sources`, `.cpcache` and `target` is empty; the digest of `src src-r21 src-r11 resources`
+(768 files) is the same for both copies.
+
+**Effect on qrda-definitions** (which binds the switch): QRDA I / QRDA III / CMS 2027 QRDA III
+mutants that agree 1,562 / 411 / 462 to 1,599 / 421 / 478. 63 of the 67 duplicates that only
+the Schematron rejected are rejected by malli now, at the target CONF; the seeds are unchanged.
+The 4 left duplicate a templateId slice the template's own schema rejects.
