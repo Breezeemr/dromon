@@ -1,0 +1,545 @@
+{"counted/C"
+ (->
+  (base-CRoot)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "C"})
+  (mu/update
+   :ident
+   (fn
+    [sch]
+    [:sequential
+     [:multi
+      {:dispatch (fn [m] (get-in m [:code]))}
+      ["A"
+       (->
+        (mu/get sch 0)
+        (m/schema options)
+        m/deref
+        (mu/assoc :code [:enum {} "A"]))]
+      ["B"
+       (->
+        (mu/get sch 0)
+        (m/schema options)
+        m/deref
+        (mu/assoc :code [:enum {} "B"]))]
+      ["C"
+       (->
+        (mu/get sch 0)
+        (m/schema options)
+        m/deref
+        (mu/assoc :code [:enum {} "C"]))]
+      ["Z"
+       (->
+        (mu/get sch 0)
+        (m/schema options)
+        m/deref
+        (mu/assoc :code [:enum {} "Z"]))]
+      [:malli.core/default
+       (-> (mu/get sch 0) (m/schema options) m/deref)]]]))),
+ "counted/CRoot"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "CRoot"})
+  (mu/assoc
+   :ident
+   [:sequential [:ref :example.t.StructureDefinition.Ident/v1-0]])
+  (mu/update-entry-properties :ident merge {:optional true})),
+ "counted/Ident"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "Ident"})
+  (mu/assoc :code [:string {:fhir/primitive "string"}])
+  (mu/update-entry-properties :code merge {:optional true})
+  (mu/assoc
+   :_code
+   [:ref :org.hl7.fhir.StructureDefinition.Element/v1-0])
+  (mu/optional-keys [:_code])
+  (mu/assoc :note [:string {:fhir/primitive "string"}])
+  (mu/update-entry-properties :note merge {:optional true})
+  (mu/assoc
+   :_note
+   [:ref :org.hl7.fhir.StructureDefinition.Element/v1-0])
+  (mu/optional-keys [:_note])),
+ "nested/Body"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "Body"})
+  (mu/assoc
+   :component
+   [:sequential [:ref :example.t.StructureDefinition.Component/v1-0]])
+  (mu/update-entry-properties :component merge {:optional true})),
+ "nested/Component"
+ (->
+  (m/schema :map options)
+  (mu/update-properties
+   merge
+   {:closed true, :resourceType "Component"})
+  (mu/assoc
+   :section
+   [:ref :example.t.StructureDefinition.Section/v1-0])
+  (mu/update-entry-properties :section merge {:optional true})),
+ "nested/DocBase"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "DocBase"})
+  (mu/assoc
+   :body
+   (->
+    (base-Body)
+    (m/schema options)
+    (mu/update-properties
+     (fn
+      [props]
+      (->
+       (or props {:closed true})
+       (assoc :resourceType "DocBase.body"))))
+    m/deref
+    (mu/update
+     :component
+     (fn
+      [sch]
+      [:sequential
+       [:multi
+        {:dispatch
+         (fn
+          [m]
+          (let
+           [tid (get-in m [:section :tid])]
+           (some
+            (fn [[tids v]] (when (contains? tids tid) v))
+            [[#{"tidA"} "http://t.example/StructureDefinition/SecA"]
+             [#{"tidB"}
+              "http://t.example/StructureDefinition/SecB"]])))}
+        ["http://t.example/StructureDefinition/SecA"
+         (->
+          (mu/get sch 0)
+          (m/schema options)
+          m/deref
+          (mu/assoc
+           :section
+           [:ref :example.t.StructureDefinition.SecA/v1-0]))]
+        ["http://t.example/StructureDefinition/SecB"
+         (->
+          (mu/get sch 0)
+          (m/schema options)
+          m/deref
+          (mu/assoc
+           :section
+           [:ref :example.t.StructureDefinition.SecB/v1-0]))]
+        [:malli.core/default
+         (-> (mu/get sch 0) (m/schema options) m/deref)]]]))))
+  (mu/update-entry-properties :body merge {:optional true})),
+ "nested/DocN"
+ (->
+  (base-DocBase)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "DocN"})),
+ "nested/Entry"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "Entry"})
+  (mu/assoc :act [:ref :example.t.StructureDefinition.Section/v1-0])
+  (mu/update-entry-properties :act merge {:optional true})),
+ "nested/SecA"
+ (->
+  (base-Section)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecA"})
+  (mu/update :title (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :title
+   clojure.core/merge
+   {:optional false})),
+ "nested/SecAN"
+ (->
+  (base-SecA)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecAN"})
+  (mu/update :note (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :note
+   clojure.core/merge
+   {:optional false})),
+ "nested/SecB"
+ (->
+  (base-Section)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecB"})
+  (mu/update :note (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :note
+   clojure.core/merge
+   {:optional false})),
+ "nested/SecBN"
+ (->
+  (base-SecB)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecBN"})
+  (mu/update :title (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :title
+   clojure.core/merge
+   {:optional false})),
+ "nested/SecR"
+ (->
+  (base-Section)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecR"})
+  (mu/update :note (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :note
+   clojure.core/merge
+   {:optional false})
+  (mu/update :title (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :title
+   clojure.core/merge
+   {:optional false})),
+ "nested/SecX"
+ (->
+  (base-SecA)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecX"})
+  (mu/update :note (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :note
+   clojure.core/merge
+   {:optional false})),
+ "nested/Section"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "Section"})
+  (mu/assoc :note [:string {:fhir/primitive "string"}])
+  (mu/update-entry-properties :note merge {:optional true})
+  (mu/assoc
+   :_note
+   [:ref :org.hl7.fhir.StructureDefinition.Element/v1-0])
+  (mu/optional-keys [:_note])
+  (mu/assoc :tid [:string {:fhir/primitive "string"}])
+  (mu/update-entry-properties :tid merge {:optional true})
+  (mu/assoc
+   :_tid
+   [:ref :org.hl7.fhir.StructureDefinition.Element/v1-0])
+  (mu/optional-keys [:_tid])
+  (mu/assoc :title [:string {:fhir/primitive "string"}])
+  (mu/update-entry-properties :title merge {:optional true})
+  (mu/assoc
+   :_title
+   [:ref :org.hl7.fhir.StructureDefinition.Element/v1-0])
+  (mu/optional-keys [:_title])),
+ "root/Body"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "Body"})
+  (mu/assoc
+   :component
+   [:sequential [:ref :example.t.StructureDefinition.Component/v1-0]])
+  (mu/update-entry-properties :component merge {:optional true})),
+ "root/Component"
+ (->
+  (m/schema :map options)
+  (mu/update-properties
+   merge
+   {:closed true, :resourceType "Component"})
+  (mu/assoc
+   :section
+   [:ref :example.t.StructureDefinition.Section/v1-0])
+  (mu/update-entry-properties :section merge {:optional true})),
+ "root/Entry"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "Entry"})
+  (mu/assoc :act [:ref :example.t.StructureDefinition.Section/v1-0])
+  (mu/update-entry-properties :act merge {:optional true})),
+ "root/SecA"
+ (->
+  (base-Section)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecA"})
+  (mu/update :title (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :title
+   clojure.core/merge
+   {:optional false})),
+ "root/SecAN"
+ (->
+  (base-SecA)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecAN"})
+  (mu/update :note (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :note
+   clojure.core/merge
+   {:optional false})),
+ "root/SecB"
+ (->
+  (base-Section)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecB"})
+  (mu/update :note (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :note
+   clojure.core/merge
+   {:optional false})),
+ "root/SecBN"
+ (->
+  (base-SecB)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecBN"})
+  (mu/update :title (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :title
+   clojure.core/merge
+   {:optional false})),
+ "root/SecR"
+ (->
+  (base-Section)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecR"})
+  (mu/update :note (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :note
+   clojure.core/merge
+   {:optional false})
+  (mu/update :title (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :title
+   clojure.core/merge
+   {:optional false})),
+ "root/SecX"
+ (->
+  (base-SecA)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SecX"})
+  (mu/update :note (fn [sch] [:string {:fhir/primitive "string"}]))
+  (mu/update-entry-properties
+   :note
+   clojure.core/merge
+   {:optional false})),
+ "root/Section"
+ (->
+  (m/schema :map options)
+  (mu/update-properties merge {:closed true, :resourceType "Section"})
+  (mu/assoc :note [:string {:fhir/primitive "string"}])
+  (mu/update-entry-properties :note merge {:optional true})
+  (mu/assoc
+   :_note
+   [:ref :org.hl7.fhir.StructureDefinition.Element/v1-0])
+  (mu/optional-keys [:_note])
+  (mu/assoc :tid [:string {:fhir/primitive "string"}])
+  (mu/update-entry-properties :tid merge {:optional true})
+  (mu/assoc
+   :_tid
+   [:ref :org.hl7.fhir.StructureDefinition.Element/v1-0])
+  (mu/optional-keys [:_tid])
+  (mu/assoc :title [:string {:fhir/primitive "string"}])
+  (mu/update-entry-properties :title merge {:optional true})
+  (mu/assoc
+   :_title
+   [:ref :org.hl7.fhir.StructureDefinition.Element/v1-0])
+  (mu/optional-keys [:_title])),
+ "root/Sheet"
+ (->
+  (base-SheetRoot)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "Sheet"})
+  (mu/update
+   :entry
+   (fn
+    [sch]
+    [:sequential
+     [:multi
+      {:dispatch
+       (fn
+        [m]
+        (let
+         [tid (get-in m [:act :tid])]
+         (some
+          (fn [[tids v]] (when (contains? tids tid) v))
+          [[#{"tidA"} "http://t.example/StructureDefinition/SecA"]
+           [#{"tidB"} "http://t.example/StructureDefinition/SecB"]])))}
+      ["http://t.example/StructureDefinition/SecA"
+       (->
+        (mu/get sch 0)
+        (m/schema options)
+        m/deref
+        (mu/assoc
+         :act
+         [:ref :example.t.StructureDefinition.SecA/v1-0]))]
+      ["http://t.example/StructureDefinition/SecB"
+       (->
+        (mu/get sch 0)
+        (m/schema options)
+        m/deref
+        (mu/assoc
+         :act
+         [:ref :example.t.StructureDefinition.SecB/v1-0]))]
+      [:malli.core/default
+       (-> (mu/get sch 0) (m/schema options) m/deref)]]]))),
+ "root/SheetD"
+ (->
+  (base-Sheet)
+  (m/schema options)
+  m/deref
+  (mu/update-properties merge {:closed true, :resourceType "SheetD"})
+  (mu/update
+   :entry
+   (fn
+    [sch]
+    (let
+     [inner (mu/get sch 0)]
+     [:sequential
+      (let
+       [inner
+        (-> inner (m/schema options) m/deref)
+        multi
+        (if
+         (clojure.core/= :multi (m/type inner))
+         inner
+         (m/schema
+          [:multi {:closed false} [:malli.core/default inner]]
+          options))
+        props
+        (or (m/properties multi) {})
+        kids
+        (vec (m/children multi))
+        base-arm
+        (or
+         (some
+          (fn
+           [c]
+           (when
+            (clojure.core/=
+             "http://t.example/StructureDefinition/SecAN"
+             (first c))
+            (nth c 2)))
+          kids)
+         (some
+          (fn
+           [c]
+           (when
+            (clojure.core/= :malli.core/default (first c))
+            (nth c 2)))
+          kids)
+         [:map {:closed false}])
+        arm
+        (->
+         base-arm
+         (mu/assoc
+          :act
+          [:ref :example.t.StructureDefinition.SecAN/v1-0]))
+        idx
+        (first
+         (keep-indexed
+          (fn
+           [i c]
+           (when
+            (clojure.core/=
+             "http://t.example/StructureDefinition/SecAN"
+             (first c))
+            i))
+          kids))
+        kids'
+        (if
+         idx
+         (assoc
+          kids
+          idx
+          ["http://t.example/StructureDefinition/SecAN" arm])
+         (conj
+          kids
+          ["http://t.example/StructureDefinition/SecAN" arm]))]
+       (m/schema (into [:multi props] kids') options))])))
+  (mu/update
+   :entry
+   (fn
+    [sch]
+    (let
+     [inner (mu/get sch 0)]
+     [:sequential
+      (let
+       [inner
+        (-> inner (m/schema options) m/deref)
+        multi
+        (if
+         (clojure.core/= :multi (m/type inner))
+         inner
+         (m/schema
+          [:multi {:closed false} [:malli.core/default inner]]
+          options))
+        props
+        (or (m/properties multi) {})
+        kids
+        (vec (m/children multi))
+        base-arm
+        (or
+         (some
+          (fn
+           [c]
+           (when
+            (clojure.core/=
+             "http://t.example/StructureDefinition/SecR"
+             (first c))
+            (nth c 2)))
+          kids)
+         (some
+          (fn
+           [c]
+           (when
+            (clojure.core/= :malli.core/default (first c))
+            (nth c 2)))
+          kids)
+         [:map {:closed false}])
+        arm
+        (->
+         base-arm
+         (mu/assoc
+          :act
+          [:ref :example.t.StructureDefinition.SecR/v1-0]))
+        idx
+        (first
+         (keep-indexed
+          (fn
+           [i c]
+           (when
+            (clojure.core/=
+             "http://t.example/StructureDefinition/SecR"
+             (first c))
+            i))
+          kids))
+        kids'
+        (if
+         idx
+         (assoc
+          kids
+          idx
+          ["http://t.example/StructureDefinition/SecR" arm])
+         (conj
+          kids
+          ["http://t.example/StructureDefinition/SecR" arm]))]
+       (m/schema (into [:multi props] kids') options))])))),
+ "root/SheetRoot"
+ (->
+  (m/schema :map options)
+  (mu/update-properties
+   merge
+   {:closed true, :resourceType "SheetRoot"})
+  (mu/assoc
+   :entry
+   [:sequential [:ref :example.t.StructureDefinition.Entry/v1-0]])
+  (mu/update-entry-properties :entry merge {:optional true}))}

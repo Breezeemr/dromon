@@ -211,6 +211,13 @@
    `*honor-child-type-profile*` exists to provide."
   nil)
 
+(def ^:dynamic *element-max*
+  "Snapshot-derived maximum cardinality (the FHIR string, \"*\" included) for the
+   StructureDefinition being compiled, as {[id-segment ...] -> max}. The
+   counterpart of `*element-min*`, read for the same reason: a slice's own
+   differential element is often silent on the bound the snapshot states."
+  nil)
+
 (def ^:dynamic *canonical-index*
   "Canonical StructureDefinition URL (no `|version` pin) -> ordered vector of
    {:pkg-id :pkg-version :version :kw}, built by `gen/canonical-index` from a
@@ -238,8 +245,9 @@
   nil)
 
 (def ^:dynamic *referencing-definition*
-  "{:version :fhirVersion} of the StructureDefinition being walked, bound by
-   `structure-definition->schema`.
+  "{:version :fhirVersion :url} of the StructureDefinition being walked, bound by
+   `structure-definition->schema`. The url only names the definition in
+   `*uncompiled-slices*` reports.
 
    Not consulted to resolve a reference the index covers -- a reference's
    version comes from resolution, never from the referrer. Only the fallbacks
@@ -355,6 +363,77 @@
    whatever its remaining discriminators can still distinguish, and keeps its
    base schema with no :multi when nothing is left or the surviving keys no
    longer tell the arms apart."
+  nil)
+
+(def ^:dynamic *discriminator-claims-fn*
+  "Optional companion of `*discriminator-dispatch-fn*` for slice counts. Called
+   with the same map, it returns a FORM evaluating to (fn [m] #{...}): EVERY
+   one of :arms' dispatch-values the occurrence `m` claims at this profile or
+   type discriminator, not only the first the dispatch picks. A CDA section may
+   claim several templates at once, so it matches several slices; FHIR counts
+   the occurrences that match a slice. Nil (or a nil result) makes the count
+   fall back to comparing the dispatch's value with the arm's.
+   See doc/inherited-slices-and-slice-counts.md, Round 2."
+  nil)
+
+(def ^:dynamic *count-soft-discriminator-fn*
+  "Optional predicate of {:element-id :path :type}, the sliced element's id and one
+   value or pattern discriminator of its slicing. True marks the discriminator
+   SOFT for slice counts: an occurrence that agrees with a slice on every other
+   discriminator but not on a soft one is a version drift of that slice. Drift
+   counts, as one occurrence, only when no occurrence of the field matches the
+   slice exactly, so a field carrying a template once unversioned and once
+   versioned still counts the versioned claim alone, and a field carrying only a
+   revision the slice does not pin is not rejected for it. Routing is not
+   affected. Nil (the default) softens nothing.
+   See doc/inherited-slices-and-slice-counts.md, Round 2 (drift)."
+  nil)
+
+(def ^:dynamic *rebuild-inherited-slicings*
+  "When true, a derived profile that restates or adds a slice of a slicing its
+   base declared rebuilds that slicing's :multi from the base's record of it
+   (`*slicings*`), instead of merging an arm keyed by what the derived
+   differential alone can say.
+
+   Off by default, so a package generated without a driver that opts in (r4b,
+   uscore8) keeps byte-identical output. See
+   doc/inherited-slices-and-slice-counts.md section 3."
+  false)
+
+(def ^:dynamic *compile-slice-counts*
+  "When true, a sliced repeating field whose slices carry a minimum above 0 or a
+   numeric maximum compiles to a counted :and: the :sequential of :multi arms
+   plus one :fn per counted slice, so an instance with too few or too many
+   occurrences of a slice is rejected, not only routed. The sliced element's
+   own `min`/`max` are not counted.
+
+   Requires `*rebuild-inherited-slicings*`: a derived profile must rebuild a
+   counted field from its record, never merge an arm into it. Off by default,
+   so a package generated without a driver that opts in keeps byte-identical
+   output. See doc/inherited-slices-and-slice-counts.md section 5."
+  false)
+
+(def ^:dynamic *slicings*
+  "While `*rebuild-inherited-slicings*` is on: an atom of {sliced-element-id
+   record} for the definition being generated, seeded from its base's
+   `:slicings` entry so records chain down a derivation like `:shape` does.
+
+   The key is the snapshot element id (enclosing slice names included) because
+   ids agree across a derivation, while the accumulator keys the walk uses mean
+   something only inside one level. Nil when the gate is off."
+  nil)
+
+(def ^:dynamic *live-base-sch*
+  "A delay of the compiled schema of the definition's base, bound beside
+   `*slicings*`. Below the root the walk holds the core type of the element it
+   is descending into, not the base's live schema, so the inherited arm a
+   nested slice constrains is reached from here by element id."
+  nil)
+
+(def ^:dynamic *uncompiled-slices*
+  "Optional atom collecting {:definition :element :slice :reason} for slices the
+   inherited-slicing rebuild could not honor, so a change in scope shows in a
+   driver's run output rather than only in a regeneration diff."
   nil)
 
 ;; ---------------------------------------------------------------------------
@@ -975,19 +1054,32 @@
 
 (declare element-definition->attribute)
 
+(defn counted-sequential
+  "The :sequential of a counted field -- an :and carrying `:fhir/slice-counts`,
+   which `*compile-slice-counts*` emits around a sliced repeating field -- else
+   nil. The :sequential is always child 0, so every walk that reads a field's
+   shape looks through the :and with this one test. Callers outside this
+   namespace (the XML serde, the wire view) restate it in two lines instead of
+   calling in."
+  [sch]
+  (when (and sch (= :and (m/type sch)) (:fhir/slice-counts (m/properties sch)))
+    (mu/get sch 0)))
+
 (defn unwrap-sequential
   "Strip the collection wrapper off a repeating field to get the element schema.
    A repeating primitive is [:sequential [:maybe prim]] -- the :maybe holds the
    place of an occurrence that carries only id/extensions -- so step through it
-   too and callers keep seeing the primitive itself."
+   too and callers keep seeing the primitive itself. A counted field is looked
+   through to its :sequential first."
   [sch]
   (if sch
-    (case (m/type sch)
-      :sequential (let [inner (mu/get sch 0)]
-                    (if (and inner (= :maybe (m/type inner)))
-                      (mu/get inner 0)
-                      inner))
-      sch)
+    (let [sch (or (counted-sequential sch) sch)]
+      (case (m/type sch)
+        :sequential (let [inner (mu/get sch 0)]
+                      (if (and inner (= :maybe (m/type inner)))
+                        (mu/get inner 0)
+                        inner))
+        sch))
     sch))
 
 
@@ -1081,6 +1173,8 @@
                 child-sch (or raw-child
                               (when-let [resolved (resolve-sch-through-refs sch)]
                                 (try (mu/get resolved k) (catch Exception _ nil))))
+                child-sch (or (try (counted-sequential child-sch) (catch Exception _ nil))
+                              child-sch)
                 is-seq? (and child-sch
                              (try (= :sequential (m/type child-sch))
                                   (catch Exception _ false)))
@@ -1160,13 +1254,24 @@
                            :discriminator disc
                            :arms arms
                            :base-sch base-sch}))]
-      (if fn-form {:fn-form fn-form} ::no-extraction))
+      (if fn-form
+        {:fn-form fn-form
+         :kind :hook
+         :claims-form (when-let [claims *discriminator-claims-fn*]
+                        (claims {:type disc-type
+                                 :path gpath
+                                 :discriminator disc
+                                 :arms arms
+                                 :base-sch base-sch}))}
+        ::no-extraction))
 
     "exists"
     (let [gpath (when (not= disc-path "$this")
                   (discriminator-path->get-in-path base-sch disc-path))]
       (if (seq gpath)
-        {:expr `(~'some? (~'get-in ~'m ~(vec gpath)))}
+        {:expr `(~'some? (~'get-in ~'m ~(vec gpath)))
+         :kind :exists
+         :path (vec gpath)}
         ::no-extraction))
 
     ;; value, pattern, and unknown types -- unchanged extraction
@@ -1174,7 +1279,9 @@
                   (resolve-this-discriminator-path slices)
                   (discriminator-path->get-in-path base-sch disc-path))]
       (if (seq gpath)
-        {:expr `(~'get-in ~'m ~(vec gpath))}
+        {:expr `(~'get-in ~'m ~(vec gpath))
+         :kind :value
+         :path (vec gpath)}
         ::no-extraction))))
 
 (defn- make-dispatch-form
@@ -1427,10 +1534,12 @@
      slice-name)))
 
 (defn- type-union-multi?
-  "Is this `:multi` a polymorphic slot rather than a slice union? The two
-   dispatch on different things, so a slice arm can never be merged into one."
+  "Is this `:multi` a polymorphic slot, or the profile union of a slice-position
+   element (`profile-union-patch`), rather than a slicing? Neither dispatches on
+   what a slice does, so a slice arm can never be merged into one."
   [sch]
-  (boolean (some-> sch m/properties :xml/type-union)))
+  (let [props (m/properties sch)]
+    (boolean (or (:xml/type-union props) (:fhir/profile-union props)))))
 
 (defn- as-sequential-multi
   "If sch is a SLICE :multi or [:sequential slice-multi], return
@@ -1439,7 +1548,8 @@
    would add an arm nothing can ever dispatch to."
   [sch]
   (when sch
-    (let [t (try (m/type sch) (catch Exception _ nil))]
+    (let [sch (or (counted-sequential sch) sch)
+          t (try (m/type sch) (catch Exception _ nil))]
       (cond
         (= t :multi) (when-not (type-union-multi? sch) [false sch])
         (= t :sequential)
@@ -1515,6 +1625,14 @@
                         (apply distinct? ks))))
       ks)))
 
+(defn- report-uncompiled-slice!
+  [element-id slice-name reason]
+  (when *uncompiled-slices*
+    (swap! *uncompiled-slices* conj {:definition (or *current-definition* (:url *referencing-definition*))
+                                     :element element-id
+                                     :slice slice-name
+                                     :reason reason})))
+
 (defn- wildcard-exists? [{:keys [type path]}]
   (and (= "exists" type) (= "*" path)))
 
@@ -1562,12 +1680,229 @@
                                                  [:dispatch-value :this-path :exists-underivable? :profile-candidates])))
                            slices)))))
 
-(defn- flush-pending-slicing
+(declare flush-inherited-group)
+
+(defn- slice-cardinality
+  "The {:min :max} of a slice's own element, for the slicing record and the
+   counts. The snapshot answers first, as it does for `*element-min*`'s other
+   readers: a differential restates a bound only where the profile changes it,
+   and a tool that relaxes a bound edits the snapshot too. The differential is
+   the fallback for a definition shipped without one. Nil entries mean neither
+   states it."
+  [{:keys [sub-elements slice-path]}]
+  (let [e (some #(when (= (:path %) slice-path) %) sub-elements)]
+    {:min (or (get *element-min* slice-path) (some-> (:min e) str parse-long))
+     :max (or (get *element-max* slice-path) (some-> (:max e) str))}))
+
+(defn- slicing-record
+  "The record a later derivation reads to rebuild this group's :multi; see
+   doc/inherited-slices-and-slice-counts.md 3.1. `slices` and `arm-keys` are
+   parallel. A slice is :collided? when a later slice shares its key, because
+   the last-wins dedupe then keeps only the later arm."
+  [{:keys [discriminators rules field-is-sequential? base-sch] :as group}
+   raw-discriminators keep-idx slices arm-keys]
+  (let [ks (vec arm-keys)]
+    {:discriminators discriminators
+     :raw-discriminators raw-discriminators
+     :keep-idx keep-idx
+     :rules rules
+     :field-is-sequential? field-is-sequential?
+     :multi? true
+     :element-sch base-sch
+     :default? (not= rules "closed")
+     :arms (into []
+                 (map-indexed
+                  (fn [i {:keys [slice-name dispatch-value profile-candidates exists-underivable?] :as slice}]
+                    (merge {:slice-name slice-name
+                            :this-path (:this-path slice)
+                            :dispatch-value dispatch-value
+                            :profile-candidates profile-candidates
+                            :exists-underivable? (boolean exists-underivable?)
+                            :key (ks i)
+                            :routable? (not (keyword? (ks i)))
+                            :collided? (boolean (some #(= (ks i) %) (subvec ks (inc i))))}
+                           (slice-cardinality slice))))
+                 slices)}))
+
+(defn- record-slicing!
+  [element-id record]
+  (when (and *slicings* element-id)
+    (swap! *slicings* assoc element-id record)))
+
+(defn- counted-arms
+  "The arms of a slicing record that compile to a count, in arm order: a slice
+   with `min` above 0 or a numeric `max` (\"0\" included). Each wanted slice the
+   dispatch cannot count is reported to `*uncompiled-slices*` with its reason
+   instead, when `report?` accepts it, because counting it would reject
+   instances the :multi routes correctly:
+
+   - the field does not repeat (the type slices of a single value);
+   - the slice's key is one the dispatch can never return, because
+     `finalize-dispatch-value` substituted the slice-name keyword (a slice that
+     states no value at a kept discriminator path). Its arm is dead today and a
+     count would turn that into a false rejection for every instance;
+
+   Two slices sharing a key (the last-wins dedupe keeps one arm) are both
+   counted: a count is over the occurrences that match the slice, not over the
+   arm the dispatch picks.
+
+   Occurrences that reach the default arm belong to no slice and count for
+   none: in an open slicing they are allowed, and a closed slicing has no
+   default arm, so its :multi already rejects them."
+  [{:keys [arms multi? field-is-sequential?]} element-id report?]
+  (let [wanted? (fn [{mn :min mx :max}]
+                  (or (some-> mn pos?) (boolean (and mx (not= "*" mx)))))
+        ]
+    (into []
+          (keep (fn [{:keys [slice-name key routable?] :as arm}]
+                  (when (wanted? arm)
+                    (let [reason (cond
+                                   (not multi?) :count-no-multi
+                                   (not field-is-sequential?) :count-non-repeating
+                                   (not routable?) :count-unroutable-key)]
+                      (if reason
+                        (do (when (report? slice-name)
+                              (report-uncompiled-slice! element-id slice-name reason))
+                            nil)
+                        arm)))))
+          arms)))
+
+(defn- numeric-max
+  "The upper bound of a slice as a number, nil for the FHIR \"*\" or no bound."
+  [mx]
+  (when (and mx (not= "*" mx)) (parse-long mx)))
+
+(defn- make-matcher-form
+  "Form evaluating to (fn [m] #{slice-name ...}): the slices of `arms` the
+   occurrence `m` matches, which is what FHIR counts. A slice matches when every
+   kept discriminator agrees with the slice's component of its arm key; a nil
+   component states nothing and agrees with any occurrence.
+
+   - value, pattern, $this: some value of the occurrence at the discriminator's
+     path equals the slice's (every element of a repeating step is looked at,
+     where the dispatch reads the first);
+   - exists: the child's presence equals the slice's;
+   - profile, type: the occurrence claims the slice's profile through
+     `*discriminator-claims-fn*`, else its dispatch value equals the slice's.
+
+   `arms` is every arm of the slicing, which the hooks need whole; `counted`
+   the arms the matcher answers for. Nil when a kept discriminator can no longer
+   be evaluated. Unlike the
+   dispatch this is not a routing decision, so an occurrence may match several
+   slices. See doc/inherited-slices-and-slice-counts.md, Round 2."
+  [element-id discriminators base-sch arms counted keep-idx]
+  (let [n (count discriminators)
+        comps (mapv #(dispatch-component % n (nth discriminators %) base-sch arms) keep-idx)
+        soft? (if-let [f *count-soft-discriminator-fn*]
+                (into #{}
+                      (keep-indexed
+                       (fn [j i]
+                         (let [{:keys [type path]} (nth discriminators i)]
+                           (when (and (not= "$this" path)
+                                      (#{"value" "pattern"} type)
+                                      (f {:element-id element-id :path path :type type}))
+                             j))))
+                      keep-idx)
+                #{})]
+    (when (not-any? #(= ::no-extraction %) comps)
+      (let [slot-expr (fn [{:keys [kind path expr fn-form claims-form]}]
+                        (case kind
+                          :value `(~'into #{} (~'remove ~'nil?) (~'at ~'m ~path))
+                          :exists `(~'boolean (~'seq (~'remove ~'nil? (~'at ~'m ~path))))
+                          :hook (if claims-form `(~claims-form ~'m) `(~fn-form ~'m))))
+            set-slot? (fn [{:keys [kind claims-form]}] (or (= kind :value) (and (= kind :hook) claims-form)))
+            component (fn [dv i]
+                        (if (= n 1)
+                          dv
+                          (when (and (vector? dv) (= n (count dv))) (nth dv i))))
+            clauses (fn [hard-only? {:keys [dispatch-value]}]
+                      (into []
+                            (keep-indexed
+                             (fn [j c]
+                               (when-let [cv (and (not (and hard-only? (soft? j)))
+                                                  (component dispatch-value (nth keep-idx j)))]
+                                 (if (set-slot? c)
+                                   `(~'contains? (~'nth ~'vs ~j) ~cv)
+                                   `(= ~cv (~'nth ~'vs ~j))))))
+                            comps))
+            drift-arm? (fn [arm]
+                         (and (seq soft?)
+                              (some (fn [j] (component (:dispatch-value arm) (nth keep-idx j))) soft?)
+                              (seq (clauses true arm))))]
+        (with-meta
+        `(~'fn [~'m]
+          (~'let [~'at (~'fn ~'at [~'x ~'path]
+                        (~'if (~'empty? ~'path)
+                         [~'x]
+                         (~'let [~'p (~'first ~'path)]
+                          (~'cond
+                           (~'integer? ~'p) (~'if (~'sequential? ~'x)
+                                             (~'mapcat (~'fn [~'e] (~'at ~'e (~'rest ~'path))) ~'x)
+                                             (~'at ~'x (~'rest ~'path)))
+                           (~'map? ~'x) (~'at (~'get ~'x ~'p) (~'rest ~'path))
+                           :else nil))))
+                  ~'vs [~@(map slot-expr comps)]]
+           (~'cond-> #{}
+            ~@(mapcat (fn [{:keys [slice-name] :as arm}]
+                        (let [cs (clauses false arm)]
+                          (cond-> [(if (seq cs) `(~'and ~@cs) true)
+                                   `(~'conj ~slice-name)]
+                            (drift-arm? arm)
+                            (into [`(~'and ~@(clauses true arm))
+                                   `(~'conj [:drift ~slice-name])]))))
+                      counted))))
+        {:drift? (boolean (some drift-arm? counted))})))))
+
+(defn- slice-count-fn-form
+  [drift? {:keys [slice-name min max]}]
+  (let [exact `(~'count (~'filter (~'fn [~'x] (~'contains? (~'matcher ~'x) ~slice-name)) ~'xs))
+        n (if drift?
+            `(~'let [~'exact ~exact]
+              (~'if (~'pos? ~'exact)
+               ~'exact
+               (~'min 1 (~'count (~'filter (~'fn [~'x] (~'contains? (~'matcher ~'x) [:drift ~slice-name])) ~'xs)))))
+            exact)]
+    `(~'fn [~'xs]
+      (~'or (~'not (~'sequential? ~'xs))
+       ~(if-let [mx (numeric-max max)]
+          `(~'<= ~(or min 0) ~n ~mx)
+          `(~'<= ~(or min 0) ~n))))))
+
+(defn- counted-form
+  "Wrap `sequential-form`, a [:sequential [:multi {:dispatch dispatch} ...]],
+   into the counted :and of doc/inherited-slices-and-slice-counts.md 5.1, with
+   the dispatch bound once as `dispatch` for the multi and every count. One :fn
+   per slice so `m/explain` reports each failing slice on its own; the :fn
+   properties name the slice and the sliced element's id, which is what a
+   consumer attributing a count error (it arrives at the field's value path,
+   with no slice segment) can look up."
+  [dispatch-expr sequential-form counted element-id matcher-expr]
+  `(~'let [~'dispatch ~dispatch-expr
+           ~'matcher ~matcher-expr]
+    [:and {:fhir/slice-counts ~(mapv (fn [{:keys [key slice-name min max]}]
+                                       [key slice-name (or min 0) (numeric-max max)])
+                                     counted)}
+     ~sequential-form
+     ~@(map (fn [{:keys [slice-name min max] :as arm}]
+              `[:fn {:fhir/slice-name ~slice-name
+                     :fhir/slice-id ~(str element-id ":" slice-name)
+                     :min ~(or min 0)
+                     :max ~(numeric-max max)
+                     :error/message ~(str "slice " slice-name ": expected "
+                                          (or min 0) ".." (or max "*") " occurrences")}
+                ~(slice-count-fn-form (:drift? (meta matcher-expr)) arm)])
+            counted)]))
+
+(defn- requires-field?
+  [counted]
+  (boolean (some #(some-> (:min %) pos?) counted)))
+
+(defn- flush-own-slicings
   [acc]
   (if-let [pending (:pending-slicing acc)]
     (reduce-kv
      (fn [acc base-k group]
-      (let [{:keys [discriminators rules base-form base-sch field-is-sequential? slices]}
+      (let [{:keys [discriminators rules base-form base-sch field-is-sequential? slices] :as expanded}
             (expand-wildcard-exists group)]
        (if (empty? slices)
          acc
@@ -1581,9 +1916,24 @@
                dispatch-form (when arm-keys dispatch-form)]
           (if (nil? dispatch-form)
            ;; No valid discriminator paths — skip :multi wrapping, just use base-form
-           (if base-form
-             (update acc :form conj base-form)
-             acc)
+           (do
+             (when *compile-slice-counts*
+               (counted-arms {:arms (mapv (fn [slice]
+                                            (assoc (slice-cardinality slice) :slice-name (:slice-name slice)))
+                                          slices)
+                              :multi? false}
+                             (:element-id group) any?))
+             (record-slicing! (:element-id group)
+                              {:discriminators discriminators
+                               :raw-discriminators (:discriminators group)
+                               :rules rules
+                               :field-is-sequential? field-is-sequential?
+                               :multi? false
+                               :element-sch base-sch
+                               :arms []})
+             (if base-form
+               (update acc :form conj base-form)
+               acc))
            (let [[raw-base-form _form-sequential?] (extract-inner-element-form base-form)
                ;; Use field-is-sequential? (known at generation time) to emit the
                ;; correct unwrap form directly, avoiding a runtime type check.
@@ -1691,13 +2041,49 @@
                default-entry (when (not= rules "closed")
                                [:malli.core/default base-element-form])
                all-entries (cond-> entries default-entry (conj default-entry))
-               multi-form `[:sequential
-                            [:multi {:dispatch ~dispatch-form}
-                             ~@all-entries]]
-               update-form `(~'mu/update ~base-k (~'fn [~'sch] ~multi-form))]
-           (-> acc (update :form conj update-form))))))))
+               record (slicing-record expanded (:discriminators group) keep-idx slices arm-keys)
+               counted (when *compile-slice-counts*
+                         (counted-arms record (:element-id group) any?))
+               matcher (when (seq counted)
+                         (make-matcher-form (:element-id group) discriminators base-sch (:arms record) counted keep-idx))
+               counted (if (or matcher (empty? counted))
+                         counted
+                         (do (doseq [{:keys [slice-name]} counted]
+                               (report-uncompiled-slice! (:element-id group) slice-name :count-no-matcher))
+                             []))
+               multi-form (if (seq counted)
+                            (counted-form dispatch-form
+                                          `[:sequential
+                                            [:multi {:dispatch ~'dispatch}
+                                             ~@all-entries]]
+                                          counted
+                                          (:element-id group)
+                                          matcher)
+                            `[:sequential
+                              [:multi {:dispatch ~dispatch-form}
+                               ~@all-entries]])
+               update-form `(~'mu/update ~base-k (~'fn [~'sch] ~multi-form))
+               required? (requires-field? counted)]
+           (record-slicing! (:element-id group)
+                            (assoc record :counted? (boolean (seq counted)) :required? required?))
+           (cond-> (update acc :form conj update-form)
+             required? (update :form conj
+                               `(~'mu/update-entry-properties ~base-k ~'merge {:optional false})))))))))
      (dissoc acc :pending-slicing)
      pending)
+    acc))
+
+(defn- flush-pending-slicing
+  "Emit every group pending on this level: groups rebuilt from an inherited
+   record (`flush-inherited-group`) and groups this definition declared itself."
+  [acc]
+  (if-let [pending (:pending-slicing acc)]
+    (let [acc (reduce-kv (fn [acc k group]
+                           (if (:inherited? group) (flush-inherited-group acc k group) acc))
+                         acc
+                         pending)]
+      (flush-own-slicings (update acc :pending-slicing
+                                  #(into {} (remove (comp :inherited? val)) %))))
     acc))
 
 ;; ---------------------------------------------------------------------------
@@ -1869,6 +2255,74 @@
     old-sch (some-> old-sch m/type)
     :else nil))
 
+(defn- slice-position?
+  "Is the element at `path` a slice, or a child hanging directly off a slice
+   arm? Both are reached only through a slicing's dispatch."
+  [path]
+  (boolean (some #(and (string? %) (str/includes? % ":")) (take-last 2 path))))
+
+(defn- profile-union-patch
+  "The value schema form of a slice-position element whose type lists several
+   profiles, or nil when the element is not one or the union cannot be built.
+
+   type.profile is any-of, so the element is a union of the profile schemas:
+   a :multi dispatched by the driver's profile hook (called as for a $this
+   profile discriminator, one arm per profile) when the hook can tell the
+   profiles apart, whose default arm is the :or of them, else the :or alone.
+   The :multi carries `:fhir/profile-union` so no walk mistakes it for a slicing.
+
+   Only under `*rebuild-inherited-slicings*` and `*honor-child-type-profile*`.
+   Without them, or when the union cannot be built, the element keeps the
+   declared base type, as before. A degradation that matters is reported to
+   `*uncompiled-slices*`: a profile no package defines (the union would be
+   narrower than any-of), or constraints below the element (the union has no
+   children to patch)."
+  [{:keys [code profile]} sub-elements main-path]
+  (when (and *rebuild-inherited-slicings*
+             *honor-child-type-profile*
+             (> (count profile) 1)
+             (slice-position? main-path)
+             code
+             (not (fhir-primitives code))
+             (not= "Resource" code)
+             (not (str/starts-with? code "http://hl7.org/fhirpath/System.")))
+    (let [canonicals (into [] (comp (keep clean-profile-url) (distinct)) profile)
+          kws (mapv profile-canonical-kw canonicals)
+          element-id (str/join "." main-path)
+          slice-name (some #(when (and (string? %) (str/includes? % ":"))
+                              (subs % (inc (str/index-of % ":"))))
+                           (reverse main-path))]
+      (cond
+        (some nil? kws)
+        (do (doseq [[c kw] (map vector canonicals kws) :when (nil? kw)]
+              (when *unresolved-profiles*
+                (swap! *unresolved-profiles* conj
+                       {:profile c :from *current-definition* :degraded-to (lookup-schema-kw code)})))
+            (report-uncompiled-slice! element-id slice-name :multi-profile-unresolved)
+            nil)
+
+        (some #(> (count (:path %)) (count main-path)) sub-elements)
+        (do (report-uncompiled-slice! element-id slice-name :multi-profile-with-constraints)
+            nil)
+
+        :else
+        (do (doseq [kw kws] (swap! *references-atom* conj kw))
+            (let [refs (mapv (fn [kw] `[:ref ~kw]) (distinct kws))
+                  or-form (if (= 1 (count refs)) (first refs) `[:or ~@refs])
+                  dispatch (when (and (> (count canonicals) 1) (> (count refs) 1))
+                             (when-let [hook *discriminator-dispatch-fn*]
+                               (hook {:type "profile"
+                                      :path nil
+                                      :discriminator {:type "profile" :path "$this"}
+                                      :arms (mapv (fn [c] {:dispatch-value c :slice-name c :profiles [c]})
+                                                  canonicals)
+                                      :base-sch nil})))]
+              (if dispatch
+                `[:multi {:dispatch ~dispatch :fhir/profile-union true}
+                  ~@(map (fn [c kw] `[~c [:ref ~kw]]) canonicals kws)
+                  [:malli.core/default ~or-form]]
+                or-form)))))))
+
 (defn compute-element-patch
   [{old-sch :sch :as acc} id {:keys [code] :as attr-type} main-attr sub-elements main-path]
   (if-let [union (type-union-form attr-type)]
@@ -1878,6 +2332,8 @@
     ;; keeps it upstream of the has-deeper-sub? split, so it stays correct if a
     ;; package ever constrains a sub-element under such a slot.
     (assoc acc :sch nil :form [union])
+    (if-let [profile-union (profile-union-patch attr-type sub-elements main-path)]
+      (assoc acc :sch nil :form [profile-union])
     (let [field-info (:field-info acc)
           dispatch (if code
                      code
@@ -1926,7 +2382,7 @@
             (prim-or-ref acc attr-type
                          {:min  (or (get *element-min* main-path)
                                     (some-> (:min main-attr) str parse-long))
-                          :path main-path})))))))
+                          :path main-path}))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; attr->value-schema-patch
@@ -2002,8 +2458,13 @@
 (defn- update-existing-child-schema [old-acc k attr-type main-attr props sub-elements main-path sub-sch field-info]
   (let [is-seq? (or (shape/seq-field? field-info)
                     (and (nil? field-info) sub-sch
-                         (try (= :sequential (m/type sub-sch)) (catch Exception _ false))))
-        is-sliced? (shape/sliced? field-info)
+                         (try (= :sequential (m/type (or (counted-sequential sub-sch) sub-sch)))
+                              (catch Exception _ false))))
+        ;; Below the root there is no field-info, so a sliced element is known
+        ;; by its slicing record instead; threading `(mu/update sch 0 ...)` onto
+        ;; its :multi would add an arm nothing dispatches to.
+        is-sliced? (or (shape/sliced? field-info)
+                       (:multi? (some-> *slicings* deref (get (str/join "." main-path)))))
         inner-sch (unwrap-sequential sub-sch)
         ;; unwrap-sequential hid the :maybe of a repeating primitive, so the
         ;; emitted mu/update needs an extra level to land on the primitive
@@ -2464,6 +2925,302 @@
       `(~'mu/update ~base-k
                     (~'fn [~'inner] ~ensure-body)))))
 
+;; ---------------------------------------------------------------------------
+;; Inherited slicings
+;;
+;; A derived profile restating or adding a slice of a slicing its base declared
+;; used to get an arm keyed by what the derived differential alone can say, so
+;; the inherited dispatch never selected it. The base's record of the slicing
+;; (`*slicings*`, written by flush-own-slicings) lets the derived walk rebuild
+;; the :multi under the keys the base already routes to.
+;; See doc/inherited-slices-and-slice-counts.md section 3.
+;; ---------------------------------------------------------------------------
+
+(defn- slicing-element-id
+  "Snapshot element id of the element a slice at `slice-path` slices: the path
+   with the slice name stripped from its last segment and enclosing slice names
+   kept."
+  [slice-path]
+  (str/join "." (conj (pop slice-path) (clean-path-segment (peek slice-path)))))
+
+(defn- live-map-schema
+  "Step a live schema down to the :map an element's children hang off."
+  [sch]
+  (loop [s sch n 0]
+    (when (and s (< n 8))
+      (case (m/type s)
+        (:ref :lazy-ref) (recur (m/deref s) (inc n))
+        (:sequential :maybe) (recur (mu/get s 0) (inc n))
+        :and (when-let [c (counted-sequential s)] (recur c (inc n)))
+        :map s
+        nil))))
+
+(defn- multi-arm
+  "The arm schema stored under key `k` in a live :multi, or nil."
+  [multi k]
+  (some (fn [[k' _ s]] (when (= k k') s)) (m/children multi)))
+
+(defn- live-sliced-field
+  "The live [:sequential [:multi ...]] the base compiled for the sliced element
+   `element-id`, reached from the definition's live base schema segment by
+   segment: a key steps into a child, a `name:slice` segment steps into the
+   enclosing record's arm for that slice. Nil when any step fails; the caller
+   then falls back to the record's :element-sch and reports it."
+  [element-id]
+  (try
+    (when-let [root (some-> *live-base-sch* deref)]
+      (let [[root-name & segs] (str/split element-id #"\.")]
+        (loop [sch root segs segs id-prefix root-name]
+          (when-let [parent (live-map-schema sch)]
+            (let [seg (first segs)
+                  idx (str/index-of seg ":")
+                  nm (if idx (subs seg 0 idx) seg)
+                  field (mu/get parent (keyword nm))
+                  field-id (str id-prefix "." nm)]
+              (cond
+                (nil? field) nil
+                (nil? (next segs)) field
+                :else
+                (let [next-sch (if idx
+                                 (let [slice (subs seg (inc idx))
+                                       arm (some #(when (= slice (:slice-name %)) %)
+                                                 (:arms (get @*slicings* field-id)))
+                                       multi (when arm (mu/get (or (counted-sequential field) field) 0))]
+                                   (when (and multi (= :multi (m/type multi)))
+                                     (multi-arm multi (:key arm))))
+                                 field)]
+                  (when next-sch
+                    (recur next-sch (next segs)
+                           (cond-> field-id idx (str ":" (subs seg (inc idx)))))))))))))
+    (catch Exception _ nil)))
+
+(defn- inherited-slice-site
+  "What the derived walk knows about a slice whose element an ancestor sliced:
+   {:record :element-id :arm :base-sch}, where :arm is the record's arm when the
+   slice restates one (nil for an added slice) and :base-sch the live inherited
+   arm the slice body is computed against (the default arm for an added slice).
+   Nil when the gate is off, the slicing has a group of its own in this
+   definition, no record exists, or the record declined its :multi on a field
+   that does not repeat, where direct threading still describes the one value.
+   {:unsupported reason} for a declined :multi on a repeating field, where
+   threading would apply one slice's constraints to every occurrence."
+  [old-acc base-field-kw main-path slice-name]
+  (when (and *rebuild-inherited-slicings* *slicings* base-field-kw
+             (not (#{:extension :modifierExtension} base-field-kw)))
+    (let [pending (get-in old-acc [:pending-slicing base-field-kw])
+          element-id (slicing-element-id main-path)
+          record (when-not (and pending (not (:inherited? pending)))
+                   (get @*slicings* element-id))]
+      (when record
+        (let [arm (some #(when (= slice-name (:slice-name %)) %) (:arms record))]
+          (cond
+            (:multi? record)
+            (let [field (live-sliced-field element-id)
+                  field (or (counted-sequential field) field)
+                  multi (when (and field (= :sequential (m/type field)))
+                          (let [c (mu/get field 0)] (when (= :multi (m/type c)) c)))
+                  arm-sch (some-> multi (multi-arm (if arm (:key arm) :malli.core/default)))]
+              {:record record
+               :element-id element-id
+               :arm arm
+               :base-sch (or arm-sch (:element-sch record))
+               :element-sch-fallback? (and (nil? arm-sch) (boolean (or arm (:default? record))))})
+
+            (:field-is-sequential? record)
+            {:unsupported :no-multi-repeating :element-id element-id}))))))
+
+(defn- apply-inherited-slice
+  "Collect one restated or added slice into the pending group of an inherited
+   slicing; flush-inherited-group emits it."
+  [old-acc {:keys [record element-id arm unsupported element-sch-fallback?]}
+   sub-elements main-path slice-name {:keys [base-field-name new-sub-form]}]
+  (cond
+    unsupported
+    (do (report-uncompiled-slice! element-id slice-name unsupported)
+        old-acc)
+
+    :else
+    (do
+      (when element-sch-fallback?
+        (report-uncompiled-slice! element-id slice-name :element-sch-fallback))
+      (update-in old-acc [:pending-slicing base-field-name]
+                 (fn [group]
+                   (update (or group {:inherited? true
+                                      :record record
+                                      :element-id element-id
+                                      :slices []})
+                           :slices conj
+                           {:slice-name slice-name
+                            :arm arm
+                            :sub-elements sub-elements
+                            :slice-path main-path
+                            :form new-sub-form}))))))
+
+(defn- flush-inherited-group
+  "Rebuild an inherited slicing's :multi: restated slices replace the inherited
+   arm in place under its inherited key, added slices follow in differential
+   order, and the dispatch is the inherited one unless the hook has to be asked
+   again (a restated slice names narrower profiles, or a slice was added).
+
+   Falls back, reporting to `*uncompiled-slices*`, when the merged group cannot
+   be dispatched with the inherited keys (the hook declines the merged list,
+   the kept discriminators change, or a key collides): restated arms still
+   replace theirs in place under the inherited dispatch, so what the base
+   routes to the slice is held to the narrower profile; added slices are
+   dropped, and a restated slice whose narrower profile the dispatch cannot
+   reach is reported beside them."
+  [acc base-k {:keys [record element-id slices]}]
+  (let [{:keys [arms discriminators raw-discriminators keep-idx element-sch default?
+                counted? required?]} record
+        report (fn [slice reason] (report-uncompiled-slice! element-id (:slice-name slice) reason))
+        wildcard? (boolean (some wildcard-exists? raw-discriminators))
+        usable (into []
+                     (keep (fn [{:keys [arm sub-elements slice-path slice-name] :as slice}]
+                             (let [derived (extract-dispatch-value discriminators sub-elements slice-path slice-name)]
+                               (cond
+                                 (and arm (:collided? arm)) (do (report slice :collided-restated) nil)
+                                 (and (nil? arm) (not default?)) (do (report slice :closed-slicing) nil)
+                                 (and (nil? arm) wildcard?) (do (report slice :wildcard-group) nil)
+                                 arm (let [cands (mapv (fn [new old] (or new old))
+                                                       (:profile-candidates derived)
+                                                       (:profile-candidates arm))]
+                                       (assoc slice :cands cands
+                                              :changed? (not= cands (:profile-candidates arm))))
+                                 :else (assoc slice :derived derived)))))
+                     slices)]
+    (if (empty? usable)
+      acc
+      (let [restated (into {} (comp (filter :arm) (map (juxt :slice-name identity))) usable)
+            added (into [] (remove :arm) usable)
+            base-arms (mapv (fn [a]
+                              (if-let [r (restated (:slice-name a))]
+                                (-> a
+                                    (assoc :profile-candidates (:cands r))
+                                    (into (remove (comp nil? val)) (slice-cardinality r)))
+                                a))
+                            arms)
+            added-arms (mapv (fn [{:keys [derived slice-name] :as s}]
+                               (merge {:slice-name slice-name
+                                       :dispatch-value (:dispatch-value derived)
+                                       :profile-candidates (:profile-candidates derived)
+                                       :exists-underivable? (boolean (:exists-underivable? derived))
+                                       :this-path (:this-path derived)}
+                                      (slice-cardinality s)))
+                             added)
+            all-arms (into base-arms added-arms)
+            ;; Only a profile, type or $this discriminator hands the arms to
+            ;; the driver hook, so only then can a changed arm list change the
+            ;; dispatch; a value or exists dispatch reads the instance alone.
+            arm-dependent? (boolean (some (fn [{:keys [type path]}]
+                                            (or (#{"profile" "type"} type) (= "$this" path)))
+                                          discriminators))
+            need-rebuild? (and arm-dependent?
+                               (or (seq added-arms) (boolean (some :changed? (vals restated)))))
+            {rebuilt-form :form new-keep :keep-idx} (when need-rebuild?
+                                                      (make-dispatch-form discriminators element-sch all-arms))
+            keep* (if need-rebuild? new-keep keep-idx)
+            ks (when keep* (dispatch-arm-keys discriminators all-arms keep*))
+            new-ks (when ks (subvec ks (count arms)))
+            ok? (boolean
+                 (and ks
+                      (or (not need-rebuild?) rebuilt-form)
+                      (= keep* keep-idx)
+                      (= (subvec ks 0 (count arms)) (mapv :key arms))
+                      (not-any? keyword? new-ks)
+                      (not-any? (set (map :key arms)) new-ks)
+                      (or (empty? new-ks) (apply distinct? new-ks))))
+            arm-expr (fn [k] `(~'arm ~k))
+            arm-form (fn [slice base-expr]
+                       (let [{:keys [arm-form is-replacement?]} (slice-arm-form (:form slice))]
+                         (if is-replacement?
+                           arm-form
+                           `(~'let [~'base-arm ~base-expr] ~arm-form))))
+            existing-entries
+            (fn [replace?]
+              (into []
+                    (comp (remove :collided?)
+                          (map (fn [{:keys [key slice-name]}]
+                                 (let [r (restated slice-name)]
+                                   [key (if (and r (replace? r))
+                                          (arm-form r (arm-expr key))
+                                          (arm-expr key))]))))
+                    arms))
+            touched? (set (map :slice-name usable))
+            ;; The field is rebuilt whole, so a field that was counted is
+            ;; unwrapped from its :and, and the new arms decide whether it is
+            ;; counted again: a narrowed 0..1 slice becomes 1..1 here.
+            emit (fn [dispatch-expr entries counted]
+                   (let [multi-expr `(~'-> ~(if counted?
+                                                `(~'mu/get (~'mu/get ~'sch 0) 0)
+                                                `(~'mu/get ~'sch 0))
+                                           (~'m/schema ~'options) ~'m/deref)
+                         sequential-form `[:sequential
+                                           [:multi {:dispatch ~(if (seq counted) 'dispatch dispatch-expr)}
+                                            ~@entries
+                                            ~@(when default?
+                                                [[:malli.core/default (arm-expr :malli.core/default)]])]]]
+                     `(~'mu/update
+                       ~base-k
+                       (~'fn [~'sch]
+                        (~'let [~'multi ~multi-expr
+                                ~'arm (~'fn [~'kk]
+                                       (~'some (~'fn [[~'k2 ~'_ ~'s2]] (~'when (= ~'kk ~'k2) ~'s2))
+                                        (~'m/children ~'multi)))]
+                         ~(if (seq counted)
+                            (counted-form dispatch-expr sequential-form counted element-id (:matcher (meta counted)))
+                            sequential-form))))))
+            counts-for (fn [arms* keep-idx*]
+                         (when *compile-slice-counts*
+                           (let [counted (counted-arms {:arms arms* :multi? true :field-is-sequential? true}
+                                                       element-id touched?)
+                                 matcher (when (seq counted)
+                                           (make-matcher-form element-id discriminators element-sch arms* counted keep-idx*))]
+                             (if (or matcher (empty? counted))
+                               (with-meta counted {:matcher matcher})
+                               (do (doseq [{:keys [slice-name]} counted]
+                                     (when (touched? slice-name)
+                                       (report-uncompiled-slice! element-id slice-name :count-no-matcher)))
+                                   [])))))
+            with-required (fn [acc counted]
+                            (cond-> acc
+                              (and (requires-field? counted) (not required?))
+                              (update :form conj
+                                      `(~'mu/update-entry-properties ~base-k ~'merge {:optional false}))))
+            inherited-dispatch `(~':dispatch (~'m/properties ~'multi))]
+        (if ok?
+          (let [merged (into (mapv #(dissoc % :changed?) base-arms)
+                             (mapv (fn [a k] (assoc a :key k :routable? true :collided? false))
+                                   added-arms new-ks))
+                counted (counts-for merged keep*)]
+            (record-slicing! element-id
+                             (assoc record
+                                    :arms merged
+                                    :counted? (boolean (seq counted))
+                                    :required? (or required? (requires-field? counted))))
+            (-> acc
+                (update :form conj
+                        (emit (if need-rebuild? rebuilt-form inherited-dispatch)
+                              (into (existing-entries (constantly true))
+                                    (mapv (fn [s k] [k (arm-form s (arm-expr :malli.core/default))])
+                                          added new-ks))
+                              counted))
+                (with-required counted)))
+          (do
+            (doseq [s added] (report s :dispatch-declined))
+            (doseq [s (vals restated) :when (:changed? s)] (report s :restated-unroutable))
+            (if (empty? restated)
+              acc
+              (let [counted (counts-for base-arms keep-idx)]
+                (record-slicing! element-id
+                                 (assoc record
+                                        :arms (mapv #(dissoc % :changed?) base-arms)
+                                        :counted? (boolean (seq counted))
+                                        :required? (or required? (requires-field? counted))))
+                (-> acc
+                    (update :form conj
+                            (emit inherited-dispatch (existing-entries (constantly true)) counted))
+                    (with-required counted))))))))))
+
 (defn- apply-non-extension-slice
   "Non-extension slices: collect into :pending-slicing, merge into an existing multi,
    or fall back to direct threading on the element schema."
@@ -2492,7 +3249,8 @@
       ;; enough: flush can mark sliced yet skip multi when dispatch is nil.
       (let [seq-multi (as-sequential-multi base-sch)
             is-base-seq? (boolean (or (when seq-multi (first seq-multi))
-                                      (some-> base-sch m/type (= :sequential))))
+                                      (some-> (or (counted-sequential base-sch) base-sch)
+                                              m/type (= :sequential))))
             {:keys [slice-forms is-replacement?]} (slice-arm-form new-sub-form)]
         (cond
           seq-multi
@@ -2560,15 +3318,19 @@
         has-resolve? (some #(and (:path %) (str/includes? (:path %) "resolve()"))
                            (:discriminator slicing))]
     (if (and slicing (not has-resolve?) (not (#{:extension :modifierExtension} effective-k)))
-        (let [raw-field-sch (mu/get (:sch res) effective-k)
+        (let [_ (when (some-> *slicings* deref (get (str/join "." main-path)))
+                  (report-uncompiled-slice! (str/join "." main-path) nil :reslicing))
+              raw-field-sch (mu/get (:sch res) effective-k)
               base-sch-for-slicing (unwrap-sequential raw-field-sch)
-              field-is-sequential? (or (some-> raw-field-sch m/type (= :sequential))
+              field-is-sequential? (or (some-> (or (counted-sequential raw-field-sch) raw-field-sch)
+                                               m/type (= :sequential))
                                        (shape/seq-field? field-info))
               [cleaned-form captured-base-form] (find-and-remove-base-form (vec (:form res)) effective-k)]
         (-> res
             (assoc :form cleaned-form)
             (assoc-in [:pending-slicing effective-k]
-                      {:discriminators (normalize-discriminators (:discriminator slicing))
+                      {:element-id (str/join "." main-path)
+                       :discriminators (normalize-discriminators (:discriminator slicing))
                        :rules (or (:rules slicing) "open")
                        :field-is-sequential? field-is-sequential?
                        :base-form captured-base-form
@@ -2601,10 +3363,13 @@
                 ;; Without it a nested min 1 (AssignedEntity.addr 1..*) was dropped.
                 (and (not choice-type?) min-val (or field-info sub-sch (zero? min-val))) (assoc :optional (zero? min-val)))]
     (if slice-name
-      (let [ctx (prepare-slice-context old-acc k attr-type main-attr sub-elements main-path base-sch min-val props slice-name)]
-        (if (:is-extension? ctx)
-          (apply-extension-slice old-acc ctx)
-          (apply-non-extension-slice old-acc base-sch sub-elements main-path slice-name ctx)))
+      (let [inherited (inherited-slice-site old-acc base-field-kw main-path slice-name)
+            ctx (prepare-slice-context old-acc k attr-type main-attr sub-elements main-path
+                                       (or (:base-sch inherited) base-sch) min-val props slice-name)]
+        (cond
+          (:is-extension? ctx) (apply-extension-slice old-acc ctx)
+          inherited (apply-inherited-slice old-acc inherited sub-elements main-path slice-name ctx)
+          :else (apply-non-extension-slice old-acc base-sch sub-elements main-path slice-name ctx)))
       (apply-regular-element old-acc effective-k attr-type main-attr props sub-elements main-path sub-sch field-info))))
 
 ;; ---------------------------------------------------------------------------
@@ -2725,6 +3490,17 @@
         (keep (fn [{:keys [id path] mn :min}]
                 (when-some [k (or id path)]
                   (when-some [m (some-> mn str parse-long)]
+                    [(into [] (str/split k #"\.")) m]))))
+        snapshot-elements))
+
+(defn snapshot->element-max
+  "The `max` counterpart of `snapshot->element-min`, keyed the same way and
+   holding the FHIR string (\"1\", \"*\")."
+  [snapshot-elements]
+  (into {}
+        (keep (fn [{:keys [id path] mx :max}]
+                (when-some [k (or id path)]
+                  (when-some [m (some-> mx str)]
                     [(into [] (str/split k #"\.")) m]))))
         snapshot-elements))
 
@@ -2916,6 +3692,9 @@
   (fn [{:keys [url version fhirVersion kind name type]
         {:keys [element]} :differential baseDefinition :baseDefinition
         :as x}]
+    (when (and *compile-slice-counts* (not *rebuild-inherited-slicings*))
+      (throw (ex-info "*compile-slice-counts* requires *rebuild-inherited-slicings*: a derived profile would merge an arm into a counted field"
+                      {:type ::slice-counts-without-rebuild :definition url})))
     (let [kw (uri->kw2 url version)
           basekw (when baseDefinition
                    (if *canonical-index*
@@ -2960,11 +3739,20 @@
                        *local-registry* local-registry
                        *recursive-references* recursive-references
                        *base-refs* (atom {})
+                       *slicings* (when *rebuild-inherited-slicings*
+                                    (atom (if (and basekw (not is-simple?))
+                                            (or (:slicings (get @schema-atom basekw)) {})
+                                            {})))
+                       *live-base-sch* (when (and *rebuild-inherited-slicings* basekw (not is-simple?))
+                                         (delay (resolve-malli-sch basekw)))
                        *element-order* (snapshot->element-order
                                         (get-in x [:snapshot :element]))
                        *element-min* (snapshot->element-min
+                                      (get-in x [:snapshot :element]))
+                       *element-max* (snapshot->element-max
                                       (get-in x [:snapshot :element]))]
-               (if (and basekw (not is-simple?))
+               (cond->
+                (if (and basekw (not is-simple?))
                  (do
                    (swap! *references-atom* conj basekw)
                    (let [patched (-> schema-atom deref
@@ -3003,7 +3791,8 @@
                        (assoc :kind kind)
                        (assoc :references @*references-atom*)
                        (assoc :base-refs @*base-refs*)
-                                              wrap-local-registry))))))))
+                                              wrap-local-registry)))
+                 *slicings* (assoc :slicings @*slicings*)))))))
 
 (defn structure-definition->schema
   "A fn that generates one StructureDefinition into `schema-atom`, with the
@@ -3012,7 +3801,7 @@
   [schema-atom]
   (let [process (definition->schema schema-atom)]
     (fn [{:keys [version fhirVersion] :as sd}]
-      (binding [*referencing-definition* {:version version :fhirVersion fhirVersion}]
+      (binding [*referencing-definition* {:version version :fhirVersion fhirVersion :url (:url sd)}]
         (process sd)))))
 
 ;; ---------------------------------------------------------------------------
