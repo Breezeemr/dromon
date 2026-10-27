@@ -662,6 +662,31 @@
   (not-empty (cond-> (dissoc opts :if-match)
                if-match (assoc :if-match if-match))))
 
+(defn- check-put-if-none-match!
+  "Refuse a transaction PUT entry whose `ifNoneMatch` does not hold against
+   the transaction's state so far (R5 conditional update): `*` fails 412 when
+   the resource exists, a version ETag fails 412 when that version of it
+   exists, current or in its history. A blank value is a 400."
+  [store tenant-id rt type id url inm]
+  (let [s (str/trim (str inm))
+        v (when-not (str/blank? s) (protocol/normalize-if-match s))]
+    (cond
+      (nil? v)
+      (throw (ex-info (str "A transaction PUT entry's ifNoneMatch must be \"*\" or a version ETag, not "
+                           (pr-str inm))
+                      {:fhir/status 400 :fhir/code "not-supported" :method "PUT" :url url}))
+
+      (= protocol/if-match-any v)
+      (when (protocol/read-resource store tenant-id rt id)
+        (throw (ex-info (str "Precondition failed: " url " exists")
+                        {:fhir/status 412 :fhir/code "conflict" :resource-type type :id id})))
+
+      :else
+      (when (protocol/vread-resource store tenant-id rt id v)
+        (throw (ex-info (str "Precondition failed: " url " version " v " exists")
+                        {:fhir/status 412 :fhir/code "conflict" :resource-type type :id id
+                         :version-id v}))))))
+
 (defn- create-with
   [store tenant-id rt resource opts]
   (if opts
@@ -997,7 +1022,10 @@
                                                           :location (str type "/" (:id res) "/_history/" vid)
                                                           :etag (str "W/\"" vid "\"")
                                                           :lastModified last-mod}})
-                                     "PUT" (let [res (update-with this tenant-id rt id resource
+                                     "PUT" (let [inm (or (:ifNoneMatch req) (get req "ifNoneMatch"))
+                                                 _ (when (some? inm)
+                                                     (check-put-if-none-match! this tenant-id rt type id url inm))
+                                                 res (update-with this tenant-id rt id resource
                                                                   (entry-opts opts entry-if-match))
                                                  vid (get-in res [:meta :versionId])
                                                  last-mod (str (get-in res [:meta :lastUpdated]))]

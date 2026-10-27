@@ -518,3 +518,36 @@
       (is (= 400 (status [(write "w3") {:request {:method "HEAD" :url "Patient/x" :ifNoneMatch "W/\"1\""}}])))
       (is (= 400 (status [(write "w3") {:request {:method "GET" :url "Patient/x" :ifNoneMatch "*"}}])))
       (is (nil? (protocol/read-resource store tenant "Patient" "w3"))))))
+
+(deftest a-put-if-none-match-is-a-conditional-update
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        put (fn [id inm] {:request (cond-> {:method "PUT" :url (str "Patient/" id)}
+                                     inm (assoc :ifNoneMatch inm))
+                          :resource {:resourceType "Patient" :id id}})
+        status (fn [entries] (try (protocol/transact-transaction store tenant entries) 200
+                                  (catch Exception ex
+                                    (some #(:fhir/status (ex-data %)) (take-while some? (iterate ex-cause ex))))))
+        vid (fn [id] (get-in (protocol/read-resource store tenant "Patient" id) [:meta :versionId]))]
+    (testing "* writes while the resource is absent"
+      (is (= 200 (status [(put "a" "*")])))
+      (is (some? (protocol/read-resource store tenant "Patient" "a"))))
+    (testing "* fails the whole transaction once it exists"
+      (is (= 412 (status [(put "sibling" nil) (put "a" "*")])))
+      (is (nil? (protocol/read-resource store tenant "Patient" "sibling"))))
+    (testing "* sees the entries before it: a DELETE in the same Bundle runs first"
+      (is (= 200 (status [(put "a" "*") {:request {:method "DELETE" :url "Patient/a"}}]))))
+    (testing "a version ETag fails while that version exists, current or historical"
+      (protocol/create-resource store tenant "Patient" "v" {:resourceType "Patient"})
+      (let [v1 (vid "v")]
+        (protocol/update-resource store tenant "Patient" "v" {:resourceType "Patient" :active false})
+        (let [v2 (vid "v")]
+          (is (= 412 (status [(put "v" (str "W/\"" v2 "\""))])) "current")
+          (is (= 412 (status [(put "v" (str "W/\"" v1 "\""))])) "historical")
+          (is (= v2 (vid "v")) "nothing was written"))))
+    (testing "a version that never existed writes"
+      (is (= 200 (status [(put "v" "W/\"999\"")])))
+      (is (not= "999" (vid "v"))))
+    (testing "a blank ifNoneMatch is refused, never ignored"
+      (is (= 400 (status [(put "blank" "  ")])))
+      (is (nil? (protocol/read-resource store tenant "Patient" "blank"))))))

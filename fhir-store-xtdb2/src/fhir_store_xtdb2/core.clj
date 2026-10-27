@@ -491,18 +491,36 @@
                 (table-name resource-type) version-match-sql)
    (into [id] (version-match-args vid))])
 
-(defn- absent-assert-op
-  "The ASSERT of a transaction `HEAD` entry with `ifNoneMatch` `*`: the
-   transaction fails unless no current `resource-type`/`id` exists. Throws
-   400 for any other `ifNoneMatch`, or one on a `GET`."
+(defn- if-none-match-op
+  "The ASSERT of a transaction entry's `ifNoneMatch`, which fails the whole
+   transaction at commit, as a 412, when it does not hold:
+
+   - `*` on `HEAD` (a fence) or `PUT` (R5 conditional update): no current
+     `resource-type`/`id` exists.
+   - a version ETag on `PUT` (R5 conditional update): no version of the
+     resource with that versionId exists, current or in its history.
+
+   Throws 400 for any other entry or value: a precondition this store does
+   not check is refused, never ignored."
   [{:keys [method resource-type id if-none-match]}]
-  (when-not (and (= "HEAD" method) (= "*" (str/trim (str if-none-match))))
-    (throw (ex-info (str "A transaction entry's ifNoneMatch is supported only as \"*\" on HEAD, not "
-                         (pr-str if-none-match) " on " method)
-                    {:fhir/status 400 :fhir/code "not-supported"
-                     :resource-type resource-type :id id})))
-  [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" (table-name resource-type))
-   [id]])
+  (let [s (str/trim (str if-none-match))
+        v (when-not (str/blank? s) (fp/normalize-if-match s))
+        table (table-name resource-type)]
+    (cond
+      (and (= fp/if-match-any v) (#{"HEAD" "PUT"} method))
+      [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s WHERE _id = ?)" table) [id]]
+
+      (and v (= "PUT" method))
+      [:sql (format "ASSERT NOT EXISTS (SELECT 1 FROM %s FOR ALL SYSTEM_TIME WHERE _id = ? AND %s)"
+                    table version-match-sql)
+       (into [id] (version-match-args v))]
+
+      :else
+      (throw (ex-info (str "A transaction entry's ifNoneMatch is supported only as \"*\" on HEAD"
+                           " and as \"*\" or a version ETag on PUT, not "
+                           (pr-str if-none-match) " on " method)
+                      {:fhir/status 400 :fhir/code "not-supported"
+                       :resource-type resource-type :id id})))))
 
 (defn- entry-if-match
   "The version a transaction PUT entry's `request.ifMatch` guards on, checked
@@ -3242,6 +3260,8 @@
                              (update :tx-ops into
                                      (cond-> []
                                        if-match (conj (version-assert-op resource-type id if-match))
+                                       (and (= "PUT" method) (:if-none-match em))
+                                       (conj (if-none-match-op em))
                                        true (conj (emit-write-op em prepared vid))))
                              (update :lifecycle-writes conj write)
                              (update :entry-results conj (assoc em :resource final :vid vid))))
@@ -3260,7 +3280,7 @@
                        ;; also asserts the resource absent at commit.
                        (-> acc
                            (cond-> (:if-none-match em)
-                             (update :tx-ops conj (absent-assert-op em)))
+                             (update :tx-ops conj (if-none-match-op em)))
                            (update :entry-results conj em))))
                    {:tx-ops [] :lifecycle-writes [] :entry-results []}
                    entry-metas))

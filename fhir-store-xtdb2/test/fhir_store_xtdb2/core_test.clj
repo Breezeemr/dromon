@@ -1171,3 +1171,42 @@
               (is (= 400 (:fhir/status (root-ex-data e))) (pr-str entry))))
           (is (nil? (db/read-resource store tenant-id :Patient "w4"))))
         (finally (close-store-nodes! store))))))
+
+(deftest a-put-if-none-match-is-a-conditional-update
+  (doseq [mode [:sql :xtql]]
+    (testing (str "query-mode " mode)
+      (let [store (core-db/create-xtdb-store {:query-mode mode})
+            tenant-id "tenant-put-inm"
+            put (fn [id inm] {:request (cond-> {:method "PUT" :url (str "Patient/" id)}
+                                         inm (assoc :ifNoneMatch inm))
+                              :resource {:resourceType "Patient" :id id :active true}})
+            status (fn [entries]
+                     (try (db/transact-transaction store tenant-id entries) 200
+                          (catch Exception e (:fhir/status (root-ex-data e)))))
+            vid (fn [id] (get-in (db/read-resource store tenant-id :Patient id) [:meta :versionId]))]
+        (try
+          (testing "* writes while the resource is absent"
+            (is (= 200 (status [(put "a" "*")])))
+            (is (some? (db/read-resource store tenant-id :Patient "a"))))
+          (testing "* fails the whole transaction once it exists"
+            (is (= 412 (status [(put "sibling" nil) (put "a" "*")])))
+            (is (nil? (db/read-resource store tenant-id :Patient "sibling"))))
+          (testing "* sees the entries before it: a DELETE in the same Bundle runs first"
+            (is (= 200 (status [(put "a" "*") {:request {:method "DELETE" :url "Patient/a"}}]))))
+          (testing "a version ETag fails while that version exists, current or historical"
+            (db/create-resource store tenant-id :Patient "v" {:resourceType "Patient" :id "v"})
+            (let [v1 (vid "v")]
+              (db/update-resource store tenant-id :Patient "v" {:resourceType "Patient" :id "v" :active false})
+              (let [v2 (vid "v")]
+                (is (= 412 (status [(put "v" (str "W/\"" v2 "\""))])) "current")
+                (is (= 412 (status [(put "v" (str "W/\"" v1 "\""))])) "historical")
+                (is (= v2 (vid "v")) "nothing was written")
+                (db/delete-resource store tenant-id :Patient "v")
+                (is (= 412 (status [(put "v" (str "W/\"" v1 "\""))])) "after a delete"))))
+          (testing "a version that never existed writes"
+            (is (= 200 (status [(put "v" "W/\"2001-01-01T000000Z\"")])))
+            (is (some? (db/read-resource store tenant-id :Patient "v"))))
+          (testing "a blank ifNoneMatch is refused, never ignored"
+            (is (= 400 (status [(put "blank" "  ")])))
+            (is (nil? (db/read-resource store tenant-id :Patient "blank"))))
+          (finally (close-store-nodes! store)))))))
