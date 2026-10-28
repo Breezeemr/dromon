@@ -1,5 +1,6 @@
 (ns fhir-store.mock.core
   (:require [clojure.string :as str]
+            [clojure.walk :as walk]
             [fhir-store.protocol :as protocol]
             [fhir-store.lifecycle :as lc]
             [taoensso.telemere :as t]
@@ -710,10 +711,45 @@
     (str (inc (Long/parseLong current)))
     "1"))
 
+(defn- wire-value
+  "`v` as FHIR JSON spells it, when `v` is one of the values the FHIR JSON
+   transformer decodes a primitive to; `v` itself otherwise. The formats are
+   the ones that transformer encodes with (malli's ISO formatters, `str` for
+   gYear and gYearMonth, `urn:uuid:` for a uuid), so a version reads back
+   exactly as a store that renders its reads through it would answer."
+  [v]
+  (condp instance? v
+    java.time.LocalDate      (.format java.time.format.DateTimeFormatter/ISO_LOCAL_DATE ^java.time.LocalDate v)
+    java.time.LocalTime      (.format java.time.format.DateTimeFormatter/ISO_LOCAL_TIME ^java.time.LocalTime v)
+    java.time.OffsetDateTime (.format java.time.format.DateTimeFormatter/ISO_OFFSET_DATE_TIME ^java.time.OffsetDateTime v)
+    java.time.Instant        (.format java.time.format.DateTimeFormatter/ISO_INSTANT ^java.time.Instant v)
+    java.time.Year           (str v)
+    java.time.YearMonth      (str v)
+    java.util.UUID           (str "urn:uuid:" v)
+    v))
+
+(defn- wire-form
+  "`resource` with every decoded primitive spelled as FHIR JSON spells it, at
+   any depth, contained resources included.
+
+   A resource that arrives over HTTP has been through the router's request
+   coercion, so a `birthDate` is a LocalDate and a `dateTime` an
+   OffsetDateTime. The Datomic and XTDB stores answer reads in the wire form
+   (Datomic renders its temporal tuples as strings and keeps contained
+   resources as JSON; XTDB encodes every read back through the FHIR JSON
+   transformer). The mock kept the decoded values, so an in-process read of a
+   version written over HTTP answered a LocalDate where the other stores
+   answer \"1990-01-01\", and code comparing it with a string written some
+   other way saw a change that never happened."
+  [resource]
+  (walk/postwalk wire-value resource))
+
 (defn- stamp-version
-  "The stored form of a version: id and meta set, the write's basis attached."
+  "The stored form of a version: the body in wire form (see `wire-form`), id
+   and meta set, the write's basis attached. meta.lastUpdated is the basis's
+   Instant, as it always was."
   [resource id vid basis]
-  (with-basis (-> resource
+  (with-basis (-> (wire-form resource)
                   (update :meta merge {:versionId vid
                                        :lastUpdated (:system-time basis)})
                   (assoc :id id))
