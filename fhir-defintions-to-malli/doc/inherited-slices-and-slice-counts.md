@@ -792,3 +792,47 @@ process 354 / 341 / 299 ok, 0 fail. `diff -r -q` of the whole tree minus `sds`, 
 mutants that agree 1,562 / 411 / 462 to 1,599 / 421 / 478. 63 of the 67 duplicates that only
 the Schematron rejected are rejected by malli now, at the target CONF; the seeds are unchanged.
 The 4 left duplicate a templateId slice the template's own schema rejects.
+
+## 13. Scalar patterns and a profile on the slice root (2026-10-27)
+
+Two switches, both default false, that let a template's own templateId reject another
+version. qrda-definitions binds both.
+
+**`*primitive-pattern-as-fixed*`.** `attr->value-schema-patch` compiles a `fixed*` value to an
+`:enum` of one and leaves every `pattern*` value out. On a primitive type a pattern is the same
+equality as a fixed value. The QRDA emitter states each template's own templateId the way
+C-CDA 5.0.0 does, as `patternString` root and extension (532 of them in the three QRDA sets,
+and no other pattern), so where a slicing discriminates by root alone a templateId with
+another `@extension` passed. With the switch, a scalar pattern (not a map, so not
+patternCodeableConcept or patternCoding) takes the fixed-value path; a fixed value still wins
+when an element states both.
+
+**`*honor-slice-root-profile*`.** `honor-at-use-site?` keeps a single-profile narrowing at an
+optional element only for a child hanging off a slice arm (`slice-arm-child?`), the shape
+C-CDA uses: the profile sits on `component:allergies.section`, never on the slice. QRDA states
+it on the slice itself (`Observation.participant:facility-location` typed Facility Location,
+`Observation.author:author` typed Author), and at `min` 0 with a profile that raises a child
+requirement the gate fell back to the base type, so the arm the dispatch selects for the
+template never applied it. With the switch, an element whose last id segment is a slice keeps
+the narrowing: it is reached only through its slicing's dispatch, and every member of a slice
+conforms to the slice's type profile. An unsliced optional child is gated as before.
+
+**Tests.** `primitive-pattern-as-fixed-test`: a patternString compiles to an `:enum` that
+rejects another value and leaves the element optional, a fixed value wins over a pattern, and
+with the switch off another value passes. `child-type-profile-narrowing-test` gains the slice
+root case: off it keeps the base type, on it refs the profile, and an unsliced optional child
+keeps the base type either way. `unbound-switches-reproduce-origin-main-test` checks both
+defaults. 59 tests, 375 assertions, 0 failures.
+
+**ccda unaffected.** The method of section 11 with both switches in the tree: a fresh
+`git archive 8612660924 ccda` copy (`run/`), `run/dromon/` symlinked to this worktree, the
+pinned ART-DECOR file copied in, `clojure -Sforce -M:generate` and `clojure -M:dispatch-index`
+for `default`, `r21` and `r11`, one JVM at a time, against the `ref/` copy of section 12. All six
+exit 0; process 354 / 341 / 299 ok, 0 fail; the 7 AuthorParticipation narrowings C-CDA withholds
+are still withheld. `diff -r -q` minus `sds`, `staging`, `sources`, `.cpcache` and `target` is
+empty, and the digest of `src src-r21 src-r11 resources` (768 files) is the same for both copies.
+
+**Effect on qrda-definitions** (which binds both): QRDA I / QRDA III / CMS 2027 QRDA III mutants
+that agree 1,599 / 421 / 478 to 1,616 / 425 / 482; Schematron-only 83 / 12 / 23 to 66 / 8 / 19.
+The seeds' findings are unchanged, and so are the false rejections over the Schematron-clean
+mutants (24 / 2 / 6, every one a deleted templateId of the template itself).
