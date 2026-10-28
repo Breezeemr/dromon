@@ -425,6 +425,36 @@
    section 12."
   false)
 
+(def ^:dynamic *primitive-pattern-as-fixed*
+  "When true, a scalar `pattern*` value (patternString, patternCode, ...)
+   compiles like a `fixed*` value, to an `:enum` of one: on a primitive type a
+   pattern requires exactly that value. Without it the pattern is left out and
+   any value passes, so a templateId whose `@extension` is pinned by
+   patternString accepts another version. A complex pattern (a map, such as
+   patternCodeableConcept) is still not compiled.
+
+   Off by default, so a package generated without a driver that opts in keeps
+   byte-identical output. See doc/inherited-slices-and-slice-counts.md
+   section 13."
+  false)
+
+(def ^:dynamic *honor-slice-root-profile*
+  "When true, the use-site gate (`honor-at-use-site?`) keeps the narrowing at a
+   slice whose own element states the profile (`Observation.participant:
+   facility-location` typed FacilityLocation), as it already does for a child
+   hanging off a slice arm. An instance reaches the arm only through its
+   slicing's dispatch, and every member of a slice has to conform to the
+   slice's type profile, so the profile's demands are the instance's own claim.
+   Without it an optional slice root (`min` 0) whose profile raises a child
+   requirement keeps the base type, and the template is never applied: a
+   templateId with the wrong `@extension` passes.
+
+   Off by default, so a package generated without a driver that opts in keeps
+   byte-identical output. C-CDA states the arm's profile on the slice's child,
+   never on the slice, so it would not change C-CDA output either. See
+   doc/inherited-slices-and-slice-counts.md section 13."
+  false)
+
 (def ^:dynamic *slicings*
   "While `*rebuild-inherited-slicings*` is on: an atom of {sliced-element-id
    record} for the definition being generated, seeded from its base's
@@ -873,6 +903,8 @@
       (nil? use-min)
       (>= use-min 1)
       (slice-arm-child? use-path)
+      (and *honor-slice-root-profile*
+           (let [seg (last use-path)] (and (string? seg) (str/includes? seg ":"))))
       (not (contains? *profiles-raising-child-requirement*
                       (strip-canonical-version canonical)))))
 
@@ -2435,7 +2467,10 @@
       new-acc)))
 
 (defn attr->value-schema-patch [acc id attr-type {attr-max :max :as main-attr} sub-elements main-path]
-  (let [fixed-k (first (filter #(str/starts-with? (name %) "fixed") (keys main-attr)))
+  (let [fixed-k (or (first (filter #(str/starts-with? (name %) "fixed") (keys main-attr)))
+                    (when *primitive-pattern-as-fixed*
+                      (first (filter #(and (str/starts-with? (name %) "pattern") (not (coll? (get main-attr %))))
+                                     (keys main-attr)))))
         fixed-v (when fixed-k (get main-attr fixed-k))
         computed-acc (if fixed-v
                        {:sch [:enum {} fixed-v], :form [`[:enum {} ~fixed-v]], :fixed-enum? true}
