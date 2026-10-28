@@ -7,5 +7,8 @@
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
-                      lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+                      lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                      ;; The FHIR JSON transformer, to decode a resource the
+                      ;; way the router's request coercion does.
+                      com.breezeehr/fhir-primitives {:local/root "../fhir-primitives"}}
          :main-opts ["-m" "kaocha.runner"]}}}
