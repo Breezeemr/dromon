@@ -703,6 +703,22 @@
                  (first (run {:code "code"
                               :profile ["http://example.org/StructureDefinition/Narrowed"]})))))
 
+        (testing "an optional slice whose profile raises a child requirement keeps the base type unless the slice-root switch is on"
+          (let [narrowed "http://example.org/StructureDefinition/Narrowed"
+                at (fn [path] (let [refs (atom #{})]
+                                (binding [fdm/*references-atom* refs
+                                          fdm/*referencing-definition* {:version "4.3.0"}
+                                          fdm/*profiles-raising-child-requirement* #{narrowed}]
+                                  (:form (fdm/prim-or-ref {} {:code "Patient" :profile [narrowed]}
+                                                          {:min 0 :path path})))))]
+            (is (false? fdm/*honor-slice-root-profile*))
+            (is (= [[:ref base-kw]] (at ["Observation" "participant:facility-location"])))
+            (binding [fdm/*honor-slice-root-profile* true]
+              (is (= [[:ref narrowed-kw]] (at ["Observation" "participant:facility-location"]))
+                  "the slice root states the profile, so the narrowing is kept")
+              (is (= [[:ref base-kw]] (at ["Observation" "participant"]))
+                  "an unsliced optional child still keeps the base type"))))
+
         (testing "a canonical no package defines degrades to the base type and reports"
           (let [unresolved (atom [])]
             (binding [fdm/*unresolved-profiles* unresolved
@@ -1011,6 +1027,40 @@
   (testing "off by default, the bound is not on the :sequential and a second occurrence passes"
     (is (false? fdm/*max-on-sequence*))
     (is (m/validate (max-on-sequence-scenario false "1" [:sequential :string]) {:f ["a" "b"]}))))
+
+(defn- primitive-pattern-scenario
+  "The schema of `:f`, a string, patched by a profile element `TP.f` carrying
+  `pattern` (an ElementDefinition fragment), with `*primitive-pattern-as-fixed*`
+  bound to `on?`."
+  [on? pattern]
+  (let [base (m/schema [:map {:closed true} [:f {:optional true} :string]] fp/fhir-registry-options)
+        form (binding [fdm/*schema-atom* (atom {})
+                       fdm/*referencing-definition* {:version "1.0"}
+                       fdm/*references-atom* (atom #{})
+                       fdm/*recursive-references* #{}
+                       fdm/*base-refs* (atom {})
+                       fdm/*primitive-pattern-as-fixed* on?]
+               (:form (fdm/element-definition->attribute
+                       {:sch base :shape {} :form []}
+                       ["TP"]
+                       [(merge {:path ["TP" "f"] :id "TP.f"} pattern)])))
+        patch (binding [*ns* (the-ns 'com.breezeehr.fhir-defintions-to-malli)]
+                (eval (list 'fn '[sch] (list* '-> 'sch form))))]
+    (patch base)))
+
+(deftest primitive-pattern-as-fixed-test
+  (testing "a scalar pattern compiles to an :enum of one, like a fixed value"
+    (let [sch (primitive-pattern-scenario true {:patternString "2021-08-01"})]
+      (is (m/validate sch {:f "2021-08-01"}))
+      (is (not (m/validate sch {:f "2019-12-01"})) "another value fails")
+      (is (m/validate sch {}) "the pattern does not make the element required")))
+  (testing "a fixed value still wins over a pattern"
+    (let [sch (primitive-pattern-scenario true {:fixedString "a" :patternString "b"})]
+      (is (m/validate sch {:f "a"}))
+      (is (not (m/validate sch {:f "b"})))))
+  (testing "off by default, the pattern is left out and any value passes"
+    (is (false? fdm/*primitive-pattern-as-fixed*))
+    (is (m/validate (primitive-pattern-scenario false {:patternString "2021-08-01"}) {:f "2019-12-01"}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Inherited slicings (doc/inherited-slices-and-slice-counts.md section 3)
@@ -1832,6 +1882,8 @@
       (is (false? fdm/*rebuild-inherited-slicings*))
       (is (false? fdm/*compile-slice-counts*))
       (is (false? fdm/*max-on-sequence*))
+      (is (false? fdm/*primitive-pattern-as-fixed*))
+      (is (false? fdm/*honor-slice-root-profile*))
       (is (nil? fdm/*discriminator-claims-fn*))
       (is (nil? fdm/*count-soft-discriminator-fn*))
       (is (nil? fdm/*uncompiled-slices*))
