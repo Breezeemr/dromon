@@ -193,6 +193,33 @@
             (println "Error extracting:" (:err result))))
         (println "Done.")))))
 
+(def qicore-target-dir "scratch/qicore")
+
+(defn download-and-extract-qicore! [version & {:keys [force?] :or {force? false}}]
+  (let [package-url (str "https://packages.fhir.org/hl7.fhir.us.qicore/" version)
+        out-dir (io/file qicore-target-dir version)
+        package-dir (io/file out-dir "package")
+        temp-tgz (io/file out-dir "package.tgz")]
+    (if (and (not force?) (.isDirectory package-dir))
+      (println "QI-Core" version "already downloaded, skipping.")
+      (do
+        (when-not (.exists out-dir)
+          (.mkdirs out-dir))
+
+        (println "Downloading QI-Core version" version "to" (.getAbsolutePath temp-tgz) "...")
+        (with-open [in (:body (hc/get package-url {:as :stream}))
+                    out (io/output-stream temp-tgz)]
+          (io/copy in out))
+
+        (println "Extracting" (.getAbsolutePath temp-tgz) "...")
+        (let [result (shell/sh "tar" "-xzf" (.getAbsolutePath temp-tgz) "-C" (.getAbsolutePath out-dir))]
+          (if (zero? (:exit result))
+            (do
+              (println "Extraction successful.")
+              (.delete temp-tgz))
+            (println "Error extracting:" (:err result))))
+        (println "Done.")))))
+
 (comment
   (download "4.3.0")
 
