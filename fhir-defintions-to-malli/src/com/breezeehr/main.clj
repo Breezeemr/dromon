@@ -224,6 +224,7 @@
      6. US Core CapabilityStatement :multi schemas
      7. US Core SearchParameter resources
      8. Da Vinci CRD extensions
+     9. QI-Core 7.0.2 DeviceRequest profile (only that one profile)
 
    FHIR Extensions is generated before xver because xver profiles 27 extensions
    that only FHIR Extensions defines (alternate-reference, the artifact-* family)
@@ -271,6 +272,7 @@
   (download-fhir/download-and-extract-sdc! "STU4" :force? force-download?)
   (download-fhir/download-and-extract-uscore! "STU8.0.1" :force? force-download?)
   (download-fhir/download-and-extract-davinci-crd! "2.0.1" :force? force-download?)
+  (download-fhir/download-and-extract-qicore! "7.0.2" :force? force-download?)
 
   (println "\n=== Planning all packages ===")
   (let [;; R4B ships as a bundle directory and SDC as a published `site` tree, so
@@ -302,6 +304,7 @@
         uscore-desc  (assoc (gen/read-package-descriptor "scratch/us-core/STU8.0.1/package")
                             :overrides uscore-overrides)
         davinci-desc (gen/read-package-descriptor "scratch/davinci-crd/2.0.1/package")
+        qicore-desc  (gen/read-package-descriptor "scratch/qicore/7.0.2/package")
         r4b-plan     (gen/plan (version-sources "scratch/definitions.json/") #{nil})
         r4b-urls     (into #{nil} (map :url) r4b-plan)
         fhirext-plan (gen/plan [{:type :directory :path "scratch/fhir-extensions/5.3.0-ballot-tc1/package"}]
@@ -318,9 +321,19 @@
         davinci-plan (filterv #(= "Extension" (:type %))
                               (gen/plan [{:type :directory :path "scratch/davinci-crd/2.0.1/package"}]
                                         uscore-urls :skip-missing true))
+        davinci-urls (into uscore-urls (map :url) davinci-plan)
+        ;; Only the DeviceRequest profile of QI-Core. QI-Core 7 derives from US Core 7
+        ;; and its Patient subject target is a QI-Core profile; planning with
+        ;; :skip-missing and keeping one URL leaves every other QI-Core definition
+        ;; out of the run. Its extensions (codeOptions, DeviceRequest.doNotPerform)
+        ;; are already generated above.
+        qicore-plan  (filterv #(= "http://hl7.org/fhir/us/qicore/StructureDefinition/qicore-devicerequest"
+                                  (:url %))
+                              (gen/plan [{:type :directory :path "scratch/qicore/7.0.2/package"}]
+                                        davinci-urls :skip-missing true))
         ;; Pipeline order; a canonical defined by two packages keeps both, and the
         ;; reference decides which is meant.
-        [r4b-desc fhirext-desc xver-desc sdc-desc uscore-desc davinci-desc
+        [r4b-desc fhirext-desc xver-desc sdc-desc uscore-desc davinci-desc qicore-desc
          :as packages]
         (gen/prepare-packages
          [(assoc r4b-desc     :plan r4b-plan)
@@ -328,11 +341,13 @@
           (assoc xver-desc    :plan xver-plan)
           (assoc sdc-desc     :plan sdc-plan)
           (assoc uscore-desc  :plan uscore-plan)
-          (assoc davinci-desc :plan davinci-plan)])
+          (assoc davinci-desc :plan davinci-plan)
+          (assoc qicore-desc  :plan qicore-plan)])
         index        (gen/canonical-index packages)
         unresolved   (atom [])]
     (println "  planned" (+ (count r4b-plan) (count fhirext-plan) (count xver-plan)
-                            (count sdc-plan) (count uscore-plan) (count davinci-plan))
+                            (count sdc-plan) (count uscore-plan) (count davinci-plan)
+                            (count qicore-plan))
              "definitions;" (count index) "distinct canonicals indexed")
     (gen/check-references! packages index)
 
@@ -346,6 +361,7 @@
             sdc-pkg     (conj base-dir "sdc")
             uscore-pkg  (conj base-dir "uscore8")
             davinci-pkg (conj base-dir "davinci")
+            qicore-pkg  (conj base-dir "qicore")
 
             ;; --- 1. R4B base ---
             _           (println "\n=== Step 1: R4B base definitions ===")
@@ -425,7 +441,18 @@
                                                       {:name "fhir-extensions" :relative-path "../fhir-extensions"}
                                                       {:name "xver" :relative-path "../xver"}
                                                       {:name "sdc" :relative-path "../sdc"}
-                                                      {:name "uscore8" :relative-path "../uscore8"}])]
+                                                      {:name "uscore8" :relative-path "../uscore8"}])
+
+            ;; --- 9. QI-Core DeviceRequest profile ---
+            ;; Written so a CapabilityStatement can name qicore-devicerequest as a supported
+            ;; profile. No SearchParameters: the statement's own type entry supplies them.
+            _           (println "\n=== Step 9: QI-Core DeviceRequest profile ===")
+            qicore-result (gen/generate! sa staging-dir (conj qicore-pkg "src") qicore-plan :package qicore-desc)
+            _           (write-deps-edn! qicore-pkg [{:name "r4b" :relative-path "../r4b"}
+                                                     {:name "fhir-extensions" :relative-path "../fhir-extensions"}
+                                                     {:name "xver" :relative-path "../xver"}
+                                                     {:name "sdc" :relative-path "../sdc"}
+                                                     {:name "uscore8" :relative-path "../uscore8"}])]
         (report-unresolved-profiles! @unresolved)
         {:r4b            r4b-result
          :xver           xver-result
@@ -433,8 +460,9 @@
          :sdc            sdc-result
          :uscore         uscore-result
          :davinci        davinci-result
+         :qicore         qicore-result
          :capability     cap-result
          :search-params  {:r4b r4b-sp :fhir-extensions fhirext-sp :sdc sdc-sp :uscore uscore-sp}
          :unresolved-profiles @unresolved
          :canonical-index index
-         :urls           (into uscore-urls (map :url) davinci-plan)}))))
+         :urls           (into davinci-urls (map :url) qicore-plan)}))))
