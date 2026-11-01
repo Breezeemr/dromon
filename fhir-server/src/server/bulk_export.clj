@@ -24,6 +24,14 @@
    bounded to one store page regardless of type size. No background worker, no
    temp files.
 
+   Replicas: every handler reaches job records only through the
+   server.bulk-job-store JobStore protocol (put at kickoff, get at status/file,
+   remove at cancel and in the TTL sweep). The default in-memory store is
+   correct for one replica; several replicas share a durable JobStore, and the
+   pinned basis travels with the job, so any replica streams the same snapshot.
+   The concurrent-stream cap stays per replica. A host that configures no job
+   store gets 501 on every bulk route (see [[job-store-required]]).
+
    Response-encoding note (critical): the status manifest is application/json
    and the NDJSON stream is application/fhir+ndjson, neither of which is what
    muuntaja would negotiate. A Clojure map body carrying an explicit
@@ -700,16 +708,33 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- sweep-expired!
-  "Evict terminal (complete/error/cancelled) jobs older than the configured
-   ttl-ms. Jobs are now tiny metadata (no files), so eviction just drops the
-   record. Runs lazily at the head of each bulk request."
+  "Evict terminal (complete/error) jobs older than the configured ttl-ms. Jobs
+   are tiny metadata (no files), so eviction just drops the record. Runs lazily
+   at the head of each bulk request, through the JobStore protocol only, so
+   with a shared durable store any replica's sweep serves all of them (removal
+   is idempotent when two replicas sweep the same job)."
   [job-store]
   (let [ttl (long (:ttl-ms (bjs/config job-store)))
         now (System/currentTimeMillis)]
     (doseq [job (bjs/all-jobs job-store)]
-      (when (and (#{:complete :error :cancelled} (:status job))
+      (when (and (#{:complete :error} (:status job))
                  (> (- now (long (or (:finished-at job) (:created-at job) now))) ttl))
         (bjs/remove-job! job-store (:tenant job) (:id job))))))
+
+;; ---------------------------------------------------------------------------
+;; Job store presence
+;; ---------------------------------------------------------------------------
+
+(defn job-store-required
+  "Wrap a bulk handler so a request reaching it without a
+   :fhir/bulk-job-store (the host configured none) answers 501 with an
+   OperationOutcome instead of failing on the missing store."
+  [handler]
+  (fn [req]
+    (if (nil? (:fhir/bulk-job-store req))
+      (oo-response 501 "not-supported"
+                   "Bulk Data export is not configured on this server.")
+      (handler req))))
 
 ;; ---------------------------------------------------------------------------
 ;; Kickoff
@@ -891,7 +916,7 @@
                    which the status and file URLs answer 404.
    :in-progress -> 202 with X-Progress + Retry-After.
    :error       -> 500 OperationOutcome.
-   :cancelled / unknown / another requester's job -> 404."
+   cancelled (removed) / unknown / another requester's job -> 404."
   [req]
   (let [tenant-id (-> req :path-params :tenant-id)
         job-id    (-> req :path-params :job-id)
@@ -913,15 +938,17 @@
       :error
       (oo-response 500 "exception" "Export failed")
 
-      ;; nil (unknown) and :cancelled both surface as 404: a cancelled job's
-      ;; status endpoint no longer exists (Bulk Data IG).
+      ;; nil: unknown, cancelled (removed) or swept. A cancelled job's status
+      ;; endpoint no longer exists (Bulk Data IG).
       (oo-response 404 "not-found"
                    (str "Export job " job-id " not found")))))
 
 (defn cancel
   "DELETE /:tenant-id/fhir/$export-status/:job-id — cancel a job (202). There is
-   no on-disk content to reclaim; the job metadata is flipped to :cancelled and
-   TTL-swept later. Another requester's job is a 404, as in `status`."
+   no on-disk content to reclaim, so the job record is removed from the job
+   store: afterwards its status and file URLs answer 404 on every replica that
+   shares the store (Bulk Data IG). Another requester's job is a 404, as in
+   `status`."
   [req]
   (let [tenant-id (-> req :path-params :tenant-id)
         job-id    (-> req :path-params :job-id)
@@ -930,9 +957,7 @@
         job       (visible-job req (bjs/get-job job-store tenant-id job-id))]
     (if job
       (do
-        (bjs/update-job! job-store tenant-id job-id
-                         (fn [j] (when j (assoc j :status :cancelled
-                                               :finished-at (System/currentTimeMillis)))))
+        (bjs/remove-job! job-store tenant-id job-id)
         (str-response 202 "application/json"
                       (json-str (operation-outcome
                                  "information" "informational"
