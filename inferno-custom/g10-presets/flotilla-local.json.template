@@ -1,6 +1,6 @@
 {
-  "title": "External target (local)",
-  "id": "external-local",
+  "title": "flotilla + login-consent + Hydra (local)",
+  "id": "flotilla-local",
   "test_suite_id": "g10_certification",
   "inputs": [
     {"name": "url", "_type": "text", "value": "${FHIR_URL}"},

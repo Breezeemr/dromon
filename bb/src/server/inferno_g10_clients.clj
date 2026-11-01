@@ -171,8 +171,8 @@
   "Gitignored with the kit clone."
   (str setup/g10-kit-dir "/clients.local.json"))
 
-(def preset-template-path "inferno-custom/g10-presets/external-local.json.template")
-(def rendered-preset-path (str setup/g10-kit-dir "/config/presets/external-local.json"))
+(def preset-template-path "inferno-custom/g10-presets/flotilla-local.json.template")
+(def rendered-preset-path (str setup/g10-kit-dir "/config/presets/flotilla-local.json"))
 
 (defn render-template
   "Replaces each ${NAME} in `template` with the JSON-string-escaped value of
