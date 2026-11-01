@@ -209,7 +209,14 @@
       (is (not (rejects? {:launch-ehr? true :token-response-context? true}))))
     (testing "extra scopes must be scope strings"
       (is (rejects? {:extra-scopes "patient/*.rs"}))
-      (is (rejects? {:extra-scopes ["patient/*.rs openid"]})))))
+      (is (rejects? {:extra-scopes ["patient/*.rs openid"]})))
+    (testing "a key given as nil takes its default, as an omitted one does"
+      (is (= sd/default-smart-discovery
+             (sd/check-smart-discovery {:launch-ehr? nil :token-response-context? nil
+                                        :context-style? nil :authorize-post? nil
+                                        :extra-scopes nil :token-endpoint nil})))
+      (is (rejects? {:launch-ehr? true :token-response-context? nil})
+          "nil is the default, false, so the launch rule still applies"))))
 
 (deftest discovery-falls-back-to-the-environment
   (let [env {"SMART_INTROSPECTION_ENDPOINT" "https://auth.example/oauth2/introspect"

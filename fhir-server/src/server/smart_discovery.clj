@@ -70,7 +70,9 @@
    `:launch-ehr? true` without `:token-response-context? true`: an EHR launch
    whose token response carries no `patient` cannot be completed by any app.
 
-   `:revocation-endpoint` may also be `false`, which omits it from discovery."
+   A key given as nil takes its default, as an omitted key does, so a host may
+   pass an unset config value straight through. `:revocation-endpoint` may
+   also be `false`, which omits it from discovery."
   [discovery]
   (when-not (or (nil? discovery) (map? discovery))
     (throw (ex-info ":smart-discovery must be a map" {:value discovery})))
@@ -78,7 +80,8 @@
     (throw (ex-info (str ":smart-discovery has no key " (pr-str (first unknown))
                          "; accepted: " (pr-str (sort (keys default-smart-discovery))))
                     {:unknown (vec unknown)})))
-  (let [d (merge default-smart-discovery discovery)]
+  (let [d (merge default-smart-discovery
+                 (into {} (remove (comp nil? val)) discovery))]
     (doseq [k url-keys
             :let [v (get d k)]
             :when (and (some? v) (not (and (= k :revocation-endpoint) (false? v))))]
