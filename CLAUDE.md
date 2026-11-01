@@ -60,6 +60,13 @@ INFERNO_SUITE=smart_stu2 INFERNO_GROUPS=all bb inferno-test
 - `INFERNO_FHIR_URL`    server base url (default the local `default` tenant)
 - `INFERNO_PATIENT_IDS` `patient_ids` input (default `123`)
 - `INFERNO_INPUTS`      full replacement for the `--inputs` tokens (`key:value`, space separated); `{{token}}`/`{{cred_json}}` expand to the obtained access token and its JSON envelope
+- `INFERNO_TARGET`      `dromon` (default: boot, seed and test the local test-server) or `external` (test a server that is already running; nothing is booted, seeded or reconfigured)
+- `INFERNO_KIT`         `us-core` (default, `inferno-test-kit/`) or `g10` (the ONC (g)(10) kit in `inferno-g10-kit/`)
+- `INFERNO_OAUTH_BASE_URL`, `INFERNO_TOKEN_URL`, `INFERNO_HYDRA_ADMIN_URL`, `INFERNO_KETO_WRITE_URL`, `INFERNO_CLIENT_ID`/`INFERNO_CLIENT_SECRET`, `INFERNO_ACCESS_TOKEN`, `INFERNO_GROUP_ID`, `INFERNO_SUITE_OPTIONS`, `INFERNO_PRESET_FILE`: see `runner-config` in `bb/src/server/inferno_runner.clj`
+
+The ONC (g)(10) certification kit has its own tasks (`bb inferno-g10-setup`,
+`bb inferno-g10-clients`, `bb inferno-g10`); see `docs/inferno-g10.md`.
+`bb inferno-runner-test` unit-tests the runner configuration.
 
 The per-run report is written to `target/inferno-report-<suite>.json` (and the
 stable `target/inferno-report.json`). The datomic runner
