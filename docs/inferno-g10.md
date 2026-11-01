@@ -108,17 +108,25 @@ type-level Keto tuples `grant-keto-permissions` writes.
 
 `bb inferno-g10` runs the runner with `INFERNO_KIT=g10` and
 `INFERNO_TARGET=external`. Both can be overridden from the environment. With
-no `INFERNO_GROUPS` it runs the two SMART discovery groups, which need
-nothing but the FHIR base:
+no `INFERNO_GROUPS` it runs the standalone patient app (1) and EHR
+practitioner app (3) groups, which need nothing but the FHIR base:
 
 ```bash
-INFERNO_FHIR_URL=https://fhir.example.test/realm/demo/fhir bb inferno-g10
+INFERNO_FHIR_URL=https://localflotilla.breezeehr.com:8444/realm/dev/fhir bb inferno-g10
 ```
+
+Both groups are `run_as_group`: Inferno refuses their SMART discovery
+subgroups (1.8, 3.7) on their own ("The chosen runnable must be run as part
+of a group"). Run whole, each completes its discovery subgroup and then stops
+at the launch with result `wait` (the authorization redirect for 1, the EHR
+launch for 3). The runner prints those as `WAIT`; finish them in the web UI.
+The run exits 0 whenever Inferno produced a report, 1 when it refused the
+run.
 
 | group | short id (SMART 2.2) | headless |
 |---|---|---|
-| Standalone patient app: discovery | 1.8 | yes |
-| EHR practitioner app: discovery | 3.7 | yes |
+| Standalone patient app: discovery | 1.8, run through 1 | yes; the launch after it waits |
+| EHR practitioner app: discovery | 3.7, run through 3 | yes; the launch after it waits |
 | Multi-Patient API (bulk, backend services) | 8 | yes, with `INFERNO_AUTH_MODE=backend_services` |
 | Standalone, limited, EHR launches; token refresh; additional authorization tests (9.x) | 1, 2, 3, 9 | no (browser) |
 | Single patient API (US Core 7) | 12 | needs the token of a standalone launch |
@@ -127,9 +135,9 @@ INFERNO_FHIR_URL=https://fhir.example.test/realm/demo/fhir bb inferno-g10
 Bulk against an external target:
 
 ```bash
-INFERNO_FHIR_URL=https://fhir.example.test/realm/demo/fhir \
-INFERNO_OAUTH_BASE_URL=https://auth.example.test/ \
-INFERNO_HYDRA_ADMIN_URL=https://auth.example.test:4445 \
+INFERNO_FHIR_URL=https://localflotilla.breezeehr.com:8444/realm/dev/fhir \
+INFERNO_OAUTH_BASE_URL=https://localhydra.breezeehr.com:4444/ \
+INFERNO_HYDRA_ADMIN_URL=https://localhydra.breezeehr.com:4445 \
 INFERNO_AUTH_MODE=backend_services INFERNO_GROUPS=8 \
 INFERNO_GROUP_ID=<Group id> INFERNO_PATIENT_IDS=<ids in the Group> \
 bb inferno-g10
@@ -189,7 +197,7 @@ before the interactive groups can pass.
 
 **Discovery `capabilities`** (SMART 2.0 and 2.2):
 - Standalone (1.8) requires: `launch-standalone client-public client-confidential-symmetric client-confidential-asymmetric sso-openid-connect context-standalone-patient permission-offline permission-patient authorize-post permission-v2 permission-v1`
-- EHR (3.7) requires: `launch-ehr client-confidential-symmetric client-confidential-asymmetric sso-openid-connect context-banner context-style context-ehr-patient permission-offline permission-user authorize-post permission-v2 permission-v1`
+- EHR (3.7) requires: `launch-ehr client-confidential-symmetric client-confidential-asymmetric sso-openid-connect context-banner context-style context-ehr-patient permission-offline permission-user authorize-post permission-v2 permission-v1`, plus `context-ehr-encounter` with US Core 5, 6 or 7 (`well_known_capabilities_test.rb`)
 
 **POST authorize.**
 - The EHR launch groups (3.4, 3.8) lock `auth_request_method` to `POST`.
@@ -254,7 +262,7 @@ export INFERNO_HYDRA_ADMIN_URL=https://localhydra.breezeehr.com:4445
 bb inferno-g10-clients
 INFERNO_EXTRA_HOSTS="$HOSTS" bb inferno-g10-setup   # rebuilds the image so the preset is listed
 
-# 3. Headless discovery groups (1.8, 3.7).
+# 3. Headless: groups 1 and 3 run their discovery subgroups (1.8, 3.7), then wait.
 bb inferno-g10
 
 # 4. Headless Multi-Patient API (8), against a Group in the dev realm.

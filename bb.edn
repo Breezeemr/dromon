@@ -51,7 +51,7 @@
    :task (g10-clients/-main (System/getenv))}
 
   inferno-g10
-  {:doc "Runs the non-interactive (g)(10) groups headless (default: SMART discovery 1.8 and 3.7; INFERNO_AUTH_MODE=backend_services with INFERNO_GROUPS=8 for the Multi-Patient API) against an already running server. Defaults INFERNO_KIT=g10 INFERNO_TARGET=external; needs INFERNO_FHIR_URL. See docs/inferno-g10.md."
+  {:doc "Runs the non-interactive (g)(10) groups headless (default: groups 1 and 3, whose SMART discovery subgroups 1.8 and 3.7 complete before the launch waits for a browser; INFERNO_AUTH_MODE=backend_services with INFERNO_GROUPS=8 for the Multi-Patient API) against an already running server. Defaults INFERNO_KIT=g10 INFERNO_TARGET=external; needs INFERNO_FHIR_URL. See docs/inferno-g10.md."
    :requires ([server.inferno-runner :as runner])
    :task (runner/run-with-defaults! {"INFERNO_KIT" "g10" "INFERNO_TARGET" "external"})}
 

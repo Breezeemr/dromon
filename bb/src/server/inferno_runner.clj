@@ -75,10 +75,12 @@
              :default-groups "2"}
    :g10     {:dir            setup/g10-kit-dir
              :default-suite  "g10_certification"
-             ;; The non-interactive discovery groups: standalone (1.8) and EHR
-             ;; (3.7) .well-known/smart-configuration checks, SMART 2.2. The
+             ;; The standalone (1) and EHR practitioner (3) app groups. Both are
+             ;; run_as_group, so Inferno refuses their discovery subgroups (1.8,
+             ;; 3.7) on their own; run whole, discovery completes and the
+             ;; launch that follows ends in `wait` for a browser. The
              ;; Multi-Patient API (8) needs INFERNO_AUTH_MODE=backend_services.
-             :default-groups "1.8 3.7"
+             :default-groups "1 3"
              :default-suite-options {"us_core_version"          "us_core_7"
                                      "smart_app_launch_version" "smart_app_launch_2_2"
                                      "multi_patient_version"    "multi_patient_api_stu2"}
@@ -654,6 +656,18 @@
   [cmd]
   (mapv #(str/replace % secret-input-re "$1:<redacted>") cmd))
 
+(defn redact-output
+  "`s` (output of running `cmd`) with every credential-bearing argument of
+   `cmd` replaced as [[redact-command]] does. podman's compose wrapper echoes
+   the whole command line on a non-zero exit."
+  [cmd s]
+  (reduce (fn [out arg]
+            (if (re-matches secret-input-re arg)
+              (str/replace out arg (str/replace arg secret-input-re "$1:<redacted>"))
+              out))
+          (str s)
+          cmd))
+
 (defn- needs-runner-token?
   "Whether the run needs a bearer token minted by the runner itself: the
    dromon target seeds data with it, and the US Core inputs carry it. The g10
@@ -675,8 +689,10 @@
         red    "\033[31m"
         yellow "\033[33m"
         reset  "\033[0m"
+        waits  (count (filter #(= "wait" (:result %)) report))
         color  (fn [r] (case r "pass" green "fail" red "error" yellow reset))
-        badge  (fn [r] (case r "pass" "PASS" "fail" "FAIL" "error" "ERR " "skip" "SKIP" "omit" "OMIT" "SKIP"))]
+        badge  (fn [r] (case r "pass" "PASS" "fail" "FAIL" "error" "ERR " "skip" "SKIP" "omit" "OMIT"
+                         "wait" "WAIT" "SKIP"))]
     (println "\n╔══════════════════════════════════════════════════════════════╗")
     (println "║                     Inferno Test Results                     ║")
     (println "╠══════════════════════════════════════════════════════════════╣")
@@ -689,11 +705,28 @@
                          (if (> (count id) 45) (str "..." (subs id (- (count id) 42))) id)
                          (if (> (count msg) 60) (str (subs msg 0 57) "...") msg)))))
     (println "╠══════════════════════════════════════════════════════════════╣")
-    (println (format "║ %s%d passed%s  %s%d failed%s  %s%d errors%s"
+    (println (format "║ %s%d passed%s  %s%d failed%s  %s%d errors%s  %d waiting"
                      green passes reset
                      red   fails  reset
-                     yellow errors reset))
+                     yellow errors reset
+                     waits))
+    (when (pos? waits)
+      (println "║ WAIT: the run reached a step that needs a browser (a launch or"
+               "\n║ a redirect); finish those groups in the web UI."))
     (println "╚══════════════════════════════════════════════════════════════╝\n")))
+
+(defn parse-report
+  "The result list in `inferno execute --outputter json` stdout, or nil when
+   there is none. Inferno logs warnings (unknown inputs and the like) to stdout
+   ahead of the report, so the report starts at the first line that opens a
+   JSON array. A refusal is printed as a bare JSON string and yields nil."
+  [out]
+  (when-let [start (some-> (re-matcher #"(?m)^\[" (str out)) (as-> m (when (.find m) (.start m))))]
+    ;; cheshire parses a top-level array lazily; realize it inside the try.
+    (let [report (try (let [r (json/parse-string (subs out start) true)]
+                        (if (sequential? r) (vec r) r))
+                      (catch Exception _ nil))]
+      (when (vector? report) report))))
 
 (defn run-inferno-tests
   "Runs `inferno execute` in the kit container and writes the report. Returns
@@ -717,24 +750,25 @@
              (System/exit 1))
            (do
              (when (seq (:err result))
-               (println "Inferno stderr:" (:err result)))
-             (let [report-file (str "target/inferno-report-" suite ".json")]
-               (spit "target/inferno-report.json" (:out result))
-               (spit report-file (:out result))
+               (println "Inferno stderr:" (redact-output cmd (:err result))))
+             (let [report      (parse-report (:out result))
+                   report-file (str "target/inferno-report-" suite ".json")
+                   body        (if report (json/generate-string report {:pretty true}) (:out result))]
+               (spit "target/inferno-report.json" body)
+               (spit report-file body)
                (println "Inferno run completed. Report written to" report-file
-                        "(and target/inferno-report.json)"))
-             (let [report (try (json/parse-string (:out result) true) (catch Exception _ nil))]
-               (if (sequential? report)
+                        "(and target/inferno-report.json)")
+               (if report
                  (do (print-report report) report)
                  (do
-                   (println "WARN: Could not parse JSON report. Raw output:")
-                   (println (:out result))
+                   (println "WARN: Inferno printed no JSON report. Raw output:")
+                   (println (redact-output cmd (:out result)))
                    nil))))))
        (catch Exception e
          (println "Error running inferno tests:" (.getMessage e))
          (when-let [edata (ex-data e)]
-           (println "Stdout:" (:out edata))
-           (println "Stderr:" (:err edata)))
+           (println "Stdout:" (redact-output cmd (:out edata)))
+           (println "Stderr:" (redact-output cmd (:err edata))))
          (System/exit 1))))))
 
 ;; ── Entry points ──────────────────────────────────────────────────────────────

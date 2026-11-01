@@ -43,7 +43,7 @@
     (is (= :external (:target c)))
     (is (= "inferno-g10-kit" (:kit-dir c)))
     (is (= "g10_certification" (:suite c)))
-    (is (= ["1.8" "3.7"] (:groups c)))
+    (is (= ["1" "3"] (:groups c)))
     (is (= {"us_core_version"          "us_core_7"
             "smart_app_launch_version" "smart_app_launch_2_2"
             "multi_patient_version"    "multi_patient_api_stu2"}
@@ -104,12 +104,31 @@
             "--suite" "g10_certification"
             "--suite-options" "multi_patient_version:multi_patient_api_stu2"
             "smart_app_launch_version:smart_app_launch_2_2" "us_core_version:us_core_7"
-            "--groups" "1.8" "3.7"
+            "--groups" "1" "3"
             "--inputs" "url:https://fhir.example.test/fhir"
             "standalone_smart_auth_info:{\"auth_type\":\"symmetric\",\"use_discovery\":\"true\"}"
             "ehr_smart_auth_info:{\"auth_type\":\"symmetric\",\"use_discovery\":\"true\"}"
             "--outputter" "json"]
            cmd))))
+
+(deftest redact-output-hides-credential-arguments
+  (let [cmd ["docker" "compose" "exec" "--inputs" "url:https://f.test/fhir"
+             "bulk_smart_auth_info:{\"client_secret\":\"s3cr3t\"}"]
+        err (str "Error: executing docker-compose exec --inputs url:https://f.test/fhir "
+                 "bulk_smart_auth_info:{\"client_secret\":\"s3cr3t\"}: exit status 7")
+        out (runner/redact-output cmd err)]
+    (is (not (str/includes? out "s3cr3t")))
+    (is (str/includes? out "bulk_smart_auth_info:<redacted>"))
+    (is (str/includes? out "url:https://f.test/fhir"))
+    (is (= "" (runner/redact-output cmd nil)))))
+
+(deftest parse-report-skips-log-lines
+  (let [out (str "W, [2026-11-01T23:33:06 #52]  WARN -- : Unknown input `ehr_smart_auth_info`\n"
+                 "[\n  {\"result\": \"pass\", \"test_id\": \"a\"},\n  {\"result\": \"wait\"}\n]\n")]
+    (is (= [{:result "pass" :test_id "a"} {:result "wait"}] (runner/parse-report out))))
+  (is (nil? (runner/parse-report "\"Missing the following required inputs: url\"")))
+  (is (nil? (runner/parse-report "[\n  {\"result\": ")))
+  (is (nil? (runner/parse-report nil))))
 
 (deftest g10-backend-inputs
   (let [c (runner/runner-config {"INFERNO_KIT" "g10" "INFERNO_TARGET" "external"
