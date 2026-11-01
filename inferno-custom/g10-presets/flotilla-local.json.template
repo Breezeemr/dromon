@@ -23,7 +23,7 @@
     {"name": "ehr_patient_smart_auth_info", "_type": "auth_info",
      "value": {"auth_type": "symmetric", "client_id": "${EHR_CLIENT_ID}", "client_secret": "${EHR_CLIENT_SECRET}"}},
     {"name": "asymmetric_smart_auth_info", "_type": "auth_info",
-     "value": {"auth_type": "asymmetric", "client_id": "${ASYMMETRIC_CLIENT_ID}"}},
+     "value": {"auth_type": "asymmetric", "client_id": "${ASYMMETRIC_CLIENT_ID}", "encryption_algorithm": "${ASYMMETRIC_ALG}"}},
     {"name": "v1_smart_auth_info", "_type": "auth_info",
      "value": {"auth_type": "symmetric", "client_id": "${SYMMETRIC_CLIENT_ID}", "client_secret": "${SYMMETRIC_CLIENT_SECRET}"}},
     {"name": "granular_scopes_1_auth_info", "_type": "auth_info",

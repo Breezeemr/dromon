@@ -41,10 +41,12 @@
 
 (def resource-types
   "The resource types the (g)(10) kit requests access to (its
-   scope_constants.rb, v8.1.0)."
+   scope_constants.rb, v8.1.0), plus Media, which the kit's reference preset
+   requests for US Core 7. Hydra refuses a whole authorization request when
+   any requested scope is unregistered."
   ["Medication" "AllergyIntolerance" "CarePlan" "CareTeam" "Condition" "Coverage" "Device"
    "DiagnosticReport" "DocumentReference" "Encounter" "Goal" "Immunization" "Location"
-   "MedicationDispense" "MedicationRequest" "Observation" "Organization" "Patient"
+   "Media" "MedicationDispense" "MedicationRequest" "Observation" "Organization" "Patient"
    "Practitioner" "PractitionerRole" "Procedure" "Provenance" "QuestionnaireResponse"
    "RelatedPerson" "ServiceRequest" "Specimen"])
 
@@ -73,7 +75,9 @@
                   (str ctx "/" t "." access))
                 granular-scopes))))
 
-(def backend-scopes ["system/*.read" "system/*.rs"])
+(def backend-scopes
+  "system/*.r is what the kit's reference preset requests under SMART 2.2."
+  ["system/*.read" "system/*.rs" "system/*.r"])
 
 (def signing-alg runner/backend-alg)
 
@@ -199,6 +203,7 @@
    "EHR_CLIENT_ID"           (:ehr ids)
    "EHR_CLIENT_SECRET"       (:ehr secrets)
    "ASYMMETRIC_CLIENT_ID"    (:asymmetric ids)
+   "ASYMMETRIC_ALG"          signing-alg
    "BACKEND_CLIENT_ID"       (:backend ids)
    "BACKEND_ALG"             signing-alg
    "BACKEND_KID"             backend-kid})
@@ -215,7 +220,7 @@
   (let [config       (runner/runner-config (merge {"INFERNO_KIT" "g10" "INFERNO_TARGET" "external"} env))
         prefix       (or (not-empty (str/trim (str (get env "INFERNO_G10_CLIENT_PREFIX" "")))) "inferno-g10")
         inferno-base (setup/g10-inferno-base-url env)
-        bulk-jwks    (json/parse-string (slurp (io/file runner/g10-bulk-jwks-path)) true)
+        bulk-jwks    (runner/g10-bulk-jwks)
         secrets      {:symmetric (random-secret) :ehr (random-secret)}
         payloads     (client-payloads {:prefix         prefix
                                        :inferno-base   inferno-base
@@ -225,7 +230,7 @@
         _            (println "Registering (g)(10) clients at" (:hydra-admin-url config) "...")
         ids          (update-vals payloads #(upsert-client! (:hydra-admin-url config) %))
         backend-kid  (runner/backend-signing-kid bulk-jwks signing-alg)]
-    (runner/grant-keto-permissions config (:backend ids))
+    (runner/grant-keto-permissions config (:backend ids) (runner/backend-client-tuples config))
     (write-private! credentials-path
                     (json/generate-string {:clients (into (sorted-map)
                                                           (map (fn [[role id]]
