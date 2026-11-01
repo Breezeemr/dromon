@@ -266,6 +266,16 @@
     (is (= {:name "Dromon FHIR Server"} (:software body)))
     (is (= "https://fhir.local:8443/default/fhir" (get-in body [:implementation :url])))))
 
+(deftest implementation-url-takes-the-first-forwarded-value
+  (let [body (:body ((handlers/capability-statement [])
+                     {:scheme :http
+                      :headers {"host" "internal:8080"
+                                "x-forwarded-proto" "https, http"
+                                "x-forwarded-host" "flotilla.example, lb.internal"}
+                      :context "/realm"
+                      :path-params {:tenant-id "dev"}}))]
+    (is (= "https://flotilla.example/realm/dev/fhir" (get-in body [:implementation :url])))))
+
 (deftest capability-metadata-is-validated
   (is (thrown? clojure.lang.ExceptionInfo (sd/check-capability-metadata {:vendor "x"})))
   (is (thrown? clojure.lang.ExceptionInfo (sd/check-capability-metadata {:publisher ""})))

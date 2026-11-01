@@ -80,16 +80,22 @@
            (get-in req [:path-params :tenant-id]))
        "/fhir"))
 
+(defn- forwarded-header
+  "The first value of a forwarded header: each proxy on the path appends its
+   own after a comma, and the first is what the client addressed."
+  [req header]
+  (some-> (get-in req [:headers header]) (str/split #",") first str/trim not-empty))
+
 (defn absolute-fhir-base
   "[[fhir-base]] as an absolute URL, its scheme and host taken from the
    request and overridden by `X-Forwarded-Proto` / `X-Forwarded-Host`, so a
    server behind a proxy states the address its clients reached."
   [req]
-  (str (or (get-in req [:headers "x-forwarded-proto"])
+  (str (or (forwarded-header req "x-forwarded-proto")
            (some-> (:scheme req) name)
            "https")
        "://"
-       (or (get-in req [:headers "x-forwarded-host"])
+       (or (forwarded-header req "x-forwarded-host")
            (get-in req [:headers "host"])
            "localhost")
        (fhir-base req)))
