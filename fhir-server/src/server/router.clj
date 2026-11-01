@@ -214,10 +214,14 @@
 (defn wrap-oauth-base-url
   "Inject the authorization server's base URL as `:fhir/oauth-base-url`, which
    SMART discovery (`server.handlers/smart-configuration`) publishes as
-   `issuer` and builds its endpoint URLs from."
-  [handler oauth-base-url]
-  (fn [req]
-    (handler (assoc req :fhir/oauth-base-url oauth-base-url))))
+   `issuer` and builds its endpoint URLs from, and the host's token endpoint
+   override as `:fhir/smart-token-endpoint` when it configured one."
+  ([handler oauth-base-url] (wrap-oauth-base-url handler oauth-base-url nil))
+  ([handler oauth-base-url smart-token-endpoint]
+   (fn [req]
+     (handler (cond-> (assoc req :fhir/oauth-base-url oauth-base-url)
+                smart-token-endpoint
+                (assoc :fhir/smart-token-endpoint smart-token-endpoint))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Options
@@ -245,8 +249,8 @@
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:bulk-manifest-extension`,
    `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
-   `:jwt-issuer`, `:jwt-audiences`, `:jwt-access-tokens-only?` and
-   `:jwt-delegating-clients`; unknown keys
+   `:jwt-issuer`, `:jwt-audiences`, `:jwt-access-tokens-only?`,
+   `:jwt-delegating-clients` and `:smart-token-endpoint`; unknown keys
    are ignored. `:lifecycle`
    is carried through as given; [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
    producer, `(fn [request])` returning a stamp or nil; with none, writes carry
@@ -273,6 +277,10 @@
                                SMART discovery's `issuer`, so it must be the
                                authorization server's issuer exactly (Hydra's
                                carries a trailing slash).
+   - :smart-token-endpoint  -- argument only: the `token_endpoint` SMART
+                               discovery advertises instead of the issuer's
+                               `/oauth2/token`, for a host whose token
+                               pass-through lives elsewhere. nil for none.
 
    The localhost fallbacks serve a standalone dromon next to a local Ory
    stack. A host that embeds dromon should pass every URL here from its own
@@ -314,7 +322,7 @@
            cors-allow-headers compartment-overrides token-claims
            enforce-smart-scopes? bulk-job-store bulk-manifest-extension login-url lifecycle
            tx-metadata temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences
-           jwt-access-tokens-only? jwt-delegating-clients]}]
+           jwt-access-tokens-only? jwt-delegating-clients smart-token-endpoint]}]
   (when-not (or (nil? bulk-manifest-extension)
                 (and (map? bulk-manifest-extension)
                      (every? string? (keys bulk-manifest-extension))))
@@ -331,6 +339,7 @@
    :keto-url              (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
    :keto-admin-url        (or keto-admin-url (System/getenv "KETO_ADMIN_URL") "http://localhost:4467")
    :oauth-base-url        (or oauth-base-url (System/getenv "OAUTH_BASE_URL") "http://localhost:4444")
+   :smart-token-endpoint  (not-empty smart-token-endpoint)
    :legacy-realm-blind-fallback? (cond
                                    (some? legacy-realm-blind-fallback?)
                                    legacy-realm-blind-fallback?
@@ -463,7 +472,7 @@
        OperationOutcome bodies themselves rather than relying on position."
   [store {:keys [trace-tap cors-origins cors-allow-headers terminology bulk-job-store
                  bulk-manifest-extension keto-url
-                 keto-admin-url oauth-base-url jwks-url jwt-issuer jwt-audiences
+                 keto-admin-url oauth-base-url smart-token-endpoint jwks-url jwt-issuer jwt-audiences
                  jwt-access-tokens-only? jwt-delegating-clients enforce-smart-scopes? login-url
                  narrative lifecycle tx-metadata temporal-canonicals
                  legacy-realm-blind-fallback? compartment-definitions token-claims]
@@ -521,7 +530,7 @@
            {:name ::token-claims
             :wrap (fn [handler] (wrap-token-claims handler token-claims))}
            {:name ::oauth-base-url
-            :wrap (fn [handler] (wrap-oauth-base-url handler oauth-base-url))}
+            :wrap (fn [handler] (wrap-oauth-base-url handler oauth-base-url smart-token-endpoint))}
            {:name ::keto-url
             :wrap (fn [handler]
                     (wrap-keto-url handler keto-url legacy-realm-blind-fallback?

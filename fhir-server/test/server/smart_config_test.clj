@@ -3,7 +3,8 @@
    .well-known/smart-configuration document and the CapabilityStatement
    SMART-on-FHIR security declaration."
   (:require [clojure.test :refer [deftest is testing]]
-            [server.handlers :as handlers]))
+            [server.handlers :as handlers]
+            [server.router :as router]))
 
 ;; ---------------------------------------------------------------------------
 ;; smart-configuration
@@ -103,6 +104,51 @@
       (when (some #{"sso-openid-connect"} (:capabilities smart-config-body))
         (is (string? (:issuer smart-config-body)))
         (is (string? (:jwks_uri smart-config-body)))))))
+
+;; ---------------------------------------------------------------------------
+;; EHR launch
+;; ---------------------------------------------------------------------------
+
+(deftest smart-configuration-advertises-ehr-launch
+  (testing "the capabilities the ONC (g)(10) EHR Practitioner App group requires"
+    ;; onc-certification-g10-test-kit smart_ehr_practitioner_app_group.rb
+    ;; required_capabilities, plus context-ehr-encounter, which its
+    ;; well-known test adds for US Core 5 and later.
+    (let [caps (set (:capabilities smart-config-body))]
+      (doseq [cap ["launch-ehr" "client-confidential-symmetric" "sso-openid-connect"
+                   "context-banner" "context-style"
+                   "context-ehr-patient" "context-ehr-encounter"
+                   "permission-offline" "permission-user"]]
+        (is (contains? caps cap) (str "missing capability: " cap)))))
+  (testing "no capability is listed twice"
+    (is (apply distinct? (:capabilities smart-config-body)))))
+
+(deftest smart-configuration-token-endpoint-override
+  (testing "a host's token endpoint replaces the issuer's /oauth2/token"
+    (let [body (:body ((handlers/smart-configuration)
+                       {:fhir/oauth-base-url        "https://oauth.example/"
+                        :fhir/smart-token-endpoint "https://auth.example/oauth2/token"}))]
+      (is (= "https://auth.example/oauth2/token" (:token_endpoint body)))
+      (testing "and nothing else moves"
+        (is (= "https://oauth.example/" (:issuer body)))
+        (is (= "https://oauth.example/oauth2/auth" (:authorization_endpoint body))))))
+  (testing "a blank override is no override"
+    (is (= "https://oauth.example/oauth2/token"
+           (:token_endpoint (:body ((handlers/smart-configuration)
+                                    {:fhir/oauth-base-url        "https://oauth.example/"
+                                     :fhir/smart-token-endpoint ""}))))))
+  (testing "resolve-options carries the option through, nil when absent"
+    (is (= "https://auth.example/oauth2/token"
+           (:smart-token-endpoint
+            (router/resolve-options {:smart-token-endpoint "https://auth.example/oauth2/token"}))))
+    (is (nil? (:smart-token-endpoint (router/resolve-options {})))))
+  (testing "the middleware injects it only when configured"
+    (let [seen (atom nil)
+          h    (fn [req] (reset! seen req) {:status 200})]
+      ((router/wrap-oauth-base-url h "https://oauth.example/" "https://auth.example/t") {})
+      (is (= "https://auth.example/t" (:fhir/smart-token-endpoint @seen)))
+      ((router/wrap-oauth-base-url h "https://oauth.example/") {})
+      (is (not (contains? @seen :fhir/smart-token-endpoint))))))
 
 ;; ---------------------------------------------------------------------------
 ;; CapabilityStatement SMART-on-FHIR security

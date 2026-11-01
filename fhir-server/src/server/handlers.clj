@@ -1707,14 +1707,32 @@
    The base is published verbatim as `issuer`, which a client compares with
    the `iss` of the tokens it receives, so it must be the issuer exactly,
    trailing slash included. The endpoint URLs are joined to it with
-   [[oauth-endpoint]]."
+   [[oauth-endpoint]].
+
+   `token_endpoint` is the request's `:fhir/smart-token-endpoint` when the
+   host configured one (`server.router/resolve-options`), else the issuer's
+   `/oauth2/token`. A host sets it when a pass-through in front of the
+   authorization server answers token requests, because SMART puts the launch
+   context (`patient`, `encounter`, `need_patient_banner`, `smart_style_url`)
+   at the top level of the token response, which Hydra cannot do. A host that
+   serves the pass-through at the issuer's own token URL needs no override,
+   and should not set one: a `private_key_jwt` assertion's audience is the
+   advertised token endpoint, and Hydra accepts only its own.
+
+   The EHR launch capabilities (`launch-ehr`, `context-ehr-patient`,
+   `context-ehr-encounter`, `context-banner`, `context-style`) describe the
+   host's launch flow, which issues the `launch` parameter and returns the
+   context. dromon's part is to read the `patient` claim the resulting token
+   carries, exactly as for a standalone launch."
   ([] (smart-configuration nil))
   ([oauth-base-url]
    (fn [req]
      (let [base (or oauth-base-url
                     (:fhir/oauth-base-url req)
                     (System/getenv "OAUTH_BASE_URL")
-                    "http://localhost:4444")]
+                    "http://localhost:4444")
+           token-endpoint (or (not-empty (:fhir/smart-token-endpoint req))
+                              (oauth-endpoint base "/oauth2/token"))]
        ;; Return a plain map body (no explicit Content-Type) so the muuntaja
        ;; response middleware serializes it, exactly like the /metadata
        ;; handler. Setting Content-Type here suppresses that encoding and Ring
@@ -1723,7 +1741,7 @@
         :body {:issuer                 base
                :jwks_uri               (oauth-endpoint base "/.well-known/jwks.json")
                :authorization_endpoint (oauth-endpoint base "/oauth2/auth")
-               :token_endpoint         (oauth-endpoint base "/oauth2/token")
+               :token_endpoint         token-endpoint
                :token_endpoint_auth_methods_supported ["client_secret_basic" "private_key_jwt"]
                ;; SMART Backend Services (SMART App Launch v2.2.0) requires the
                ;; asymmetric client-assertion signing algorithms the server's
@@ -1743,9 +1761,13 @@
                ;; `jwks_uri` to be present (SMART App Launch STU2 discovery).
                ;; `client-confidential-asymmetric` advertises the
                ;; `private_key_jwt` backend-services authentication method.
-               :capabilities           ["launch-standalone" "client-public" "client-confidential-symmetric"
+               :capabilities           ["launch-standalone" "launch-ehr"
+                                        "client-public" "client-confidential-symmetric"
                                         "client-confidential-asymmetric"
-                                        "sso-openid-connect" "context-passthrough-banner"
+                                        "sso-openid-connect"
+                                        "context-ehr-patient" "context-ehr-encounter"
+                                        "context-banner" "context-style"
+                                        "context-passthrough-banner"
                                         "permission-offline" "permission-patient" "permission-user"]}}))))
 
 (defn- system-history-entry [base default-type res]
