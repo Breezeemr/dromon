@@ -76,8 +76,14 @@ installs `server.scope/ScopeFilteringStore` for any token whose unqualified wild
 everything it grants. The store pushes the filter down on search and count (a client's own
 `category` is ANDed as a repeated parameter), answers 403 on a read or vread the grant does not
 admit, filters history, judges `_include`/`_revinclude` targets under their own type, refuses a
-qualified write that does not match, and gates the entries of a Bundle POSTed to the base. Bulk
-export applies the same filter while streaming a scope-authorized export.
+qualified write that does not match, and gates the entries of a Bundle POSTed to the base. A
+compartment search needs the search letter on its target type. Bulk export applies the same
+filter while streaming, to a system-tuple export as well as a scope-authorized one.
+
+Known limits: a token that may update or delete but not read a type cannot use a handler path
+that reads first (PATCH, a conditional write), and a conditional create cannot see matches it
+may not search. `_has` is not judged against the granular filter (the Datomic store does not
+support `_has`).
 
 Repeated search parameters must AND in the store for the client-category intersection to be
 exact. The mock and Datomic stores do; the xtdb2 store stringifies a repeated value, so such a
