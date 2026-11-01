@@ -33,7 +33,13 @@ replica streams the same snapshot.
   `:fhir/bulk-job-store` Integrant key. It is correct for one replica only.
 - A host passes its own store as `(bjs/create-store config jobs)`, or as `:jobs`
   in the Integrant opts. Anything that does not satisfy the protocol throws at
-  construction.
+  construction, and so does a `:jobs` key inside `config`.
+- A job is bound to its key. `put-job!` refuses a job whose `:tenant` is not
+  the key's tenant, and `get-job` and `update-job!` throw when the store
+  answers with a record whose `:tenant` or `:id` differs from the key asked
+  for. The file stream reads `(:tenant job)` while authorization judged the
+  request's tenant, so a faulty store must fail loudly rather than serve
+  another tenant's export.
 - The public fns `put-job!`, `get-job`, `update-job!`, `remove-job!` and
   `all-jobs` delegate to the protocol. The bulk handlers use nothing else:
   - kickoff puts;
@@ -56,7 +62,11 @@ A durable store keeps `(bjs/job->edn job)` and returns `(bjs/edn->job s)`.
   truncated basis would read a snapshot slightly before the pinned transaction
   and silently drop its writes from the export.
 - `job->edn` throws `ex-info` when the job holds a value EDN cannot carry, the
-  basis carries an unknown key, or a required key is missing. `edn->job`
+  basis carries an unknown key, or a required key is missing. It also reads
+  the printed string back and throws unless that equals the job: a keyword
+  decoded from a client's JSON key (`(keyword "a b")`) or a NaN prints as text
+  that reads back differently or not at all, and one such row would break
+  every later `-all-jobs` read (the TTL sweep reads them all). `edn->job`
   validates the record with a malli schema and throws on anything malformed;
   it never returns a partial job.
 - A store whose basis carries more than `:tx-id`, `:system-time` and

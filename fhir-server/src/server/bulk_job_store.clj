@@ -140,6 +140,9 @@
   ([] (create-store {}))
   ([config] (create-store config (memory-job-store)))
   ([config jobs]
+   (when (contains? config :jobs)
+     (throw (ex-info "Pass the bulk JobStore as create-store's second argument, not as config :jobs"
+                     {:config-keys (vec (keys config))})))
    (when-not (satisfies? JobStore jobs)
      (throw (ex-info "Bulk job store :jobs must satisfy server.bulk-job-store/JobStore"
                      {:jobs-type (some-> jobs class .getName)})))
@@ -155,23 +158,42 @@
 (defn- jobs-of [store]
   (:jobs store))
 
+(defn- check-key!
+  "`job` when it is nil or names `[tenant-id job-id]`, else throw. The file
+   stream reads `(:tenant job)` while authorization judged the request's
+   tenant, so a store that answered with a record under another key would
+   export another tenant's data."
+  [job tenant-id job-id]
+  (when (and (some? job)
+             (or (not= tenant-id (:tenant job)) (not= job-id (:id job))))
+    (throw (ex-info "Bulk job store holds a job under another key"
+                    {:tenant-id tenant-id :job-id job-id
+                     :job-tenant (:tenant job) :job-id-found (:id job)})))
+  job)
+
 (defn put-job!
-  "Insert (or replace) `job` under `[tenant-id (:id job)]`. Returns the job."
+  "Insert (or replace) `job` under `[tenant-id (:id job)]`. Returns the job.
+   Throws when the job's own :tenant is not `tenant-id`."
   [store tenant-id job]
+  (check-key! job tenant-id (:id job))
   (-put-job! (jobs-of store) tenant-id job))
 
 (defn get-job
-  "Return the job for `[tenant-id job-id]`, or nil when unknown."
+  "Return the job for `[tenant-id job-id]`, or nil when unknown. Throws when
+   the store answers with a job under another key."
   [store tenant-id job-id]
-  (-get-job (jobs-of store) tenant-id job-id))
+  (check-key! (-get-job (jobs-of store) tenant-id job-id) tenant-id job-id))
 
 (defn update-job!
   "Apply `f` (plus `args`) to the job at `[tenant-id job-id]` and return the
    updated job. `f` receives the current job (which may be nil) and returns the
    new job, or nil to remove it. `f` must be pure: a durable store may retry
-   it."
+   it. A job under another key, read or returned by `f`, throws."
   [store tenant-id job-id f & args]
-  (-update-job! (jobs-of store) tenant-id job-id #(apply f % args)))
+  (check-key!
+   (-update-job! (jobs-of store) tenant-id job-id
+                 #(check-key! (apply f (check-key! % tenant-id job-id) args) tenant-id job-id))
+   tenant-id job-id))
 
 (defn remove-job!
   "Remove the job at `[tenant-id job-id]` (idempotent)."
@@ -300,20 +322,35 @@
     (throw (ex-info "Malformed bulk job record"
                     {:errors (me/humanize explanation)}))))
 
+(defn- read-back
+  "`s` read as EDN, or ::unreadable."
+  [s]
+  (try (edn/read-string s)
+       (catch Exception _ ::unreadable)))
+
 (defn job->edn
   "Serialize `job` to an EDN string a durable [[JobStore]] can keep, with the
    basis Instants as ISO-8601 strings. Throws ex-info when the job holds a
    value EDN cannot carry or misses a required key, so nothing is stored that
-   [[edn->job]] would refuse."
+   [[edn->job]] would refuse.
+
+   The printed string is read back and must equal what was printed. A keyword
+   is printed by name without escaping, so one decoded from a client's JSON key
+   (`(keyword \"a b\")`, from a POST Parameters body) prints as text that reads
+   back as something else or not at all; one such row would break every
+   later read of the shared store (the TTL sweep reads them all)."
   ^String [job]
   (let [encoded (update job :basis encode-basis)]
     (check-plain-data! encoded [])
     (check-serialized! encoded)
-    (binding [*print-length*         nil
-              *print-level*          nil
-              *print-meta*           false
-              *print-namespace-maps* false]
-      (pr-str encoded))))
+    (let [s (binding [*print-length*         nil
+                      *print-level*          nil
+                      *print-meta*           false
+                      *print-namespace-maps* false]
+              (pr-str encoded))]
+      (when-not (= encoded (read-back s))
+        (throw (ex-info "Bulk job does not survive an EDN round trip" {:job-id (:id job)})))
+      s)))
 
 (defn edn->job
   "Read a job written by [[job->edn]]. Throws ex-info on unreadable EDN, a

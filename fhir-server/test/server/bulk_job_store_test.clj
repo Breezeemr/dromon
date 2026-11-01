@@ -28,6 +28,8 @@
         (is (identical? jobs (:jobs store)))
         (is (not (contains? (bjs/config store) :jobs)))
         (is (= 7 (:ttl-ms (bjs/config store))))))
+    (testing "a JobStore smuggled in as config is refused, not ignored"
+      (is (thrown? clojure.lang.ExceptionInfo (bjs/create-store {:jobs jobs}))))
     (testing "anything else is refused at construction"
       (is (thrown? clojure.lang.ExceptionInfo (bjs/create-store {} (atom {}))))
       (is (thrown? clojure.lang.ExceptionInfo (bjs/create-store {} nil)))
@@ -133,7 +135,12 @@
                          ["a non-integer tx-id" (assoc-in job [:basis :tx-id] "7")]
                          ["no basis" (dissoc job :basis)]
                          ["no tenant" (dissoc job :tenant)]
-                         ["an unknown status" (assoc job :status :cancelled)]]]
+                         ["an unknown status" (assoc job :status :cancelled)]
+                         ["a keyword with a space, as a JSON key decodes"
+                          (assoc-in job [:params "x"] {(keyword "a b") "v"})]
+                         ["a keyword that would close the map early"
+                          (assoc-in job [:params "x"] {(keyword "a} :access :system {:b") "v"})]
+                         ["a NaN" (assoc-in job [:params "x"] Double/NaN)]]]
       (testing label
         (is (thrown? clojure.lang.ExceptionInfo (bjs/job->edn bad)))))))
 
@@ -150,3 +157,43 @@
       (testing label
         (is (not= good bad) "the fixture really altered the record")
         (is (thrown? clojure.lang.ExceptionInfo (bjs/edn->job bad)))))))
+
+;; ---------------------------------------------------------------------------
+;; A job is bound to the key it was asked for
+;; ---------------------------------------------------------------------------
+
+(defn- answering-with
+  "A JobStore whose every read answers `job`, whatever key was asked for."
+  [job]
+  (reify bjs/JobStore
+    (-put-job! [_ _ j] j)
+    (-get-job [_ _ _] job)
+    (-update-job! [_ _ _ f] (f job))
+    (-remove-job! [_ _ _] nil)
+    (-all-jobs [_] [job])))
+
+(deftest a-job-under-another-key-is-refused
+  (let [other-tenant {:id "j" :tenant "t2" :status :complete}
+        store        (bjs/create-store {} (answering-with other-tenant))]
+    (testing "get-job refuses another tenant's job rather than returning it"
+      (is (thrown? clojure.lang.ExceptionInfo (bjs/get-job store "t1" "j"))))
+    (testing "and another id under the same tenant"
+      (is (thrown? clojure.lang.ExceptionInfo (bjs/get-job store "t2" "k"))))
+    (testing "update-job! refuses it before f sees it"
+      (let [seen (atom nil)]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (bjs/update-job! store "t1" "j" (fn [j] (reset! seen j) j))))
+        (is (nil? @seen))))
+    (testing "the matching key is served"
+      (is (= other-tenant (bjs/get-job store "t2" "j")))))
+  (testing "put-job! refuses a job whose :tenant is not the key's"
+    (let [store (bjs/create-store)]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (bjs/put-job! store "t1" {:id "j" :tenant "t2" :status :complete})))
+      (is (empty? (bjs/all-jobs store)))))
+  (testing "update-job! refuses an f that moves the job to another tenant"
+    (let [store (bjs/create-store)]
+      (bjs/put-job! store "t1" {:id "j" :tenant "t1" :status :complete})
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (bjs/update-job! store "t1" "j" assoc :tenant "t2")))
+      (is (= "t1" (:tenant (bjs/get-job store "t1" "j")))))))
