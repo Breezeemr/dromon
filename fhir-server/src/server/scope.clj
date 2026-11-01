@@ -312,9 +312,9 @@
                   (some (fn [token] (some #(token-matches-coding? token %) cs)) tokens))))
             query-map)))
 
-(defn- admits?
+(defn admits?
   "True when `resource` satisfies the grant filter `f` (`:all` or
-   `{:any-of ...}`)."
+   `{:any-of ...}`, see [[grant-filter]])."
   [f resource]
   (or (= :all f)
       (boolean (some #(resource-matches? % resource) (:any-of f)))))
