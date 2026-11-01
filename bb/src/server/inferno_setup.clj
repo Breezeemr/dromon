@@ -34,6 +34,11 @@
    read from this release."
   "v8.1.0")
 
+(def g10-kit-commit
+  "The commit [[g10-kit-tag]] named when it was pinned. A tag can be moved;
+   the clone must be this commit, because setup builds and runs its code."
+  "ff87c7e4857e03173c76a2da70c86ece72553515")
+
 (def us-core-nginx-port 8080)
 (def g10-default-nginx-port 8081)
 
@@ -240,21 +245,30 @@
 (defn- git-out [dir & args]
   (str/trim (:out (apply shell {:dir dir :out :string :err :string :continue true} "git" args))))
 
+(defn check-g10-head!
+  "Throws unless `head` (the clone's `git rev-parse HEAD`) is
+   [[g10-kit-commit]]."
+  [head]
+  (when-not (= head g10-kit-commit)
+    (throw (ex-info (str g10-kit-dir " is at commit " (pr-str head) ", not " g10-kit-commit
+                         " (" g10-kit-tag "). The tag may have moved upstream, or the clone is"
+                         " stale: remove the directory and run bb inferno-g10-setup again,"
+                         " or re-pin g10-kit-tag and g10-kit-commit deliberately.")
+                    {:dir g10-kit-dir :head head :expected g10-kit-commit :tag g10-kit-tag}))))
+
 (defn ensure-g10-clone!
-  "Clones the (g)(10) kit at [[g10-kit-tag]], or fails when an existing clone
-   is checked out at anything else (a stale clone would silently run other
-   suite ids). Delete inferno-g10-kit/ to move to a new tag."
+  "Clones the (g)(10) kit at [[g10-kit-tag]], then checks it is
+   [[g10-kit-commit]]. An existing clone is checked the same way (a stale
+   clone would silently run other suite ids). Delete inferno-g10-kit/ to move
+   to a new pin."
   []
   (if-not (.exists (io/file g10-kit-dir))
     (do (println "Cloning" g10-kit-repo "at" g10-kit-tag "...")
         (shell "git" "-c" "advice.detachedHead=false" "clone" "--depth" "1"
-               "--branch" g10-kit-tag g10-kit-repo g10-kit-dir))
-    (let [head (git-out g10-kit-dir "describe" "--tags" "--exact-match" "HEAD")]
-      (when-not (= head g10-kit-tag)
-        (throw (ex-info (str g10-kit-dir " is checked out at " (pr-str head) ", not " g10-kit-tag
-                             ". Remove the directory and run bb inferno-g10-setup again.")
-                        {:dir g10-kit-dir :head head :expected g10-kit-tag})))
-      (println g10-kit-dir "already at" g10-kit-tag))))
+               "--branch" g10-kit-tag g10-kit-repo g10-kit-dir)
+        (check-g10-head! (git-out g10-kit-dir "rev-parse" "HEAD")))
+    (do (check-g10-head! (git-out g10-kit-dir "rev-parse" "HEAD"))
+        (println g10-kit-dir "already at" g10-kit-tag g10-kit-commit))))
 
 (defn g10-inferno-base-url
   "Inferno's own base url for the g10 kit, as the browser on the host sees it.
