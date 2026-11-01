@@ -759,12 +759,18 @@
         defs           (compartment/request-definitions req)
         types          (requested-types defs kind params all-registries)
         readable?      (fn [rt] (or (= :system access) (scope/permitted? scopes rt :read)))
-        ;; A caller authorized by its scopes exports only the rows its
-        ;; granular scopes admit; a system-tuple export is not scope-gated.
-        scope-filters  (when (= :subject access)
+        ;; Every export, a system-tuple one included, carries only the rows
+        ;; the token's granular scopes admit of a type they narrow. The type
+        ;; gate above is unchanged: a system-tuple export is not type-gated by
+        ;; scopes, but a backend client granted only
+        ;; `system/Observation.rs?category=...` still exports only that
+        ;; category. A type no qualified-only grant names is not filtered.
+        scope-filters  (let [token-scopes (if (= :subject access)
+                                            scopes
+                                            (scope/request-scopes req))]
                          (into {}
                                (keep (fn [rt]
-                                       (let [f (scope/grant-filter scopes rt :read)]
+                                       (let [f (scope/grant-filter token-scopes rt :read)]
                                          (when (map? f) [rt f]))))
                                types))]
     (sweep-expired! job-store)

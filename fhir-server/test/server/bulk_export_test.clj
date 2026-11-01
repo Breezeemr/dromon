@@ -1150,6 +1150,30 @@
     (testing "the job keeps the filter as plain data"
       (is (= #{"Observation"} (set (keys (:scope-filters job))))))))
 
+(deftest a-system-tuple-export-is-narrowed-by-a-granular-scope-too
+  (let [store     (temporal-search-store categorized-data (atom []))
+        job-store (bjs/create-store)
+        backend   {:sub "backend" :client_id "backend"
+                   :scope (str "system/Patient.rs system/Observation.rs?category="
+                               "http://terminology.hl7.org/CodeSystem/observation-category"
+                               "|laboratory")}
+        req       (merge (named-patient-req store job-store backend #{} ["Patient/p1"])
+                         authorized)
+        resp      (be/patient-export req)
+        job-id    (content-location-job-id resp)
+        job       (bjs/get-job job-store "default" job-id)]
+    (is (= 202 (:status resp)))
+    (is (= :system (:access job)))
+    (is (= {"Patient" #{"p1"} "Observation" #{"lab"}} (output-ids req job-store job-id)))
+    (is (= 1 (:count (first (filter #(= "Observation" (:type %)) (:output job))))))
+    (testing "an unqualified grant is not narrowed"
+      (let [req  (merge (named-patient-req store job-store
+                                           (assoc backend :scope "system/*.read") #{} ["Patient/p1"])
+                        authorized)
+            resp (be/patient-export req)]
+        (is (= {"Patient" #{"p1"} "Observation" #{"lab" "vital" "none"}}
+               (output-ids req job-store (content-location-job-id resp))))))))
+
 (deftest a-system-caller-may-name-patients
   (let [calls     (atom [])
         store     (temporal-search-store two-patient-data calls)
