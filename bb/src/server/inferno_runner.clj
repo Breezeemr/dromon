@@ -69,6 +69,12 @@
    "smart_app_launch_version" #{"smart_app_launch_2" "smart_app_launch_2_2"}
    "multi_patient_version"    #{"multi_patient_api_stu1" "multi_patient_api_stu2"}})
 
+(def inferno-dir
+  "The US Core kit clone the runner drives. dromon-datomic's runner rebinds it
+   (alter-var-root) to ../dromon/inferno-test-kit, so [[runner-config]] reads
+   it at call time for the us-core kit."
+  setup/us-core-kit-dir)
+
 (def kits
   {:us-core {:dir            setup/us-core-kit-dir
              :default-suite  "us_core_v610"
@@ -143,6 +149,13 @@
                        (throw (ex-info "INFERNO_TARGET=external needs INFERNO_FHIR_URL (the FHIR base to test)."
                                        {:var "INFERNO_FHIR_URL"}))))
         oauth    (strip-trailing-slash (or (env-str env "INFERNO_OAUTH_BASE_URL") default-oauth-base-url))
+        _        (when (and dromon? (not= oauth default-oauth-base-url))
+                   ;; ensure-hydra-issuer! and docker/hydra.yml pin the local
+                   ;; Hydra to this issuer; another value would be advertised
+                   ;; by the test-server but never served.
+                   (throw (ex-info (str "INFERNO_OAUTH_BASE_URL is fixed to " default-oauth-base-url
+                                        " for INFERNO_TARGET=dromon (docker/hydra.yml); got " (pr-str oauth))
+                                   {:var "INFERNO_OAUTH_BASE_URL" :value oauth})))
         token    (or (env-str env "INFERNO_TOKEN_URL")
                      (env-str env "BACKEND_TOKEN_URL")
                      (str oauth "/oauth2/token"))
@@ -157,7 +170,7 @@
                    (:default-suite-options kit-spec {}))]
     {:target            target
      :kit               kit
-     :kit-dir           (:dir kit-spec)
+     :kit-dir           (if (= kit :us-core) inferno-dir (:dir kit-spec))
      :suite             (or (env-str env "INFERNO_SUITE") (:default-suite kit-spec))
      :groups            (if (contains? #{"" "all" "ALL"} groups) [] (setup/split-list groups))
      :suite-options     options
@@ -182,11 +195,6 @@
 (defn- cfg [] (runner-config (System/getenv)))
 
 ;; ── Pre-flight helpers ────────────────────────────────────────────────────────
-
-(def inferno-dir
-  "The US Core kit clone. Kept for callers that predate INFERNO_KIT; the runner
-   itself uses the configured kit's :kit-dir."
-  setup/us-core-kit-dir)
 
 (defn ensure-inferno-containers!
   ([] (ensure-inferno-containers! (cfg)))
@@ -306,16 +314,38 @@
    "Practitioner" "PractitionerRole" "Organization" "Location" "Provenance" "Endpoint"
    "system"])
 
+(defn runner-client-tuples
+  "[object relation] pairs for the runner's own client_credentials client.
+   The dromon target seeds the test data with it, so it needs `write`; against
+   an external target it only reads."
+  [{:keys [target]}]
+  (vec (for [obj      keto-type-objects
+             relation (if (= target :dromon)
+                        ["read" "write" "search-type"]
+                        ["read" "search-type"])]
+         [obj relation])))
+
+(defn backend-client-tuples
+  "[object relation] pairs for a backend-services (bulk) client. Bulk export is
+   gated on the realm's `system` read tuple alone (bulk_export.clj
+   system-authorized?), so an external target's realm gets exactly that: the
+   g10 kit signs with a key set that is public on GitHub, and whoever holds it
+   can act as this client. The dromon target keeps its historical grant set."
+  [{:keys [target] :as config}]
+  (if (= target :dromon)
+    (runner-client-tuples config)
+    [["system" "read"]]))
+
 (defn grant-keto-permissions
   ([client-id] (grant-keto-permissions (cfg) client-id))
-  ([{:keys [realm keto-write-url]} client-id]
+  ([config client-id] (grant-keto-permissions config client-id (runner-client-tuples config)))
+  ([{:keys [realm keto-write-url]} client-id tuples]
    (if-not keto-write-url
      (println "No INFERNO_KETO_WRITE_URL -- skipping Keto grants for" client-id)
      (do
        (println "Granting Keto permissions...")
        (println "  realm:" realm)
-       (doseq [obj keto-type-objects
-               relation ["read" "write" "search-type"]]
+       (doseq [[obj relation] tuples]
          (let [resp (try
                       (curl/put (str keto-write-url "/admin/relation-tuples")
                                 {:headers {"Content-Type" "application/json"}
@@ -344,7 +374,8 @@
 ;;      group takes a key minted per run; the g10 kit locks its own committed
 ;;      test key set, so its public half is registered instead.
 ;;   3. Grant that client subject the Keto "system" read tuple so the RS256
-;;      access token Hydra issues passes dromon's authorization.
+;;      access token Hydra issues passes dromon's authorization
+;;      ([[backend-client-tuples]]).
 ;;   4. Hand Inferno the backend-services `smart_auth_info` (token_url, client_id,
 ;;      alg, kid, and the PRIVATE JWK set it signs the assertion with).
 
@@ -434,7 +465,7 @@
    the container), so the matching public key is what Hydra must hold."
   (str setup/g10-kit-dir "/lib/onc_certification_g10_test_kit/bulk_data_jwks.json"))
 
-(defn- g10-bulk-jwks []
+(defn g10-bulk-jwks []
   (let [f (io/file g10-bulk-jwks-path)]
     (when-not (.isFile f)
       (throw (ex-info (str g10-bulk-jwks-path " not found; run bb inferno-g10-setup first.")
@@ -520,7 +551,7 @@
   (let [jwks (if (= :g10 (:kit config)) (g10-bulk-jwks) (generate-backend-jwks))
         bcid (create-backend-client config (backend-public-jwk jwks))]
     (println "Backend-services client ID:" bcid)
-    (grant-keto-permissions config bcid)
+    (grant-keto-permissions config bcid (backend-client-tuples config))
     (backend-smart-auth-info config bcid (json/generate-string jwks) (backend-signing-kid jwks))))
 
 ;; Store warmup used to happen here via an authenticated `GET /Patient?_count=1`
@@ -647,26 +678,131 @@
       (into (cons "--inputs" (input-tokens config token backend-auth)))
       (into ["--outputter" "json"])))
 
-(def ^:private secret-input-re
-  #"(?i)^([A-Za-z0-9_]*(?:auth|token|secret|jwks|cred)[A-Za-z0-9_]*):.*$")
+(defn- secret-name?
+  "Whether an input named `n` carries a credential (an auth_info, a token, a
+   client secret, a key set). `*_url` inputs such as token_url do not."
+  [n]
+  (boolean (and (string? n)
+                (re-find #"(?i)auth|token|secret|jwks|cred|password|private" n)
+                (not (re-find #"(?i)_url$" n)))))
+
+(defn- input-arg
+  "[name value] of a `name:value` --inputs argument, or nil."
+  [arg]
+  (when-let [[_ n v] (re-matches #"(?s)^([A-Za-z0-9_]+):(.*)$" (str arg))]
+    [n v]))
+
+(defn- secret-arg? [arg]
+  (secret-name? (first (input-arg arg))))
+
+(defn- redacted-arg [arg]
+  (str (first (input-arg arg)) ":<redacted>"))
+
+(def ^:private secret-json-keys
+  "Keys whose values are credentials wherever they appear in an auth_info
+   JSON value: tokens, client secrets, and the private members of a JWK."
+  #{"access_token" "refresh_token" "id_token" "client_secret" "jwks"
+    "d" "p" "q" "dp" "dq" "qi" "k"})
 
 (defn redact-command
   "`cmd` safe to print: input values that carry credentials (access tokens,
    client secrets, private JWKs) are replaced."
   [cmd]
-  (mapv #(str/replace % secret-input-re "$1:<redacted>") cmd))
+  (mapv #(if (secret-arg? %) (redacted-arg %) %) cmd))
+
+(defn- parse-json-object [s]
+  (when (and (string? s) (str/starts-with? (str/triml s) "{"))
+    (try (let [v (json/parse-string s)] (when (map? v) v))
+         (catch Exception _ nil))))
+
+(defn- secret-leaves
+  "Every credential string inside `v` (a parsed JSON value): the values under
+   [[secret-json-keys]], descending into JSON objects encoded as strings (the
+   `jwks` member of an auth_info is one)."
+  [v]
+  (cond
+    (map? v)        (mapcat (fn [[k x]]
+                              (if (and (contains? secret-json-keys (str k)) (string? x))
+                                (cons x (secret-leaves (parse-json-object x)))
+                                (secret-leaves x)))
+                            v)
+    (sequential? v) (mapcat secret-leaves v)
+    (string? v)     (secret-leaves (parse-json-object v))
+    :else           nil))
+
+(defn secret-values
+  "The credential strings carried by `cmd`, plus `extra` (the runner's own
+   token and client secret). A credential-bearing argument contributes the
+   credentials inside its JSON value, or its whole value when that is not
+   JSON (a header, a bare token). Values shorter than 8 characters are
+   dropped: replacing them would mangle unrelated output."
+  [cmd extra]
+  (->> cmd
+       (keep (fn [arg]
+               (when (secret-arg? arg)
+                 (let [[_ v] (input-arg arg)]
+                   (if-let [m (parse-json-object v)] (secret-leaves m) [v])))))
+       (apply concat extra)
+       (filter #(and (string? %) (>= (count %) 8)))
+       distinct
+       (sort-by count >)
+       vec))
+
+(defn- json-escaped [s]
+  (let [q (json/generate-string s)] (subs q 1 (dec (count q)))))
 
 (defn redact-output
-  "`s` (output of running `cmd`) with every credential-bearing argument of
-   `cmd` replaced as [[redact-command]] does. podman's compose wrapper echoes
-   the whole command line on a non-zero exit."
-  [cmd s]
-  (reduce (fn [out arg]
-            (if (re-matches secret-input-re arg)
-              (str/replace out arg (str/replace arg secret-input-re "$1:<redacted>"))
-              out))
-          (str s)
-          cmd))
+  "`s` (output of running `cmd`, or a report body) with every credential
+   replaced: each credential-bearing argument of `cmd` as [[redact-command]]
+   prints it, and then each value of [[secret-values]] wherever it still
+   appears, raw or JSON-escaped, so a quoted or escaped echo of the command
+   (podman's compose wrapper prints it on a non-zero exit) leaks nothing."
+  ([cmd s] (redact-output cmd [] s))
+  ([cmd extra s]
+   (let [by-arg (reduce (fn [out arg]
+                          (if (secret-arg? arg)
+                            (str/replace out arg (redacted-arg arg))
+                            out))
+                        (str s)
+                        cmd)]
+     (reduce (fn [out v]
+               (-> out
+                   (str/replace v "<redacted>")
+                   (str/replace (json-escaped v) "<redacted>")))
+             by-arg
+             (secret-values cmd extra)))))
+
+(defn- redact-io-entry
+  "One `inputs`/`outputs` entry of an Inferno result with its credentials
+   replaced: the whole value when the entry's name says it is a credential,
+   otherwise the [[secret-json-keys]] members of a JSON object value."
+  [{:keys [name value] :as entry}]
+  (cond
+    (and (secret-name? name) (not (parse-json-object value)))
+    (cond-> entry (some? value) (assoc :value "<redacted>"))
+
+    (parse-json-object value)
+    (let [redact (fn redact [m]
+                   (into {} (map (fn [[k x]]
+                                   [k (cond
+                                        (contains? secret-json-keys (str k)) "<redacted>"
+                                        (map? x) (redact x)
+                                        :else x)]))
+                         m))]
+      (assoc entry :value (json/generate-string (redact (parse-json-object value)))))
+
+    :else entry))
+
+(defn redact-report
+  "The parsed Inferno report with the credentials in each result's `inputs`
+   and `outputs` replaced (Inferno echoes them, tokens it minted itself
+   included)."
+  [report]
+  (mapv (fn [result]
+          (cond-> result
+            (sequential? (:inputs result))  (update :inputs #(mapv redact-io-entry %))
+            (sequential? (:outputs result)) (update :outputs #(mapv redact-io-entry %))))
+        report))
 
 (defn- needs-runner-token?
   "Whether the run needs a bearer token minted by the runner itself: the
@@ -719,8 +855,8 @@
   "The result list in `inferno execute --outputter json` stdout, or nil when
    there is none. Inferno logs warnings (unknown inputs and the like) to stdout
    ahead of the report, so the report is the first line-initial `[` from which
-   the rest parses as a JSON array. A refusal is printed as a bare JSON string
-   and yields nil."
+   the rest parses as a JSON array of result objects. A refusal is printed as a
+   bare JSON string and yields nil."
   [out]
   (let [out (str out)
         m   (re-matcher #"(?m)^\[" out)]
@@ -728,7 +864,7 @@
       (when (.find m)
         ;; cheshire parses a top-level array lazily; realize it inside the try.
         (or (try (let [r (json/parse-string (subs out (.start m)) true)]
-                   (when (sequential? r) (vec r)))
+                   (when (and (sequential? r) (every? map? r)) (vec r)))
                  (catch Exception _ nil))
             (recur))))))
 
@@ -740,7 +876,9 @@
   ([{:keys [suite kit-dir] :as config} token backend-auth]
    (println "Running Inferno tests for suite" suite "in" kit-dir "...")
    (.mkdirs (io/file "target"))
-   (let [cmd (execute-command config token backend-auth)]
+   (let [cmd    (execute-command config token backend-auth)
+         extra  (remove nil? [token (:client-secret config)])
+         redact #(redact-output cmd extra %)]
      (println "Executing:" (str/join " " (redact-command cmd)))
      (try
        (let [proc   (process cmd {:dir kit-dir :out :string :err :string})
@@ -754,10 +892,12 @@
              (System/exit 1))
            (do
              (when (seq (:err result))
-               (println "Inferno stderr:" (redact-output cmd (:err result))))
-             (let [report      (parse-report (:out result))
+               (println "Inferno stderr:" (redact (:err result))))
+             (let [report      (some-> (parse-report (:out result)) redact-report)
                    report-file (str "target/inferno-report-" suite ".json")
-                   body        (if report (json/generate-string report {:pretty true}) (:out result))]
+                   body        (redact (if report
+                                         (json/generate-string report {:pretty true})
+                                         (:out result)))]
                (spit "target/inferno-report.json" body)
                (spit report-file body)
                (println "Inferno run completed. Report written to" report-file
@@ -766,13 +906,13 @@
                  (do (print-report report) report)
                  (do
                    (println "WARN: Inferno printed no JSON report. Raw output:")
-                   (println (redact-output cmd (:out result)))
+                   (println body)
                    nil))))))
        (catch Exception e
          (println "Error running inferno tests:" (.getMessage e))
          (when-let [edata (ex-data e)]
-           (println "Stdout:" (redact-output cmd (:out edata)))
-           (println "Stderr:" (redact-output cmd (:err edata))))
+           (println "Stdout:" (redact (:out edata)))
+           (println "Stderr:" (redact (:err edata))))
          (System/exit 1))))))
 
 ;; ── Entry points ──────────────────────────────────────────────────────────────
