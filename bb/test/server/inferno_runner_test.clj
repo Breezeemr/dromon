@@ -126,6 +126,8 @@
   (let [out (str "W, [2026-11-01T23:33:06 #52]  WARN -- : Unknown input `ehr_smart_auth_info`\n"
                  "[\n  {\"result\": \"pass\", \"test_id\": \"a\"},\n  {\"result\": \"wait\"}\n]\n")]
     (is (= [{:result "pass" :test_id "a"} {:result "wait"}] (runner/parse-report out))))
+  (is (= [{:result "fail"}]
+         (runner/parse-report "[worker] starting\n[\n  {\"result\": \"fail\"}\n]\n")))
   (is (nil? (runner/parse-report "\"Missing the following required inputs: url\"")))
   (is (nil? (runner/parse-report "[\n  {\"result\": ")))
   (is (nil? (runner/parse-report nil))))

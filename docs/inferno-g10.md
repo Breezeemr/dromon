@@ -279,7 +279,7 @@ off):
 
 | group | needs |
 |---|---|
-| 1.8, 3.7 discovery | flotilla `smart-token-response-context`, `smart-launch-enabled`, `smart-style-url` and `smart-authorize-post`, so `capabilities` carries `context-banner`, `context-style`, `launch-ehr` and `authorize-post` |
+| 1.8, 3.7 discovery | flotilla `smart-token-response-context`, `smart-launch-enabled`, `smart-style-url` and `smart-authorize-post`, so `capabilities` carries `context-banner`, `context-style`, `launch-ehr` and `authorize-post`; `permission-v1`, `permission-v2` and `context-ehr-encounter` come from the dromon SMART discovery change, live in flotilla only after its dromon submodule bump |
 | 1, 2, 9.x standalone and limited launches | the login-consent token proxy, with flotilla `smart-token-endpoint` pointing at it |
 | 3.x EHR launch | flotilla launch mint (`smart-launch-enabled`), login-consent launch verification and `SMART_STYLE_URL`, and a POST `/oauth2/auth` whose `launch` reaches the consent request |
 | 8 Multi-Patient API | a backend client allowed `system/*.read`, and a Group in the realm |

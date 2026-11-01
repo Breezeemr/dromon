@@ -718,15 +718,19 @@
 (defn parse-report
   "The result list in `inferno execute --outputter json` stdout, or nil when
    there is none. Inferno logs warnings (unknown inputs and the like) to stdout
-   ahead of the report, so the report starts at the first line that opens a
-   JSON array. A refusal is printed as a bare JSON string and yields nil."
+   ahead of the report, so the report is the first line-initial `[` from which
+   the rest parses as a JSON array. A refusal is printed as a bare JSON string
+   and yields nil."
   [out]
-  (when-let [start (some-> (re-matcher #"(?m)^\[" (str out)) (as-> m (when (.find m) (.start m))))]
-    ;; cheshire parses a top-level array lazily; realize it inside the try.
-    (let [report (try (let [r (json/parse-string (subs out start) true)]
-                        (if (sequential? r) (vec r) r))
-                      (catch Exception _ nil))]
-      (when (vector? report) report))))
+  (let [out (str out)
+        m   (re-matcher #"(?m)^\[" out)]
+    (loop []
+      (when (.find m)
+        ;; cheshire parses a top-level array lazily; realize it inside the try.
+        (or (try (let [r (json/parse-string (subs out (.start m)) true)]
+                   (when (sequential? r) (vec r)))
+                 (catch Exception _ nil))
+            (recur))))))
 
 (defn run-inferno-tests
   "Runs `inferno execute` in the kit container and writes the report. Returns
