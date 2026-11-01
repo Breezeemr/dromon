@@ -22,6 +22,19 @@
 
 (def ^:private all-permissions #{\c \r \u \d \s})
 
+(def us-core-granular-scopes
+  "The US Core granular (query-qualified) `patient/` scopes, as SMART
+   discovery advertises them by default."
+  ["patient/Condition.rs?category=http://terminology.hl7.org/CodeSystem/condition-category|encounter-diagnosis"
+   "patient/Condition.rs?category=http://terminology.hl7.org/CodeSystem/condition-category|problem-list-item"
+   "patient/Condition.rs?category=http://hl7.org/fhir/us/core/CodeSystem/condition-category|health-concern"
+   "patient/Observation.rs?category=http://terminology.hl7.org/CodeSystem/observation-category|laboratory"
+   "patient/Observation.rs?category=http://terminology.hl7.org/CodeSystem/observation-category|social-history"
+   "patient/Observation.rs?category=http://terminology.hl7.org/CodeSystem/observation-category|vital-signs"
+   "patient/Observation.rs?category=http://terminology.hl7.org/CodeSystem/observation-category|survey"
+   "patient/Observation.rs?category=http://hl7.org/fhir/us/core/CodeSystem/us-core-category|sdoh"])
+
+
 (def ^:private access->permissions
   {"read"  #{\r \s}
    "write" #{\c \u \d}

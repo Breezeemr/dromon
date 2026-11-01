@@ -286,6 +286,7 @@
    ::router/compartment-definitions
    ::router/token-claims
    ::router/oauth-base-url
+   ::router/smart-discovery
    ::router/keto-url
    ::router/jwt-auth
    ::router/keto-authorization])

@@ -10,6 +10,7 @@
             [server.json-patch :as json-patch]
             [jsonista.core :as json]
             [server.search-registry :as sr]
+            [server.smart-discovery :as sd]
             [server.temporal :as tmp]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]))
@@ -78,6 +79,20 @@
        (or (get-in req [:reitit.core/match :path-params :tenant-id])
            (get-in req [:path-params :tenant-id]))
        "/fhir"))
+
+(defn absolute-fhir-base
+  "[[fhir-base]] as an absolute URL, its scheme and host taken from the
+   request and overridden by `X-Forwarded-Proto` / `X-Forwarded-Host`, so a
+   server behind a proxy states the address its clients reached."
+  [req]
+  (str (or (get-in req [:headers "x-forwarded-proto"])
+           (some-> (:scheme req) name)
+           "https")
+       "://"
+       (or (get-in req [:headers "x-forwarded-host"])
+           (get-in req [:headers "host"])
+           "localhost")
+       (fhir-base req)))
 
 (defn- gone-response [resource-type id]
   {:status 410
@@ -1598,9 +1613,22 @@
       (conj {:type "Group"
              :operation [(bulk-export-resource-operations "Group")]}))))
 
-(defn capability-statement [schemas]
-  (fn [_req]
-    (let [resources (mapv (fn [schema]
+(defn- html-escape [s]
+  (str/escape (str s) {\< "&lt;" \> "&gt;" \& "&amp;" \" "&quot;"}))
+
+(defn capability-statement
+  "The `metadata` handler. The publisher and software strings come from the
+   host's `:fhir/capability-metadata`, `implementation.url` is the FHIR base the
+   request reached, and `rest.security` carries the SMART `oauth-uris`
+   extension built from the same `:fhir/smart-discovery` and
+   `:fhir/oauth-base-url` the discovery document is."
+  [schemas]
+  (fn [req]
+    (let [discovery  (sd/request-discovery req)
+          oauth-base (sd/request-oauth-base req)
+          {:keys [publisher software-name software-version implementation-description]}
+          (sd/request-capability-metadata req)
+          resources (mapv (fn [schema]
                             (let [props (m/properties schema)
                                   fhir-type (:resourceType props)
                                   cap-schema (:fhir/cap-schema props)
@@ -1649,19 +1677,23 @@
               :instantiates ["http://hl7.org/fhir/us/core/CapabilityStatement/us-core-server"
                              "http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"]
               :text {:status "generated"
-                     :div "<div xmlns=\"http://www.w3.org/1999/xhtml\">Dromon Capability Statement</div>"}
+                     :div (str "<div xmlns=\"http://www.w3.org/1999/xhtml\">"
+                               (html-escape software-name) " Capability Statement</div>")}
               :status "active"
               :date (str (java.time.LocalDate/now))
-              :publisher "Dromon"
+              :publisher publisher
               :kind "instance"
-              :software {:name "Dromon FHIR Server"}
-              :implementation {:description "Dromon FHIR Server"
-                               :url "https://fhir.local:8443/default/fhir"}
+              :software (cond-> {:name software-name}
+                          software-version (assoc :version software-version))
+              :implementation {:description implementation-description
+                               :url (absolute-fhir-base req)}
               :fhirVersion "4.0.1"
               :format ["application/fhir+json"]
               :rest [{:mode "server"
-                      :security {:service [{:coding [{:system "http://terminology.hl7.org/CodeSystem/restful-security-service"
-                                                      :code "SMART-on-FHIR"}]}]}
+                      :security {:cors true
+                                 :service [{:coding [{:system "http://terminology.hl7.org/CodeSystem/restful-security-service"
+                                                      :code "SMART-on-FHIR"}]}]
+                                 :extension [(sd/oauth-uris-extension oauth-base discovery)]}
                       ;; System-level Bulk Data $export. Inferno's bulk_data
                       ;; operation_support check locates system export at the
                       ;; rest level (operation.name "export"); the patient- and
@@ -1689,13 +1721,12 @@
 ;; dromon's own token validation (Hydra RS256 access tokens) is unchanged.
 (defn oauth-endpoint
   "`path` (starting with a slash) under the authorization server `base`, with
-   exactly one slash between them. An issuer is published verbatim and may end
-   in a slash (Hydra's does); concatenating would then yield `//oauth2/auth`."
+   exactly one slash between them. See `server.smart-discovery/oauth-endpoint`."
   [base path]
-  (str (str/replace base #"/+$" "") path))
+  (sd/oauth-endpoint base path))
 
 (defn smart-configuration
-  "Returns the SMART configuration handler.
+  "Returns the SMART configuration handler (SMART App Launch 2.2.0).
 
    The authorization server's base URL is, in order: `oauth-base-url` when
    given; else the request's `:fhir/oauth-base-url`, which
@@ -1706,47 +1737,19 @@
 
    The base is published verbatim as `issuer`, which a client compares with
    the `iss` of the tokens it receives, so it must be the issuer exactly,
-   trailing slash included. The endpoint URLs are joined to it with
-   [[oauth-endpoint]]."
+   trailing slash included. The endpoints, capabilities and extra scopes come
+   from the request's `:fhir/smart-discovery` (the `SMART_*` environment for a
+   handler outside the chain); see `server.smart-discovery`."
   ([] (smart-configuration nil))
   ([oauth-base-url]
    (fn [req]
-     (let [base (or oauth-base-url
-                    (:fhir/oauth-base-url req)
-                    (System/getenv "OAUTH_BASE_URL")
-                    "http://localhost:4444")]
+     (let [base (or oauth-base-url (sd/request-oauth-base req))]
        ;; Return a plain map body (no explicit Content-Type) so the muuntaja
        ;; response middleware serializes it, exactly like the /metadata
        ;; handler. Setting Content-Type here suppresses that encoding and Ring
        ;; then fails to stream the raw map (HTTP 500).
        {:status 200
-        :body {:issuer                 base
-               :jwks_uri               (oauth-endpoint base "/.well-known/jwks.json")
-               :authorization_endpoint (oauth-endpoint base "/oauth2/auth")
-               :token_endpoint         (oauth-endpoint base "/oauth2/token")
-               :token_endpoint_auth_methods_supported ["client_secret_basic" "private_key_jwt"]
-               ;; SMART Backend Services (SMART App Launch v2.2.0) requires the
-               ;; asymmetric client-assertion signing algorithms the server's
-               ;; token endpoint (Ory Hydra) accepts for `private_key_jwt`.
-               :token_endpoint_auth_signing_alg_values_supported ["RS384" "ES384"]
-               :grant_types_supported  ["authorization_code" "client_credentials"]
-               :code_challenge_methods_supported ["S256"]
-               ;; `system/*.read` and `system/*.rs` advertise SMART Backend
-               ;; Services (bulk data) scopes alongside the launch/patient/user
-               ;; scopes.
-               :scopes_supported       ["openid" "profile" "launch" "launch/patient"
-                                        "patient/*.read" "patient/*.write"
-                                        "user/*.read" "user/*.write"
-                                        "system/*.read" "system/*.rs"]
-               :response_types_supported ["code"]
-               ;; `sso-openid-connect` in :capabilities requires `issuer` +
-               ;; `jwks_uri` to be present (SMART App Launch STU2 discovery).
-               ;; `client-confidential-asymmetric` advertises the
-               ;; `private_key_jwt` backend-services authentication method.
-               :capabilities           ["launch-standalone" "client-public" "client-confidential-symmetric"
-                                        "client-confidential-asymmetric"
-                                        "sso-openid-connect" "context-passthrough-banner"
-                                        "permission-offline" "permission-patient" "permission-user"]}}))))
+        :body (sd/smart-configuration-body base (sd/request-discovery req))}))))
 
 (defn- system-history-entry [base default-type res]
   (let [rt (or (:resourceType res) default-type)]
