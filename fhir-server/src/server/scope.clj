@@ -454,7 +454,18 @@
 
 (defn- add-param
   "`params` with `value` ANDed onto `param`: a repeated parameter (a vector),
-   whichever key spelling the caller used."
+   whichever key spelling the caller used. With no client value the store
+   receives one plain string.
+
+   A repeated parameter is FHIR's AND, kept rather than replaced by a
+   token-wise intersection: the client's value and the grant may be met by
+   different codings of one CodeableConcept[] (an Observation categorized both
+   `survey` and `sdoh`, searched for `sdoh` under a `survey` grant), which an
+   intersection of the two token sets would wrongly exclude. The mock and
+   Datomic stores AND repeated values. A store that does not can only return
+   too few or too many rows: too many are removed again by the check
+   [[ScopeFilteringStore]] runs over every search result, but a count is only
+   as accurate as the store's AND."
   [params param value]
   (let [kw       (keyword param)
         existing (concat (as-seq (get params param)) (as-seq (get params kw)))]
@@ -514,8 +525,15 @@
         [type id] (str/split type-and-id #"/")
         interaction (entry-interaction method id url)]
     (cond
+      ;; A leading slash, an absolute URL or an unknown method leaves the
+      ;; entry with no type or interaction to judge. The base parses the URL
+      ;; the same way and cannot resolve it either, but a store may fall back
+      ;; to the body's resourceType, so a token whose grants can narrow
+      ;; anything is refused rather than trusted to that.
       (or (str/blank? type) (nil? interaction))
-      nil
+      (when-not (unrestricted? scopes)
+        (str "Insufficient scope: a Bundle entry whose request names no resource type "
+             "or no supported method cannot be judged under these scopes."))
 
       (and gate-types? (not (permitted? scopes type interaction)))
       (str "Insufficient scope: no granted scope permits " (name interaction) " on " type ".")

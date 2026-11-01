@@ -331,6 +331,67 @@
                                                       [(entry "POST" "Observation?identifier=x"
                                                               (obs nil lab))])))))))
 
+;; Every search the base store receives, with the rows it answers regardless.
+(defn- recording-store [rows calls]
+  (reify db/IFHIRStore
+    (search [_ _ _ params _] (swap! calls conj params) rows)
+    (count-resources [_ _ _ params _] (swap! calls conj params) (count rows))))
+
+(deftest store-pushdown-reaches-the-base-as-one-value-or-an-and
+  (let [grant (str obs-cat "|laboratory")]
+    (testing "with no client category the base receives one plain string"
+      (let [calls (atom [])]
+        (db/search (fstore (recording-store [] calls) lab-scope) tenant :Observation
+                   {"patient" "123"} obs-registry)
+        (is (= [{"patient" "123" "category" grant}] @calls))))
+    (testing "a client category, under either key spelling, is ANDed as a repeated parameter"
+      (doseq [k ["category" :category]]
+        (let [calls (atom [])]
+          (db/count-resources (fstore (recording-store [] calls) lab-scope) tenant :Observation
+                              {k "vital-signs"} obs-registry)
+          (is (= [{"category" ["vital-signs" grant]}] @calls)))))
+    (testing "a repeated client category keeps its values and gains the grant"
+      (let [calls (atom [])]
+        (db/search (fstore (recording-store [] calls) lab-scope) tenant :Observation
+                   {"category" ["a" "b"]} obs-registry)
+        (is (= [{"category" ["a" "b" grant]}] @calls))))
+    (testing "two qualified grants on one parameter push down as one OR set"
+      (let [calls (atom [])]
+        (db/search (fstore (recording-store [] calls) [lab-scope vital-scope]) tenant :Observation
+                   {} obs-registry)
+        (is (= [{"category" (str grant "," obs-cat "|vital-signs")}] @calls))))))
+
+(deftest store-search-results-are-checked-even-when-the-base-ignores-the-pushdown
+  (let [rows [(obs "lab-1" lab) (obs "vital-1" vital) (obs "none-1")]]
+    (is (= #{"lab-1"} (ids (db/search (fstore (recording-store rows (atom [])) lab-scope)
+                                      tenant :Observation {} obs-registry))))))
+
+(deftest store-refuses-bundle-entries-it-cannot-judge
+  (let [claim (str "patient/Observation.crs?category=" obs-cat "|laboratory")
+        gated (fn [base scopes] (scope/filtering-store base {:scopes (scope/parse-scopes scopes)
+                                                             :search-types :all
+                                                             :all-registries registries
+                                                             :gate-types? true}))]
+    (testing "a url with no resource type in front"
+      (doseq [url ["/Observation" "/Observation/vital-1" ""]]
+        (is (= 403 (status-of #(db/transact-transaction (gated (seeded) claim) tenant
+                                                        [(entry "POST" url (obs nil vital))])))
+            url)))
+    (testing "an unsupported method"
+      (is (= 403 (status-of #(db/transact-transaction (gated (seeded) claim) tenant
+                                                      [(entry "TRACE" "Observation/lab-1")])))))
+    (testing "a batch answers the refusal in place and runs the rest"
+      (let [res (db/transact-bundle (gated (seeded) claim) tenant
+                                    [(entry "GET" "/Observation/vital-1")
+                                     (entry "GET" "Observation/vital-1")
+                                     (entry "GET" "Observation/lab-1")])]
+        (is (= ["403 Forbidden" "403 Forbidden"]
+               (mapv #(get-in % [:response :status]) (take 2 (:entry res)))))
+        (is (= "lab-1" (get-in (nth (:entry res) 2) [:resource :id])))))
+    (testing "an unrestricted token is not held to it"
+      (is (nil? (#'scope/entry-refusal (gated (seeded) "user/*.*") tenant
+                                       (entry "POST" "/Observation" (obs nil vital))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; The whole router, scope enforcement on
 ;; ---------------------------------------------------------------------------
@@ -450,3 +511,15 @@
   (is (= #{"lab-1" "vital-1" "both-1"}
          (entry-ids (call (seeded) (request :get "/default/fhir/Observation" "patient/*.read"))
                     "match"))))
+
+(deftest router-batch-cannot-read-around-the-grant
+  (let [bundle {:resourceType "Bundle" :type "batch"
+                :entry [{:request {:method "GET" :url "Observation/vital-1"}}
+                        {:request {:method "GET" :url "/Observation/vital-1"}}
+                        {:request {:method "GET" :url "Observation/lab-1"}}]}
+        resp   (call (seeded) (request :post "/default/fhir" lab-scope :body bundle))
+        entries (get-in resp [:body :entry])]
+    (is (= 200 (:status resp)))
+    (is (= ["403 Forbidden" "403 Forbidden"] (mapv #(get-in % [:response :status]) (take 2 entries))))
+    (is (not-any? #(= "vital-1" (get-in % [:resource :id])) entries))
+    (is (= "lab-1" (get-in (nth entries 2) [:resource :id])))))
