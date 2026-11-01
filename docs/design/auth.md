@@ -53,10 +53,54 @@ missing subject is a `401`; a denial or a Keto error is **fail-closed** to `403`
 ## OAuth2 / SMART (Ory Hydra)
 - **Hydra** issues OAuth2 tokens. The dev/Inferno path provisions a Hydra client and obtains a
   token via the `client_credentials` grant.
-- **SMART discovery** — `/.well-known/smart-configuration` advertises `authorization_endpoint` /
-  `token_endpoint`, grant types (`authorization_code`, `client_credentials`), SMART scopes
-  (`launch`, `launch/patient`, `patient/*.read`, ...), and capabilities including
-  `launch-standalone`. The CapabilityStatement advertises the `SMART-on-FHIR` security service.
+- **SMART discovery** (SMART App Launch 2.2.0, `server.smart-discovery`) --
+  `/.well-known/smart-configuration` advertises the authorize, token and revocation endpoints,
+  grant types (`authorization_code`, `client_credentials`, `refresh_token`), the SMART v1 and v2
+  scopes plus the US Core granular scopes, and capabilities. A host configures it through the
+  `:smart-discovery` option (or the `SMART_*` environment): token, introspection, revocation and
+  management endpoint URLs, and the flags that add `launch-ehr`, the `context-*` capabilities and
+  `authorize-post`. Every flag defaults off, so discovery never claims a feature the deployment
+  has not switched on. The CapabilityStatement advertises the `SMART-on-FHIR` security service,
+  `cors`, and the same endpoints as the SMART `oauth-uris` extension.
+
+### Granular scopes (`server.scope`)
+A v2 scope may carry a query (`patient/Observation.rs?category=<system>|<code>`). Only the
+parameters in `server.scope/granular-parameters` are accepted (today `category` on Condition and
+Observation); a v1 scope, a wildcard type, an unknown parameter or an unparseable query makes the
+whole scope malformed, and it is dropped and logged rather than read as the unqualified scope.
+`server.scope/grant-filter` unions a token's grants per type and interaction: an unqualified
+grant wins, otherwise a resource must match one of the qualified queries.
+
+`::smart-scope` remains the type gate. `::smart-scope-filter`, inside `::patient-compartment`,
+installs `server.scope/ScopeFilteringStore` for any token whose unqualified wildcards do not cover
+everything it grants. The store pushes the filter down on search and count (a client's own
+`category` is ANDed as a repeated parameter), answers 403 on a read or vread the grant does not
+admit, filters history, judges `_include`/`_revinclude` targets under their own type, refuses a
+qualified write that does not match, and gates the entries of a Bundle POSTed to the base. Bulk
+export applies the same filter while streaming a scope-authorized export.
+
+Repeated search parameters must AND in the store for the client-category intersection to be
+exact. The mock and Datomic stores do; the xtdb2 store stringifies a repeated value, so such a
+search returns nothing there (fail closed) until it learns repeated parameters.
+
+### Token response context, introspection and revocation
+Hydra cannot add top-level fields to its token response, and serves RFC 7662 introspection only
+on its admin API. The split, owned outside dromon, is:
+
+- **Token proxy** -- the host's login-consent service answers `POST /oauth2/token` at Hydra's own
+  public token URL (so a `private_key_jwt` assertion's `aud` still matches), forwards the raw body
+  to Hydra, and copies a fixed allowlist of launch context (`patient`, `encounter`,
+  `need_patient_banner`, `smart_style_url`) from the issued access token's claims into the
+  response JSON. Discovery publishes it as `token_endpoint` only when configured.
+- **Introspection** -- login-consent also answers `POST /oauth2/introspect`, authenticating the
+  caller (client_secret_basic, checked against Hydra, or a bearer access token) and forwarding to
+  Hydra's admin introspection. An inactive or foreign token answers exactly `{"active": false}`.
+  Discovery publishes `introspection_endpoint` only when configured.
+- **Revocation** -- Hydra's public `/oauth2/revoke` (RFC 7009) is published by default. A
+  patient's connected-apps revocation deletes the Hydra consent session for that client, which
+  revokes its access and refresh tokens. dromon verifies access tokens locally (JWKS), so a
+  revoked access token keeps working here until it expires unless the host adds an
+  introspection-backed check in front of the FHIR chain.
 
 ## Open items
 Open auth decisions are tracked in [`../open-decisions.md`](../open-decisions.md): building the
