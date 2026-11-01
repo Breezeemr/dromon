@@ -582,6 +582,9 @@
 
 ;; ── Suite inputs ──────────────────────────────────────────────────────────────
 
+(def ^:private g10-discovery-auth-info
+  (json/generate-string {:auth_type "symmetric" :use_discovery "true"}))
+
 (defn input-tokens
   "The `key:value` tokens passed after --inputs. INFERNO_INPUTS fully replaces
    the defaults, with {{token}}, {{cred_json}} and {{backend_auth}} expanded."
@@ -606,10 +609,14 @@
        "bulk_timeout:180"
        "since_timestamp:2020-01-01T00:00:00Z"]
 
-      ;; The g10 discovery groups need only the FHIR base; launches and their
-      ;; credentials come from a preset or the web UI.
+      ;; The g10 discovery groups read only the FHIR base, but declare the
+      ;; launch credentials as required inputs (discovery writes the
+      ;; endpoints it finds into them). Launches and their real credentials
+      ;; come from a preset or the web UI.
       (= kit :g10)
-      [(str "url:" fhir-url)]
+      [(str "url:" fhir-url)
+       (str "standalone_smart_auth_info:" g10-discovery-auth-info)
+       (str "ehr_smart_auth_info:" g10-discovery-auth-info)]
 
       ;; Backend-services default input set for the bulk_data suites: the FHIR
       ;; base is `bulk_server_url` and auth is the real private_key_jwt flow
@@ -689,6 +696,9 @@
     (println "╚══════════════════════════════════════════════════════════════╝\n")))
 
 (defn run-inferno-tests
+  "Runs `inferno execute` in the kit container and writes the report. Returns
+   the parsed result list, or nil when Inferno printed no JSON report (it
+   refused the run, e.g. for a missing input)."
   ([token backend-auth] (run-inferno-tests (cfg) token backend-auth))
   ([{:keys [suite kit-dir] :as config} token backend-auth]
    (println "Running Inferno tests for suite" suite "in" kit-dir "...")
@@ -715,11 +725,11 @@
                         "(and target/inferno-report.json)"))
              (let [report (try (json/parse-string (:out result) true) (catch Exception _ nil))]
                (if (sequential? report)
-                 (print-report report)
+                 (do (print-report report) report)
                  (do
                    (println "WARN: Could not parse JSON report. Raw output:")
-                   (println (:out result)))))
-             result)))
+                   (println (:out result))
+                   nil))))))
        (catch Exception e
          (println "Error running inferno tests:" (.getMessage e))
          (when-let [edata (ex-data e)]
@@ -898,8 +908,9 @@
         (get-token config cid secret))))
 
 (defn run-suite!
-  "Runs the configured suite. Exits the process: 0 when the run completed
-   (whatever the test results; read the report), 1 on a setup failure."
+  "Runs the configured suite. Exits the process: 0 when Inferno produced a
+   report (whatever the test results; read it), 1 on a setup failure or when
+   Inferno refused the run."
   [config]
   (let [{:keys [target backend? kit suite]} config
         dromon? (= target :dromon)]
@@ -938,8 +949,7 @@
           (insert-patient config token)
           (insert-test-data config token))
         (let [backend-auth (when backend? (backend-auth! config))]
-          (run-inferno-tests config token backend-auth))))
-    (System/exit 0)))
+          (System/exit (if (run-inferno-tests config token backend-auth) 0 1)))))))
 
 (defn run-check!
   "Entry point of `bb inferno-test`: [[run-suite!]] with the configuration from the

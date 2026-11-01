@@ -106,6 +106,8 @@
             "smart_app_launch_version:smart_app_launch_2_2" "us_core_version:us_core_7"
             "--groups" "1.8" "3.7"
             "--inputs" "url:https://fhir.example.test/fhir"
+            "standalone_smart_auth_info:{\"auth_type\":\"symmetric\",\"use_discovery\":\"true\"}"
+            "ehr_smart_auth_info:{\"auth_type\":\"symmetric\",\"use_discovery\":\"true\"}"
             "--outputter" "json"]
            cmd))))
 
