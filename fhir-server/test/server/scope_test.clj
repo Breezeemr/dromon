@@ -11,15 +11,18 @@
 
 (deftest parse-scope-v1
   (testing "v1 .read expands to read + search"
-    (is (= {:compartment "patient" :resource "Observation" :permissions #{\r \s}}
+    (is (= {:compartment "patient" :resource "Observation" :permissions #{\r \s}
+            :version :v1 :query nil}
            (scope/parse-scope "patient/Observation.read"))))
 
   (testing "v1 .write expands to create + update + delete"
-    (is (= {:compartment "user" :resource "Patient" :permissions #{\c \u \d}}
+    (is (= {:compartment "user" :resource "Patient" :permissions #{\c \u \d}
+            :version :v1 :query nil}
            (scope/parse-scope "user/Patient.write"))))
 
   (testing "v1 wildcard resource"
-    (is (= {:compartment "patient" :resource "*" :permissions #{\r \s}}
+    (is (= {:compartment "patient" :resource "*" :permissions #{\r \s}
+            :version :v1 :query nil}
            (scope/parse-scope "patient/*.read"))))
 
   (testing "v1 .* grants all permissions"
@@ -27,12 +30,15 @@
            (:permissions (scope/parse-scope "user/*.*"))))))
 
 (deftest parse-scope-v2
-  (testing "v2 granular letters parse to the literal letter set"
-    (is (= {:compartment "patient" :resource "Observation" :permissions #{\r \s}}
+  (testing "v2 letters parse to the literal letter set"
+    (is (= {:compartment "patient" :resource "Observation" :permissions #{\r \s}
+            :version :v2 :query nil}
            (scope/parse-scope "patient/Observation.rs")))
-    (is (= {:compartment "patient" :resource "Observation" :permissions #{\c \r \u \d \s}}
+    (is (= {:compartment "patient" :resource "Observation" :permissions #{\c \r \u \d \s}
+            :version :v2 :query nil}
            (scope/parse-scope "patient/Observation.cruds")))
-    (is (= {:compartment "system" :resource "*" :permissions #{\c \r \u \d \s}}
+    (is (= {:compartment "system" :resource "*" :permissions #{\c \r \u \d \s}
+            :version :v2 :query nil}
            (scope/parse-scope "system/*.cruds")))
     (is (= #{\c \u} (:permissions (scope/parse-scope "user/Encounter.cu"))))))
 
@@ -45,7 +51,8 @@
 (deftest parse-scope-malformed
   (testing "malformed scopes are dropped"
     (doseq [s ["" "patient/" "patient/Observation" "patient/Observation.xyz"
-               "foo/Observation.read" "patient/Observation.readx" "/Observation.read"]]
+               "foo/Observation.read" "patient/Observation.readx" "/Observation.read"
+               "patient/Observation.rc" "patient/Observation.ssr" "patient/Observation."]]
       (is (nil? (scope/parse-scope s)) (str "should be rejected: " s)))))
 
 (deftest parse-scopes-claim-forms

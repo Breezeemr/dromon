@@ -1,0 +1,452 @@
+(ns server.scope-granular-test
+  "SMART v2 granular (query-qualified) scopes: the grammar, the union a set of
+   grants makes, the in-memory match, the scope-filtering store, and the whole
+   router with scope enforcement on."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [buddy.sign.jwt :as jwt]
+            [fhir-store.mock.core :as mock]
+            [fhir-store.protocol :as db]
+            [hato.client :as hc]
+            [jsonista.core :as json]
+            [malli.core :as m]
+            [malli.util :as mu]
+            [reitit.ring :as ring]
+            [server.auth :as auth]
+            [server.core :as sc]
+            [server.router :as router]
+            [server.scope :as scope])
+  (:import [java.io ByteArrayInputStream InputStream]))
+
+(def ^:private tenant "default")
+
+(def ^:private obs-cat "http://terminology.hl7.org/CodeSystem/observation-category")
+(def ^:private cond-cat "http://terminology.hl7.org/CodeSystem/condition-category")
+
+(def ^:private lab-scope
+  (str "patient/Observation.rs?category=" obs-cat "|laboratory"))
+
+(def ^:private vital-scope
+  (str "patient/Observation.rs?category=" obs-cat "|vital-signs"))
+
+;; ---------------------------------------------------------------------------
+;; Grammar
+;; ---------------------------------------------------------------------------
+
+(deftest us-core-granular-scopes-all-parse
+  (doseq [s scope/us-core-granular-scopes]
+    (let [parsed (scope/parse-scope s)]
+      (is (some? parsed) s)
+      (is (= :v2 (:version parsed)))
+      (is (= #{\r \s} (:permissions parsed)))
+      (is (= #{"category"} (set (keys (:query parsed))))))))
+
+(deftest parse-granular-scope
+  (testing "system|code"
+    (is (= {:compartment "patient" :resource "Observation" :permissions #{\r \s}
+            :version :v2
+            :query {"category" [{:system obs-cat :code "laboratory"}]}}
+           (scope/parse-scope lab-scope))))
+  (testing "comma values OR within one parameter"
+    (is (= [{:system obs-cat :code "laboratory"} {:system nil :code "vital-signs"}]
+           (get-in (scope/parse-scope (str "patient/Observation.rs?category="
+                                           obs-cat "|laboratory,vital-signs"))
+                   [:query "category"]))))
+  (testing "the four token forms"
+    (is (= [{:system nil :code "laboratory"}]
+           (get-in (scope/parse-scope "patient/Observation.rs?category=laboratory")
+                   [:query "category"])))
+    (is (= [{:system obs-cat :code nil}]
+           (get-in (scope/parse-scope (str "patient/Observation.rs?category=" obs-cat "|"))
+                   [:query "category"])))
+    (is (= [{:system nil :code "laboratory" :no-system? true}]
+           (get-in (scope/parse-scope "patient/Observation.rs?category=|laboratory")
+                   [:query "category"]))))
+  (testing "percent-decoding is applied once, and + is not a space"
+    (is (= [{:system obs-cat :code "laboratory"}]
+           (get-in (scope/parse-scope (str "patient/Observation.rs?category="
+                                           (str/replace obs-cat ":" "%3A") "%7Claboratory"))
+                   [:query "category"])))
+    (is (= [{:system nil :code "a+b"}]
+           (get-in (scope/parse-scope "patient/Observation.rs?category=a+b")
+                   [:query "category"])))
+    (is (= [{:system nil :code "%7C"}]
+           (get-in (scope/parse-scope "patient/Observation.rs?category=%257C")
+                   [:query "category"]))
+        "a double-encoded bar decodes to a literal %7C, not to a separator"))
+  (testing "a qualified write scope keeps its letters"
+    (is (= #{\c \r \u \s}
+           (:permissions (scope/parse-scope (str "patient/Observation.crus?category=" obs-cat "|laboratory")))))))
+
+(deftest malformed-granular-scopes-are-dropped-whole
+  (doseq [s [;; a query is v2-only
+             (str "patient/Observation.read?category=" obs-cat "|laboratory")
+             (str "patient/Observation.*?category=laboratory")
+             ;; and needs a concrete type
+             "patient/*.rs?category=laboratory"
+             ;; non-canonical letters
+             "patient/Observation.sr?category=laboratory"
+             ;; unparseable queries
+             "patient/Observation.rs?"
+             "patient/Observation.rs?category"
+             "patient/Observation.rs?category="
+             "patient/Observation.rs?=laboratory"
+             "patient/Observation.rs?category=laboratory&"
+             "patient/Observation.rs?category=a,,b"
+             "patient/Observation.rs?category=|"
+             "patient/Observation.rs?category=a|b|c"
+             "patient/Observation.rs?category=%ZZ"
+             ;; a duplicate parameter
+             "patient/Observation.rs?category=a&category=b"
+             ;; unsupported parameters
+             "patient/Observation.rs?code=1234-5"
+             "patient/Patient.rs?category=x"
+             "patient/Observation.rs?category=laboratory&status=final"]]
+    (is (nil? (scope/parse-scope s)) s))
+  (testing "never read as the unqualified scope"
+    (is (= [] (scope/parse-scopes "patient/Observation.rs?code=1234-5")))
+    (is (not (scope/permitted? (scope/parse-scopes "patient/Observation.rs?code=1234-5")
+                               "Observation" :read)))))
+
+(deftest a-second-supported-parameter-ands
+  (with-redefs [scope/granular-parameters {"Observation" #{"category" "status"}}]
+    (is (= {"category" [{:system nil :code "laboratory"}]
+            "status"   [{:system nil :code "final"}]}
+           (:query (scope/parse-scope "patient/Observation.rs?category=laboratory&status=final"))))))
+
+;; ---------------------------------------------------------------------------
+;; grant-filter / unrestricted?
+;; ---------------------------------------------------------------------------
+
+(deftest grant-filter-union
+  (let [lab   {"category" [{:system obs-cat :code "laboratory"}]}
+        vital {"category" [{:system obs-cat :code "vital-signs"}]}]
+    (testing "no granting scope"
+      (is (= :none (scope/grant-filter (scope/parse-scopes lab-scope) "Condition" :read)))
+      (is (= :none (scope/grant-filter (scope/parse-scopes lab-scope) "Observation" :create))))
+    (testing "qualified scopes union"
+      (is (= {:any-of [lab vital]}
+             (scope/grant-filter (scope/parse-scopes [lab-scope vital-scope]) "Observation" :search))))
+    (testing "an unqualified grant wins the union"
+      (is (= :all (scope/grant-filter (scope/parse-scopes [lab-scope "patient/Observation.rs"])
+                                      "Observation" :read)))
+      (is (= :all (scope/grant-filter (scope/parse-scopes [lab-scope "patient/*.read"])
+                                      "Observation" :read))))
+    (testing "the letter decides which scopes grant"
+      (is (= {:any-of [lab]}
+             (scope/grant-filter (scope/parse-scopes [(str "patient/Observation.c?category=" obs-cat "|laboratory")
+                                                      "patient/Observation.rs"])
+                                 "Observation" :create))))))
+
+(deftest unrestricted-tokens
+  (is (scope/unrestricted? (scope/parse-scopes "user/*.*")))
+  (is (scope/unrestricted? (scope/parse-scopes "system/*.read")))
+  (is (scope/unrestricted? (scope/parse-scopes "patient/*.read patient/Patient.c patient/Encounter.cu")))
+  (is (scope/unrestricted? (scope/parse-scopes (str "patient/*.read " lab-scope))))
+  (is (not (scope/unrestricted? (scope/parse-scopes "patient/Observation.rs"))))
+  (is (not (scope/unrestricted? (scope/parse-scopes lab-scope))))
+  (is (not (scope/unrestricted? (scope/parse-scopes
+                                 (str "patient/*.read patient/Observation.c?category=" obs-cat "|laboratory"))))))
+
+;; ---------------------------------------------------------------------------
+;; resource-matches?
+;; ---------------------------------------------------------------------------
+
+(defn- category [& codings]
+  (mapv (fn [c] {:coding [c]}) codings))
+
+(deftest token-matching
+  (let [lab-obs  {:resourceType "Observation" :category (category {:system obs-cat :code "laboratory"})}
+        bare-obs {:resourceType "Observation" :category (category {:code "laboratory"})}
+        q        (fn [& tokens] {"category" (vec tokens)})]
+    (testing "system|code is exact"
+      (is (scope/resource-matches? (q {:system obs-cat :code "laboratory"}) lab-obs))
+      (is (not (scope/resource-matches? (q {:system obs-cat :code "vital-signs"}) lab-obs)))
+      (is (not (scope/resource-matches? (q {:system "http://other" :code "laboratory"}) lab-obs))))
+    (testing "code matches in any system"
+      (is (scope/resource-matches? (q {:system nil :code "laboratory"}) lab-obs))
+      (is (scope/resource-matches? (q {:system nil :code "laboratory"}) bare-obs)))
+    (testing "system| matches any code in the system"
+      (is (scope/resource-matches? (q {:system obs-cat :code nil}) lab-obs))
+      (is (not (scope/resource-matches? (q {:system obs-cat :code nil}) bare-obs))))
+    (testing "|code matches only a coding without a system"
+      (is (scope/resource-matches? (q {:system nil :code "laboratory" :no-system? true}) bare-obs))
+      (is (not (scope/resource-matches? (q {:system nil :code "laboratory" :no-system? true}) lab-obs))))
+    (testing "values OR"
+      (is (scope/resource-matches? (q {:system obs-cat :code "vital-signs"}
+                                      {:system obs-cat :code "laboratory"})
+                                   lab-obs)))
+    (testing "a resource without the element never matches"
+      (is (not (scope/resource-matches? (q {:system nil :code "laboratory"})
+                                        {:resourceType "Observation"}))))))
+
+;; ---------------------------------------------------------------------------
+;; ScopeFilteringStore
+;; ---------------------------------------------------------------------------
+
+(def ^:private obs-registry
+  {"category" {:type "token" :columns [{:col "category" :fhir-type "CodeableConcept" :array? true}]}
+   "patient"  {:type "reference" :target ["Patient"] :columns [{:col "subject"}]}
+   "subject"  {:type "reference" :columns [{:col "subject"}]}
+   "performer" {:type "reference" :columns [{:col "performer" :array? true}]}})
+
+(def ^:private cond-registry
+  {"category" {:type "token" :columns [{:col "category" :fhir-type "CodeableConcept" :array? true}]}
+   "patient"  {:type "reference" :target ["Patient"] :columns [{:col "subject"}]}})
+
+(def ^:private registries
+  {"Observation" obs-registry
+   "Condition"   cond-registry
+   "Practitioner" {"name" {:type "string" :columns [{:col "name"}]}}
+   "Patient"     {}})
+
+(defn- obs [id & codings]
+  {:resourceType "Observation" :id id
+   :subject {:reference "Patient/123"}
+   :performer [{:reference "Practitioner/pr-1"}]
+   :category (apply category codings)})
+
+(def ^:private lab {:system obs-cat :code "laboratory"})
+(def ^:private vital {:system obs-cat :code "vital-signs"})
+
+(defn- seeded []
+  (let [store (mock/create-mock-store {:registries registries})]
+    (db/create-resource store tenant :Observation "lab-1" (obs "lab-1" lab))
+    (db/create-resource store tenant :Observation "vital-1" (obs "vital-1" vital))
+    (db/create-resource store tenant :Observation "both-1" (obs "both-1" lab {:system "http://x" :code "other"}))
+    (db/create-resource store tenant :Practitioner "pr-1" {:resourceType "Practitioner" :id "pr-1"})
+    (db/create-resource store tenant :Condition "c-1"
+                        {:resourceType "Condition" :id "c-1" :subject {:reference "Patient/123"}
+                         :category (category {:system cond-cat :code "problem-list-item"})})
+    store))
+
+(defn- fstore
+  ([base claim] (fstore base claim #{"Observation"}))
+  ([base claim search-types]
+   (scope/filtering-store base {:scopes (scope/parse-scopes claim)
+                                :search-types search-types
+                                :all-registries registries})))
+
+(defn- status-of [f]
+  (try (f) nil (catch clojure.lang.ExceptionInfo e (:fhir/status (ex-data e)))))
+
+(defn- ids [rs] (set (map :id rs)))
+
+(deftest store-search-pushes-the-filter-down
+  (let [store (fstore (seeded) lab-scope)]
+    (is (= #{"lab-1" "both-1"} (ids (db/search store tenant :Observation {} obs-registry))))
+    (is (= 2 (db/count-resources store tenant :Observation {} obs-registry)))
+    (testing "a client category intersects the grant"
+      (is (= #{} (ids (db/search store tenant :Observation
+                                 {"category" (str obs-cat "|vital-signs")} obs-registry))))
+      (is (= 0 (db/count-resources store tenant :Observation
+                                   {"category" (str obs-cat "|vital-signs")} obs-registry)))
+      (is (= #{"both-1"} (ids (db/search store tenant :Observation
+                                         {"category" "http://x|other"} obs-registry)))
+          "the grant and the client's category may match different codings")
+      (is (= #{"lab-1" "both-1"} (ids (db/search store tenant :Observation
+                                                 {:category "laboratory"} obs-registry)))))
+    (testing "two qualified grants union"
+      (is (= #{"lab-1" "vital-1" "both-1"}
+             (ids (db/search (fstore (seeded) [lab-scope vital-scope])
+                             tenant :Observation {} obs-registry)))))
+    (testing "a type with no grant returns nothing"
+      (is (= [] (db/search store tenant :Condition {} cond-registry)))
+      (is (= 0 (db/count-resources store tenant :Condition {} cond-registry))))
+    (testing "a registry that cannot express the filter yields nothing"
+      (is (= [] (db/search store tenant :Observation {} (dissoc obs-registry "category")))))))
+
+(deftest store-reads-refuse-what-the-grant-does-not-admit
+  (let [store (fstore (seeded) lab-scope)]
+    (is (= "lab-1" (:id (db/read-resource store tenant :Observation "lab-1"))))
+    (is (= 403 (status-of #(db/read-resource store tenant :Observation "vital-1"))))
+    (is (= 403 (status-of #(db/vread-resource store tenant :Observation "vital-1" "1"))))
+    (is (= "lab-1" (:id (db/vread-resource store tenant :Observation "lab-1" "1"))))
+    (is (nil? (db/read-resource store tenant :Observation "absent")))
+    (testing "an ungranted type is refused"
+      (is (= 403 (status-of #(db/read-resource store tenant :Condition "c-1")))))))
+
+(deftest store-history-omits-versions-the-grant-does-not-admit
+  (let [base  (seeded)
+        _     (db/update-resource base tenant :Observation "lab-1" (obs "lab-1" vital))
+        store (fstore base lab-scope)]
+    (is (= ["1"] (mapv #(get-in % [:meta :versionId]) (db/history store tenant :Observation "lab-1"))))
+    (is (= #{"lab-1" "both-1"} (ids (db/history-type store tenant :Observation {}))))
+    (is (= [] (db/history store tenant :Condition "c-1")))))
+
+(deftest store-includes-are-judged-under-their-own-type
+  (testing "an included type is read-gated: no grant, no rows"
+    (is (= [] (db/search (fstore (seeded) lab-scope) tenant :Practitioner {"_id" "pr-1"} nil))))
+  (testing "a read grant is enough for an included type"
+    (is (= #{"pr-1"} (ids (db/search (fstore (seeded) [lab-scope "patient/Practitioner.r"])
+                                     tenant :Practitioner {"_id" "pr-1"} nil)))))
+  (testing "but a type the request searches directly needs the search letter"
+    (is (= [] (db/search (fstore (seeded) [lab-scope "patient/Practitioner.r"] #{"Practitioner"})
+                         tenant :Practitioner {"_id" "pr-1"} nil)))))
+
+(deftest store-qualified-writes
+  (let [scope-claim (str "patient/Observation.crud?category=" obs-cat "|laboratory")]
+    (testing "a create must match the grant"
+      (let [store (fstore (seeded) scope-claim)]
+        (is (= 403 (status-of #(db/create-resource store tenant :Observation "n-1" (obs "n-1" vital)))))
+        (is (nil? (status-of #(db/create-resource store tenant :Observation "n-2" (obs "n-2" lab)))))))
+    (testing "an update must match, and so must the version it replaces"
+      (let [base (seeded) store (fstore base scope-claim)]
+        (is (= 403 (status-of #(db/update-resource store tenant :Observation "lab-1" (obs "lab-1" vital)))))
+        (is (= 403 (status-of #(db/update-resource store tenant :Observation "vital-1" (obs "vital-1" lab)))))
+        (is (= obs-cat (get-in (db/read-resource base tenant :Observation "vital-1")
+                               [:category 0 :coding 0 :system])))
+        (is (nil? (status-of #(db/update-resource store tenant :Observation "lab-1" (obs "lab-1" lab)))))))
+    (testing "a delete must name a resource the grant admits"
+      (let [base (seeded) store (fstore base scope-claim)]
+        (is (= 403 (status-of #(db/delete-resource store tenant :Observation "vital-1"))))
+        (is (some? (db/read-resource base tenant :Observation "vital-1")))
+        (is (nil? (status-of #(db/delete-resource store tenant :Observation "lab-1"))))))
+    (testing "an unqualified grant writes freely"
+      (is (nil? (status-of #(db/create-resource (fstore (seeded) "patient/Observation.c")
+                                                tenant :Observation "n-3" (obs "n-3" vital))))))))
+
+(defn- entry
+  ([method url] {:request {:method method :url url}})
+  ([method url resource] {:request {:method method :url url} :resource resource}))
+
+(deftest store-gates-bundle-entries
+  (let [claim (str "patient/Observation.crs?category=" obs-cat "|laboratory")
+        gated (fn [base] (scope/filtering-store base {:scopes (scope/parse-scopes claim)
+                                                      :search-types :all
+                                                      :all-registries registries
+                                                      :gate-types? true}))]
+    (testing "a transaction fails whole on an entry the grant does not admit"
+      (let [base (seeded)]
+        (is (= 403 (status-of #(db/transact-transaction (gated base) tenant
+                                                        [(entry "POST" "Observation" (obs nil lab))
+                                                         (entry "POST" "Observation" (obs nil vital))]))))
+        (is (= 3 (count (db/search base tenant :Observation {} obs-registry))))))
+    (testing "an entry of an ungranted type is refused at the base"
+      (is (= 403 (status-of #(db/transact-transaction (gated (seeded)) tenant
+                                                      [(entry "POST" "Condition"
+                                                              {:resourceType "Condition"})])))))
+    (testing "a conditional entry cannot be judged under a qualified grant"
+      (is (= 403 (status-of #(db/transact-transaction (gated (seeded)) tenant
+                                                      [(entry "POST" "Observation?identifier=x"
+                                                              (obs nil lab))])))))))
+
+;; ---------------------------------------------------------------------------
+;; The whole router, scope enforcement on
+;; ---------------------------------------------------------------------------
+
+(defn- server-schema [fhir-type registry]
+  (mu/update-properties
+   (sc/capability-schema->server-schema
+    (m/schema [:map {:resourceType fhir-type
+                     :interactions ["read" "vread" "create" "update" "search-type"
+                                    "history-instance" "history-type"]
+                     :search-params []}]))
+   assoc :fhir/search-registry registry))
+
+(def ^:private schemas
+  [(server-schema "Observation" obs-registry)
+   (server-schema "Condition" cond-registry)
+   (server-schema "Practitioner" (get registries "Practitioner"))
+   (server-schema "Patient" {})])
+
+(def ^:private keypair
+  (let [gen (java.security.KeyPairGenerator/getInstance "RSA")]
+    (.initialize gen 2048)
+    (.generateKeyPair gen)))
+
+(defn- bearer [claims]
+  (str "Bearer " (jwt/sign (merge {:sub "patient-user" :patient "123"} claims)
+                           (.getPrivate keypair)
+                           {:alg :rs256 :header {:kid "kid-1"}})))
+
+(defn- app [store]
+  (ring/ring-handler
+   (router/router schemas
+                  (router/default-middleware
+                   store
+                   (router/resolve-options {:jwks-url "http://jwks.test/.well-known/jwks.json"
+                                            :keto-url "http://keto.test"
+                                            :enforce-smart-scopes? true
+                                            :smart-discovery {}})))
+   router/default-handler))
+
+(defn- request [method uri scope-claim & {:keys [body query]}]
+  (cond-> {:request-method method
+           :uri uri
+           :headers (cond-> {"accept" "application/fhir+json"
+                             "authorization" (bearer {:scope scope-claim})}
+                      body (assoc "content-type" "application/fhir+json"))}
+    query (assoc :query-string query)
+    body  (assoc :body (ByteArrayInputStream. (json/write-value-as-bytes body)))))
+
+(defn- call [store req]
+  (with-redefs [auth/fetch-jwks (fn [_] {"kid-1" (.getPublic keypair)})
+                hc/get (fn [_ _] {:status 200 :body {:allowed true}})]
+    (let [resp ((app store) req)
+          b    (:body resp)]
+      (assoc resp :body (when b (json/read-value (if (instance? InputStream b) (slurp b) b)
+                                                 json/keyword-keys-object-mapper))))))
+
+(defn- entry-ids [resp mode]
+  (set (keep #(when (= mode (get-in % [:search :mode])) (get-in % [:resource :id]))
+             (get-in resp [:body :entry]))))
+
+(deftest router-search-is-filtered
+  (let [store (seeded)]
+    (is (= #{"lab-1" "both-1"}
+           (entry-ids (call store (request :get "/default/fhir/Observation" lab-scope)) "match")))
+    (testing "intersected with a client category"
+      (is (= #{} (entry-ids (call store (request :get "/default/fhir/Observation" lab-scope
+                                                 :query (str "category=" obs-cat "|vital-signs")))
+                            "match")))
+      (is (= #{"both-1"} (entry-ids (call store (request :get "/default/fhir/Observation" lab-scope
+                                                         :query "category=http://x|other"))
+                                    "match"))))
+    (testing "the total reflects the filter"
+      (is (= 2 (get-in (call store (request :get "/default/fhir/Observation" lab-scope
+                                            :query "_count=0"))
+                       [:body :total]))))))
+
+(deftest router-read-of-a-non-matching-resource-is-403
+  (let [resp (call (seeded) (request :get "/default/fhir/Observation/vital-1" lab-scope))]
+    (is (= 403 (:status resp)))
+    (is (= "forbidden" (get-in resp [:body :issue 0 :code])))
+    (is (= "Insufficient scope: no granted scope permits read on Observation/vital-1."
+           (get-in resp [:body :issue 0 :diagnostics]))))
+  (is (= 200 (:status (call (seeded) (request :get "/default/fhir/Observation/lab-1" lab-scope)))))
+  (is (= 403 (:status (call (seeded) (request :get "/default/fhir/Observation/vital-1/_history/1"
+                                              lab-scope))))))
+
+(deftest router-include-of-an-ungranted-type-is-omitted
+  (is (= #{} (entry-ids (call (seeded) (request :get "/default/fhir/Observation" lab-scope
+                                                :query "_include=Observation:performer"))
+                        "include")))
+  (is (= #{"pr-1"} (entry-ids (call (seeded) (request :get "/default/fhir/Observation"
+                                                      (str lab-scope " patient/Practitioner.rs")
+                                                      :query "_include=Observation:performer"))
+                              "include"))))
+
+(deftest router-system-history-is-filtered
+  (let [resp (call (seeded) (request :get "/default/fhir/_history" lab-scope))
+        seen (set (map #(str (get-in % [:resource :resourceType]) "/" (get-in % [:resource :id]))
+                       (get-in resp [:body :entry])))]
+    (is (= 200 (:status resp)))
+    (is (= #{"Observation/lab-1" "Observation/both-1"} seen))))
+
+(deftest router-type-history-is-filtered
+  (let [resp (call (seeded) (request :get "/default/fhir/Observation/_history" lab-scope))]
+    (is (= #{"lab-1" "both-1"} (set (map #(get-in % [:resource :id]) (get-in resp [:body :entry])))))))
+
+(deftest router-qualified-write-is-refused
+  (let [claim (str "patient/Observation.crs?category=" obs-cat "|laboratory")
+        store (seeded)]
+    (is (= 403 (:status (call store (request :post "/default/fhir/Observation" claim
+                                             :body (dissoc (obs nil vital) :id))))))
+    (is (= 201 (:status (call store (request :post "/default/fhir/Observation" claim
+                                             :body (dissoc (obs nil lab) :id))))))))
+
+(deftest router-unrestricted-tokens-are-not-filtered
+  (is (= #{"lab-1" "vital-1" "both-1"}
+         (entry-ids (call (seeded) (request :get "/default/fhir/Observation" "patient/*.read"))
+                    "match"))))

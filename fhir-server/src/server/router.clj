@@ -402,8 +402,8 @@
    carries a `:trace-tap` function, `::lifecycle` only when it carries a
    `:lifecycle` (a lifecycle value, a qualified symbol naming one, or a
    constructor fn, resolved here by `fhir-store.lifecycle/resolve-lifecycle`
-   with `opts` as its argument), and `::smart-scope` / `::patient-compartment`
-   only when `:enforce-smart-scopes?` is truthy.
+   with `opts` as its argument), and `::smart-scope` / `::patient-compartment` /
+   `::smart-scope-filter` only when `:enforce-smart-scopes?` is truthy.
 
    A host that also hands the lifecycle to its store should pass the same
    value, or a symbol naming it, to both: a constructor fn is called once by
@@ -442,13 +442,17 @@
       `::narrative`, `::lifecycle`, `::tx-metadata`, `::temporal-canonicals`,
       `::bulk-job-store`, `::compartment-definitions`, `::token-claims`,
       `::keto-url`, `::oauth-base-url`, `::smart-discovery`) must sit
-      outside `::patient-compartment`, which reads and REPLACES `:fhir/store`
-      with a compartment-filtering store, and outside the handlers that
+      outside `::patient-compartment` and `::smart-scope-filter`, which read and
+      REPLACE `:fhir/store` with a filtering store, and outside the handlers that
       consume the injected values.
    8. `::jwt-auth` must sit outside `::smart-scope`, `::patient-compartment` and
       `::keto-authorization`, all of which read the `:identity` it attaches.
       `::smart-scope` must sit outside `::patient-compartment` (compartment
       assumes scope already authorized the type + interaction).
+      `::smart-scope-filter` must sit inside `::patient-compartment`: it wraps
+      the compartment-filtering store, so a read of an in-compartment resource
+      a granular scope does not admit is refused (403) rather than reading as
+      absent, and outside `::keto-authorization` like the other two.
       `::keto-authorization` is innermost; it and `::smart-scope` /
       `::patient-compartment` honor the `:public?` route data via
       `:reitit.core/match`.
@@ -564,7 +568,9 @@
     enforce-smart-scopes?
     (conj {:name ::smart-scope :wrap (fn [handler] (scope/wrap-smart-scope handler {}))}
           {:name ::patient-compartment
-           :wrap (fn [handler] (compartment/wrap-patient-compartment handler {}))})
+           :wrap (fn [handler] (compartment/wrap-patient-compartment handler {}))}
+          {:name ::smart-scope-filter
+           :wrap (fn [handler] (scope/wrap-scope-filtering-store handler {}))})
 
     :always
     (conj {:name ::keto-authorization
