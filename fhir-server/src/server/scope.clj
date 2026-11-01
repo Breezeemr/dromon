@@ -543,7 +543,8 @@
             rt (keyword type)]
         (when (map? f)
           (cond
-            (or (str/includes? url "?") (:ifNoneExist request) (get request "ifNoneExist"))
+            (or (= :search interaction)
+                (str/includes? url "?") (:ifNoneExist request) (get request "ifNoneExist"))
             "Insufficient scope: a conditional or search Bundle entry cannot be judged under a qualified scope."
 
             (= "PATCH" method)
@@ -576,9 +577,13 @@
         (= :none filters)  []
         (empty? filters)   (db/search base tenant-id resource-type params registry)
         :else
-        (if-let [p (pushdown params registry filters)]
+        (if-let [p (pushdown (dissoc params "_summary" :_summary) registry filters)]
           ;; The push-down is the filter; the check over the returned rows
-          ;; keeps a store that mishandles it from widening the grant.
+          ;; keeps a store that mishandles it from widening the grant. That
+          ;; check needs the whole row, so `_summary` is not passed down: a
+          ;; store may project the page it answers (the Datomic store pulls
+          ;; only id, meta and text), and the response middleware applies
+          ;; `_summary` afterwards anyway.
           (filterv #(matches-filters? filters %)
                    (db/search base tenant-id resource-type p registry))
           []))))
@@ -791,13 +796,29 @@
                 (forbidden (format "Insufficient scope: no granted scope permits %s on %s."
                                    (name interaction) fhir-type))))))))))
 
+(def ^:private fhir-base-path-re
+  #"^/[^/]+/fhir/?$")
+
 (defn- base-bundle-post?
   "True for a request that POSTs a Bundle to the FHIR base (a transaction or
    batch), whose entries no type gate has seen."
   [request fhir-type]
   (and (nil? fhir-type)
        (= :post (:request-method request))
-       (not (str/includes? (or (:uri request) "") "_search"))))
+       (boolean (re-matches fhir-base-path-re (or (:uri request) "")))))
+
+(defn- search-types
+  "The type names a request searches directly, whose rows must also satisfy
+   the search grant: its own type, and the target of a compartment search
+   (`Patient/123/Observation`; `*` is every type). `:all` for a system
+   endpoint that names no type."
+  [request fhir-type]
+  (let [target (get-in request [:path-params :target-type])]
+    (cond
+      (nil? fhir-type) :all
+      (= "*" target)   :all
+      target           #{fhir-type target}
+      :else            #{fhir-type})))
 
 (defn wrap-scope-filtering-store
   "Middleware that installs a [[ScopeFilteringStore]] on `:fhir/store` for
@@ -810,10 +831,10 @@
    in-compartment resource the qualified scopes do not admit is answered 403,
    as SMART asks, instead of looking absent. Both narrowings apply (AND).
 
-   The request's own type must also satisfy the search grant on a search; a
-   type reached by `_include`/`_revinclude` is judged on read alone, under its
-   own type. A system endpoint (`/_search`, `/_history`) is narrowed type by
-   type."
+   The request's own type, and a compartment search's target type, must also
+   satisfy the search grant on a search; a type reached by
+   `_include`/`_revinclude` is judged on read alone, under its own type. A
+   system endpoint (`/_search`, `/_history`) is narrowed type by type."
   [handler _opts]
   (fn [request]
     (let [route-data (get-in request [:reitit.core/match :data])]
@@ -827,6 +848,6 @@
             (handler (assoc request :fhir/store
                             (filtering-store (:fhir/store request)
                                              {:scopes         scopes
-                                              :search-types   (if fhir-type #{fhir-type} :all)
+                                              :search-types   (search-types request fhir-type)
                                               :all-registries (:fhir/all-registries route-data)
                                               :gate-types?    bundle?})))))))))

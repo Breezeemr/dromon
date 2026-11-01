@@ -361,6 +361,37 @@
                    {} obs-registry)
         (is (= [{"category" (str grant "," obs-cat "|vital-signs")}] @calls))))))
 
+(deftest store-search-does-not-pass-summary-down
+  (testing "the row check needs whole rows, so a projecting store is not asked to project"
+    (let [calls (atom [])
+          rows  [(obs "lab-1" lab)]]
+      (doseq [k ["_summary" :_summary]]
+        (reset! calls [])
+        (is (= #{"lab-1"} (ids (db/search (fstore (recording-store rows calls) lab-scope)
+                                          tenant :Observation {k "true"} obs-registry))))
+        (is (not-any? #(or (contains? % "_summary") (contains? % :_summary)) @calls)))))
+  (testing "an unfiltered type keeps its _summary"
+    (let [calls (atom [])]
+      (db/search (fstore (recording-store [] calls) "patient/Observation.rs")
+                 tenant :Observation {"_summary" "true"} obs-registry)
+      (is (= [{"_summary" "true"}] @calls)))))
+
+(deftest search-types-of-a-request
+  (let [st #'scope/search-types]
+    (is (= #{"Observation"} (st {} "Observation")))
+    (is (= :all (st {} nil)))
+    (is (= #{"Patient" "Observation"} (st {:path-params {:target-type "Observation"}} "Patient")))
+    (is (= :all (st {:path-params {:target-type "*"}} "Patient")))))
+
+(deftest only-a-post-to-the-base-is-a-bundle-post
+  (let [bp? #'scope/base-bundle-post?]
+    (is (bp? {:request-method :post :uri "/default/fhir"} nil))
+    (is (bp? {:request-method :post :uri "/default/fhir/"} nil))
+    (is (not (bp? {:request-method :post :uri "/default/fhir/_search"} nil)))
+    (is (not (bp? {:request-method :post :uri "/auth/grants"} nil)))
+    (is (not (bp? {:request-method :get :uri "/default/fhir"} nil)))
+    (is (not (bp? {:request-method :post :uri "/default/fhir"} "Observation")))))
+
 (deftest store-search-results-are-checked-even-when-the-base-ignores-the-pushdown
   (let [rows [(obs "lab-1" lab) (obs "vital-1" vital) (obs "none-1")]]
     (is (= #{"lab-1"} (ids (db/search (fstore (recording-store rows (atom [])) lab-scope)
@@ -377,6 +408,11 @@
         (is (= 403 (status-of #(db/transact-transaction (gated (seeded) claim) tenant
                                                         [(entry "POST" url (obs nil vital))])))
             url)))
+    (testing "a search entry, which the base would not filter"
+      (doseq [method ["GET" "HEAD"]]
+        (is (= 403 (status-of #(db/transact-transaction (gated (seeded) claim) tenant
+                                                        [(entry method "Observation")])))
+            method)))
     (testing "an unsupported method"
       (is (= 403 (status-of #(db/transact-transaction (gated (seeded) claim) tenant
                                                       [(entry "TRACE" "Observation/lab-1")])))))
@@ -523,3 +559,13 @@
     (is (= ["403 Forbidden" "403 Forbidden"] (mapv #(get-in % [:response :status]) (take 2 entries))))
     (is (not-any? #(= "vital-1" (get-in % [:resource :id])) entries))
     (is (= "lab-1" (get-in (nth entries 2) [:resource :id])))))
+
+(deftest router-compartment-search-needs-the-search-letter-on-its-target
+  (let [cs (fn [scope-claim]
+             (let [resp (call (seeded) (request :get "/default/fhir/Patient/123/Observation"
+                                                scope-claim))]
+               [(:status resp) (entry-ids resp "match")]))]
+    (is (= [200 #{"lab-1" "both-1"}] (cs (str "patient/Patient.rs " lab-scope))))
+    (is (= [200 #{}] (cs (str "patient/Patient.rs patient/Observation.r?category="
+                              obs-cat "|laboratory")))
+        "a read-only grant on the target type does not let a compartment search find it")))
