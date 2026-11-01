@@ -130,6 +130,9 @@
          (runner/parse-report "[worker] starting\n[\n  {\"result\": \"fail\"}\n]\n")))
   (is (nil? (runner/parse-report "\"Missing the following required inputs: url\"")))
   (is (nil? (runner/parse-report "[\n  {\"result\": ")))
+  (testing "a log line that is itself a JSON array is not the report"
+    (is (= [{:result "pass"}]
+           (runner/parse-report "[1, 2]\n[\n  {\"result\": \"pass\"}\n]\n"))))
   (is (nil? (runner/parse-report nil))))
 
 (deftest g10-backend-inputs
@@ -256,11 +259,12 @@
     (is (= ["private_key_jwt" "ES384" {:keys [{:kid "a"}]}]
            ((juxt :token_endpoint_auth_method :token_endpoint_auth_signing_alg :jwks) (:asymmetric ps))))
     (is (= ["client_credentials"] (get-in ps [:backend :grant_types])))
-    (is (= "system/*.read system/*.rs" (get-in ps [:backend :scope])))
+    (is (= "system/*.read system/*.rs system/*.r" (get-in ps [:backend :scope])))
     (testing "the exact scope strings the suite requests are registered"
       (is (every? scopes ["openid" "fhirUser" "launch" "launch/patient" "offline_access"
                           "patient/Patient.read" "patient/Patient.rs" "user/Observation.rs"
-                          "patient/Medication.rs" "user/Specimen.read"]))
+                          "patient/Medication.rs" "user/Specimen.read"
+                          "patient/Media.rs" "user/Media.rs"]))
       (is (every? scopes clients/granular-scopes))
       (is (= 8 (count clients/granular-scopes))))))
 
@@ -273,6 +277,9 @@
                                         "kid")
         rendered (json/parse-string (clients/render-template template values) true)]
     (is (= "g10_certification" (:test_suite_id rendered)))
+    (testing "the asymmetric launch signs with the alg of the one registered key"
+      (is (= "ES384" (get-in (some #(when (= "asymmetric_smart_auth_info" (:name %)) %) (:inputs rendered))
+                             [:value :encryption_algorithm]))))
     (is (not (str/includes? (json/generate-string rendered) "${")))
     (is (= "sec\"ret" (get-in (some #(when (= "standalone_smart_auth_info" (:name %)) %) (:inputs rendered))
                               [:value :client_secret])))
@@ -280,3 +287,71 @@
       (is (str/includes? template "${SYMMETRIC_CLIENT_SECRET}")))
     (testing "a placeholder without a value is refused"
       (is (re-find #"FHIR_URL" (thrown-message #(clients/render-template template (dissoc values "FHIR_URL"))))))))
+
+;; ── review fixes ──────────────────────────────────────────────────────────────
+
+(deftest us-core-kit-dir-follows-the-inferno-dir-var
+  (testing "dromon-datomic rebinds inferno-dir to ../dromon/inferno-test-kit"
+    (with-redefs [runner/inferno-dir "../dromon/inferno-test-kit"]
+      (is (= "../dromon/inferno-test-kit" (:kit-dir (runner/runner-config {}))))
+      (is (= "inferno-g10-kit" (:kit-dir (runner/runner-config {"INFERNO_KIT" "g10"})))))))
+
+(deftest dromon-target-pins-the-oauth-issuer
+  (is (re-find #"INFERNO_OAUTH_BASE_URL"
+               (thrown-message #(runner/runner-config {"INFERNO_OAUTH_BASE_URL" "https://other.test"}))))
+  (is (= "https://fhir.local:4443"
+         (:oauth-base-url (runner/runner-config {"INFERNO_OAUTH_BASE_URL" "https://fhir.local:4443/"})))))
+
+(deftest keto-grants-are-least-privilege-for-external-targets
+  (let [dromon   (runner/runner-config {})
+        external (runner/runner-config {"INFERNO_TARGET" "external"
+                                        "INFERNO_FHIR_URL" "https://f.test/realm/dev/fhir"})
+        relations #(set (map second %))]
+    (testing "dromon keeps the historical grant set (it seeds data)"
+      (is (= #{"read" "write" "search-type"} (relations (runner/runner-client-tuples dromon))))
+      (is (= (runner/runner-client-tuples dromon) (runner/backend-client-tuples dromon))))
+    (testing "an external target never gets write"
+      (is (= #{"read" "search-type"} (relations (runner/runner-client-tuples external))))
+      (is (= [["system" "read"]] (runner/backend-client-tuples external))))))
+
+(deftest redaction-by-value-survives-quoting-and-escaping
+  (let [jwks "{\"keys\":[{\"kty\":\"EC\",\"d\":\"PRIVATEKEYMATERIAL\",\"x\":\"pubx\"}]}"
+        auth (json/generate-string {:auth_type "backend_services" :client_id "c1"
+                                    :token_url "https://a.test/oauth2/token" :jwks jwks})
+        cmd  ["exec" "--inputs" "url:https://f.test/fhir" (str "bulk_smart_auth_info:" auth)
+              "custom_authorization_header:Bearer HEADERTOKEN123"
+              "token_url:https://a.test/oauth2/token"]
+        echo (str "Error: exec '--inputs' 'bulk_smart_auth_info:" (str/replace auth "\"" "\\\"") "'"
+                  " custom_authorization_header:\"Bearer HEADERTOKEN123\" runner=RUNNERTOKEN99")
+        out  (runner/redact-output cmd ["RUNNERTOKEN99"] echo)]
+    (is (not (str/includes? out "PRIVATEKEYMATERIAL")))
+    (is (not (str/includes? out "HEADERTOKEN123")))
+    (is (not (str/includes? out "RUNNERTOKEN99")))
+    (testing "non-secret values stay readable"
+      (is (str/includes? out "pubx"))
+      (is (= ["exec" "--inputs" "url:https://f.test/fhir" "bulk_smart_auth_info:<redacted>"
+              "custom_authorization_header:<redacted>" "token_url:https://a.test/oauth2/token"]
+             (runner/redact-command cmd))))
+    (testing "short values are never treated as secrets"
+      (is (= [] (runner/secret-values ["x_token:abc"] ["short"]))))))
+
+(deftest report-inputs-and-outputs-are-redacted
+  (let [report [{:result "pass"
+                 :inputs [{:name "url" :value "https://f.test/fhir" :type "text"}
+                          {:name "smart_auth_info" :type "auth_info"
+                           :value (json/generate-string {:access_token "AT-SECRET" :refresh_token "RT-SECRET"
+                                                         :client_secret "CS-SECRET" :client_id "cid"
+                                                         :token_url "https://a.test/t"})}]
+                 :outputs [{:name "standalone_access_token" :value "OUT-SECRET"}
+                           {:name "token_url" :value "https://a.test/t"}]}]
+        red    (runner/redact-report report)
+        text   (json/generate-string red)]
+    (doseq [secret ["AT-SECRET" "RT-SECRET" "CS-SECRET" "OUT-SECRET"]]
+      (is (not (str/includes? text secret)) secret))
+    (is (str/includes? text "cid"))
+    (is (= "https://a.test/t" (get-in red [0 :outputs 1 :value])))
+    (is (= "https://f.test/fhir" (get-in red [0 :inputs 0 :value])))))
+
+(deftest g10-clone-must-be-the-pinned-commit
+  (is (nil? (setup/check-g10-head! setup/g10-kit-commit)))
+  (is (re-find #"not ff87c7e" (thrown-message #(setup/check-g10-head! "0000000")))))
