@@ -14,10 +14,12 @@
             [reitit.ring :as ring]
             [ring.core.protocols :as ring-protocols]
             [fhir-store.lifecycle :as lifecycle]
+            [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as db]
             [server.bulk-export :as be]
             [server.bulk-job-store :as bjs]
             [server.compartment :as compartment]
+            [server.core :as sc]
             [server.handlers :as handlers]
             [server.router :as router]
             [server.routing :as routing])
@@ -1375,3 +1377,51 @@
           (is (= 501 (:status resp)))
           (is (= "not-supported"
                  (get-in (json->clj (:body resp)) ["issue" 0 "code"]))))))))
+
+;; ---------------------------------------------------------------------------
+;; The served CapabilityStatement advertises Bulk Data
+;;
+;; Through the full composed router, as a host such as flotilla serves it, not
+;; the handler alone. Presence only: the statement's other content belongs to
+;; server.handlers/capability-statement and may change around this.
+;; ---------------------------------------------------------------------------
+
+(deftest the-served-capability-statement-advertises-bulk-data
+  (let [schemas [(sc/capability-schema->server-schema
+                  (m/schema [:map {:resourceType  "Patient"
+                                   :interactions  ["read" "search-type"]
+                                   :search-params []}]))
+                 (sc/capability-schema->server-schema
+                  (m/schema [:map {:resourceType  "Observation"
+                                   :interactions  ["read" "search-type"]
+                                   :search-params []}]))]
+        app     (ring/ring-handler
+                 (router/router schemas
+                                (router/default-middleware
+                                 (mock/create-mock-store {})
+                                 (router/resolve-options {:jwks-url "http://jwks.test/jwks.json"
+                                                          :keto-url "http://keto.test"
+                                                          :enforce-smart-scopes? false
+                                                          :bulk-job-store (bjs/create-store)})))
+                 router/default-handler)
+        resp    (app {:request-method :get
+                      :uri "/default/fhir/metadata"
+                      :headers {"accept" "application/fhir+json"}})
+        body    (json->clj (let [b (:body resp)] (if (string? b) b (slurp b))))
+        rest0   (first (get body "rest"))
+        export  (fn [ops] (first (filter #(= "export" (get % "name")) ops)))
+        resource-export (fn [rtype]
+                          (export (get (first (filter #(= rtype (get % "type")) (get rest0 "resource")))
+                                       "operation")))]
+    (is (= 200 (:status resp)))
+    (is (= "CapabilityStatement" (get body "resourceType")))
+    (is (some #{"http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"}
+              (get body "instantiates")))
+    (is (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"
+           (get (export (get rest0 "operation")) "definition"))
+        "system-level export at the rest level")
+    (is (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
+           (get (resource-export "Patient") "definition")))
+    (is (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
+           (get (resource-export "Group") "definition")))
+    (is (nil? (resource-export "Observation")))))
