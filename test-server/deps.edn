@@ -63,4 +63,9 @@
          :main-opts ["-m" "kaocha.runner"]
          :jvm-opts ["-Xmx6g"
                     "--add-opens=java.base/java.nio=ALL-UNNAMED"
-                    "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]}}}
+                    "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
+                    ;; As in fhir-store-xtdb2's :test alias: on Java 24+ an
+                    ;; embedded xtdb2 node dies in Arrow's allocator init
+                    ;; without Unsafe memory access (JEP 498).
+                    "--sun-misc-unsafe-memory-access=allow"
+                    "-Dio.netty.noUnsafe=false"]}}}
