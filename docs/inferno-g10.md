@@ -250,6 +250,15 @@ is on the login-consent host, so:
   token URL, because Hydra checks the assertion's `aud` against it. The
   runner's default (`<INFERNO_OAUTH_BASE_URL>/oauth2/token`) already is that
   URL; do not set `INFERNO_TOKEN_URL` to the proxy.
+- The asymmetric launch (`inferno-g10-asymmetric`) takes its token URL from
+  discovery, so its `private_key_jwt` assertion is addressed to the proxy.
+  Hydra v2.2.0 accepts an assertion `aud` only from
+  `webfinger.oidc_discovery.token_url` or `<urls.self.public>/oauth2/token`
+  (`fositex/config.go` `GetTokenURLs`), so it refuses that assertion unless
+  the local Hydra config sets
+  `webfinger.oidc_discovery.token_url: https://localauth.breezeehr.com:3001/oauth2/token`.
+  With that set, both URLs are accepted and the bulk group works either way.
+  Production needs nothing: the proxy answers on Hydra's own token URL.
 
 The containers resolve the development host names to the host gateway, so
 the three services must listen on an interface the containers reach, not only
