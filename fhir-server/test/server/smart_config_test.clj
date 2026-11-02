@@ -113,12 +113,15 @@
   (testing "the capabilities the ONC (g)(10) EHR Practitioner App group requires"
     ;; onc-certification-g10-test-kit smart_ehr_practitioner_app_group.rb
     ;; required_capabilities, plus context-ehr-encounter, which its
-    ;; well-known test adds for US Core 5 and later.
+    ;; well-known test adds for US Core 5 and later. The STU2 groups also
+    ;; require authorize-post, permission-v1 and permission-v2 (observed on a
+    ;; local run of the 8.1.0 kit).
     (let [caps (set (:capabilities smart-config-body))]
       (doseq [cap ["launch-ehr" "client-confidential-symmetric" "sso-openid-connect"
                    "context-banner" "context-style"
                    "context-ehr-patient" "context-ehr-encounter"
-                   "permission-offline" "permission-user"]]
+                   "permission-offline" "permission-user"
+                   "authorize-post" "permission-v1" "permission-v2"]]
         (is (contains? caps cap) (str "missing capability: " cap)))))
   (testing "no capability is listed twice"
     (is (apply distinct? (:capabilities smart-config-body)))))

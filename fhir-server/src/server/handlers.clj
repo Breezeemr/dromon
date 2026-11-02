@@ -1724,6 +1724,11 @@
    override, and should not set one: a `private_key_jwt` assertion's audience is the
    advertised token endpoint, and Hydra accepts only its own.
 
+   `permission-v1` and `permission-v2`: `server.scope` parses and enforces
+   both scope syntaxes. `authorize-post`: the authorization endpoint accepts
+   a form POST, which Hydra alone does not complete; a host advertising this
+   document must bridge it (see `:fhir/smart-authorization-endpoint`).
+
    The EHR launch capabilities (`launch-ehr`, `context-ehr-patient`,
    `context-ehr-encounter`, `context-banner`, `context-style`) describe the
    host's launch flow, which issues the `launch` parameter and returns the
@@ -1775,7 +1780,9 @@
                                         "context-ehr-patient" "context-ehr-encounter"
                                         "context-banner" "context-style"
                                         "context-passthrough-banner"
-                                        "permission-offline" "permission-patient" "permission-user"]}}))))
+                                        "permission-offline" "permission-patient" "permission-user"
+                                        "permission-v1" "permission-v2"
+                                        "authorize-post"]}}))))
 
 (defn- system-history-entry [base default-type res]
   (let [rt (or (:resourceType res) default-type)]
