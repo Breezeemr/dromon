@@ -210,6 +210,19 @@
   (testing "patient/Observation.rs is denied for Patient"
     (is (= 403 (:status ((wrapped) (req "patient/Observation.rs" :get "Patient" :id "1")))))))
 
+(deftest middleware-no-subject-is-unauthenticated
+  (testing "a request with no token at all is a 401, as Keto would answer it"
+    (let [response ((wrapped) {:request-method :get :fhir/resource-type "Patient"
+                               :path-params {:id "1"}})]
+      (is (= 401 (:status response)))
+      (is (= "login" (get-in response [:body :issue 0 :code])))))
+  (testing "with the deployment's login URL"
+    (let [response ((scope/wrap-smart-scope ok-handler {:login-url "https://login.example/start"})
+                    {:request-method :get :fhir/resource-type "Patient"})]
+      (is (= "https://login.example/start" (get-in response [:body :login-url])))))
+  (testing "a subject without scopes is still refused for scope"
+    (is (= 403 (:status ((wrapped) (req nil :get "Patient" :id "1")))))))
+
 (deftest middleware-missing-scope
   (testing "no scope claim is denied"
     (let [response ((wrapped) (req nil :get "Patient" :id "1"))]
