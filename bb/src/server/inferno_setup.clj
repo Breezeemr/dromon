@@ -112,15 +112,25 @@
         (update-in [:services :worker] patch-svc)
         (assoc-in [:services :nginx :ports] [(str nginx-port ":80")]))))
 
+(def validator-mem-limit
+  "Memory cap for the kit's HL7 validator container. Its JVM sizes the heap
+   from the container limit (-XX:MaxRAMPercentage=79) and caches sessions
+   forever, so with no limit it grew past 19 GB on a 61 GB host."
+  "6g")
+
 (defn patch-background-compose
   "The kit's docker-compose.background.yml (parsed) with nginx on
-   `nginx-port`. With `drop-redis-port?` redis is no longer published on the
-   host: the kit's containers reach it on the compose network, and a second
-   kit publishing 6379 would collide with the first."
+   `nginx-port` and the HL7 validator capped at [[validator-mem-limit]]. With
+   `drop-redis-port?` redis is no longer published on the host: the kit's
+   containers reach it on the compose network, and a second kit publishing
+   6379 would collide with the first."
   [compose {:keys [nginx-port drop-redis-port?]}]
   (cond-> (assoc-in compose [:services :nginx :ports] [(str nginx-port ":80")])
     (and drop-redis-port? (get-in compose [:services :redis]))
-    (update-in [:services :redis] dissoc :ports)))
+    (update-in [:services :redis] dissoc :ports)
+
+    (get-in compose [:services :hl7_validator_service])
+    (assoc-in [:services :hl7_validator_service :mem_limit] validator-mem-limit)))
 
 (defn- rewrite-yaml!
   "Applies `f` to the YAML at `path`; writes only when the result differs, so

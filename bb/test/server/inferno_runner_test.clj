@@ -194,7 +194,8 @@
 
 (def ^:private stock-g10-background
   {:services {:nginx {:image "nginx" :ports ["80:80"]}
-              :redis {:image "redis" :ports ["6379:6379"]}}})
+              :redis {:image "redis" :ports ["6379:6379"]}
+              :hl7_validator_service {:image "infernocommunity/inferno-resource-validator"}}})
 
 (deftest compose-patch-is-idempotent-and-collapses-duplicates
   (let [opts    {:nginx-port 8081
@@ -227,7 +228,8 @@
   (let [patched (setup/patch-background-compose stock-g10-background {:nginx-port 8081 :drop-redis-port? true})]
     (is (= ["8081:80"] (get-in patched [:services :nginx :ports])))
     (is (nil? (get-in patched [:services :redis :ports])))
-    (is (= "redis" (get-in patched [:services :redis :image]))))
+    (is (= "redis" (get-in patched [:services :redis :image])))
+    (is (= setup/validator-mem-limit (get-in patched [:services :hl7_validator_service :mem_limit]))))
   (testing "the US Core kit keeps its redis port"
     (is (= ["6379:6379"] (get-in (setup/patch-background-compose stock-g10-background {:nginx-port 8080})
                                  [:services :redis :ports])))))
