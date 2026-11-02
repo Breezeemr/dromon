@@ -1,22 +1,34 @@
 (ns server.bulk-job-store
-  "In-memory registry for FHIR Bulk Data Access ($export) jobs.
+  "Registry for FHIR Bulk Data Access ($export) jobs.
 
-   Jobs are ephemeral and per-node: the store is
-   `{:jobs (atom {[tenant-id job-id] -> job})
+   The store is
+   `{:jobs           <JobStore>
      :active-streams (atom {stream-token -> start-epoch-ms})
-     :config {...}}`. Keying on `[tenant-id job-id]` keeps the registry
-   multitenant without a store-backed table (which would diverge across the
-   xtdb2/datomic backends). This is the MVP choice documented in
-   docs/proposals/bulk-data-export-and-backend-services.md.
+     :config         {...}}`.
+
+   Job records live behind the [[JobStore]] protocol, keyed by
+   `[tenant-id job-id]`. [[MemoryJobStore]] (the default) keeps them in one
+   process, which is correct only while a single replica serves the tenant: a
+   status poll, file download or DELETE that a load balancer sends to another
+   replica answers 404. A host running several replicas supplies a durable
+   JobStore shared by all of them (see [[create-store]]), storing each job as
+   [[job->edn]] and reading it back with [[edn->job]]. Kickoff, status, cancel,
+   file download and the TTL sweep reach jobs only through the protocol, so a
+   durable store needs no handler change: cancel removes the job, after which
+   every replica answers 404.
+
+   Stream-slot accounting (`:active-streams`, capped by
+   :max-concurrent-streams) stays per process and outside the protocol on
+   purpose: the cap bounds the memory one replica spends on concurrent download
+   streams, so each replica counts its own.
 
    Lazy stream-at-download model: a job holds only tiny metadata (a pinned
    store basis + a pre-serialized manifest + per-file stream descriptors). No
-   NDJSON is ever held in the job map and nothing is spooled to disk; the bytes
-   are produced by streaming from the store at download time (see
-   server.bulk-export). The only bounded resource is the number of concurrent
-   download streams, tracked by `:active-streams` (timestamped tokens, so a
-   slot leaked by a client that disconnects before Jetty writes the body
-   self-heals after :max-stream-ms) and capped by :max-concurrent-streams.
+   NDJSON is ever held in the job record and nothing is spooled to disk; the
+   bytes are produced by streaming from the store at download time (see
+   server.bulk-export). Stream tokens are timestamped, so a slot leaked by a
+   client that disconnects before Jetty writes the body self-heals after
+   :max-stream-ms.
 
    Job record shape:
      {:id               job-id string
@@ -32,7 +44,7 @@
       :scan-mode        #{:type :compartment} how each type is enumerated
       :access           #{:system :subject} what the requester was authorized as
       :owner            {:sub :client-id} of the requester
-      :status           #{:in-progress :complete :error :cancelled}
+      :status           #{:in-progress :complete :error}
       :transaction-time ISO-8601 instant string derived from the basis
       :request-url      absolute kickoff URL string
       :created-at       epoch millis at kickoff
@@ -41,26 +53,100 @@
       :output           [{:type rt :file-id id :count n} ...]
       :error            [{:type \"OperationOutcome\" :file-id id :diagnostics s} ...]
       :files            {file-id {:kind #{:output :error} :type :diagnostics}}}"
-  (:require [integrant.core :as ig]))
+  (:require [clojure.edn :as edn]
+            [integrant.core :as ig]
+            [malli.core :as m]
+            [malli.error :as me])
+  (:import [java.time Instant]
+           [java.time.format DateTimeParseException]))
+
+;; ---------------------------------------------------------------------------
+;; Job storage protocol
+;; ---------------------------------------------------------------------------
+
+(defprotocol JobStore
+  "Where bulk export job records live. Every replica that serves a tenant's
+   bulk routes must see the same JobStore for that tenant, or a request that
+   lands on another replica answers 404.
+
+   Implementations must:
+   - key jobs by `[tenant id]`, never by id alone;
+   - make `-update-job!` atomic per job: `f` receives the current job (nil when
+     absent) and returns the new one, or nil to remove it. A compare-and-set
+     store may call `f` more than once, so `f` must be pure (compute clocks and
+     ids outside it);
+   - make `-remove-job!` idempotent (two replicas may sweep the same job);
+   - return plain job maps as [[edn->job]] would, never their serialized form."
+  (-put-job! [s tenant job]
+    "Insert or replace `job` under `[tenant (:id job)]`. Returns the job.")
+  (-get-job [s tenant id]
+    "The job under `[tenant id]`, or nil.")
+  (-update-job! [s tenant id f]
+    "Atomically replace the job under `[tenant id]` with `(f job)`, removing
+     it when that is nil. Returns the new job or nil.")
+  (-remove-job! [s tenant id]
+    "Remove the job under `[tenant id]`; a missing job is not an error.
+     Returns nil.")
+  (-all-jobs [s]
+    "A snapshot collection of every job, across tenants, for the TTL sweep."))
+
+(defrecord MemoryJobStore [jobs]
+  JobStore
+  (-put-job! [_ tenant job]
+    (swap! jobs assoc [tenant (:id job)] job)
+    job)
+  (-get-job [_ tenant id]
+    (get @jobs [tenant id]))
+  (-update-job! [_ tenant id f]
+    (let [k [tenant id]]
+      (get (swap! jobs (fn [m]
+                         (if-some [job (f (get m k))]
+                           (assoc m k job)
+                           (dissoc m k))))
+           k)))
+  (-remove-job! [_ tenant id]
+    (swap! jobs dissoc [tenant id])
+    nil)
+  (-all-jobs [_]
+    (vec (vals @jobs))))
+
+(defn memory-job-store
+  "A fresh, empty in-process [[JobStore]]. Correct for one replica only."
+  []
+  (->MemoryJobStore (atom {})))
+
+;; ---------------------------------------------------------------------------
+;; Store construction
+;; ---------------------------------------------------------------------------
 
 (def default-config
   "Bounded-resource config for the bulk job store. :max-concurrent-streams caps
-   simultaneous download streams (each holds at most one store page in memory);
-   :max-stream-ms (milliseconds) bounds how long a leaked stream slot lingers
-   before it self-heals (a client can disconnect after the 200 but before Jetty
-   writes the body, so the body's release finally never runs); :ttl-ms bounds
-   how long completed job metadata lingers. Overridable via the Integrant
-   component opts and the BULK_* env vars (see the :fhir/bulk-job-store
-   init-key)."
+   simultaneous download streams on this replica (each holds at most one store
+   page in memory); :max-stream-ms (milliseconds) bounds how long a leaked
+   stream slot lingers before it self-heals (a client can disconnect after the
+   200 but before Jetty writes the body, so the body's release finally never
+   runs); :ttl-ms bounds how long completed job metadata lingers. Overridable
+   via the Integrant component opts and the BULK_* env vars (see the
+   :fhir/bulk-job-store init-key)."
   {:max-concurrent-streams 4
    :max-stream-ms          3600000     ; 1h -- self-heal a leaked stream slot
    :ttl-ms                 3600000})   ; 1h
 
 (defn create-store
-  "Create a fresh, empty job registry with `config` merged over the defaults."
+  "Create a bulk job store with `config` merged over the defaults. Jobs live in
+   `jobs`, a [[JobStore]] (default: a fresh [[memory-job-store]]); a host
+   running several replicas passes one durable store shared by all of them.
+   Anything that is not a JobStore throws."
   ([] (create-store {}))
-  ([config]
-   {:jobs           (atom {})
+  ([config] (create-store config (memory-job-store)))
+  ([config jobs]
+   (when (contains? config :jobs)
+     (throw (ex-info "Pass the bulk JobStore as create-store's second argument, not as config :jobs"
+                     {:config-keys (vec (keys config))})))
+   (when-not (satisfies? JobStore jobs)
+     (throw (ex-info "Bulk job store :jobs must satisfy server.bulk-job-store/JobStore"
+                     {:jobs-type (some-> jobs class .getName)})))
+   {:jobs           jobs
     :active-streams (atom {})
     :config         (merge default-config config)}))
 
@@ -69,41 +155,220 @@
   [store]
   (:config store))
 
-(defn- jobs-atom [store]
+(defn- jobs-of [store]
   (:jobs store))
 
-(defn put-job!
-  "Insert (or replace) `job` under `[tenant-id (:id job)]`. Returns the job."
-  [store tenant-id job]
-  (swap! (jobs-atom store) assoc [tenant-id (:id job)] job)
+(defn- check-key!
+  "`job` when it is nil or names `[tenant-id job-id]`, else throw. The file
+   stream reads `(:tenant job)` while authorization judged the request's
+   tenant, so a store that answered with a record under another key would
+   export another tenant's data."
+  [job tenant-id job-id]
+  (when (and (some? job)
+             (or (not= tenant-id (:tenant job)) (not= job-id (:id job))))
+    (throw (ex-info "Bulk job store holds a job under another key"
+                    {:tenant-id tenant-id :job-id job-id
+                     :job-tenant (:tenant job) :job-id-found (:id job)})))
   job)
 
+(defn put-job!
+  "Insert (or replace) `job` under `[tenant-id (:id job)]`. Returns the job.
+   Throws when the job's own :tenant is not `tenant-id`."
+  [store tenant-id job]
+  (check-key! job tenant-id (:id job))
+  (-put-job! (jobs-of store) tenant-id job))
+
 (defn get-job
-  "Return the job for `[tenant-id job-id]`, or nil when unknown."
+  "Return the job for `[tenant-id job-id]`, or nil when unknown. Throws when
+   the store answers with a job under another key."
   [store tenant-id job-id]
-  (get @(jobs-atom store) [tenant-id job-id]))
+  (check-key! (-get-job (jobs-of store) tenant-id job-id) tenant-id job-id))
 
 (defn update-job!
   "Apply `f` (plus `args`) to the job at `[tenant-id job-id]` and return the
-   updated job. `f` receives the current job (which may be nil) and must
-   return the new job (or nil to leave/remove it)."
+   updated job. `f` receives the current job (which may be nil) and returns the
+   new job, or nil to remove it. `f` must be pure: a durable store may retry
+   it. A job under another key, read or returned by `f`, throws."
   [store tenant-id job-id f & args]
-  (let [k [tenant-id job-id]]
-    (get (apply swap! (jobs-atom store) update k f args) k)))
+  (check-key!
+   (-update-job! (jobs-of store) tenant-id job-id
+                 #(check-key! (apply f (check-key! % tenant-id job-id) args) tenant-id job-id))
+   tenant-id job-id))
 
 (defn remove-job!
-  "Remove the job at `[tenant-id job-id]`."
+  "Remove the job at `[tenant-id job-id]` (idempotent)."
   [store tenant-id job-id]
-  (swap! (jobs-atom store) dissoc [tenant-id job-id])
+  (-remove-job! (jobs-of store) tenant-id job-id)
   nil)
 
 (defn all-jobs
   "A snapshot vector of every job currently in the store."
   [store]
-  (vec (vals @(jobs-atom store))))
+  (vec (-all-jobs (jobs-of store))))
 
 ;; ---------------------------------------------------------------------------
-;; Concurrent-stream accounting (memory bound)
+;; Serialization (for a durable JobStore)
+;;
+;; A job is plain data except its :basis, whose :system-time (and optional
+;; :valid-time) is a java.time.Instant. Every store's current-basis (mock,
+;; xtdb2, datomic) returns {:tx-id <long-or-nil> :system-time <Instant>}, so one
+;; basis codec serves them all: each Instant is written as its ISO-8601 string
+;; and parsed back with Instant/parse. Not #inst: that reads back as a
+;; java.util.Date at millisecond precision, which would move an xtdb2
+;; `FOR SYSTEM_TIME AS OF` to before the pinned transaction and silently drop
+;; its writes from the export. A store whose basis carries anything else
+;; must extend encode-basis and decode-basis, or encoding throws.
+;; ---------------------------------------------------------------------------
+
+(def ^:private basis-instant-keys [:system-time :valid-time])
+
+(defn- encode-basis [basis]
+  (when-not (map? basis)
+    (throw (ex-info "Bulk job basis must be a map" {:basis-type (some-> basis class .getName)})))
+  (let [unknown (remove #{:tx-id :system-time :valid-time} (keys basis))]
+    (when (seq unknown)
+      (throw (ex-info "Bulk job basis carries keys the codec does not know"
+                      {:unknown-keys (vec unknown)}))))
+  (when-not (or (nil? (:tx-id basis)) (int? (:tx-id basis)))
+    (throw (ex-info "Bulk job basis :tx-id must be an integer or nil"
+                    {:tx-id-type (some-> (:tx-id basis) class .getName)})))
+  (when-not (instance? Instant (:system-time basis))
+    (throw (ex-info "Bulk job basis :system-time must be a java.time.Instant"
+                    {:system-time-type (some-> (:system-time basis) class .getName)})))
+  (reduce (fn [b k]
+            (let [v (get b k)]
+              (cond
+                (nil? v) b
+                (instance? Instant v) (assoc b k (str v))
+                :else (throw (ex-info (str "Bulk job basis " k " must be a java.time.Instant")
+                                      {:key k :type (.getName (class v))})))))
+          basis
+          basis-instant-keys))
+
+(defn- decode-basis [basis]
+  (reduce (fn [b k]
+            (if-some [v (get b k)]
+              (assoc b k (try (Instant/parse v)
+                              (catch DateTimeParseException e
+                                (throw (ex-info (str "Bulk job basis " k " is not an ISO-8601 instant")
+                                                {:key k} e)))))
+              b))
+          basis
+          basis-instant-keys))
+
+(defn- edn-leaf? [x]
+  (or (nil? x) (string? x) (keyword? x) (boolean? x) (int? x) (double? x)))
+
+(defn- check-plain-data!
+  "Throw naming the path of the first value EDN cannot carry faithfully."
+  [x path]
+  (cond
+    (edn-leaf? x) nil
+    (map? x)      (doseq [[k v] x]
+                    (check-plain-data! k (conj path :key))
+                    (check-plain-data! v (conj path k)))
+    (or (vector? x) (set? x) (seq? x))
+    (doseq [[i v] (map-indexed vector x)]
+      (check-plain-data! v (conj path i)))
+    :else
+    (throw (ex-info "Bulk job holds a value that cannot be serialized"
+                    {:path path :type (.getName (class x))}))))
+
+(def ^:private SerializedJob
+  "The shape edn->job accepts: the keys every handler relies on, typed.
+   Optional keys are typed when present."
+  (m/schema
+   [:map
+    [:id :string]
+    [:tenant :string]
+    [:kind [:enum :system :patient :group]]
+    [:status [:enum :in-progress :complete :error]]
+    [:basis [:map
+             [:tx-id {:optional true} [:maybe :int]]
+             [:system-time :string]
+             [:valid-time {:optional true} [:maybe :string]]]]
+    [:created-at :int]
+    [:finished-at {:optional true} [:maybe :int]]
+    [:group-id {:optional true} [:maybe :string]]
+    [:params {:optional true} [:maybe map?]]
+    [:owner-ids {:optional true} [:maybe [:set :string]]]
+    [:patient-ids {:optional true} [:maybe [:vector :string]]]
+    [:compartment-definitions {:optional true}
+     [:maybe [:map-of :string [:map-of :string [:maybe [:vector :string]]]]]]
+    [:scan-mode {:optional true} [:maybe [:enum :type :compartment]]]
+    [:access {:optional true} [:maybe [:enum :system :subject]]]
+    [:owner {:optional true} [:maybe [:map
+                                      [:sub [:maybe :string]]
+                                      [:client-id [:maybe :string]]]]]
+    [:transaction-time {:optional true} [:maybe :string]]
+    [:request-url {:optional true} [:maybe :string]]
+    [:manifest {:optional true} [:maybe :string]]
+    [:output {:optional true} [:maybe [:vector [:map
+                                                [:type :string]
+                                                [:file-id :string]
+                                                [:count :int]]]]]
+    [:error {:optional true} [:maybe [:vector [:map
+                                               [:type :string]
+                                               [:file-id :string]
+                                               [:diagnostics :string]]]]]
+    [:files {:optional true}
+     [:maybe [:map-of :string [:map
+                               [:kind [:enum :output :error]]
+                               [:type :string]
+                               [:diagnostics {:optional true} :string]]]]]]))
+
+(defn- check-serialized! [job]
+  (when-let [explanation (m/explain SerializedJob job)]
+    (throw (ex-info "Malformed bulk job record"
+                    {:errors (me/humanize explanation)}))))
+
+(defn- read-back
+  "`s` read as EDN, or ::unreadable."
+  [s]
+  (try (edn/read-string s)
+       (catch Exception _ ::unreadable)))
+
+(defn job->edn
+  "Serialize `job` to an EDN string a durable [[JobStore]] can keep, with the
+   basis Instants as ISO-8601 strings. Throws ex-info when the job holds a
+   value EDN cannot carry or misses a required key, so nothing is stored that
+   [[edn->job]] would refuse.
+
+   The printed string is read back and must equal what was printed. A keyword
+   is printed by name without escaping, so one decoded from a client's JSON key
+   (`(keyword \"a b\")`, from a POST Parameters body) prints as text that reads
+   back as something else or not at all; one such row would break every
+   later read of the shared store (the TTL sweep reads them all)."
+  ^String [job]
+  (let [encoded (update job :basis encode-basis)]
+    (check-plain-data! encoded [])
+    (check-serialized! encoded)
+    (let [s (binding [*print-length*         nil
+                      *print-level*          nil
+                      *print-meta*           false
+                      *print-namespace-maps* false]
+              (pr-str encoded))]
+      (when-not (= encoded (read-back s))
+        (throw (ex-info "Bulk job does not survive an EDN round trip" {:job-id (:id job)})))
+      s)))
+
+(defn edn->job
+  "Read a job written by [[job->edn]]. Throws ex-info on unreadable EDN, a
+   record missing a required key or holding a wrongly typed value, or a basis
+   instant that does not parse; a partial job is never returned."
+  [s]
+  (when-not (string? s)
+    (throw (ex-info "Serialized bulk job must be a string" {:type (some-> s class .getName)})))
+  (let [job (try (edn/read-string s)
+                 (catch Exception e
+                   (throw (ex-info "Unreadable serialized bulk job" {} e))))]
+    (when-not (map? job)
+      (throw (ex-info "Serialized bulk job is not a map" {:type (some-> job class .getName)})))
+    (check-serialized! job)
+    (update job :basis decode-basis)))
+
+;; ---------------------------------------------------------------------------
+;; Concurrent-stream accounting (memory bound, per replica)
 ;; ---------------------------------------------------------------------------
 
 (defn- prune-stale
@@ -167,4 +432,9 @@
 
 (defmethod ig/init-key :fhir/bulk-job-store [_ opts]
   ;; Integrant opts provide the base config; BULK_* env vars override per key.
-  (create-store (merge (or opts {}) (env-config))))
+  ;; An optional :jobs (e.g. an ig/ref to a durable JobStore) replaces the
+  ;; in-memory default.
+  (let [opts (or opts {})]
+    (if (contains? opts :jobs)
+      (create-store (merge (dissoc opts :jobs) (env-config)) (:jobs opts))
+      (create-store (merge opts (env-config))))))

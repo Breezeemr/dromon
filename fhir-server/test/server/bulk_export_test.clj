@@ -14,10 +14,12 @@
             [reitit.ring :as ring]
             [ring.core.protocols :as ring-protocols]
             [fhir-store.lifecycle :as lifecycle]
+            [fhir-store.mock.core :as mock]
             [fhir-store.protocol :as db]
             [server.bulk-export :as be]
             [server.bulk-job-store :as bjs]
             [server.compartment :as compartment]
+            [server.core :as sc]
             [server.handlers :as handlers]
             [server.router :as router]
             [server.routing :as routing])
@@ -383,7 +385,7 @@
                          :fhir/bulk-job-store job-store})]
     (is (= 404 (:status resp)))))
 
-(deftest cancel-flips-to-cancelled-and-status-then-404s
+(deftest cancel-removes-the-job-and-status-then-404s
   (let [job-store (bjs/create-store)]
     (bjs/put-job! job-store "default" {:id "j" :tenant "default" :status :in-progress})
     (let [cancel-resp (be/cancel (merge {:path-params {:tenant-id "default" :job-id "j"}
@@ -392,7 +394,9 @@
                                          :fhir/bulk-job-store job-store}
                                         authorized))]
       (is (= 202 (:status cancel-resp)))
-      (is (= :cancelled (:status (bjs/get-job job-store "default" "j"))))
+      (is (nil? (bjs/get-job job-store "default" "j"))
+          "cancel removes the record through the JobStore protocol")
+      (is (empty? (bjs/all-jobs job-store)))
       (testing "a cancelled job's status endpoint 404s"
         (let [status-resp (be/status (merge {:path-params {:tenant-id "default" :job-id "j"}
                                              :headers {"host" "h"}
@@ -1291,3 +1295,186 @@
       (handler {})
       (is (= format-extension (:fhir/bulk-manifest-extension @seen)))
       (is (= :store (:fhir/bulk-job-store @seen))))))
+
+;; ---------------------------------------------------------------------------
+;; Several replicas sharing one durable job store
+;;
+;; edn-job-store keeps every job ONLY as its job->edn string, the way a durable
+;; store shared by replicas would, so each put and get crosses the codec. Two
+;; bulk job stores over it stand for two replicas: each has its own stream
+;; accounting, both see the same jobs.
+;; ---------------------------------------------------------------------------
+
+(defn- edn-job-store
+  "A JobStore over `rows` ({[tenant id] edn-string}) that keeps nothing but
+   serialized jobs."
+  [rows]
+  (reify bjs/JobStore
+    (-put-job! [_ tenant job]
+      (swap! rows assoc [tenant (:id job)] (bjs/job->edn job))
+      job)
+    (-get-job [_ tenant id]
+      (some-> (get @rows [tenant id]) bjs/edn->job))
+    (-update-job! [_ tenant id f]
+      (let [k [tenant id]]
+        (loop []
+          (let [cur @rows
+                job (f (some-> (get cur k) bjs/edn->job))
+                nxt (if (some? job) (assoc cur k (bjs/job->edn job)) (dissoc cur k))]
+            (if (compare-and-set! rows cur nxt) job (recur))))))
+    (-remove-job! [_ tenant id]
+      (swap! rows dissoc [tenant id])
+      nil)
+    (-all-jobs [_]
+      (mapv bjs/edn->job (vals @rows)))))
+
+(deftest a-system-export-started-on-one-replica-is-served-and-cancelled-on-another
+  (let [rows      (atom {})
+        shared    (edn-job-store rows)
+        replica-a (bjs/create-store {} shared)
+        replica-b (bjs/create-store {} shared)
+        {:keys [kickoff status cancel file]} (system-route-handlers {"Patient" :reg} {})
+        req       (fn [job-store]
+                    (merge {:path-params {:tenant-id "default"}
+                            :headers {"host" "fhir.local:3001"}
+                            :scheme :https
+                            :identity {:sub "tester"}
+                            :fhir/store (fake-store)
+                            :fhir/bulk-job-store job-store}
+                           authorized))
+        kick      (kickoff (assoc (req replica-a) :request-method :get :uri "/default/fhir/$export"))
+        job-id    (content-location-job-id kick)
+        at        (fn [job-store & {:as path}]
+                    (assoc (req job-store) :path-params (merge {:tenant-id "default" :job-id job-id} path)))]
+    (is (= 202 (:status kick)))
+    (is (string? (get @rows ["default" job-id])) "the shared store holds only the serialized job")
+    (testing "replica B answers the poll with the manifest replica A built"
+      (let [resp (status (assoc (at replica-b) :request-method :get))]
+        (is (= 200 (:status resp)))
+        (is (= (:manifest (bjs/get-job replica-a "default" job-id)) (:body resp)))
+        (is (= "2026-07-09T00:00:00Z" (get (json->clj (:body resp)) "transactionTime")))))
+    (testing "replica B streams the file from the basis replica A pinned"
+      (let [job     (bjs/get-job replica-b "default" job-id)
+            file-id (:file-id (first (:output job)))
+            resp    (file (assoc (at replica-b :file-id file-id) :request-method :get))]
+        (is (= fixed-basis (:basis job)) "the basis survives the codec unchanged")
+        (is (= 200 (:status resp)))
+        (is (= #{"123" "bulk-export-2"}
+               (set (map #(get (json->clj %) "id")
+                         (remove str/blank? (str/split-lines (stream-body->string (:body resp))))))))
+        (is (zero? (bjs/active-stream-count replica-b)))))
+    (testing "the stream cap is per replica"
+      (let [token (bjs/acquire-stream! replica-a 1)]
+        (is (some? token))
+        (is (some? (bjs/acquire-stream! replica-b 1)) "A's slot does not count against B")
+        (bjs/release-stream! replica-a token)))
+    (testing "a DELETE on replica B ends the job for replica A too"
+      (is (= 202 (:status (cancel (assoc (at replica-b) :request-method :delete)))))
+      (is (empty? @rows))
+      (is (= 404 (:status (status (assoc (at replica-a) :request-method :get)))))
+      (is (= 404 (:status (file (assoc (at replica-a :file-id "any") :request-method :get))))))))
+
+(deftest a-named-patient-export-crosses-replicas-with-its-owner-and-subjects
+  (let [rows      (atom {})
+        shared    (edn-job-store rows)
+        replica-a (bjs/create-store {} shared)
+        replica-b (bjs/create-store {} shared)
+        store     (temporal-search-store two-patient-data (atom []))
+        identity  (patient-token "kratos-a" "p1" "patient/*.read")
+        owner-a   (named-patient-req store replica-a identity #{"p1"} ["Patient/p1"])
+        owner-b   (assoc owner-a :fhir/bulk-job-store replica-b)
+        job-id    (content-location-job-id (be/patient-export owner-a))
+        job       (bjs/get-job replica-b "default" job-id)]
+    (is (= :subject (:access job)))
+    (is (= #{"p1"} (:owner-ids job)))
+    (is (= ["p1"] (:patient-ids job)))
+    (is (= {:sub "kratos-a" :client-id "portal"} (:owner job)))
+    (is (= {"Patient" #{"p1"} "Observation" #{"o1"}} (output-ids owner-b replica-b job-id))
+        "replica B confines the stream to the subject exactly as A would")
+    (testing "another subject still cannot see the job on either replica"
+      (let [{:keys [status]} (system-route-handlers member-registries {})
+            other (assoc owner-b :identity (patient-token "kratos-b" "p1" "patient/*.read"))]
+        (is (= 404 (:status (status (assoc other :request-method :get
+                                           :path-params {:tenant-id "default" :job-id job-id})))))))))
+
+(deftest the-ttl-sweep-on-one-replica-evicts-for-all
+  (let [rows      (atom {})
+        shared    (edn-job-store rows)
+        replica-a (bjs/create-store {:ttl-ms 0} shared)
+        replica-b (bjs/create-store {:ttl-ms 0} shared)
+        old       (- (System/currentTimeMillis) 10000)]
+    (bjs/put-job! replica-a "default" {:id "old" :tenant "default" :kind :system :status :complete
+                                       :basis fixed-basis :created-at old :finished-at old})
+    (be/status {:path-params {:tenant-id "default" :job-id "other"}
+                :headers {"host" "h"}
+                :fhir/bulk-job-store replica-b})
+    (is (nil? (bjs/get-job replica-a "default" "old")))
+    (is (empty? @rows))))
+
+;; ---------------------------------------------------------------------------
+;; A host that configures no job store
+;; ---------------------------------------------------------------------------
+
+(deftest every-bulk-route-answers-501-without-a-job-store
+  (let [{:keys [kickoff status cancel file]} (system-route-handlers {"Patient" :reg} {})
+        req (merge {:path-params {:tenant-id "default" :job-id "j" :file-id "f"}
+                    :headers {"host" "h"}
+                    :scheme :https
+                    :identity {:sub "tester"}
+                    :fhir/store (fake-store)}
+                   authorized)]
+    (doseq [[label handler method] [["kickoff" kickoff :get] ["status" status :get]
+                                    ["cancel" cancel :delete] ["file" file :get]]]
+      (testing label
+        (let [resp (handler (assoc req :request-method method))]
+          (is (= 501 (:status resp)))
+          (is (= "not-supported"
+                 (get-in (json->clj (:body resp)) ["issue" 0 "code"]))))))))
+
+;; ---------------------------------------------------------------------------
+;; The served CapabilityStatement advertises Bulk Data
+;;
+;; Through the full composed router, as a host such as flotilla serves it, not
+;; the handler alone. Presence only: the statement's other content belongs to
+;; server.handlers/capability-statement and may change around this.
+;; ---------------------------------------------------------------------------
+
+(deftest the-served-capability-statement-advertises-bulk-data
+  (let [schemas [(sc/capability-schema->server-schema
+                  (m/schema [:map {:resourceType  "Patient"
+                                   :interactions  ["read" "search-type"]
+                                   :search-params []}]))
+                 (sc/capability-schema->server-schema
+                  (m/schema [:map {:resourceType  "Observation"
+                                   :interactions  ["read" "search-type"]
+                                   :search-params []}]))]
+        app     (ring/ring-handler
+                 (router/router schemas
+                                (router/default-middleware
+                                 (mock/create-mock-store {})
+                                 (router/resolve-options {:jwks-url "http://jwks.test/jwks.json"
+                                                          :keto-url "http://keto.test"
+                                                          :enforce-smart-scopes? false
+                                                          :bulk-job-store (bjs/create-store)})))
+                 router/default-handler)
+        resp    (app {:request-method :get
+                      :uri "/default/fhir/metadata"
+                      :headers {"accept" "application/fhir+json"}})
+        body    (json->clj (let [b (:body resp)] (if (string? b) b (slurp b))))
+        rest0   (first (get body "rest"))
+        export  (fn [ops] (first (filter #(= "export" (get % "name")) ops)))
+        resource-export (fn [rtype]
+                          (export (get (first (filter #(= rtype (get % "type")) (get rest0 "resource")))
+                                       "operation")))]
+    (is (= 200 (:status resp)))
+    (is (= "CapabilityStatement" (get body "resourceType")))
+    (is (some #{"http://hl7.org/fhir/uv/bulkdata/CapabilityStatement/bulk-data"}
+              (get body "instantiates")))
+    (is (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/export"
+           (get (export (get rest0 "operation")) "definition"))
+        "system-level export at the rest level")
+    (is (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/patient-export"
+           (get (resource-export "Patient") "definition")))
+    (is (= "http://hl7.org/fhir/uv/bulkdata/OperationDefinition/group-export"
+           (get (resource-export "Group") "definition")))
+    (is (nil? (resource-export "Observation")))))

@@ -256,8 +256,10 @@ backpressure, so peak memory is one store page regardless of type size.
    - TTL eviction: completed/cancelled jobs older than `ttl-ms` are dropped. The
      records are now tiny metadata, so eviction is a plain `dissoc` - no files
      to delete. A lazy sweep runs at the head of each bulk request.
-   - Cancel flips the job to `:cancelled` (202); there is no on-disk content to
-     reclaim.
+   - Cancel removes the job record (202); there is no on-disk content to
+     reclaim. (It first flipped the job to `:cancelled`; removal is what lets a
+     job store shared by several replicas answer 404 on all of them. See
+     `docs/design/bulk-job-store.md`.)
 
 The removed machinery - the background worker, the `:files
 {file-id ndjson-string}` / on-disk file-metadata storage, the per-tenant/job
@@ -399,7 +401,8 @@ Changed files:
   optional `scan-type` streaming method and temp-file output for full
   conformance.
 - In-memory job store: ephemeral and per-node, acceptable for the kit and
-  single-node dev; a store-backed registry would diverge across backends.
+  single-node dev. Several replicas now share a host-supplied durable
+  `JobStore` instead (see `docs/design/bulk-job-store.md`).
 - Patient two-id rule: the NDJSON validator requires two distinct Patient ids;
   the current seed inserts one `Patient/123` - add a second.
 - `_since` depends on `_lastUpdated` search support in each backend; verify

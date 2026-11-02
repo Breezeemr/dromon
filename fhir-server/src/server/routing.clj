@@ -255,10 +255,12 @@
         ;; serializing NDJSON). Both are closed over here and injected per
         ;; request, mirroring wrap-system-search.
         wrap-bulk (fn [handler-fn]
-                    (fn [req]
-                      (handler-fn (assoc req
-                                         :fhir/all-registries all-registries
-                                         :fhir/resource-encoders encoders))))
+                    (let [handler ((resolve-handler 'server.bulk-export/job-store-required)
+                                   handler-fn)]
+                      (fn [req]
+                        (handler (assoc req
+                                        :fhir/all-registries all-registries
+                                        :fhir/resource-encoders encoders)))))
         require-auth (resolve-handler 'server.auth/wrap-require-auth)]
     [["/.well-known/smart-configuration" {:get  ((resolve-handler 'server.handlers/smart-configuration))
                                           :public? true}]
