@@ -71,6 +71,11 @@ A durable store keeps `(bjs/job->edn job)` and returns `(bjs/edn->job s)`.
   it never returns a partial job.
 - A store whose basis carries more than `:tx-id`, `:system-time` and
   `:valid-time` must extend the codec, or encoding throws.
+- The record schema is an open map, so a job key the schema does not name
+  round-trips unchanged. That is load-bearing for `:scope-filters` (the
+  granular SMART read filter per type, written by the granular-scope change):
+  dropping it on a round trip would widen a granular-scoped export. A test
+  pins it.
 - One known limit: a POST kickoff's Parameters body is kept in `:params` as
   decoded. If a host's body decoder turns a `value[x]` into a non-EDN object,
   `job->edn` refuses the job (the kickoff fails loudly) rather than storing a
@@ -95,12 +100,12 @@ When `:bulk-job-store` is nil, every bulk route answers 501 with an
 ## Durable store for flotilla (design, not built)
 
 flotilla runs one replica (`Recreate`, for its Lucene index), so a durable
-store is not urgent. But note: **flotilla passes no `:bulk-job-store` to
-`resolve-options` today.** The CapabilityStatement it serves advertises
-`$export`, yet every bulk request there fails: a NullPointerException before
-this change, 501 after the dromon bump. Making Bulk Data work on flotilla needs
-`:bulk-job-store (bjs/create-store ...)` in `fhir-middleware`'s options first,
-with the in-memory store while it runs one replica.
+store is not urgent. flotilla already supplies the in-memory store:
+`com.breezeehr.flotilla.fhir/fhir-middleware` passes
+`:bulk-job-store (ig/init-key :fhir/bulk-job-store {})` to `resolve-options`,
+which after the dromon bump returns a `MemoryJobStore`-backed store, so
+flotilla needs no change for this protocol. (An earlier version of this note
+said flotilla passed no store; that was wrong.)
 
 The durable design, selected by flotilla config `bulk-job-store "accounts"`:
 

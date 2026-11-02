@@ -111,6 +111,16 @@
             job   (kickoff-like-job basis)]
         (is (= job (bjs/edn->job (bjs/job->edn job))))))))
 
+(deftest keys-the-schema-does-not-name-round-trip
+  (testing "a granular scope filter per type survives, so a durable store never widens an export"
+    (let [filters {"Observation" {:any-of [{"category" [{:system "http://terminology.hl7.org/CodeSystem/observation-category"
+                                                         :code   "laboratory"}]}]}
+                   "Condition"   {:any-of [{"category" [{:system nil :code "problem-list-item"}]}
+                                           {"category" [{:system "http://hl7.org/fhir/us/core/CodeSystem/condition-category"
+                                                         :code   nil}]}]}}
+          job     (assoc (kickoff-like-job nano-basis) :scope-filters filters)]
+      (is (= job (bjs/edn->job (bjs/job->edn job)))))))
+
 (deftest the-mock-stores-basis-round-trips
   (let [store (mock/create-mock-store {})
         _     (db/create-resource store "t" :Patient "p1" {:resourceType "Patient" :id "p1"})
