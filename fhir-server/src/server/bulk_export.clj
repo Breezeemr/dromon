@@ -399,23 +399,31 @@
 
 (defn- export-filter-xf
   "A STATEFUL transducer for one export type: keeps only resources that pass
-   compartment confinement (for :patient/:group), match at least one
-   _typeFilter spec, satisfy _since, and have a not-yet-seen id (global dedup
-   within this stream). Create a fresh one per stream/collect; it closes over a
-   mutable seen-id set."
-  [defs kind owner-ids resource-type registry param-maps since]
-  (let [seen (java.util.HashSet.)
-        in-compartment? (if (= kind :system)
-                          (constantly true)
-                          (fn [r] (compartment/resource-in-any-compartment?
-                                   defs "Patient" owner-ids resource-type r registry)))]
-    (filter (fn [r]
-              (let [id (:id r)]
-                (and (in-compartment? r)
-                     (matches-any-type-filter? param-maps r)
-                     (after-since? since r)
-                     (not (.contains seen id))
-                     (do (.add seen id) true)))))))
+   compartment confinement (for :patient/:group), the caller's granular scope
+   filter for the type (`scope-filter`, a `server.scope/grant-filter` value;
+   nil when the scopes do not narrow it), match at least one _typeFilter spec,
+   satisfy _since, and have a not-yet-seen id (global dedup within this
+   stream). Create a fresh one per stream/collect; it closes over a mutable
+   seen-id set."
+  ([defs kind owner-ids resource-type registry param-maps since]
+   (export-filter-xf defs kind owner-ids resource-type registry param-maps since nil))
+  ([defs kind owner-ids resource-type registry param-maps since scope-filter]
+   (let [seen (java.util.HashSet.)
+         in-compartment? (if (= kind :system)
+                           (constantly true)
+                           (fn [r] (compartment/resource-in-any-compartment?
+                                    defs "Patient" owner-ids resource-type r registry)))
+         in-scope? (if scope-filter
+                     (fn [r] (scope/admits? scope-filter r))
+                     (constantly true))]
+     (filter (fn [r]
+               (let [id (:id r)]
+                 (and (in-compartment? r)
+                      (in-scope? r)
+                      (matches-any-type-filter? param-maps r)
+                      (after-since? since r)
+                      (not (.contains seen id))
+                      (do (.add seen id) true))))))))
 
 (defn- scan-type
   "Reducible of live resources of `resource-type` as of `basis`."
@@ -501,8 +509,10 @@
    the count equals the streamed line count and empty-in-compartment types are
    omitted from :output (the unfiltered count-as-of would overcount a
    compartment and list empty files that the Bulk Data validator rejects)."
-  [store tenant-id basis defs mode kind owner-ids resource-type registry param-maps since]
-  (transduce (export-filter-xf defs kind owner-ids resource-type registry param-maps since)
+  [store tenant-id basis defs mode kind owner-ids resource-type registry param-maps since
+   scope-filter]
+  (transduce (export-filter-xf defs kind owner-ids resource-type registry param-maps since
+                               scope-filter)
              (completing (fn [n _] (inc n)))
              0
              (export-source store tenant-id basis defs mode owner-ids resource-type registry)))
@@ -543,10 +553,11 @@
    batch. Peak memory is one store page: scan-type-as-of pulls the next page
    only after the reducing fn returns, and a backpressured socket pauses that
    pull."
-  [store tenant-id basis defs mode kind owner-ids resource-type registry param-maps since encode
-   ^OutputStream out]
+  [store tenant-id basis defs mode kind owner-ids resource-type registry param-maps since
+   scope-filter encode ^OutputStream out]
   (let [w (writer-on out)]
-    (transduce (export-filter-xf defs kind owner-ids resource-type registry param-maps since)
+    (transduce (export-filter-xf defs kind owner-ids resource-type registry param-maps since
+                                 scope-filter)
                (writing-rf w encode)
                0
                (export-source store tenant-id basis defs mode owner-ids resource-type registry))))
@@ -609,9 +620,12 @@
    is the cheap unfiltered count-as-of for :system (exact there, no
    confinement), and the exact confinement/_typeFilter/_since-filtered count for
    :patient/:group (equal to what the stream will emit). A type with zero
-   resources tenant-wide is skipped before any confined scan. Returns
+   resources tenant-wide is skipped before any confined scan. `scope-filters`
+   is {type grant-filter} for the types the caller's granular scopes narrow;
+   their counts are confined by it as the stream is. Returns
    {:outputs [{:type :file-id :count}...] :errors [{:type :file-id :diagnostics}...]}."
-  [store tenant-id basis defs mode kind owner-ids all-registries types since type-filters]
+  [store tenant-id basis defs mode kind owner-ids all-registries types since type-filters
+   scope-filters]
   (reduce
    (fn [acc rt]
      (let [registry (get all-registries rt)]
@@ -634,10 +648,12 @@
              ;; Nothing of this type exists as of the basis (the compartment is a
              ;; subset, so it is empty too): omit it without a confined scan.
              acc
-             (let [cnt (if (= kind :system)
+             (let [scope-filter (get scope-filters rt)
+                   cnt (if (and (= kind :system) (nil? scope-filter))
                          tenant-cnt
                          (confined-count store tenant-id basis defs mode kind owner-ids rt
-                                         registry (filters-for type-filters rt) since))]
+                                         registry (filters-for type-filters rt) since
+                                         scope-filter))]
                (if (pos? (long (or cnt 0)))
                  (update acc :outputs conj
                          {:type rt :file-id (str (random-uuid)) :count cnt})
@@ -742,7 +758,21 @@
         max-streams    (long (:max-concurrent-streams cfg))
         defs           (compartment/request-definitions req)
         types          (requested-types defs kind params all-registries)
-        readable?      (fn [rt] (or (= :system access) (scope/permitted? scopes rt :read)))]
+        readable?      (fn [rt] (or (= :system access) (scope/permitted? scopes rt :read)))
+        ;; Every export, a system-tuple one included, carries only the rows
+        ;; the token's granular scopes admit of a type they narrow. The type
+        ;; gate above is unchanged: a system-tuple export is not type-gated by
+        ;; scopes, but a backend client granted only
+        ;; `system/Observation.rs?category=...` still exports only that
+        ;; category. A type no qualified-only grant names is not filtered.
+        scope-filters  (let [token-scopes (if (= :subject access)
+                                            scopes
+                                            (scope/request-scopes req))]
+                         (into {}
+                               (keep (fn [rt]
+                                       (let [f (scope/grant-filter token-scopes rt :read)]
+                                         (when (map? f) [rt f]))))
+                               types))]
     (sweep-expired! job-store)
     (cond
       (:invalid params)
@@ -789,7 +819,7 @@
              type-filters (parse-type-filters params)
              files        (build-job-files store tenant-id basis defs mode kind owner-ids
                                            all-registries (filterv readable? types)
-                                           since type-filters)
+                                           since type-filters scope-filters)
              now          (System/currentTimeMillis)
              base-job    {:id               job-id
                           :tenant           tenant-id
@@ -801,6 +831,7 @@
                           :compartment-definitions defs
                           :scan-mode        mode
                           :access           access
+                          :scope-filters    (not-empty scope-filters)
                           :patient-ids      (not-empty (vec patient-ids))
                           :owner            (requester req)
                           :status           :complete
@@ -951,7 +982,7 @@
    then writes each surviving resource as `(present type resource)`; an :error
    descriptor writes a single OperationOutcome line."
   [job-store job store all-registries encoders present descriptor token]
-  (let [{:keys [kind basis owner-ids params compartment-definitions scan-mode]} job
+  (let [{:keys [kind basis owner-ids params compartment-definitions scan-mode scope-filters]} job
         {:keys [type diagnostics]} descriptor
         ;; Presented after the export filter, which must judge the stored
         ;; resource, and before the wire encoding.
@@ -970,7 +1001,8 @@
              (stream-error! diagnostics out)
              (stream-output! store (:tenant job) basis compartment-definitions
                              (or scan-mode :type) kind owner-ids type registry
-                             (filters-for type-filters type) since encode out)))
+                             (filters-for type-filters type) since
+                             (get scope-filters type) encode out)))
           (finally
             (bjs/release-stream! job-store token)))))))
 

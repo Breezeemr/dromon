@@ -340,6 +340,9 @@
    `:lifecycle` (see `server.router/default-middleware`) and
    `:temporal-canonicals` (the canonical URLs temporal responses state, see
    `server.temporal/default-canonicals`) have no environment fallback.
+   `:smart-discovery` falls back to the `SMART_*` environment and
+   `:capability-metadata` to dromon's own strings (see
+   `server.smart-discovery`).
 
    This is a thin composition of `server.router/resolve-options`,
    `default-middleware`, `router` and `default-handler`. Hosts that need to
@@ -353,7 +356,8 @@
 (defmethod ig/init-key :server/jetty [_ {:keys [port ssl-port keystore keystore-type key-password store schemas
                                                 jwks-url keto-url keto-admin-url oauth-base-url terminology
                                                 cors-allowed-origins cors-allow-headers bulk-job-store lifecycle
-                                                temporal-canonicals compartment-overrides token-claims]}]
+                                                temporal-canonicals compartment-overrides token-claims
+                                                smart-discovery capability-metadata]}]
   ;; A nil :port means TLS only. The adapter's default is a cleartext
   ;; connector beside the TLS one, so it has to be told (:http? false) rather
   ;; than merely not given a port.
@@ -379,7 +383,9 @@
                                :bulk-job-store bulk-job-store
                                :lifecycle lifecycle :temporal-canonicals temporal-canonicals
                                :compartment-overrides compartment-overrides
-                               :token-claims token-claims)
+                               :token-claims token-claims
+                               :smart-discovery smart-discovery
+                               :capability-metadata capability-metadata)
                      jetty-opts)))
 
 (defmethod ig/halt-key! :server/jetty [_ server]

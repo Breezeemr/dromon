@@ -286,6 +286,7 @@
    ::router/compartment-definitions
    ::router/token-claims
    ::router/oauth-base-url
+   ::router/smart-discovery
    ::router/keto-url
    ::router/jwt-auth
    ::router/keto-authorization])
@@ -302,15 +303,17 @@
     (let [mw (router/default-middleware nil (assoc resolved-opts :trace-tap identity))]
       (is (= (into [::router/trace-tap] default-middleware-names) (mapv :name mw)))))
 
-  (testing "::smart-scope and ::patient-compartment appear only when SMART
-            scope enforcement is on, between ::jwt-auth and ::keto-authorization"
+  (testing "::smart-scope, ::patient-compartment and ::smart-scope-filter appear
+            only when SMART scope enforcement is on, between ::jwt-auth and
+            ::keto-authorization, the scope filter inside the compartment"
     (let [off (mapv :name (router/default-middleware nil resolved-opts))
           on  (mapv :name (router/default-middleware
                             nil (assoc resolved-opts :enforce-smart-scopes? true)))]
-      (is (not-any? #{::router/smart-scope ::router/patient-compartment} off))
+      (is (not-any? #{::router/smart-scope ::router/patient-compartment
+                      ::router/smart-scope-filter} off))
       (is (= [::router/jwt-auth ::router/smart-scope ::router/patient-compartment
-              ::router/keto-authorization]
-             (subvec on (- (count on) 4)))))))
+              ::router/smart-scope-filter ::router/keto-authorization]
+             (subvec on (- (count on) 5)))))))
 
 (def presenting-lifecycle
   "Named by symbol in the ::lifecycle tests below, so it must stay public."

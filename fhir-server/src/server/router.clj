@@ -58,6 +58,7 @@
             [server.middleware :as middleware]
             [server.routing :as routing]
             [server.scope :as scope]
+            [server.smart-discovery :as smart-discovery]
             [server.temporal :as temporal])
   (:import [com.fasterxml.jackson.core JsonGenerator$Feature]
            [com.fasterxml.jackson.datatype.jsr310 JavaTimeModule]
@@ -219,6 +220,18 @@
   (fn [req]
     (handler (assoc req :fhir/oauth-base-url oauth-base-url))))
 
+(defn wrap-smart-discovery
+  "Inject the validated SMART discovery configuration (see
+   `server.smart-discovery/check-smart-discovery`) as `:fhir/smart-discovery`,
+   and the host's CapabilityStatement metadata as `:fhir/capability-metadata`.
+   `server.handlers/smart-configuration` and `capability-statement` read both;
+   a nil value makes them fall back to the environment and the defaults."
+  [handler discovery capability-metadata]
+  (fn [req]
+    (handler (cond-> req
+               discovery           (assoc :fhir/smart-discovery discovery)
+               capability-metadata (assoc :fhir/capability-metadata capability-metadata)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Options
 ;; ---------------------------------------------------------------------------
@@ -245,8 +258,9 @@
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:bulk-manifest-extension`,
    `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
-   `:jwt-issuer`, `:jwt-audiences`, `:jwt-access-tokens-only?` and
-   `:jwt-delegating-clients`; unknown keys
+   `:jwt-issuer`, `:jwt-audiences`, `:jwt-access-tokens-only?`,
+   `:jwt-delegating-clients`, `:smart-discovery` and `:capability-metadata`;
+   unknown keys
    are ignored. `:lifecycle`
    is carried through as given; [[default-middleware]] resolves it. `:tx-metadata` is the host's stamp
    producer, `(fn [request])` returning a stamp or nil; with none, writes carry
@@ -304,6 +318,14 @@
                                host's link to its export format documentation.
                                nil for none; anything but a map with string
                                keys throws here.
+   - :smart-discovery       -- `server.smart-discovery/resolve-smart-discovery`
+                               of the argument: the host's map validated, or,
+                               when it passes none, the `SMART_*` environment
+                               variables. A malformed value throws here.
+   - :capability-metadata   -- `server.smart-discovery/check-capability-metadata`
+                               of the argument: the CapabilityStatement's
+                               publisher and software strings over dromon's
+                               defaults. A malformed value throws here.
    - :token-claims          -- argument only: the host's extra access-token
                                claims for the token hook
                                (`server.grant/token-hook`), or nil.
@@ -314,7 +336,7 @@
            cors-allow-headers compartment-overrides token-claims
            enforce-smart-scopes? bulk-job-store bulk-manifest-extension login-url lifecycle
            tx-metadata temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences
-           jwt-access-tokens-only? jwt-delegating-clients]}]
+           jwt-access-tokens-only? jwt-delegating-clients smart-discovery capability-metadata]}]
   (when-not (or (nil? bulk-manifest-extension)
                 (and (map? bulk-manifest-extension)
                      (every? string? (keys bulk-manifest-extension))))
@@ -331,6 +353,8 @@
    :keto-url              (or keto-url (System/getenv "KETO_URL") "http://localhost:4466")
    :keto-admin-url        (or keto-admin-url (System/getenv "KETO_ADMIN_URL") "http://localhost:4467")
    :oauth-base-url        (or oauth-base-url (System/getenv "OAUTH_BASE_URL") "http://localhost:4444")
+   :smart-discovery       (smart-discovery/resolve-smart-discovery smart-discovery)
+   :capability-metadata   (smart-discovery/check-capability-metadata capability-metadata)
    :legacy-realm-blind-fallback? (cond
                                    (some? legacy-realm-blind-fallback?)
                                    legacy-realm-blind-fallback?
@@ -378,8 +402,8 @@
    carries a `:trace-tap` function, `::lifecycle` only when it carries a
    `:lifecycle` (a lifecycle value, a qualified symbol naming one, or a
    constructor fn, resolved here by `fhir-store.lifecycle/resolve-lifecycle`
-   with `opts` as its argument), and `::smart-scope` / `::patient-compartment`
-   only when `:enforce-smart-scopes?` is truthy.
+   with `opts` as its argument), and `::smart-scope` / `::patient-compartment` /
+   `::smart-scope-filter` only when `:enforce-smart-scopes?` is truthy.
 
    A host that also hands the lifecycle to its store should pass the same
    value, or a symbol naming it, to both: a constructor fn is called once by
@@ -417,14 +441,18 @@
    7. The injection middleware (`::fhir-store`, `::terminology`,
       `::narrative`, `::lifecycle`, `::tx-metadata`, `::temporal-canonicals`,
       `::bulk-job-store`, `::compartment-definitions`, `::token-claims`,
-      `::keto-url`, `::oauth-base-url`) must sit
-      outside `::patient-compartment`, which reads and REPLACES `:fhir/store`
-      with a compartment-filtering store, and outside the handlers that
+      `::keto-url`, `::oauth-base-url`, `::smart-discovery`) must sit
+      outside `::patient-compartment` and `::smart-scope-filter`, which read and
+      REPLACE `:fhir/store` with a filtering store, and outside the handlers that
       consume the injected values.
    8. `::jwt-auth` must sit outside `::smart-scope`, `::patient-compartment` and
       `::keto-authorization`, all of which read the `:identity` it attaches.
       `::smart-scope` must sit outside `::patient-compartment` (compartment
       assumes scope already authorized the type + interaction).
+      `::smart-scope-filter` must sit inside `::patient-compartment`: it wraps
+      the compartment-filtering store, so a read of an in-compartment resource
+      a granular scope does not admit is refused (403) rather than reading as
+      absent, and outside `::keto-authorization` like the other two.
       `::keto-authorization` is innermost; it and `::smart-scope` /
       `::patient-compartment` honor the `:public?` route data via
       `:reitit.core/match`.
@@ -466,7 +494,8 @@
                  keto-admin-url oauth-base-url jwks-url jwt-issuer jwt-audiences
                  jwt-access-tokens-only? jwt-delegating-clients enforce-smart-scopes? login-url
                  narrative lifecycle tx-metadata temporal-canonicals
-                 legacy-realm-blind-fallback? compartment-definitions token-claims]
+                 legacy-realm-blind-fallback? compartment-definitions token-claims
+                 smart-discovery capability-metadata]
           :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?
                compartment-definitions compartment/compartment-definitions}
           :as opts}]
@@ -522,6 +551,9 @@
             :wrap (fn [handler] (wrap-token-claims handler token-claims))}
            {:name ::oauth-base-url
             :wrap (fn [handler] (wrap-oauth-base-url handler oauth-base-url))}
+           {:name ::smart-discovery
+            :wrap (fn [handler]
+                    (wrap-smart-discovery handler smart-discovery capability-metadata))}
            {:name ::keto-url
             :wrap (fn [handler]
                     (wrap-keto-url handler keto-url legacy-realm-blind-fallback?
@@ -536,7 +568,9 @@
     enforce-smart-scopes?
     (conj {:name ::smart-scope :wrap (fn [handler] (scope/wrap-smart-scope handler {}))}
           {:name ::patient-compartment
-           :wrap (fn [handler] (compartment/wrap-patient-compartment handler {}))})
+           :wrap (fn [handler] (compartment/wrap-patient-compartment handler {}))}
+          {:name ::smart-scope-filter
+           :wrap (fn [handler] (scope/wrap-scope-filtering-store handler {}))})
 
     :always
     (conj {:name ::keto-authorization
