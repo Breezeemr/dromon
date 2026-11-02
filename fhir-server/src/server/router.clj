@@ -566,7 +566,8 @@
                                                              :delegating-clients  jwt-delegating-clients}))}])
 
     enforce-smart-scopes?
-    (conj {:name ::smart-scope :wrap (fn [handler] (scope/wrap-smart-scope handler {}))}
+    (conj {:name ::smart-scope
+           :wrap (fn [handler] (scope/wrap-smart-scope handler {:login-url login-url}))}
           {:name ::patient-compartment
            :wrap (fn [handler] (compartment/wrap-patient-compartment handler {}))}
           {:name ::smart-scope-filter
