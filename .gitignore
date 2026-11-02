@@ -32,3 +32,7 @@ e2e-server.log
 docker/tls/
 # Kratos config rendered from docker/kratos.yml by start-auth-stack!.
 docker/generated/
+
+# ONC (g)(10) certification kit clone (bb inferno-g10-setup); also holds the
+# registered client credentials and the rendered preset.
+inferno-g10-kit/

@@ -35,109 +35,33 @@
                    (shell "mkcert" "-pkcs12" "-p12-file" (.getPath keystore) domain))))))}
 
   inferno-setup
-  {:doc "Clones the US Core Test Kit, installs custom suites (base-fhir-r4), and builds docker images."
+  {:doc "Clones the US Core Test Kit, installs custom suites (base-fhir-r4) and the bulk gem, patches docker-compose and builds the images. INFERNO_EXTRA_HOSTS adds host names the containers resolve to the host."
    :depends [tls-setup]
-   :requires ([clj-yaml.core :as yaml])
-   :task (let [compose-file "inferno-test-kit/docker-compose.yml"
-               bg-file      "inferno-test-kit/docker-compose.background.yml"
-               rootca-file  (clojure.java.io/file "inferno-test-kit/rootCA.pem")
-               patched?     (fn [f]
-                              (and (.exists (clojure.java.io/file f))
-                                   (clojure.string/includes? (slurp f) "fhir.local:host-gateway")))
-               ;; Copy the tracked custom Inferno suites into the (gitignored)
-               ;; kit clone so Inferno auto-loads them from lib/*.rb. Idempotent
-               ;; and cheap; run every time so a fresh checkout gets them even
-               ;; when the kit itself is already set up.
-               install-custom-suites!
-               (fn []
-                 (let [src "inferno-custom/base-fhir-r4"
-                       lib "inferno-test-kit/lib"]
-                   (when (.isDirectory (clojure.java.io/file src))
-                     (println "Installing base-fhir-r4 custom suite into" lib "...")
-                     (.mkdirs (clojure.java.io/file lib "base_fhir_r4"))
-                     (clojure.java.io/copy (clojure.java.io/file src "base_fhir_r4_test_kit.rb")
-                                           (clojure.java.io/file lib "base_fhir_r4_test_kit.rb"))
-                     (doseq [f (.listFiles (clojure.java.io/file src "base_fhir_r4"))
-                             :when (and (.isFile f) (clojure.string/ends-with? (.getName f) ".rb"))]
-                       (clojure.java.io/copy f (clojure.java.io/file lib "base_fhir_r4" (.getName f)))))))
-               ;; Wire the Inferno bulk_data_test_kit into the cloned kit so the
-               ;; bulk_data_v200/bulk_data_v101 suites become available:
-               ;;   1. Append `gem "bulk_data_test_kit"` to the Gemfile so the
-               ;;      image build's `bundle install` pulls it in. Unpinned, so
-               ;;      Bundler's conservative resolution keeps inferno_core and
-               ;;      the other locked kits untouched (resolves to 0.13.0).
-               ;;   2. Drop a loader file into lib/ that requires the gem.
-               ;;      Inferno's suite boot only globs the app's own lib/*.rb
-               ;;      (gem suites are not auto-loaded), so without this shim the
-               ;;      installed gem registers no suites.
-               ;; Both steps are idempotent.
-               ensure-bulk-gem!
-               (fn []
-                 (let [gemfile (clojure.java.io/file "inferno-test-kit/Gemfile")
-                       loader  (clojure.java.io/file "inferno-test-kit/lib/bulk_data_test_kit_loader.rb")]
-                   (when (.isFile gemfile)
-                     (let [contents (slurp gemfile)]
-                       (when-not (clojure.string/includes? contents "bulk_data_test_kit")
-                         (println "Appending bulk_data_test_kit gem to" (.getPath gemfile) "...")
-                         (spit gemfile (str (clojure.string/trimr contents)
-                                            "\n\ngem \"bulk_data_test_kit\"\n"))))
-                     (let [loader-src "require \"bulk_data_test_kit\"\n"]
-                       (when-not (and (.isFile loader) (= loader-src (slurp loader)))
-                         (println "Writing bulk_data_test_kit loader into" (.getPath loader) "...")
-                         (.mkdirs (.getParentFile loader))
-                         (spit loader loader-src))))))]
-           (when-not (.exists (clojure.java.io/file "inferno-test-kit"))
-             (println "Cloning us-core-test-kit...")
-             (shell "git" "clone" "https://github.com/inferno-framework/us-core-test-kit" "inferno-test-kit"))
-           ;; Ensure rootCA.pem exists *before* any container start: the compose patch
-           ;; bind-mounts ./rootCA.pem into the inferno/worker containers, and Podman
-           ;; will silently create an empty directory at the bind source if the file is
-           ;; missing -- which then renders the in-container path unreadable as a cert,
-           ;; making every Ruby fhir_client TLS handshake fail. Recover from that case
-           ;; by removing any pre-existing stub before copying.
-           (when (and (.exists rootca-file) (.isDirectory rootca-file))
-             (println "Removing stub rootCA.pem directory left by Podman bind-mount...")
-             (shell "rm" "-rf" (.getPath rootca-file)))
-           (when-not (.isFile rootca-file)
-             (let [caroot (clojure.string/trim (:out (shell {:out :string} "mkcert" "-CAROOT")))]
-               (println "Copying mkcert rootCA.pem into inferno-test-kit/ ...")
-               (clojure.java.io/copy (clojure.java.io/file caroot "rootCA.pem") rootca-file)))
-           (install-custom-suites!)
-           (ensure-bulk-gem!)
-           (if (and (patched? compose-file) (patched? bg-file))
-             (println "Inferno test kit already set up and patched -- skipping.")
-             (do
-               (println "Running inferno setup script...")
-               (shell {:dir "inferno-test-kit"} "./setup.sh")
-               (when (.exists (clojure.java.io/file "inferno-test-kit/data/redis/.keep"))
-                 (println "Removing redis .keep file to allow permission fixes...")
-                 (clojure.java.io/delete-file "inferno-test-kit/data/redis/.keep" true))
-               (println "Patching docker-compose files...")
-               (let [compose     (yaml/parse-string (slurp compose-file))
-                     extra-hosts ["host.docker.internal:host-gateway"
-                                  "fhir.local:host-gateway"]
-                     ssl-env     ["SSL_CERT_FILE=/opt/inferno/rootCA.pem"]
-                     patch-svc   (fn [svc]
-                                   (-> svc
-                                       (assoc :extra_hosts extra-hosts)
-                                       (update :volumes (fnil conj []) "./rootCA.pem:/opt/inferno/rootCA.pem")
-                                       (update :environment (fnil into []) ssl-env)))
-                     patched     (-> compose
-                                     (update-in [:services :inferno] patch-svc)
-                                     (update-in [:services :worker] patch-svc)
-                                     (assoc-in [:services :nginx :ports] ["8080:80"]))]
-                 (spit compose-file (yaml/generate-string patched :dumper-options {:flow-style :block}))
-                 (println "  docker-compose.yml patched."))
-               (let [bg      (yaml/parse-string (slurp bg-file))
-                     patched (assoc-in bg [:services :nginx :ports] ["8080:80"])]
-                 (spit bg-file (yaml/generate-string patched :dumper-options {:flow-style :block}))
-                 (println "  docker-compose.background.yml patched."))))
-           ;; Bake the custom suites into the image (cache-friendly; a no-op
-           ;; when lib/ is unchanged). Runs regardless of the patched?
-           ;; short-circuit above, so an already-set-up kit still picks them up.
-           (when (.exists (clojure.java.io/file compose-file))
-             (println "Rebuilding inferno image so custom suites are present...")
-             (shell {:dir "inferno-test-kit"} "docker" "compose" "build" "inferno" "worker")))}
+   :requires ([server.inferno-setup :as inferno-setup])
+   :task (inferno-setup/us-core-setup! (System/getenv))}
+
+  inferno-g10-setup
+  {:doc "Clones the ONC (g)(10) certification kit at its pinned tag into inferno-g10-kit/ (separate from the US Core kit), patches docker-compose (root CA, host-gateway names, nginx on INFERNO_G10_PORT, default 8081) and builds the images. INFERNO_EXTRA_HOSTS adds host names the containers resolve to the host."
+   :requires ([server.inferno-setup :as inferno-setup])
+   :task (inferno-setup/g10-setup! (System/getenv))}
+
+  inferno-g10-clients
+  {:doc "Registers the Hydra clients the (g)(10) suite needs (public PKCE, confidential symmetric, EHR launch, confidential asymmetric, backend services) through INFERNO_HYDRA_ADMIN_URL, writes their credentials to a gitignored file and renders the g10 preset from inferno-custom/g10-presets. Never prints a secret."
+   :requires ([server.inferno-g10-clients :as g10-clients])
+   :task (g10-clients/-main (System/getenv))}
+
+  inferno-g10
+  {:doc "Runs the non-interactive (g)(10) groups headless (default: groups 1 and 3, whose SMART discovery subgroups 1.8 and 3.7 complete before the launch waits for a browser; INFERNO_AUTH_MODE=backend_services with INFERNO_GROUPS=8 for the Multi-Patient API) against an already running server. Defaults INFERNO_KIT=g10 INFERNO_TARGET=external; needs INFERNO_FHIR_URL. See docs/inferno-g10.md."
+   :requires ([server.inferno-runner :as runner])
+   :task (runner/run-with-defaults! {"INFERNO_KIT" "g10" "INFERNO_TARGET" "external"})}
+
+  inferno-runner-test
+  {:doc "Unit tests for the Inferno runner configuration, the kit compose patch and the g10 client registration payloads. Needs no containers."
+   :requires ([babashka.classpath :as cp] [clojure.test :as test])
+   :task (do (cp/add-classpath "bb/test")
+             (require 'server.inferno-runner-test)
+             (let [{:keys [fail error]} (test/run-tests 'server.inferno-runner-test)]
+               (System/exit (if (pos? (+ fail error)) 1 0))))}
 
   inferno-run
   {:doc "Runs the Inferno Test Kit suite locally"
@@ -201,10 +125,11 @@
                       "clj" "-X" "com.breezeehr.main/generate-uscore!"))))}
 
   inferno-down
-  {:doc "Stops the Inferno docker instances"
-   :task (if (.exists (clojure.java.io/file "inferno-test-kit/docker-compose.yml"))
-           (shell {:dir "inferno-test-kit"} "docker" "compose" "down")
-           (println "inferno-test-kit not present -- nothing to stop."))}
+  {:doc "Stops the Inferno docker instances of both kits"
+   :task (doseq [kit ["inferno-test-kit" "inferno-g10-kit"]]
+           (if (.exists (clojure.java.io/file kit "docker-compose.yml"))
+             (shell {:dir kit} "docker" "compose" "down")
+             (println kit "not present -- nothing to stop.")))}
 
   trace
   {:doc "Wraps curl with X-Dromon-Trace: 1 and renders the captured span tree on stderr. Body passes through to stdout."

@@ -1,173 +1,388 @@
 (ns server.inferno-runner
-  (:require [babashka.process :refer [shell process]]
+  (:require [babashka.process :as p :refer [shell process]]
             [babashka.curl :as curl]
             [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [server.docker-env :as env]))
+            [server.docker-env :as env]
+            [server.inferno-setup :as setup]))
 
-;; ── Pre-flight helpers ────────────────────────────────────────────────────────
+;; ── Runner configuration (env) ────────────────────────────────────────────────
+;; Every knob is read once from the environment by `runner-config`, a pure fn
+;; of the env map, so the defaults are testable. Two independent axes:
+;;
+;;   INFERNO_TARGET   `dromon` (default): boot the local test-server, align the
+;;                    local Hydra issuer, seed the test data. `external`: test
+;;                    a server that is already running elsewhere; nothing is
+;;                    booted, seeded or reconfigured, and the target's Hydra
+;;                    issuer is never touched.
+;;   INFERNO_KIT      `us-core` (default, inferno-test-kit/) or `g10`
+;;                    (inferno-g10-kit/, the ONC (g)(10) certification kit).
+;;
+;; Target endpoints:
+;;   INFERNO_FHIR_URL         FHIR base (dromon default: the local `default`
+;;                            tenant; required for `external`)
+;;   INFERNO_OAUTH_BASE_URL   authorization server issuer (default
+;;                            https://fhir.local:4443)
+;;   INFERNO_TOKEN_URL        token endpoint handed to Inferno (default
+;;                            <issuer>/oauth2/token; BACKEND_TOKEN_URL is an alias)
+;;   INFERNO_HYDRA_ADMIN_URL  Hydra admin API used to register clients
+;;                            (default http://127.0.0.1:4445)
+;;   INFERNO_KETO_WRITE_URL   Keto write API for `grant-keto-permissions`
+;;                            (dromon default http://127.0.0.1:4467; for
+;;                            `external` grants are skipped unless it is set)
+;;   INFERNO_REALM            realm for Keto objects (default: the path segment
+;;                            before /fhir in INFERNO_FHIR_URL)
+;;
+;; Credentials and test data:
+;;   INFERNO_CLIENT_ID / INFERNO_CLIENT_SECRET  use this client_credentials
+;;                            client instead of registering one (both or neither)
+;;   INFERNO_ACCESS_TOKEN     use this bearer token instead of obtaining one
+;;   INFERNO_PATIENT_IDS      patient ids (default "123")
+;;   INFERNO_GROUP_ID         bulk Group id (default "1")
+;;   INFERNO_AUTH_MODE        `backend_services` runs the private_key_jwt flow
+;;
+;; Suite selection:
+;;   INFERNO_SUITE            suite id (default per kit)
+;;   INFERNO_GROUPS           space/comma group short ids, or all/"" for the
+;;                            whole suite (default per kit)
+;;   INFERNO_SUITE_OPTIONS    space/comma `option:value` pairs (g10 default:
+;;                            US Core 7, SMART App Launch 2.2, Bulk Data 2.0)
+;;   INFERNO_PRESET_FILE      preset path inside the kit container
+;;   INFERNO_INPUTS           full replacement for the --inputs tokens; the
+;;                            tokens {{token}}, {{cred_json}} and
+;;                            {{backend_auth}} expand to the access token, its
+;;                            JSON envelope and the backend smart_auth_info.
 
-(def inferno-dir "inferno-test-kit")
+(def default-dromon-fhir-url "https://fhir.local:3001/default/fhir")
+(def default-oauth-base-url "https://fhir.local:4443")
+(def default-hydra-admin-url "http://127.0.0.1:4445")
+(def default-dromon-keto-write-url "http://127.0.0.1:4467")
+;; dromon mode issues its own client_credentials token against the plain-HTTP
+;; Hydra port; the TLS terminator on 4443 only runs in backend-services mode.
+(def ^:private dromon-runner-token-url "http://127.0.0.1:4444/oauth2/token")
 
-(defn ensure-inferno-containers! []
-  (println "Ensuring Inferno containers are up..." inferno-dir)
-  (shell {:dir inferno-dir}
-         "docker" "compose" "up" "-d"
-         "--wait"        ; wait for healthchecks where defined
-         "inferno" "worker" "hl7_validator_service"
-         "nginx" "redis"))
+(def g10-suite-option-values
+  "The suite options onc-certification-g10-test-kit (setup/g10-kit-tag) offers.
+   US Core 8.0.1 is not among them."
+  {"us_core_version"          #{"us_core_6" "us_core_7"}
+   "smart_app_launch_version" #{"smart_app_launch_2" "smart_app_launch_2_2"}
+   "multi_patient_version"    #{"multi_patient_api_stu1" "multi_patient_api_stu2"}})
 
-(defn wait-for-validator
-  "Polls the HL7 validator via nginx until it responds with 200 or timeout.
-   The hl7_validator_service takes 30-90s to load FHIR packages on cold start."
-  [timeout-seconds]
-  (println "Waiting for HL7 validator to be ready (may take up to 90s on cold start)...")
-  (loop [left timeout-seconds]
-    (let [resp (try
-                 (curl/get "http://localhost:8080/hl7validatorapi/"
-                           {:timeout 3000 :throw false})
-                 (catch Exception _ nil))]
-      (cond
-        (and resp (= 200 (:status resp)))
-        (println "HL7 validator is ready!")
+(def inferno-dir
+  "The US Core kit clone the runner drives. dromon-datomic's runner rebinds it
+   (alter-var-root) to ../dromon/inferno-test-kit, so [[runner-config]] reads
+   it at call time for the us-core kit."
+  setup/us-core-kit-dir)
 
-        (<= left 0)
-        (do (println "ERROR: HL7 validator did not become ready within timeout.")
-            (println "Check: docker compose -f inferno-test-kit/docker-compose.yml logs hl7_validator_service")
-            (System/exit 1))
+(def kits
+  {:us-core {:dir            setup/us-core-kit-dir
+             :default-suite  "us_core_v610"
+             :default-groups "2"}
+   :g10     {:dir            setup/g10-kit-dir
+             :default-suite  "g10_certification"
+             ;; The standalone (1) and EHR practitioner (3) app groups. Both are
+             ;; run_as_group, so Inferno refuses their discovery subgroups (1.8,
+             ;; 3.7) on their own; run whole, discovery completes and the
+             ;; launch that follows ends in `wait` for a browser. The
+             ;; Multi-Patient API (8) needs INFERNO_AUTH_MODE=backend_services.
+             :default-groups "1 3"
+             :default-suite-options {"us_core_version"          "us_core_7"
+                                     "smart_app_launch_version" "smart_app_launch_2_2"
+                                     "multi_patient_version"    "multi_patient_api_stu2"}
+             :suite-option-values g10-suite-option-values}})
 
-        :else
-        (do (print ".") (flush)
-            (Thread/sleep 3000)
-            (recur (- left 3))))))
-  (println)) ; newline after dots
+(defn- env-str [env k] (not-empty (str/trim (str (get env k "")))))
 
-;; ── FHIR server helpers ───────────────────────────────────────────────────────
+(defn- strip-trailing-slash [s] (str/replace (str s) #"/+$" ""))
 
-(defn wait-for-server [timeout-seconds]
-  (println "Waiting for FHIR server to start...")
-  (loop [left timeout-seconds]
-    (let [resp (try
-                 (curl/get "https://fhir.local:3001/default/fhir/metadata"
-                           {:timeout 2000
-                            :throw false
-                            :insecure? true})
-                 (catch Exception _ nil))]
-      (if (and resp (= 200 (:status resp)))
-        (println "Server is up!")
-        (if (<= left 0)
-          (do
-            (println "ERROR: FHIR server failed to start within timeout. Check server.log.")
-            (System/exit 1))
-          (do
-            (Thread/sleep 1000)
-            (recur (dec left))))))))
+(defn- parse-enum [env k allowed default]
+  (if-let [v (env-str env k)]
+    (or (get allowed v)
+        (throw (ex-info (str k " must be one of " (str/join ", " (sort (keys allowed)))
+                             ", got " (pr-str v))
+                        {:var k :value v})))
+    default))
 
-;; ── Hydra / Keto setup ────────────────────────────────────────────────────────
-
-(defn create-client []
-  (println "Creating Hydra client...")
-  (let [resp (try
-               (curl/post "http://127.0.0.1:4445/admin/clients"
-                          {:headers {"Content-Type" "application/json"}
-                           :body (json/generate-string {:client_name "test"
-                                                        :grant_types ["client_credentials"]
-                                                        :token_endpoint_auth_method "client_secret_basic"})
-                           :timeout 10000
-                           :throw false})
-               (catch Exception e {:status 500 :body (.getMessage e)}))
-        client (try (json/parse-string (:body resp) true) (catch Exception _ nil))]
-    (when (not= 201 (:status resp))
-      (println "Failed to create client:" (:body resp))
-      (System/exit 1))
-    client))
-
-(defn get-token [client-id client-secret]
-  (println "Getting access token...")
-  (let [resp (try
-               (curl/post "http://127.0.0.1:4444/oauth2/token"
-                          {:basic-auth [client-id client-secret]
-                           :form-params {"grant_type" "client_credentials"}
-                           :timeout 10000
-                           :throw false})
-               (catch Exception e {:status 500 :body (.getMessage e)}))
-        body (try (json/parse-string (:body resp) true) (catch Exception _ nil))]
-    (when (not= 200 (:status resp))
-      (println "Failed to get token:" (:body resp))
-      (System/exit 1))
-    (:access_token body)))
+(defn parse-suite-options
+  "INFERNO_SUITE_OPTIONS (space/comma `option:value` pairs) as a map. A token
+   without a colon, an option the kit does not offer, or a value the kit does
+   not list for it is rejected: Inferno would otherwise run the default
+   option set and report it as the requested one."
+  [s allowed]
+  (into {}
+        (map (fn [token]
+               (let [[k v] (str/split token #":" 2)]
+                 (when (or (str/blank? k) (str/blank? v))
+                   (throw (ex-info (str "INFERNO_SUITE_OPTIONS entry is not option:value: " (pr-str token))
+                                   {:entry token})))
+                 (when (and allowed (not (contains? (get allowed k) v)))
+                   (throw (ex-info (str "INFERNO_SUITE_OPTIONS " (pr-str token) " is not offered by this kit; "
+                                        "options: " (pr-str (into (sorted-map) (update-vals allowed sort))))
+                                   {:entry token :allowed allowed})))
+                 [k v])))
+        (setup/split-list s)))
 
 (defn url->realm
-  "The tenant segment of a dromon base url:
-   \"https://fhir.local:3001/default/fhir\" -> \"default\".
+  "The tenant segment of a FHIR base url, the path segment right before
+   /fhir: \"https://fhir.local:3001/default/fhir\" -> \"default\",
+   \"https://host/realm/dev/fhir\" -> \"dev\".
 
    Keto objects in the `fhir` namespace carry the realm as their first segment,
    so a client provisioned against one tenant no longer authorizes every other
    tenant the server hosts. Derived from the url the suite is actually pointed
    at rather than hard-coded, so INFERNO_FHIR_URL keeps working."
   [url]
-  (second (re-find #"://[^/]+/([^/]+)/fhir" (str url))))
+  (second (re-find #"://[^/]+/(?:[^/]+/)*?([^/]+)/fhir/?$" (str url))))
 
-(defn- inferno-realm []
-  (or (url->realm (or (not-empty (System/getenv "INFERNO_FHIR_URL"))
-                      "https://fhir.local:3001/default/fhir"))
-      "default"))
+(defn runner-config
+  "The runner's whole configuration from an env map (see the table above).
+   Malformed values throw rather than falling back to a default."
+  [env]
+  (let [target   (parse-enum env "INFERNO_TARGET" {"dromon" :dromon "external" :external} :dromon)
+        kit      (parse-enum env "INFERNO_KIT" {"us-core" :us-core "g10" :g10} :us-core)
+        kit-spec (get kits kit)
+        dromon?  (= target :dromon)
+        fhir-url (or (some-> (env-str env "INFERNO_FHIR_URL") strip-trailing-slash)
+                     (if dromon?
+                       default-dromon-fhir-url
+                       (throw (ex-info "INFERNO_TARGET=external needs INFERNO_FHIR_URL (the FHIR base to test)."
+                                       {:var "INFERNO_FHIR_URL"}))))
+        oauth    (strip-trailing-slash (or (env-str env "INFERNO_OAUTH_BASE_URL") default-oauth-base-url))
+        _        (when (and dromon? (not= oauth default-oauth-base-url))
+                   ;; ensure-hydra-issuer! and docker/hydra.yml pin the local
+                   ;; Hydra to this issuer; another value would be advertised
+                   ;; by the test-server but never served.
+                   (throw (ex-info (str "INFERNO_OAUTH_BASE_URL is fixed to " default-oauth-base-url
+                                        " for INFERNO_TARGET=dromon (docker/hydra.yml); got " (pr-str oauth))
+                                   {:var "INFERNO_OAUTH_BASE_URL" :value oauth})))
+        token    (or (env-str env "INFERNO_TOKEN_URL")
+                     (env-str env "BACKEND_TOKEN_URL")
+                     (str oauth "/oauth2/token"))
+        cid      (env-str env "INFERNO_CLIENT_ID")
+        csecret  (env-str env "INFERNO_CLIENT_SECRET")
+        _        (when (not= (some? cid) (some? csecret))
+                   (throw (ex-info "Set both INFERNO_CLIENT_ID and INFERNO_CLIENT_SECRET, or neither."
+                                   {:client-id? (some? cid)})))
+        groups   (str/trim (str (get env "INFERNO_GROUPS" (:default-groups kit-spec))))
+        options  (if-let [s (env-str env "INFERNO_SUITE_OPTIONS")]
+                   (parse-suite-options s (:suite-option-values kit-spec))
+                   (:default-suite-options kit-spec {}))]
+    {:target            target
+     :kit               kit
+     :kit-dir           (if (= kit :us-core) inferno-dir (:dir kit-spec))
+     :suite             (or (env-str env "INFERNO_SUITE") (:default-suite kit-spec))
+     :groups            (if (contains? #{"" "all" "ALL"} groups) [] (setup/split-list groups))
+     :suite-options     options
+     :preset-file       (env-str env "INFERNO_PRESET_FILE")
+     :inputs-override   (env-str env "INFERNO_INPUTS")
+     :fhir-url          fhir-url
+     :realm             (or (env-str env "INFERNO_REALM") (url->realm fhir-url) "default")
+     :oauth-base-url    oauth
+     :token-url         token
+     :runner-token-url  (if dromon? dromon-runner-token-url token)
+     :hydra-admin-url   (strip-trailing-slash (or (env-str env "INFERNO_HYDRA_ADMIN_URL") default-hydra-admin-url))
+     :keto-write-url    (some-> (or (env-str env "INFERNO_KETO_WRITE_URL")
+                                    (when dromon? default-dromon-keto-write-url))
+                                strip-trailing-slash)
+     :client-id         cid
+     :client-secret     csecret
+     :access-token      (env-str env "INFERNO_ACCESS_TOKEN")
+     :patient-ids       (or (env-str env "INFERNO_PATIENT_IDS") "123")
+     :group-id          (or (env-str env "INFERNO_GROUP_ID") "1")
+     :backend?          (= "backend_services" (env-str env "INFERNO_AUTH_MODE"))}))
 
-(defn grant-keto-permissions [client-id]
-  (println "Granting Keto permissions...")
-  (let [realm (inferno-realm)
-        objects ["Patient/123" "Patient" "Observation" "AllergyIntolerance" "CarePlan" "CareTeam" "Condition"
-                 "Coverage" "Device" "DiagnosticReport" "DocumentReference" "Encounter" "Goal"
-                 "Immunization" "MedicationDispense" "MedicationRequest" "Procedure"
-                 "QuestionnaireResponse" "RelatedPerson" "ServiceRequest" "Specimen"
-                 "Practitioner" "PractitionerRole" "Organization" "Location" "Provenance" "Endpoint"
-                 "system"]]
-    (println "  realm:" realm)
-    (doseq [obj objects
-            relation ["read" "write" "search-type"]]
-      (let [resp (try
-                   (curl/put "http://127.0.0.1:4467/admin/relation-tuples"
-                             {:headers {"Content-Type" "application/json"}
-                              :body (json/generate-string {:namespace "fhir"
-                                                           :object (str realm "/" obj)
-                                                           :relation relation
-                                                           :subject_id client-id})
-                              :timeout 10000
-                              :throw false})
-                   (catch Exception e {:status 500 :body (.getMessage e)}))]
-        (when (not= 201 (:status resp))
-          (println "Failed to grant" relation "permission for" obj ":" (:body resp))
-          (System/exit 1))))))
+(defn- cfg [] (runner-config (System/getenv)))
+
+;; ── Pre-flight helpers ────────────────────────────────────────────────────────
+
+(defn ensure-inferno-containers!
+  ([] (ensure-inferno-containers! (cfg)))
+  ([{:keys [kit-dir]}]
+   (println "Ensuring Inferno containers are up..." kit-dir)
+   (shell {:dir kit-dir}
+          "docker" "compose" "up" "-d"
+          "--wait"        ; wait for healthchecks where defined
+          "inferno" "worker" "hl7_validator_service"
+          "nginx" "redis")))
+
+(defn- validator-ready?
+  "The US Core kit's nginx proxies the HL7 validator on the host; the g10 kit's
+   does not, so its validator is probed from inside the inferno container."
+  [{:keys [kit kit-dir]}]
+  (case kit
+    :us-core (let [resp (try (curl/get (str "http://localhost:" setup/us-core-nginx-port "/hl7validatorapi/")
+                                       {:timeout 3000 :throw false})
+                             (catch Exception _ nil))]
+               (= 200 (:status resp)))
+    :g10 (-> (shell {:dir kit-dir :out :string :err :string :continue true}
+                    "docker" "compose" "exec" "-T" "inferno"
+                    "curl" "-s" "-o" "/dev/null" "-w" "%{http_code}" "--max-time" "3"
+                    "http://hl7_validator_service:3500/")
+             :out str/trim (= "200"))))
+
+(defn wait-for-validator
+  "Polls the HL7 validator until it responds with 200 or timeout.
+   The hl7_validator_service takes 30-90s to load FHIR packages on cold start."
+  ([timeout-seconds] (wait-for-validator (cfg) timeout-seconds))
+  ([config timeout-seconds]
+   (println "Waiting for HL7 validator to be ready (may take up to 90s on cold start)...")
+   (loop [left timeout-seconds]
+     (cond
+       (validator-ready? config)
+       (println "HL7 validator is ready!")
+
+       (<= left 0)
+       (do (println "ERROR: HL7 validator did not become ready within timeout.")
+           (println "Check: docker compose -f" (str (:kit-dir config) "/docker-compose.yml") "logs hl7_validator_service")
+           (System/exit 1))
+
+       :else
+       (do (print ".") (flush)
+           (Thread/sleep 3000)
+           (recur (- left 3)))))
+   (println)))
+
+;; ── FHIR server helpers ───────────────────────────────────────────────────────
+
+(defn- metadata-status [fhir-url]
+  (try
+    (:status (curl/get (str fhir-url "/metadata")
+                       {:timeout 2000 :throw false :insecure? true}))
+    (catch Exception _ nil)))
+
+(defn wait-for-server
+  ([timeout-seconds] (wait-for-server (cfg) timeout-seconds))
+  ([{:keys [fhir-url]} timeout-seconds]
+   (println "Waiting for FHIR server at" (str fhir-url "/metadata") "...")
+   (loop [left timeout-seconds]
+     (if (= 200 (metadata-status fhir-url))
+       (println "Server is up!")
+       (if (<= left 0)
+         (do
+           (println "ERROR: FHIR server did not answer" (str fhir-url "/metadata") "within timeout. Check server.log.")
+           (System/exit 1))
+         (do
+           (Thread/sleep 1000)
+           (recur (dec left))))))))
+
+;; ── Hydra / Keto setup ────────────────────────────────────────────────────────
+
+(defn- parse-json-body [resp]
+  (try (json/parse-string (:body resp) true) (catch Exception _ nil)))
+
+(defn create-client
+  ([] (create-client (cfg)))
+  ([{:keys [hydra-admin-url]}]
+   (println "Creating Hydra client...")
+   (let [resp (try
+                (curl/post (str hydra-admin-url "/admin/clients")
+                           {:headers {"Content-Type" "application/json"}
+                            :body (json/generate-string {:client_name "test"
+                                                         :grant_types ["client_credentials"]
+                                                         :token_endpoint_auth_method "client_secret_basic"})
+                            :timeout 10000
+                            :throw false})
+                (catch Exception e {:status 500 :body (.getMessage e)}))]
+     (when (not= 201 (:status resp))
+       (println "Failed to create client:" (:body resp))
+       (System/exit 1))
+     (parse-json-body resp))))
+
+(defn get-token
+  ([client-id client-secret] (get-token (cfg) client-id client-secret))
+  ([{:keys [runner-token-url]} client-id client-secret]
+   (println "Getting access token from" runner-token-url "...")
+   (let [resp (try
+                (curl/post runner-token-url
+                           {:basic-auth [client-id client-secret]
+                            :form-params {"grant_type" "client_credentials"}
+                            :timeout 10000
+                            :throw false})
+                (catch Exception e {:status 500 :body (.getMessage e)}))
+         body (parse-json-body resp)]
+     (when (not= 200 (:status resp))
+       (println "Failed to get token: HTTP" (:status resp) (:error body) (:error_description body))
+       (System/exit 1))
+     (:access_token body))))
+
+(def keto-type-objects
+  ["Patient/123" "Patient" "Observation" "AllergyIntolerance" "CarePlan" "CareTeam" "Condition"
+   "Coverage" "Device" "DiagnosticReport" "DocumentReference" "Encounter" "Goal"
+   "Immunization" "MedicationDispense" "MedicationRequest" "Procedure"
+   "QuestionnaireResponse" "RelatedPerson" "ServiceRequest" "Specimen"
+   "Practitioner" "PractitionerRole" "Organization" "Location" "Provenance" "Endpoint"
+   "system"])
+
+(defn runner-client-tuples
+  "[object relation] pairs for the runner's own client_credentials client.
+   The dromon target seeds the test data with it, so it needs `write`; against
+   an external target it only reads."
+  [{:keys [target]}]
+  (vec (for [obj      keto-type-objects
+             relation (if (= target :dromon)
+                        ["read" "write" "search-type"]
+                        ["read" "search-type"])]
+         [obj relation])))
+
+(defn backend-client-tuples
+  "[object relation] pairs for a backend-services (bulk) client. Bulk export is
+   gated on the realm's `system` read tuple alone (bulk_export.clj
+   system-authorized?), so an external target's realm gets exactly that: the
+   g10 kit signs with a key set that is public on GitHub, and whoever holds it
+   can act as this client. The dromon target keeps its historical grant set."
+  [{:keys [target] :as config}]
+  (if (= target :dromon)
+    (runner-client-tuples config)
+    [["system" "read"]]))
+
+(defn grant-keto-permissions
+  ([client-id] (grant-keto-permissions (cfg) client-id))
+  ([config client-id] (grant-keto-permissions config client-id (runner-client-tuples config)))
+  ([{:keys [realm keto-write-url]} client-id tuples]
+   (if-not keto-write-url
+     (println "No INFERNO_KETO_WRITE_URL -- skipping Keto grants for" client-id)
+     (do
+       (println "Granting Keto permissions...")
+       (println "  realm:" realm)
+       (doseq [[obj relation] tuples]
+         (let [resp (try
+                      (curl/put (str keto-write-url "/admin/relation-tuples")
+                                {:headers {"Content-Type" "application/json"}
+                                 :body (json/generate-string {:namespace "fhir"
+                                                              :object (str realm "/" obj)
+                                                              :relation relation
+                                                              :subject_id client-id})
+                                 :timeout 10000
+                                 :throw false})
+                      (catch Exception e {:status 500 :body (.getMessage e)}))]
+           (when (not= 201 (:status resp))
+             (println "Failed to grant" relation "permission for" obj ":" (:body resp))
+             (System/exit 1))))))))
 
 ;; ── SMART Backend Services (private_key_jwt) ──────────────────────────────────
-;; The bulk_data_v200 auth group runs the real RFC 7523 client-credentials flow:
-;; Inferno signs a client assertion with a private JWK and posts it to Hydra's
-;; token endpoint. Wiring:
-;;   1. Hydra's issuer must be reachable under the same name from the host and
-;;      from inside the Inferno container (host-gateway). docker/hydra.yml pins
-;;      it to http://fhir.local:4444/; `ensure-hydra-issuer!` recreates a stale
-;;      container so the running issuer matches.
+;; The bulk_data_v200 auth group (and g10's Multi-Patient API group) runs the
+;; real RFC 7523 client-credentials flow: Inferno signs a client assertion with
+;; a private JWK and posts it to the token endpoint. Wiring:
+;;   1. The issuer must be reachable under the same name from the host and
+;;      from inside the Inferno container (host-gateway). For the dromon target
+;;      docker/hydra.yml pins it to https://fhir.local:4443/;
+;;      `ensure-hydra-issuer!` recreates a stale container so the running
+;;      issuer matches. An external target's issuer is never touched.
 ;;   2. Register a Hydra client (token_endpoint_auth_method private_key_jwt) with
-;;      the PUBLIC JWK so Hydra can verify the assertion.
+;;      the PUBLIC JWK so Hydra can verify the assertion. The US Core kit's
+;;      group takes a key minted per run; the g10 kit locks its own committed
+;;      test key set, so its public half is registered instead.
 ;;   3. Grant that client subject the Keto "system" read tuple so the RS256
-;;      access token Hydra issues passes dromon's authorization.
+;;      access token Hydra issues passes dromon's authorization
+;;      ([[backend-client-tuples]]).
 ;;   4. Hand Inferno the backend-services `smart_auth_info` (token_url, client_id,
 ;;      alg, kid, and the PRIVATE JWK set it signs the assertion with).
 
-(def ^:private backend-alg "ES384")
-;; SMART Backend Services requires the token endpoint over TLS. The nginx TLS
-;; terminator (docker/hydra-tls.conf) fronts Hydra at https://fhir.local:4443
-;; and Hydra's issuer is set to match, so the client-assertion `aud` validates.
-(def ^:private desired-hydra-issuer "https://fhir.local:4443/")
-(def ^:private oauth-base-url "https://fhir.local:4443")
+(def backend-alg "ES384")
+(def ^:private desired-hydra-issuer (str default-oauth-base-url "/"))
 
-(defn backend-mode? []
-  (= "backend_services" (System/getenv "INFERNO_AUTH_MODE")))
-
-(defn- backend-token-url []
-  (or (not-empty (System/getenv "BACKEND_TOKEN_URL"))
-      (str oauth-base-url "/oauth2/token")))
+(defn backend-mode? [] (:backend? (cfg)))
 
 (defn- b64url-no-pad [^bytes bs]
   (.encodeToString (.withoutPadding (java.util.Base64/getUrlEncoder)) bs))
@@ -224,16 +439,38 @@
     {:keys [{:kty "EC" :crv "P-384" :x x :y y :d d :key_ops ["sign"] :kid kid :alg backend-alg}
             {:kty "EC" :crv "P-384" :x x :y y :use "sig" :key_ops ["verify"] :kid kid :alg backend-alg}]}))
 
-(defn- backend-signing-kid [jwks]
-  (:kid (some #(when (some #{"sign"} (:key_ops %)) %) (:keys jwks))))
+(defn backend-signing-kid
+  "The kid of the signing key for `alg` in a JWK set."
+  ([jwks] (backend-signing-kid jwks backend-alg))
+  ([jwks alg]
+   (:kid (some #(when (and (some #{"sign"} (:key_ops %)) (= alg (:alg %))) %) (:keys jwks)))))
 
-(defn- backend-public-jwk
+(defn backend-public-jwk
   "The public JWK Hydra registers to verify the client assertion: the verify key
-   (or any key) reduced to its public components."
-  [jwks]
-  (let [k (or (some #(when-not (:d %) %) (:keys jwks)) (first (:keys jwks)))]
-    {:kty (:kty k) :crv (:crv k) :x (:x k) :y (:y k)
-     :kid (:kid k) :alg backend-alg :use "sig"}))
+   for `alg` (or any key) reduced to its public components."
+  ([jwks] (backend-public-jwk jwks backend-alg))
+  ([jwks alg]
+   (let [ks (filter #(= alg (:alg %)) (:keys jwks))
+         k  (or (some #(when (some #{"verify"} (:key_ops %)) %) ks)
+                (some #(when-not (:d %) %) ks)
+                (first ks)
+                (throw (ex-info (str "No " alg " key in the JWK set") {:alg alg})))]
+     (case (:kty k)
+       "EC"  {:kty "EC" :crv (:crv k) :x (:x k) :y (:y k) :kid (:kid k) :alg alg :use "sig"}
+       "RSA" {:kty "RSA" :n (:n k) :e (:e k) :kid (:kid k) :alg alg :use "sig"}))))
+
+(def g10-bulk-jwks-path
+  "The g10 kit's committed backend-services test key set. Its Multi-Patient
+   API group locks `jwks` to this file (G10_BULK_DATA_JWKS overrides it inside
+   the container), so the matching public key is what Hydra must hold."
+  (str setup/g10-kit-dir "/lib/onc_certification_g10_test_kit/bulk_data_jwks.json"))
+
+(defn g10-bulk-jwks []
+  (let [f (io/file g10-bulk-jwks-path)]
+    (when-not (.isFile f)
+      (throw (ex-info (str g10-bulk-jwks-path " not found; run bb inferno-g10-setup first.")
+                      {:path g10-bulk-jwks-path})))
+    (json/parse-string (slurp f) true)))
 
 (defn live-hydra-issuer []
   (try
@@ -243,9 +480,9 @@
     (catch Exception _ nil)))
 
 (defn ensure-hydra-issuer!
-  "Ensures the running Hydra advertises `desired-hydra-issuer`. Recreates the
-   container from docker/hydra.yml (idempotently) if it does not, then waits for
-   the token endpoint to come back."
+  "Ensures the running local Hydra advertises `desired-hydra-issuer`. Recreates
+   the container from docker/hydra.yml (idempotently) if it does not, then
+   waits for the token endpoint to come back. dromon target only."
   []
   (let [iss (live-hydra-issuer)]
     (if (= iss desired-hydra-issuer)
@@ -261,45 +498,61 @@
                               (System/exit 1))
               :else (do (Thread/sleep 1000) (recur (dec left))))))))))
 
+(defn backend-client-payload
+  "Hydra admin body for a SMART Backend Services client verified by the inline
+   `public-jwk`."
+  [public-jwk]
+  {:client_name "inferno-backend-services"
+   :grant_types ["client_credentials"]
+   :response_types []
+   :token_endpoint_auth_method "private_key_jwt"
+   :token_endpoint_auth_signing_alg (:alg public-jwk)
+   :jwks {:keys [public-jwk]}
+   :scope "system/*.read"})
+
 (defn create-backend-client
   "Registers a Hydra client for the SMART Backend Services flow: private_key_jwt
    auth with the inline PUBLIC JWK. Returns the client_id."
-  [public-jwk]
-  (println "Creating Hydra backend-services (private_key_jwt) client...")
-  (let [resp (try
-               (curl/post "http://127.0.0.1:4445/admin/clients"
-                          {:headers {"Content-Type" "application/json"}
-                           :body (json/generate-string
-                                  {:client_name "inferno-backend-services"
-                                   :grant_types ["client_credentials"]
-                                   :response_types []
-                                   :token_endpoint_auth_method "private_key_jwt"
-                                   :token_endpoint_auth_signing_alg backend-alg
-                                   :jwks {:keys [public-jwk]}
-                                   :scope "system/*.read"})
-                           :timeout 10000
-                           :throw false})
-               (catch Exception e {:status 500 :body (.getMessage e)}))
-        client (try (json/parse-string (:body resp) true) (catch Exception _ nil))]
-    (when (not= 201 (:status resp))
-      (println "Failed to create backend-services client:" (:body resp))
-      (System/exit 1))
-    (:client_id client)))
+  ([public-jwk] (create-backend-client (cfg) public-jwk))
+  ([{:keys [hydra-admin-url]} public-jwk]
+   (println "Creating Hydra backend-services (private_key_jwt) client...")
+   (let [resp (try
+                (curl/post (str hydra-admin-url "/admin/clients")
+                           {:headers {"Content-Type" "application/json"}
+                            :body (json/generate-string (backend-client-payload public-jwk))
+                            :timeout 10000
+                            :throw false})
+                (catch Exception e {:status 500 :body (.getMessage e)}))]
+     (when (not= 201 (:status resp))
+       (println "Failed to create backend-services client:" (:body resp))
+       (System/exit 1))
+     (:client_id (parse-json-body resp)))))
 
 (defn backend-smart-auth-info
   "The `smart_auth_info` JSON string Inferno consumes for a backend-services run.
    `jwks-str` is the PRIVATE JWK set (as a string) Inferno signs the assertion
    with; `token_url` is both the assertion `aud` and the POST target."
-  [client-id jwks-str kid]
-  (json/generate-string
-   {:auth_type "backend_services"
-    :use_discovery "false"
-    :token_url (backend-token-url)
-    :client_id client-id
-    :requested_scopes "system/*.read"
-    :encryption_algorithm backend-alg
-    :kid kid
-    :jwks jwks-str}))
+  ([client-id jwks-str kid] (backend-smart-auth-info (cfg) client-id jwks-str kid))
+  ([{:keys [token-url]} client-id jwks-str kid]
+   (json/generate-string
+    {:auth_type "backend_services"
+     :use_discovery "false"
+     :token_url token-url
+     :client_id client-id
+     :requested_scopes "system/*.read"
+     :encryption_algorithm backend-alg
+     :kid kid
+     :jwks jwks-str})))
+
+(defn- backend-auth!
+  "Registers the backend-services client for this run and returns its
+   smart_auth_info JSON string."
+  [config]
+  (let [jwks (if (= :g10 (:kit config)) (g10-bulk-jwks) (generate-backend-jwks))
+        bcid (create-backend-client config (backend-public-jwk jwks))]
+    (println "Backend-services client ID:" bcid)
+    (grant-keto-permissions config bcid (backend-client-tuples config))
+    (backend-smart-auth-info config bcid (json/generate-string jwks) (backend-signing-kid jwks))))
 
 ;; Store warmup used to happen here via an authenticated `GET /Patient?_count=1`
 ;; to force per-tenant cold-start (XTDB node start, Datomic peer connect, JIT of
@@ -309,232 +562,407 @@
 ;; By the time `wait-for-server` sees a 200 on `/metadata`, the default tenant
 ;; is already warm, so the runner has nothing left to do here.
 
-(defn insert-patient [token]
-  (println "Inserting test Patient...")
-  (let [patient-body {:resourceType "Patient"
-                      :id "123"
-                      :text {:status "generated" :div "<div xmlns=\"http://www.w3.org/1999/xhtml\">John Smith</div>"}
-                      :active true
-                      :identifier [{:system "urn:oid:1.2.36.146.595.217.0.1" :value "pat-123"}]
-                      :name [{:family "Smith" :given ["John"]}]
-                      :gender "male"
-                      :birthDate "1980-01-01"
-                      :address [{:line ["123 Main St"] :city "Anytown" :state "NY" :postalCode "12345" :country "US"}]}
-        resp (try
-               (curl/put "https://fhir.local:3001/default/fhir/Patient/123"
-                         {:headers {"Authorization" (str "Bearer " token)
-                                    "Content-Type" "application/json"}
-                          :body (json/generate-string patient-body)
-                          :timeout 10000
-                          :throw false
-                          :insecure? true})
-               (catch Exception e {:status 500 :body (.getMessage e)}))]
-    (when (not (#{200 201} (:status resp)))
-      (println "Failed to insert patient. Status:" (:status resp) "Body:" (:body resp))
-      (System/exit 1))))
+(defn insert-patient
+  ([token] (insert-patient (cfg) token))
+  ([{:keys [fhir-url]} token]
+   (println "Inserting test Patient...")
+   (let [patient-body {:resourceType "Patient"
+                       :id "123"
+                       :text {:status "generated" :div "<div xmlns=\"http://www.w3.org/1999/xhtml\">John Smith</div>"}
+                       :active true
+                       :identifier [{:system "urn:oid:1.2.36.146.595.217.0.1" :value "pat-123"}]
+                       :name [{:family "Smith" :given ["John"]}]
+                       :gender "male"
+                       :birthDate "1980-01-01"
+                       :address [{:line ["123 Main St"] :city "Anytown" :state "NY" :postalCode "12345" :country "US"}]}
+         resp (try
+                (curl/put (str fhir-url "/Patient/123")
+                          {:headers {"Authorization" (str "Bearer " token)
+                                     "Content-Type" "application/json"}
+                           :body (json/generate-string patient-body)
+                           :timeout 10000
+                           :throw false
+                           :insecure? true})
+                (catch Exception e {:status 500 :body (.getMessage e)}))]
+     (when (not (#{200 201} (:status resp)))
+       (println "Failed to insert patient. Status:" (:status resp) "Body:" (:body resp))
+       (System/exit 1)))))
 
-(defn insert-test-data [token]
-  (println "Inserting test data bundle...")
-  (let [resp (try
-               (let [result (shell {:out :string :err :string :continue true}
-                                   "curl" "-s" "-k" "--max-time" "30"
-                                   "-X" "POST"
-                                   "-H" (str "Authorization: Bearer " token)
-                                   "-H" "Content-Type: application/json"
-                                   "-d" "@bb/resources/inferno-test-bundle.json"
-                                   "-w" "\n%{http_code}"
-                                   "https://fhir.local:3001/default/fhir")
-                     lines (str/split-lines (:out result))
-                     status (parse-long (last lines))
-                     body (str/join "\n" (butlast lines))]
-                 {:status status :body body})
-               (catch Exception e {:status 500 :body (.getMessage e)}))]
-    (if (#{200 201} (:status resp))
-      (println "Test data bundle inserted successfully.")
-      (do
-        (println "Failed to insert test data bundle. Status:" (:status resp))
-        (println "Response body:" (:body resp))
-        (System/exit 1)))))
+(defn insert-test-data
+  ([token] (insert-test-data (cfg) token))
+  ([{:keys [fhir-url]} token]
+   (println "Inserting test data bundle...")
+   (let [resp (try
+                (let [result (shell {:out :string :err :string :continue true}
+                                    "curl" "-s" "-k" "--max-time" "30"
+                                    "-X" "POST"
+                                    "-H" (str "Authorization: Bearer " token)
+                                    "-H" "Content-Type: application/json"
+                                    "-d" "@bb/resources/inferno-test-bundle.json"
+                                    "-w" "\n%{http_code}"
+                                    fhir-url)
+                      lines (str/split-lines (:out result))
+                      status (parse-long (last lines))
+                      body (str/join "\n" (butlast lines))]
+                  {:status status :body body})
+                (catch Exception e {:status 500 :body (.getMessage e)}))]
+     (if (#{200 201} (:status resp))
+       (println "Test data bundle inserted successfully.")
+       (do
+         (println "Failed to insert test data bundle. Status:" (:status resp))
+         (println "Response body:" (:body resp))
+         (System/exit 1))))))
 
-;; ── Suite configuration (env-overridable) ─────────────────────────────────────
-;; The suite, group filter, and inputs default to the historical US Core v6.1.0
-;; run so existing tooling is unaffected. Override via env to point the same
-;; runner at other suites (e.g. base FHIR R4, SMART App Launch):
-;;   INFERNO_SUITE       suite id (default "us_core_v610")
-;;   INFERNO_GROUPS      space/comma list of group ids, or "all"/"" to run the
-;;                       whole suite (default "2")
-;;   INFERNO_FHIR_URL    server base url (default the local default tenant)
-;;   INFERNO_PATIENT_IDS patient_ids input (default "123")
-;;   INFERNO_INPUTS      full replacement for the --inputs tokens, space
-;;                       separated "key:value"; the tokens {{token}} and
-;;                       {{cred_json}} are substituted with the obtained access
-;;                       token and its JSON envelope.
+;; ── Suite inputs ──────────────────────────────────────────────────────────────
 
-(def default-suite "us_core_v610")
+(def ^:private g10-discovery-auth-info
+  (json/generate-string {:auth_type "symmetric" :use_discovery "true"}))
 
-(defn inferno-suite []
-  (or (not-empty (System/getenv "INFERNO_SUITE")) default-suite))
-
-(defn- group-args []
-  (let [g (or (System/getenv "INFERNO_GROUPS") "2")]
-    (if (contains? #{"" "all" "ALL"} (str/trim g))
-      []
-      (into ["--groups"] (remove str/blank? (str/split g #"[,\s]+"))))))
-
-(defn- input-args
-  "The `--inputs k:v ...` argument vector. INFERNO_INPUTS fully replaces the
-   defaults; the substitution tokens {{token}}, {{cred_json}}, and
-   {{backend_auth}} expand to the access token, its JSON envelope, and the
-   backend-services smart_auth_info JSON respectively."
-  [token backend-auth]
-  (let [cred-json (json/generate-string {:access_token token})
+(defn input-tokens
+  "The `key:value` tokens passed after --inputs. INFERNO_INPUTS fully replaces
+   the defaults, with {{token}}, {{cred_json}} and {{backend_auth}} expanded."
+  [{:keys [kit backend? fhir-url patient-ids group-id inputs-override]} token backend-auth]
+  (let [cred-json (json/generate-string {:access_token (or token "")})
         subst (fn [s] (-> s
                           (str/replace "{{cred_json}}" cred-json)
                           (str/replace "{{backend_auth}}" (or backend-auth ""))
-                          (str/replace "{{token}}" token)))
-        url (or (not-empty (System/getenv "INFERNO_FHIR_URL"))
-                "https://fhir.local:3001/default/fhir")
-        tokens (cond
-                 (not-empty (System/getenv "INFERNO_INPUTS"))
-                 (mapv subst (remove str/blank? (str/split (System/getenv "INFERNO_INPUTS") #"\s+")))
+                          (str/replace "{{token}}" (or token ""))))]
+    (cond
+      inputs-override
+      (mapv subst (remove str/blank? (str/split inputs-override #"\s+")))
 
-                 ;; Backend-services default input set for the bulk_data suites:
-                 ;; the FHIR base is `bulk_server_url` and auth is the real
-                 ;; private_key_jwt flow driven from `smart_auth_info`.
-                 (backend-mode?)
-                 [(str "bulk_server_url:" url)
-                  (str "smart_auth_info:" backend-auth)
-                  "group_id:1"
-                  "bulk_timeout:180"
-                  "since_timestamp:2020-01-01T00:00:00Z"]
+      ;; The (g)(10) Multi-Patient API group: same backend-services flow, its
+      ;; own input names.
+      (and (= kit :g10) backend?)
+      [(str "url:" fhir-url)
+       (str "bulk_server_url:" fhir-url)
+       (str "bulk_smart_auth_info:" backend-auth)
+       (str "group_id:" group-id)
+       (str "bulk_patient_ids_in_group:" patient-ids)
+       "bulk_timeout:180"
+       "since_timestamp:2020-01-01T00:00:00Z"]
 
-                 :else
-                 [(str "url:" url)
-                  (str "patient_ids:" (or (not-empty (System/getenv "INFERNO_PATIENT_IDS")) "123"))
-                  (str "smart_auth_info:" cred-json)])]
-    (into ["--inputs"] tokens)))
+      ;; The g10 discovery groups read only the FHIR base, but declare the
+      ;; launch credentials as required inputs (discovery writes the
+      ;; endpoints it finds into them). Launches and their real credentials
+      ;; come from a preset or the web UI.
+      (= kit :g10)
+      [(str "url:" fhir-url)
+       (str "standalone_smart_auth_info:" g10-discovery-auth-info)
+       (str "ehr_smart_auth_info:" g10-discovery-auth-info)]
+
+      ;; Backend-services default input set for the bulk_data suites: the FHIR
+      ;; base is `bulk_server_url` and auth is the real private_key_jwt flow
+      ;; driven from `smart_auth_info`.
+      backend?
+      [(str "bulk_server_url:" fhir-url)
+       (str "smart_auth_info:" backend-auth)
+       (str "group_id:" group-id)
+       "bulk_timeout:180"
+       "since_timestamp:2020-01-01T00:00:00Z"]
+
+      :else
+      [(str "url:" fhir-url)
+       (str "patient_ids:" patient-ids)
+       (str "smart_auth_info:" cred-json)])))
+
+(defn execute-command
+  "The `inferno execute` command vector run inside the kit's inferno container."
+  [{:keys [suite suite-options groups preset-file] :as config} token backend-auth]
+  (-> ["docker" "compose" "exec" "-T" "inferno" "bundle" "exec" "inferno" "execute"
+       "--suite" suite]
+      (cond-> (seq suite-options)
+        (into (cons "--suite-options" (map (fn [[k v]] (str k ":" v)) (sort suite-options)))))
+      (cond-> (seq groups) (into (cons "--groups" groups)))
+      (cond-> preset-file (into ["--preset-file" preset-file]))
+      (into (cons "--inputs" (input-tokens config token backend-auth)))
+      (into ["--outputter" "json"])))
+
+(defn- secret-name?
+  "Whether an input named `n` carries a credential (an auth_info, a token, a
+   client secret, a key set). `*_url` inputs such as token_url do not."
+  [n]
+  (boolean (and (string? n)
+                (re-find #"(?i)auth|token|secret|jwks|cred|password|private" n)
+                (not (re-find #"(?i)_url$" n)))))
+
+(defn- input-arg
+  "[name value] of a `name:value` --inputs argument, or nil."
+  [arg]
+  (when-let [[_ n v] (re-matches #"(?s)^([A-Za-z0-9_]+):(.*)$" (str arg))]
+    [n v]))
+
+(defn- secret-arg? [arg]
+  (secret-name? (first (input-arg arg))))
+
+(defn- redacted-arg [arg]
+  (str (first (input-arg arg)) ":<redacted>"))
+
+(def ^:private secret-json-keys
+  "Keys whose values are credentials wherever they appear in an auth_info
+   JSON value: tokens, client secrets, and the private members of a JWK."
+  #{"access_token" "refresh_token" "id_token" "client_secret" "jwks"
+    "d" "p" "q" "dp" "dq" "qi" "k"})
+
+(defn redact-command
+  "`cmd` safe to print: input values that carry credentials (access tokens,
+   client secrets, private JWKs) are replaced."
+  [cmd]
+  (mapv #(if (secret-arg? %) (redacted-arg %) %) cmd))
+
+(defn- parse-json-object [s]
+  (when (and (string? s) (str/starts-with? (str/triml s) "{"))
+    (try (let [v (json/parse-string s)] (when (map? v) v))
+         (catch Exception _ nil))))
+
+(defn- secret-leaves
+  "Every credential string inside `v` (a parsed JSON value): the values under
+   [[secret-json-keys]], descending into JSON objects encoded as strings (the
+   `jwks` member of an auth_info is one)."
+  [v]
+  (cond
+    (map? v)        (mapcat (fn [[k x]]
+                              (if (and (contains? secret-json-keys (str k)) (string? x))
+                                (cons x (secret-leaves (parse-json-object x)))
+                                (secret-leaves x)))
+                            v)
+    (sequential? v) (mapcat secret-leaves v)
+    (string? v)     (secret-leaves (parse-json-object v))
+    :else           nil))
+
+(defn secret-values
+  "The credential strings carried by `cmd`, plus `extra` (the runner's own
+   token and client secret). A credential-bearing argument contributes the
+   credentials inside its JSON value, or its whole value when that is not
+   JSON (a header, a bare token). Values shorter than 8 characters are
+   dropped: replacing them would mangle unrelated output."
+  [cmd extra]
+  (->> cmd
+       (keep (fn [arg]
+               (when (secret-arg? arg)
+                 (let [[_ v] (input-arg arg)]
+                   (if-let [m (parse-json-object v)] (secret-leaves m) [v])))))
+       (apply concat extra)
+       (filter #(and (string? %) (>= (count %) 8)))
+       distinct
+       (sort-by count >)
+       vec))
+
+(defn- json-escaped [s]
+  (let [q (json/generate-string s)] (subs q 1 (dec (count q)))))
+
+(defn redact-output
+  "`s` (output of running `cmd`, or a report body) with every credential
+   replaced: each credential-bearing argument of `cmd` as [[redact-command]]
+   prints it, and then each value of [[secret-values]] wherever it still
+   appears, raw or JSON-escaped, so a quoted or escaped echo of the command
+   (podman's compose wrapper prints it on a non-zero exit) leaks nothing."
+  ([cmd s] (redact-output cmd [] s))
+  ([cmd extra s]
+   (let [by-arg (reduce (fn [out arg]
+                          (if (secret-arg? arg)
+                            (str/replace out arg (redacted-arg arg))
+                            out))
+                        (str s)
+                        cmd)]
+     (reduce (fn [out v]
+               (-> out
+                   (str/replace v "<redacted>")
+                   (str/replace (json-escaped v) "<redacted>")))
+             by-arg
+             (secret-values cmd extra)))))
+
+(defn- redact-io-entry
+  "One `inputs`/`outputs` entry of an Inferno result with its credentials
+   replaced: the whole value when the entry's name says it is a credential,
+   otherwise the [[secret-json-keys]] members of a JSON object value."
+  [{:keys [name value] :as entry}]
+  (cond
+    (and (secret-name? name) (not (parse-json-object value)))
+    (cond-> entry (some? value) (assoc :value "<redacted>"))
+
+    (parse-json-object value)
+    (let [redact (fn redact [m]
+                   (into {} (map (fn [[k x]]
+                                   [k (cond
+                                        (contains? secret-json-keys (str k)) "<redacted>"
+                                        (map? x) (redact x)
+                                        :else x)]))
+                         m))]
+      (assoc entry :value (json/generate-string (redact (parse-json-object value)))))
+
+    :else entry))
+
+(defn redact-report
+  "The parsed Inferno report with the credentials in each result's `inputs`
+   and `outputs` replaced (Inferno echoes them, tokens it minted itself
+   included)."
+  [report]
+  (mapv (fn [result]
+          (cond-> result
+            (sequential? (:inputs result))  (update :inputs #(mapv redact-io-entry %))
+            (sequential? (:outputs result)) (update :outputs #(mapv redact-io-entry %))))
+        report))
+
+(defn- needs-runner-token?
+  "Whether the run needs a bearer token minted by the runner itself: the
+   dromon target seeds data with it, and the US Core inputs carry it. The g10
+   groups obtain their own tokens, and an INFERNO_INPUTS that never references
+   one does not need it either."
+  [{:keys [target kit backend? inputs-override]}]
+  (or (= target :dromon)
+      (if inputs-override
+        (boolean (re-find #"\{\{(token|cred_json)\}\}" inputs-override))
+        (and (= kit :us-core) (not backend?)))))
 
 ;; ── Test runner ───────────────────────────────────────────────────────────────
 
-(defn run-inferno-tests [token backend-auth]
-  (println "Running Inferno tests for suite" (inferno-suite) "...")
-  (.mkdirs (io/file "target"))
+(defn- print-report [report]
+  (let [passes (count (filter #(= "pass" (:result %)) report))
+        fails  (count (filter #(= "fail" (:result %)) report))
+        errors (count (filter #(= "error" (:result %)) report))
+        green  "\033[32m"
+        red    "\033[31m"
+        yellow "\033[33m"
+        reset  "\033[0m"
+        waits  (count (filter #(= "wait" (:result %)) report))
+        color  (fn [r] (case r "pass" green "fail" red "error" yellow reset))
+        badge  (fn [r] (case r "pass" "PASS" "fail" "FAIL" "error" "ERR " "skip" "SKIP" "omit" "OMIT"
+                         "wait" "WAIT" "SKIP"))]
+    (println "\n╔══════════════════════════════════════════════════════════════╗")
+    (println "║                     Inferno Test Results                     ║")
+    (println "╠══════════════════════════════════════════════════════════════╣")
+    (doseq [t report]
+      (let [r   (:result t "skip")
+            id  (or (:test_id t) (:test_group_id t) (:test_suite_id t) "unknown")
+            msg (str/replace (or (:result_message t) "") #"\s+" " ")]
+        (println (format "%s[%s]%s %-45s %s"
+                         (color r) (badge r) reset
+                         (if (> (count id) 45) (str "..." (subs id (- (count id) 42))) id)
+                         (if (> (count msg) 60) (str (subs msg 0 57) "...") msg)))))
+    (println "╠══════════════════════════════════════════════════════════════╣")
+    (println (format "║ %s%d passed%s  %s%d failed%s  %s%d errors%s  %d waiting"
+                     green passes reset
+                     red   fails  reset
+                     yellow errors reset
+                     waits))
+    (when (pos? waits)
+      (println "║ WAIT: the run reached a step that needs a browser (a launch or"
+               "\n║ a redirect); finish those groups in the web UI."))
+    (println "╚══════════════════════════════════════════════════════════════╝\n")))
 
-  (let [cmd (into ["docker" "compose" "exec" "-T" "inferno" "bundle" "exec" "inferno" "execute"
-                   "--suite" (inferno-suite)]
-                  (concat (group-args)
-                          (input-args token backend-auth)
-                          ["--outputter" "json"]))
-        _ (println "Executing:" (str/join " " cmd))]
+(defn parse-report
+  "The result list in `inferno execute --outputter json` stdout, or nil when
+   there is none. Inferno logs warnings (unknown inputs and the like) to stdout
+   ahead of the report, so the report is the first line-initial `[` from which
+   the rest parses as a JSON array of result objects. A refusal is printed as a
+   bare JSON string and yields nil."
+  [out]
+  (let [out (str out)
+        m   (re-matcher #"(?m)^\[" out)]
+    (loop []
+      (when (.find m)
+        ;; cheshire parses a top-level array lazily; realize it inside the try.
+        (or (try (let [r (json/parse-string (subs out (.start m)) true)]
+                   (when (and (sequential? r) (every? map? r)) (vec r)))
+                 (catch Exception _ nil))
+            (recur))))))
 
-    (try
-      (let [proc (process cmd {:dir inferno-dir :out :string :err :string})
-            ;; 10-minute hard timeout
-            result (deref (future @proc) 600000 ::timeout)]
-        (if (= ::timeout result)
-          (do
-            (println "ERROR: Inferno test suite timed out after 10 minutes.")
-            (println "Check worker logs: docker compose -f inferno-test-kit/docker-compose.yml logs worker")
-            (.destroy proc)
-            (System/exit 1))
-          (do
-            (when (seq (:err result))
-              (println "Inferno stderr:" (:err result)))
-            (let [report-file (str "target/inferno-report-" (inferno-suite) ".json")]
-              (spit "target/inferno-report.json" (:out result))
-              (spit report-file (:out result))
-              (println "Inferno run completed. Report written to" report-file
-                       "(and target/inferno-report.json)"))
-            (let [report (try (json/parse-string (:out result) true) (catch Exception _ nil))]
-              (if report
-                (let [passes (count (filter #(= "pass" (:result %)) report))
-                      fails  (count (filter #(= "fail" (:result %)) report))
-                      errors (count (filter #(= "error" (:result %)) report))
-                      ;; ANSI color helpers
-                      green  "\033[32m"
-                      red    "\033[31m"
-                      yellow "\033[33m"
-                      reset  "\033[0m"
-                      color  (fn [r] (case r "pass" green "fail" red "error" yellow reset))
-                      badge  (fn [r] (case r "pass" "PASS" "fail" "FAIL" "error" "ERR " "SKIP"))]
-                  ;; Per-test table
-                  (println "\n╔══════════════════════════════════════════════════════════════╗")
-                  (println "║                     Inferno Test Results                     ║")
-                  (println "╠══════════════════════════════════════════════════════════════╣")
-                  (doseq [t report]
-                    (let [r  (:result t "skip")
-                          id (or (:test_id t) (:test_group_id t) "unknown")
-                          msg (or (:result_message t) "")]
-                      (println (format "%s[%s]%s %-45s %s"
-                                       (color r) (badge r) reset
-                                       (if (> (count id) 45) (str (subs id 0 42) "...") id)
-                                       (if (> (count msg) 60) (str (subs msg 0 57) "...") msg)))))
-                  (println "╠══════════════════════════════════════════════════════════════╣")
-                  (println (format "║ %s%d passed%s  %s%d failed%s  %s%d errors%s"
-                                   green passes reset
-                                   red   fails  reset
-                                   yellow errors reset))
-                  (println "╚══════════════════════════════════════════════════════════════╝\n"))
-                (do
-                  (println "WARN: Could not parse JSON report. Raw output:")
-                  (println (:out result))))))))
-      (catch Exception e
-        (println "Error running inferno tests:" (.getMessage e))
-        (when-let [edata (ex-data e)]
-          (println "Stdout:" (:out edata))
-          (println "Stderr:" (:err edata)))
-        (System/exit 1)))))
+(defn run-inferno-tests
+  "Runs `inferno execute` in the kit container and writes the report. Returns
+   the parsed result list, or nil when Inferno printed no JSON report (it
+   refused the run, e.g. for a missing input)."
+  ([token backend-auth] (run-inferno-tests (cfg) token backend-auth))
+  ([{:keys [suite kit-dir] :as config} token backend-auth]
+   (println "Running Inferno tests for suite" suite "in" kit-dir "...")
+   (.mkdirs (io/file "target"))
+   (let [cmd    (execute-command config token backend-auth)
+         extra  (remove nil? [token (:client-secret config)])
+         redact #(redact-output cmd extra %)]
+     (println "Executing:" (str/join " " (redact-command cmd)))
+     (try
+       (let [proc   (process cmd {:dir kit-dir :out :string :err :string})
+             ;; 10-minute hard timeout
+             result (deref (future @proc) 600000 ::timeout)]
+         (if (= ::timeout result)
+           (do
+             (println "ERROR: Inferno test suite timed out after 10 minutes.")
+             (println "Check worker logs: docker compose -f" (str kit-dir "/docker-compose.yml") "logs worker")
+             (p/destroy-tree proc)
+             (System/exit 1))
+           (do
+             (when (seq (:err result))
+               (println "Inferno stderr:" (redact (:err result))))
+             (let [report      (some-> (parse-report (:out result)) redact-report)
+                   report-file (str "target/inferno-report-" suite ".json")
+                   body        (redact (if report
+                                         (json/generate-string report {:pretty true})
+                                         (:out result)))]
+               (spit "target/inferno-report.json" body)
+               (spit report-file body)
+               (println "Inferno run completed. Report written to" report-file
+                        "(and target/inferno-report.json)")
+               (if report
+                 (do (print-report report) report)
+                 (do
+                   (println "WARN: Inferno printed no JSON report. Raw output:")
+                   (println body)
+                   nil))))))
+       (catch Exception e
+         (println "Error running inferno tests:" (.getMessage e))
+         (when-let [edata (ex-data e)]
+           (println "Stdout:" (redact (:out edata)))
+           (println "Stderr:" (redact (:err edata))))
+         (System/exit 1))))))
 
-;; ── Entry point ───────────────────────────────────────────────────────────────
+;; ── Entry points ──────────────────────────────────────────────────────────────
 
-(defn kill-stale-inferno-processes! []
-  (println "Killing any stale 'inferno execute' processes in the container...")
-  (try
-    (shell {:dir inferno-dir :out :string :err :string}
-           "sh" "-c" "docker compose exec -T inferno pkill -f 'inferno execute' 2>/dev/null || true")
-    (catch Exception _
-      ;; Container may not be running yet — that's fine
-      nil)))
+(defn kill-stale-inferno-processes!
+  "Stops `inferno execute` runs left inside the kit's own inferno container by
+   an interrupted run. Scoped to the container; nothing on the host is
+   touched."
+  ([] (kill-stale-inferno-processes! (cfg)))
+  ([{:keys [kit-dir]}]
+   (println "Killing any stale 'inferno execute' processes in the container...")
+   (try
+     (shell {:dir kit-dir :out :string :err :string}
+            "sh" "-c" "docker compose exec -T inferno pkill -f 'inferno execute' 2>/dev/null || true")
+     (catch Exception _
+       ;; Container may not be running yet; that is fine.
+       nil))))
 
-(defn check! []
-  "Smoke-test: verify Inferno containers are healthy and the FHIR server responds
-  to GET /default/fhir/metadata. Does NOT run the full test suite."
-  (println "=== Inferno Environment Check ===")
+(defn check!
+  "Smoke-test: verify the kit's containers are up and the FHIR server answers
+   GET <INFERNO_FHIR_URL>/metadata. Does NOT run the suite."
+  ([] (check! (cfg)))
+  ([{:keys [kit-dir fhir-url target] :as config}]
+   (println "=== Inferno Environment Check ===")
 
-  ;; 1. Check that the Inferno containers are up
-  (println "\n[1/3] Checking Inferno containers...")
-  (let [result (try
-                 (shell {:dir inferno-dir :out :string :err :string}
-                        "docker" "compose" "ps" "--services" "--filter" "status=running")
-                 (catch Exception e {:exit 1 :out "" :err (.getMessage e)}))]
-    (if (zero? (:exit result 0))
-      (println "  ✓ Containers responding to docker compose ps")
-      (do (println "  ✗ Could not query container status:" (:err result))
-          (System/exit 1))))
+   (println "\n[1/3] Checking Inferno containers in" kit-dir "...")
+   (let [result (try
+                  (shell {:dir kit-dir :out :string :err :string}
+                         "docker" "compose" "ps" "--services" "--filter" "status=running")
+                  (catch Exception e {:exit 1 :out "" :err (.getMessage e)}))]
+     (if (zero? (:exit result 0))
+       (println "  ok: containers responding to docker compose ps")
+       (do (println "  FAIL: could not query container status:" (:err result))
+           (System/exit 1))))
 
-  ;; 2. Check FHIR server metadata endpoint
-  (println "\n[2/3] Checking FHIR server metadata endpoint...")
-  (let [resp (try
-               (curl/get "https://fhir.local:3001/default/fhir/metadata"
-                         {:timeout 5000 :throw false :insecure? true})
-               (catch Exception _ nil))]
-    (if (and resp (= 200 (:status resp)))
-      (println "  ✓ FHIR server responded with 200 at https://fhir.local:3001/default/fhir/metadata")
-      (do (println "  ✗ FHIR server did not respond (status:" (some-> resp :status) ")")
-          (println "    Start the server with: clojure -X:test test-server.core/-main :port 3000 :ssl-port 3001")
-          (System/exit 1))))
+   (println "\n[2/3] Checking FHIR server metadata endpoint...")
+   (let [status (metadata-status fhir-url)]
+     (if (= 200 status)
+       (println "  ok: 200 from" (str fhir-url "/metadata"))
+       (do (println "  FAIL: no 200 from" (str fhir-url "/metadata") "(status:" status ")")
+           (when (= :dromon target)
+             (println "    Start the server with: clojure -X:test test-server.core/-main :port 3000 :ssl-port 3001"))
+           (System/exit 1))))
 
-  ;; 3. Check HL7 validator via nginx
-  (println "\n[3/3] Checking HL7 validator service...")
-  (let [resp (try
-               (curl/get "http://localhost:8080/hl7validatorapi/"
-                         {:timeout 5000 :throw false})
-               (catch Exception _ nil))]
-    (if (and resp (= 200 (:status resp)))
-      (println "  ✓ HL7 validator responded with 200")
-      (println "  ⚠ HL7 validator not reachable (may still be warming up)")))
+   (println "\n[3/3] Checking HL7 validator service...")
+   (if (validator-ready? config)
+     (println "  ok: HL7 validator responded with 200")
+     (println "  warn: HL7 validator not reachable (may still be warming up)"))
 
-  (println "\n=== Check complete. Environment looks good! ==="))
+   (println "\n=== Check complete. Environment looks good! ===")))
 
 (def ^:private server-java-home
   "JDK the spawned FHIR server actually runs on. Pinned here (overridable via
@@ -555,27 +983,30 @@
                  (catch Exception _ ""))]
     (or (some-> (re-find #"version \"(\d+)" out) second parse-long) 21)))
 
-(defn run-check! []
-  (println "Starting test run...")
+(def ^:private test-server-ports [3000 3001])
 
-  ;; 0. Kill any stale inferno execute processes from previous runs
-  (kill-stale-inferno-processes!)
+(defn- listening-pids
+  "Descriptions of the listeners on `port` (ss output lines), or nil."
+  [port]
+  (let [out (:out (shell {:out :string :err :string :continue true}
+                         "ss" "-ltnpH" (str "sport = :" port)))]
+    (not-empty (str/trim out))))
 
-  ;; 1. Ensure Inferno Docker stack is up
-  (ensure-inferno-containers!)
+(defn- ensure-test-server-ports-free!
+  "Refuses to start when the test-server ports are taken. Whatever holds them
+   may belong to another session, so it is reported, never killed."
+  []
+  (doseq [port test-server-ports]
+    (when-let [holder (listening-pids port)]
+      (println "ERROR: port" port "is already in use; stop that process first:")
+      (println " " holder)
+      (System/exit 1))))
 
-  ;; 2. Wait for HL7 validator (cold start can take 30-90s)
-  (wait-for-validator 120)
-
-  ;; 3. Start the FHIR server
-  (println "Killing existing java processes (port 3000)...")
-  (try (shell {:out :string :err :string} "sh" "-c" "fuser -k 3000/tcp 2>/dev/null || true")
-       (catch Exception _))
-  (println "Waiting for port 3000 to clear...")
-  (Thread/sleep 2000)
-
+(defn- start-test-server!
+  "Starts the dromon test-server and returns its process handle."
+  [config]
+  (ensure-test-server-ports-free!)
   (io/delete-file "server.log" true)
-
   (println "Starting FHIR server...")
   (let [profile?  (= "1" (System/getenv "DROMON_PERF_PROFILE"))
         otel?     (= "1" (System/getenv "DROMON_OTEL"))
@@ -626,51 +1057,89 @@
       (println "DROMON_OTEL=1 -- launching with OTel SDK, OTLP exporter to http://localhost:4318"))
     (process cmd
              {:dir "test-server"
-            :out (io/file "server.log")
-            :err :out
-            :extra-env (merge {"JAVA_HOME" server-java-home
-                               "PATH" (str server-java-home "/bin:" (System/getenv "PATH"))}
-                              ;; In backend-services mode the SMART discovery doc
-                              ;; must advertise a TLS token endpoint reachable
-                              ;; from the Inferno container and matching Hydra's
-                              ;; issuer (the nginx TLS terminator).
-                              (when (backend-mode?)
-                                {"OAUTH_BASE_URL" oauth-base-url})
-                              otel-env)}))
+              :out (io/file "server.log")
+              :err :out
+              :extra-env (merge {"JAVA_HOME" server-java-home
+                                 "PATH" (str server-java-home "/bin:" (System/getenv "PATH"))}
+                                ;; In backend-services mode the SMART discovery doc
+                                ;; must advertise a TLS token endpoint reachable
+                                ;; from the Inferno container and matching Hydra's
+                                ;; issuer (the nginx TLS terminator).
+                                (when (:backend? config)
+                                  {"OAUTH_BASE_URL" (:oauth-base-url config)})
+                                otel-env)})))
 
-  (wait-for-server 30)
+(defn- runner-token!
+  "The bearer token the run uses: INFERNO_ACCESS_TOKEN, else a
+   client_credentials token for INFERNO_CLIENT_ID/SECRET, else for a client
+   registered through the Hydra admin API (and granted Keto tuples when a
+   Keto write url is configured)."
+  [{:keys [access-token client-id client-secret] :as config}]
+  (or access-token
+      (let [[cid secret registered?]
+            (if client-id
+              [client-id client-secret false]
+              (let [{:keys [client_id client_secret]} (create-client config)]
+                [client_id client_secret true]))]
+        (println "Client ID:" cid)
+        (when registered? (grant-keto-permissions config cid))
+        (get-token config cid secret))))
 
-  ;; 4. Setup test data and run tests
+(defn run-suite!
+  "Runs the configured suite. Exits the process: 0 when Inferno produced a
+   report (whatever the test results; read it), 1 on a setup failure or when
+   Inferno refused the run."
+  [config]
+  (let [{:keys [target backend? kit suite]} config
+        dromon? (= target :dromon)]
+    (println "Starting test run:" (name kit) "kit, suite" suite "against" (name target)
+             "target" (:fhir-url config))
 
-  ;; Backend-services auth needs Hydra's issuer to match the container-reachable
-  ;; TLS token endpoint, plus the nginx TLS terminator that serves it; align both
-  ;; before issuing any tokens.
-  (when (backend-mode?)
-    (ensure-hydra-issuer!)
-    (env/ensure-hydra-tls-terminator!))
+    ;; 0. Stop interrupted `inferno execute` runs in the kit container.
+    (kill-stale-inferno-processes! config)
 
-  (let [{client-id :client_id
-         client-secret :client_secret} (create-client)
-        token (get-token client-id client-secret)]
+    ;; 1. Ensure the kit's Docker stack is up, and its validator warm.
+    (ensure-inferno-containers! config)
+    (wait-for-validator config 120)
 
-    (println "Client ID:" client-id)
-    (grant-keto-permissions client-id)
-    (insert-patient token)
-    (insert-test-data token)
-    ;; In backend-services mode, register the private_key_jwt client, grant it
-    ;; the Keto system tuple, and build the smart_auth_info Inferno signs with.
-    (let [backend-auth (when (backend-mode?)
-                         (let [jwks     (generate-backend-jwks)
-                               jwks-str (json/generate-string jwks)
-                               kid      (backend-signing-kid jwks)
-                               bcid     (create-backend-client (backend-public-jwk jwks))]
-                           (println "Backend-services client ID:" bcid)
-                           (grant-keto-permissions bcid)
-                           (backend-smart-auth-info bcid jwks-str kid)))]
-      (run-inferno-tests token backend-auth))
-    (try (shell {:out :string :err :string} "sh" "-c" "pkill -f 'test-server.core/-main' || true")
-         (catch Exception _))
-    (System/exit 0)))
+    ;; 2. The server under test: booted here for dromon, already running for
+    ;;    an external target.
+    (let [server (when dromon? (start-test-server! config))]
+      ;; A shutdown hook rather than `finally`: the failure paths below end in
+      ;; System/exit, which skips `finally` but runs hooks.
+      (when server
+        (.addShutdownHook (Runtime/getRuntime)
+                          (Thread. (fn []
+                                     (println "Stopping the FHIR server this run started...")
+                                     (p/destroy-tree server)))))
+      (wait-for-server config (if dromon? 30 10))
+
+      ;; Backend-services auth against the local dromon stack needs Hydra's
+      ;; issuer to match the container-reachable TLS token endpoint, plus the
+      ;; nginx TLS terminator that serves it. Never for an external target:
+      ;; its issuer belongs to its own deployment.
+      (when (and dromon? backend?)
+        (ensure-hydra-issuer!)
+        (env/ensure-hydra-tls-terminator!))
+
+      (let [token (when (needs-runner-token? config) (runner-token! config))]
+        (when dromon?
+          (insert-patient config token)
+          (insert-test-data config token))
+        (let [backend-auth (when backend? (backend-auth! config))]
+          (System/exit (if (run-inferno-tests config token backend-auth) 0 1)))))))
+
+(defn run-check!
+  "Entry point of `bb inferno-test`: [[run-suite!]] with the configuration from the
+   process environment."
+  []
+  (run-suite! (cfg)))
+
+(defn run-with-defaults!
+  "[[run-suite!]] with `defaults` (an env map) under the process environment, which
+   wins. `bb inferno-g10` uses it to default to the g10 kit, external target."
+  [defaults]
+  (run-suite! (runner-config (merge defaults (System/getenv)))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (run-check!))
