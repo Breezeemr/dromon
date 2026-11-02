@@ -33,6 +33,7 @@
    resource type."
   (:require [clojure.string :as str]
             [fhir-store.protocol :as db]
+            [server.keto :as keto]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace])
   (:import [java.net URLDecoder]
@@ -754,8 +755,15 @@
    enforced by the store [[wrap-scope-filtering-store]] installs.
 
    A route may pin the scored interaction with `:smart/interaction` (see
-   `route-interaction`). An unrecognised override is refused with 403."
-  [handler _opts]
+   `route-interaction`). An unrecognised override is refused with 403.
+
+   A request that carries no subject at all is answered as
+   `::keto-authorization` answers it (`server.keto/unauthenticated-response`,
+   401 with `:login-url`), not as a scope refusal: nothing was denied, nobody
+   presented a token. Router invariant 9 makes that rejection Keto's, and this
+   middleware sits outside Keto, so a 403 here pre-empted the 401 a SMART
+   client (and the ONC (g)(10) test kit's unauthorized-access test) must see."
+  [handler {:keys [login-url]}]
   (fn [request]
     (let [route-data (get-in request [:reitit.core/match :data])
           public?    (:public? route-data)]
@@ -776,6 +784,10 @@
 
             (nil? fhir-type)
             (handler request)
+
+            (and (nil? (get-in request [:identity :sub]))
+                 (nil? (:fhir/delegation request)))
+            (keto/unauthenticated-response login-url)
 
             (empty? scopes)
             (forbidden "No SMART scopes present in token; insufficient scope.")
