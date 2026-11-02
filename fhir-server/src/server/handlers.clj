@@ -1709,14 +1709,19 @@
    trailing slash included. The endpoint URLs are joined to it with
    [[oauth-endpoint]].
 
+   `authorization_endpoint` is the request's
+   `:fhir/smart-authorization-endpoint` when the host configured one, else the
+   issuer's `/oauth2/auth`: Hydra cannot complete an authorize request sent
+   by POST, which SMART 2.x allows, so a host bridges it in front of Hydra.
+
    `token_endpoint` is the request's `:fhir/smart-token-endpoint` when the
    host configured one (`server.router/resolve-options`), else the issuer's
    `/oauth2/token`. A host sets it when a pass-through in front of the
    authorization server answers token requests, because SMART puts the launch
    context (`patient`, `encounter`, `need_patient_banner`, `smart_style_url`)
    at the top level of the token response, which Hydra cannot do. A host that
-   serves the pass-through at the issuer's own token URL needs no override,
-   and should not set one: a `private_key_jwt` assertion's audience is the
+   serves the pass-through (or the bridge) at the issuer's own URL needs no
+   override, and should not set one: a `private_key_jwt` assertion's audience is the
    advertised token endpoint, and Hydra accepts only its own.
 
    The EHR launch capabilities (`launch-ehr`, `context-ehr-patient`,
@@ -1732,7 +1737,9 @@
                     (System/getenv "OAUTH_BASE_URL")
                     "http://localhost:4444")
            token-endpoint (or (not-empty (:fhir/smart-token-endpoint req))
-                              (oauth-endpoint base "/oauth2/token"))]
+                              (oauth-endpoint base "/oauth2/token"))
+           authorization-endpoint (or (not-empty (:fhir/smart-authorization-endpoint req))
+                                      (oauth-endpoint base "/oauth2/auth"))]
        ;; Return a plain map body (no explicit Content-Type) so the muuntaja
        ;; response middleware serializes it, exactly like the /metadata
        ;; handler. Setting Content-Type here suppresses that encoding and Ring
@@ -1740,7 +1747,7 @@
        {:status 200
         :body {:issuer                 base
                :jwks_uri               (oauth-endpoint base "/.well-known/jwks.json")
-               :authorization_endpoint (oauth-endpoint base "/oauth2/auth")
+               :authorization_endpoint authorization-endpoint
                :token_endpoint         token-endpoint
                :token_endpoint_auth_methods_supported ["client_secret_basic" "private_key_jwt"]
                ;; SMART Backend Services (SMART App Launch v2.2.0) requires the

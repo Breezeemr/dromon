@@ -150,6 +150,22 @@
       ((router/wrap-oauth-base-url h "https://oauth.example/") {})
       (is (not (contains? @seen :fhir/smart-token-endpoint))))))
 
+(deftest smart-configuration-authorization-endpoint-override
+  (let [body (:body ((handlers/smart-configuration)
+                     {:fhir/oauth-base-url               "https://oauth.example/"
+                      :fhir/smart-authorization-endpoint "https://auth.example/oauth2/auth"}))]
+    (is (= "https://auth.example/oauth2/auth" (:authorization_endpoint body)))
+    (is (= "https://oauth.example/oauth2/token" (:token_endpoint body))))
+  (is (= "https://auth.example/oauth2/auth"
+         (:smart-authorization-endpoint
+          (router/resolve-options {:smart-authorization-endpoint "https://auth.example/oauth2/auth"}))))
+  (let [seen (atom nil)]
+    ((router/wrap-oauth-base-url (fn [req] (reset! seen req) {:status 200})
+                                 "https://oauth.example/" nil "https://auth.example/a")
+     {})
+    (is (= "https://auth.example/a" (:fhir/smart-authorization-endpoint @seen)))
+    (is (not (contains? @seen :fhir/smart-token-endpoint)))))
+
 ;; ---------------------------------------------------------------------------
 ;; CapabilityStatement SMART-on-FHIR security
 ;; ---------------------------------------------------------------------------
