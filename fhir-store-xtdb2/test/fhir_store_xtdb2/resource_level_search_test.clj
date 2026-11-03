@@ -229,3 +229,27 @@
                      (set (map :id (db/search store tenant :Patient
                                               {"_lastUpdated" (str "ge" t2)} nil)))))))
           (finally (close-store-nodes! store)))))))
+
+;; ---------------------------------------------------------------------------
+;; A modified registry entry (server.search-registry/with-modifier)
+;; ---------------------------------------------------------------------------
+
+(deftest a-modified-entry-is-refused-not-read-as-its-plain-parameter
+  (doseq [query-mode [:sql :xtql]]
+    (testing (str query-mode)
+      (let [store (core-db/create-xtdb-store {:resource/schemas [patient-schema]
+                                              :query-mode query-mode})
+            tenant "modified-entry"
+            registry (assoc registry-without-meta-params
+                            "active:not" (assoc (get registry-without-meta-params "active")
+                                                :modifier :not))
+            status (fn [f]
+                     (try (f) nil
+                          (catch clojure.lang.ExceptionInfo e
+                            (some #(:fhir/status (ex-data %)) (take-while some? (iterate ex-cause e))))))]
+        (try
+          (db/create-tenant store tenant)
+          (db/create-resource store tenant :Patient "p1" {:resourceType "Patient" :active true})
+          (is (= 400 (status #(db/search store tenant :Patient {"active:not" "true"} registry))))
+          (is (= 400 (status #(db/count-resources store tenant :Patient {"active:not" "true"} registry))))
+          (finally (close-store-nodes! store)))))))

@@ -1463,6 +1463,24 @@
       :else
       [(format "\"%s\" = ?" pname) [v-str]])))
 
+(defn refuse-modified-param!
+  "Throws a 400 for a registry entry carrying `:modifier` (see
+   `server.search-registry`): this store builds no modified condition, and
+   reading the entry as its plain parameter would answer the opposite question
+   for `:not`."
+  [param-name search-param]
+  (when-some [modifier (:modifier search-param)]
+    (throw (ex-info (str "Search parameter " (name param-name) " is not supported here")
+                    {:fhir/status 400 :fhir/code "not-supported"
+                     :param (name param-name) :modifier modifier}))))
+
+(defn- refuse-modified-params!
+  "[[refuse-modified-param!]] for every parameter of a search, BEFORE the query
+   runs: a failed query is answered empty, which would hide the refusal."
+  [params search-registry]
+  (doseq [k (keys params)]
+    (refuse-modified-param! k (get search-registry (name k)))))
+
 (defn- build-condition
   "Builds a parameterized SQL WHERE condition for a search parameter.
    Resource-level parameters (see resource-level-param?) are answered from
@@ -1475,6 +1493,7 @@
    `table-ref` is [sql params] naming the searched table with its temporal
    qualifier, for conditions that query the table again."
   [param-name param-value search-param table-ref]
+  (refuse-modified-param! param-name search-param)
   (let [pname (name param-name)
         param-str (if (keyword? param-value) (name param-value) (str param-value))]
     (if (resource-level-param? pname)
@@ -3132,6 +3151,7 @@
 
   (search [this tenant-id resource-type params search-registry]
     (refuse-unencodable-input! {:resource-type resource-type :params params})
+    (refuse-modified-params! params search-registry)
     (ftrace/trace!
      {:id :store/search
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -3157,6 +3177,7 @@
 
   (count-resources [this tenant-id resource-type params search-registry]
     (refuse-unencodable-input! {:resource-type resource-type :params params})
+    (refuse-modified-params! params search-registry)
     (ftrace/trace!
      {:id :store/count
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -3586,6 +3607,7 @@
   (search-as-of [this tenant-id resource-type params search-registry basis]
     (reject-xtql-temporal! query-mode)
     (refuse-unencodable-input! {:resource-type resource-type :params params})
+    (refuse-modified-params! params search-registry)
     (ftrace/trace!
      {:id :store/search-as-of
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}
@@ -3597,6 +3619,7 @@
   (count-as-of-basis [this tenant-id resource-type params search-registry basis]
     (reject-xtql-temporal! query-mode)
     (refuse-unencodable-input! {:resource-type resource-type :params params})
+    (refuse-modified-params! params search-registry)
     (ftrace/trace!
      {:id :store/count-as-of-basis
       :data {:tenant-id (str tenant-id) :resource-type (name resource-type)}}

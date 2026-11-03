@@ -612,6 +612,38 @@
           (when (seq columns)
             {:type sp-type :target target :columns columns}))))))
 
+;; ---------------------------------------------------------------------------
+;; Modified parameters
+;;
+;; A registry is matched by EXACT name (`unsupported-filter-params`), so a
+;; modified parameter is served only where a host declares it under its
+;; modified name. The entry is the plain parameter's entry plus `:modifier`,
+;; which tells the store how to read it. The one modifier a store may be asked
+;; for is the token `:not`: the resources the plain search would not match,
+;; a resource with no value for the element included.
+;;
+;;   fhir-store-mock    honours it
+;;   fhir-store-xtdb2   refuses an entry carrying `:modifier` (400)
+;;
+;; A store that does not know an entry's `:modifier` must refuse it: read as
+;; the plain parameter it would answer the opposite question.
+;; ---------------------------------------------------------------------------
+
+(def supported-modifiers
+  "Modifiers a registry entry may carry, by the parameter type they apply to."
+  {"token" #{:not}})
+
+(defn with-modifier
+  "`registry` with `pname:modifier` declared: `pname`'s entry plus `:modifier`.
+   Throws when `pname` is not in the registry or its type does not take
+   `modifier` (see [[supported-modifiers]])."
+  [registry pname modifier]
+  (let [entry (get registry pname)]
+    (when-not (contains? (get supported-modifiers (:type entry)) modifier)
+      (throw (ex-info (str "Search parameter " pname " cannot take :" (name modifier))
+                      {:param pname :modifier modifier :type (:type entry)})))
+    (assoc registry (str pname ":" (name modifier)) (assoc entry :modifier modifier))))
+
 (defn build-resource-registry
   "Builds a search registry for a single resource type.
 

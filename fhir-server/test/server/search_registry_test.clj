@@ -418,3 +418,15 @@
     (testing "and the parameter is reported rather than answered empty"
       (is (= ["component-code-value-quantity"]
              (sr/unsupported-filter-params registry {"component-code-value-quantity" "8480-6$gt100"}))))))
+
+(deftest a-token-takes-the-not-modifier-under-its-modified-name
+  (let [registry' (sr/with-modifier registry "status" :not)]
+    (is (= (assoc (get registry "status") :modifier :not) (get registry' "status:not")))
+    (is (empty? (sr/unsupported-filter-params registry' {"status:not" "final"}))
+        "the modified name is served once declared")
+    (is (= ["status:not"] (sr/unsupported-filter-params registry {"status:not" "final"}))
+        "and refused where it is not"))
+  (testing "only a token parameter, and only :not"
+    (is (thrown? clojure.lang.ExceptionInfo (sr/with-modifier registry "patient" :not)))
+    (is (thrown? clojure.lang.ExceptionInfo (sr/with-modifier registry "status" :missing)))
+    (is (thrown? clojure.lang.ExceptionInfo (sr/with-modifier registry "absent" :not)))))
