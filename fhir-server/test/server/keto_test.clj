@@ -61,7 +61,9 @@
           (is (= 403 (:status response)))
           (is (= "OperationOutcome" (:resourceType (:body response))))
           (is (= "Subject user123 is not allowed to read Patient"
-                 (-> response :body :issue first :diagnostics))))))
+                 (-> response :body :issue first :diagnostics)))
+          (is (= "You don't have read access to Patient."
+                 (-> response :body :issue first :details :text))))))
 
     (testing "handles exception during keto check safely"
       (with-redefs [hc/get (fn [_ _] (throw (Exception. "Keto down!")))]
@@ -122,7 +124,9 @@
               response (wrapped-handler request)]
           (is (= 403 (:status response)))
           (is (= "Subject user123 is not allowed to read Patient/123"
-                 (-> response :body :issue first :diagnostics))))))))
+                 (-> response :body :issue first :diagnostics)))
+          (is (= "You don't have read access to Patient/123."
+                 (-> response :body :issue first :details :text))))))))
 
 (deftest unauthenticated-401-carries-login-url
   (testing "a deployment that configured a login URL advertises it on the 401,
@@ -256,7 +260,9 @@
                                :path-params {:tenant-id "r1" :id "123"}
                                :fhir/resource-type "Patient"})]
         (is (= "Subject user123 is not allowed to read r1/Patient/123"
-               (-> response :body :issue first :diagnostics)))))))
+               (-> response :body :issue first :diagnostics)))
+        (is (= "You don't have read access to Patient/123 in realm r1."
+               (-> response :body :issue first :details :text)))))))
 
 (deftest system-read-is-checked-per-realm
   (testing "the :public? bulk-data gate scopes to the realm in the path: a
@@ -349,3 +355,72 @@
     (with-redefs [hc/get (fn [_ _] (throw (AssertionError. "asked")))]
       (is (false? (keto/allowed? "http://mock-keto" "ns" "r1/role" "has" " ")))
       (is (false? (keto/allowed? "http://mock-keto" "ns" nil "has" "user:/p"))))))
+
+(defn- denial
+  "The 403 body of `request`, with Keto allowing only what `allow?` answers
+   true for, as [object relation]."
+  [request allow?]
+  (with-redefs [hc/get (recording-keto (atom []) allow?)]
+    (let [wrapped (keto/wrap-keto-authorization (fn [_] {:status 200}) {:keto-url "http://mock-keto"})
+          response (wrapped request)]
+      (is (= 403 (:status response)))
+      (-> response :body :issue first))))
+
+(deftest denial-text-names-the-operation
+  (is (= {:text "Measure/$evaluate-measure needs write access to Measure in realm r1."}
+         (:details (denial {:identity {:sub "user123"}
+                            :request-method :post
+                            :uri "/r1/fhir/Measure/$evaluate-measure"
+                            :path-params {:tenant-id "r1"}
+                            :fhir/resource-type "Measure"}
+                           (fn [_ _] false))))))
+
+(deftest denial-text-names-a-delegated-client
+  (is (= {:text "The app svc is not allowed to write ClaimResponse in realm r1 on your behalf."}
+         (:details (denial {:identity {:sub "person-1" :client_id "svc"}
+                            :fhir/delegation {:subject "person-1" :client "svc"}
+                            :request-method :post
+                            :path-params {:tenant-id "r1"}
+                            :fhir/resource-type "ClaimResponse"}
+                           (fn [_ _] false))))))
+
+(deftest denial-text-says-when-the-caller-may-only-read
+  (let [read-only (fn [_ relation] (= "read" relation))]
+    (testing "a refused write by a reader"
+      (is (= {:text "You don't have write access to Measure/m1 in realm r1. You have read access only."}
+             (:details (denial {:identity {:sub "user123"}
+                                :request-method :put
+                                :path-params {:tenant-id "r1" :id "m1"}
+                                :fhir/resource-type "Measure"}
+                               (fn [object relation] (and (= "r1/Measure" object)
+                                                          (read-only object relation))))))))
+    (testing "a refused delete by a delegated reader"
+      (is (= {:text "The app svc is not allowed to delete Task in realm r1 on your behalf. It has read access only."}
+             (:details (denial {:identity {:sub "person-1"}
+                                :fhir/delegation {:subject "person-1" :client "svc"}
+                                :request-method :delete
+                                :path-params {:tenant-id "r1"}
+                                :fhir/resource-type "Task"}
+                               read-only)))))
+    (testing "the diagnostics keep their operator wording"
+      (is (= "Subject user123 is not allowed to write r1/Measure"
+             (:diagnostics (denial {:identity {:sub "user123"}
+                                    :request-method :post
+                                    :path-params {:tenant-id "r1"}
+                                    :fhir/resource-type "Measure"}
+                                   read-only)))))))
+
+(deftest a-refused-read-asks-keto-nothing-more
+  (let [calls (atom [])]
+    (with-redefs [hc/get (recording-keto calls (fn [_ _] false))]
+      ((keto/wrap-keto-authorization (fn [_] {:status 200}) {:keto-url "http://mock-keto"
+                                                             :legacy-realm-blind-fallback? false})
+       {:identity {:sub "user123"}
+        :request-method :get
+        :path-params {:tenant-id "r1"}
+        :fhir/resource-type "Measure"})
+      (is (= [["r1/Measure" "read"]] (mapv (juxt :object :relation) @calls))))))
+
+(deftest denial-text-without-a-type-or-realm
+  (is (= "You don't have read access to system-level resources."
+         (keto/denial-text {:relation "read"}))))

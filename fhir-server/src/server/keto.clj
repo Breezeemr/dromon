@@ -177,6 +177,34 @@
                            :diagnostics "Missing subject in identity; cannot authorize."}]}
            (not (str/blank? login-url)) (assoc :login-url login-url))})
 
+(defn denial-text
+  "The person-facing sentence of a Keto 403, for `issue.details.text`.
+
+   `diagnostics` keeps naming the subject and the Keto object for operators;
+   this one names what the caller tried in FHIR terms: the type or instance,
+   the realm, the operation when the request was one, and the app when it acts
+   on someone's behalf. `read-only?` is whether the caller would have been
+   allowed to read what it was refused writing or deleting."
+  [{:keys [relation realm fhir-type resource-id operation client read-only?]}]
+  (let [target (cond
+                 (and fhir-type resource-id) (str fhir-type "/" resource-id)
+                 fhir-type fhir-type
+                 :else "system-level resources")
+        where (when-not (str/blank? (str realm)) (str " in realm " realm))
+        refusal (cond
+                  operation
+                  (str (when fhir-type (str fhir-type "/")) operation
+                       " needs " relation " access to " target where ".")
+
+                  client
+                  (str "The app " client " is not allowed to " relation " "
+                       target where " on your behalf.")
+
+                  :else
+                  (str "You don't have " relation " access to " target where "."))]
+    (cond-> refusal
+      read-only? (str (if client " It has" " You have") " read access only."))))
+
 (defn wrap-keto-authorization
   "Middleware that checks Ory Keto to see if the identity is authorized to perform the action.
    Requires `identity` to be populated by buddy-auth (or injected upstream by a
@@ -263,8 +291,20 @@
                             (authorized? keto-url "fhir" objects relation subject-id))]
               (if allowed?
                 (handler request)
-                {:status 403
-                 :body {:resourceType "OperationOutcome"
-                        :issue [{:severity "error"
-                                 :code "forbidden"
-                                 :diagnostics (format "Subject %s is not allowed to %s %s" subject-id relation object)}]}}))))))))
+                (let [operation (let [segment (peek parts)]
+                                  (when (str/starts-with? (str segment) "$") segment))
+                      ;; One more Keto call, on the refusal path only.
+                      read-only? (and (#{"write" "delete"} relation)
+                                      (authorized? keto-url "fhir" objects "read" subject-id))]
+                  {:status 403
+                   :body {:resourceType "OperationOutcome"
+                          :issue [{:severity "error"
+                                   :code "forbidden"
+                                   :details {:text (denial-text {:relation relation
+                                                                 :realm realm
+                                                                 :fhir-type fhir-type
+                                                                 :resource-id resource-id
+                                                                 :operation operation
+                                                                 :client (:client delegation)
+                                                                 :read-only? read-only?})}
+                                   :diagnostics (format "Subject %s is not allowed to %s %s" subject-id relation object)}]}})))))))))
