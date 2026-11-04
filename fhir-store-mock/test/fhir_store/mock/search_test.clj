@@ -265,3 +265,20 @@
     (is (= ["a"] (ids store :MedicationRequest {"_tag" "http://localhost/tags|erx"})))
     (is (= ["a"] (ids store :MedicationRequest {"_profile" erx})))
     (is (= ["a" "b"] (ids store :MedicationRequest {"_lastUpdated" "gt2000-01-01"})))))
+
+(deftest token-not-leaves-out-what-the-token-would-match
+  (let [category {:type "token" :target nil
+                  :columns [{:col "category" :fhir-type "CodeableConcept" :array? true}]}
+        registry {"category" category "category:not" (assoc category :modifier :not)}
+        coded (fn [system code] [{:coding [{:system system :code code}]}])
+        store (seeded {:resourceType "Observation" :id "item"
+                       :category (into (coded "http://example.org/category" "exam")
+                                       (coded "http://example.org/kind" "item"))}
+                      {:resourceType "Observation" :id "vital"
+                       :category (coded "http://example.org/category" "vital-signs")}
+                      {:resourceType "Observation" :id "bare"})
+        found (fn [params] (set (map :id (protocol/search store tenant :Observation params registry))))]
+    (is (= #{"vital" "bare"} (found {"category:not" "http://example.org/kind|item"}))
+        "an Observation with no category matches, as FHIR reads :not")
+    (is (= #{"bare"} (found {"category:not" "http://example.org/kind|item,vital-signs"}))
+        "a comma list is none of its values")))

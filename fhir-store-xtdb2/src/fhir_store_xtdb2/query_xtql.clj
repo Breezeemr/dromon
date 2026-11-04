@@ -167,6 +167,7 @@
   "Returns {:where <xtql-form>} for a single search param, or :fallback/complex
    if the predicate isn't first-class under the XTQL pathway yet."
   [param-name param-value search-param]
+  (core/refuse-modified-param! param-name search-param)
   (let [param-str (cond
                     (keyword? param-value) (name param-value)
                     (boolean? param-value) (str param-value)

@@ -338,8 +338,10 @@
   (let [[base modifier] (str/split (name k) #":" 2)
         param-desc (get search-registry base)]
     (every? (fn [alternatives]
-              (if (= "missing" modifier)
-                (some #(= (= "true" %) (not (present? res param-desc base))) alternatives)
+              (case modifier
+                "missing" (some #(= (= "true" %) (not (present? res param-desc base))) alternatives)
+                ;; The token :not: none of the alternatives, an absent element included.
+                "not"     (not-any? #(alternative-matches? res param-desc base nil %) alternatives)
                 (some #(alternative-matches? res param-desc base modifier %) alternatives)))
             (and-groups v))))
 
