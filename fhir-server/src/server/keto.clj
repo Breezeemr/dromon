@@ -100,6 +100,31 @@
   (boolean (some #(check-permission keto-url namespace % relation subject-id)
                  objects)))
 
+(defn check-subject-prefixes
+  "`prefixes` as a vector of strings, or nil when there are none. Throws on
+   anything else, so a malformed `:keto-subject-prefixes` fails at startup
+   instead of authorizing nothing extra at runtime."
+  [prefixes]
+  (when-not (or (nil? prefixes)
+                (and (sequential? prefixes)
+                     (every? #(and (string? %) (not (str/blank? %))) prefixes)))
+    (throw (ex-info ":keto-subject-prefixes must be a sequence of non-blank strings"
+                    {:keto-subject-prefixes prefixes})))
+  (not-empty (vec prefixes)))
+
+(defn subject-spellings
+  "The subject ids one check asks Keto about, in order: `subject-id` as given,
+   then `subject-id` under each of `prefixes`.
+
+   A host whose other Keto namespaces spell people as `<prefix><id>` can grant
+   `fhir` access to a subject set from one of them, such as
+   `fhir:r1/Measure#read@(roles:r1/admin#member)`. Keto expands that set to the
+   members as their tuples spell them, so the check has to ask with the same
+   spelling. The bare id goes first, so a caller holding a direct tuple costs
+   no extra call."
+  [subject-id prefixes]
+  (into [subject-id] (map #(str % subject-id)) prefixes))
+
 (defn system-read-allowed?
   "Whether `subject-id` holds a system read tuple in the 'fhir' namespace for
    `realm`.
@@ -218,8 +243,12 @@
    `unauthenticated-response`.
 
    `:legacy-realm-blind-fallback?` keeps the pre-realm-scoping objects as a
-   fallback; see `default-legacy-realm-blind-fallback?`."
-  [handler {:keys [keto-url login-url legacy-realm-blind-fallback?]
+   fallback; see `default-legacy-realm-blind-fallback?`.
+
+   `:subject-prefixes` are the other spellings a person's subject is asked
+   about once its bare id is refused; see [[subject-spellings]]. A delegated
+   request is asked about as its client id only."
+  [handler {:keys [keto-url login-url legacy-realm-blind-fallback? subject-prefixes]
             :or {keto-url default-keto-url
                  legacy-realm-blind-fallback? default-legacy-realm-blind-fallback?}}]
   (fn [request]
@@ -233,6 +262,9 @@
               ;; the person: the client's tuples bound what it may do for
               ;; anyone, and the person's own authority is the host's to check.
               subject-id (if delegation (:client delegation) (:sub identity))
+              subject-ids (if delegation
+                            [subject-id]
+                            (subject-spellings subject-id subject-prefixes))
               uri (or (:uri request) "")
               parts (str/split uri #"/")
               ;; URI: /default/fhir/Patient/123 -> ["" "default" "fhir" "Patient" "123"]
@@ -272,7 +304,10 @@
               realm (get-in request [:path-params :tenant-id])
               objects (request-objects realm fhir-type resource-id
                                        legacy-realm-blind-fallback?)
-              object (request-object realm fhir-type resource-id)]
+              object (request-object realm fhir-type resource-id)
+              allowed-as? (fn [relation]
+                            (boolean (some #(authorized? keto-url "fhir" objects relation %)
+                                           subject-ids)))]
 
           (log/info "Keto authz -> subject:" subject-id
                     (if delegation (str "(delegated by " (:subject delegation) ")") "")
@@ -282,20 +317,21 @@
             (let [allowed? (ftrace/trace!
                             {:id :authz/keto.check
                              :data {:subject-id subject-id
+                                    :subject-ids subject-ids
                                     :namespace "fhir"
                                     :relation relation
                                     :object object
                                     :objects objects
                                     :realm realm
                                     :fhir-type fhir-type}}
-                            (authorized? keto-url "fhir" objects relation subject-id))]
+                            (allowed-as? relation))]
               (if allowed?
                 (handler request)
                 (let [operation (let [segment (peek parts)]
                                   (when (str/starts-with? (str segment) "$") segment))
-                      ;; One more Keto call, on the refusal path only.
+                      ;; More Keto calls, on the refusal path only.
                       read-only? (and (#{"write" "delete"} relation)
-                                      (authorized? keto-url "fhir" objects "read" subject-id))]
+                                      (allowed-as? "read"))]
                   {:status 403
                    :body {:resourceType "OperationOutcome"
                           :issue [{:severity "error"

@@ -258,7 +258,7 @@
    `:enforce-smart-scopes?`, `:bulk-job-store`, `:bulk-manifest-extension`,
    `:login-url`, `:lifecycle`,
    `:tx-metadata`, `:temporal-canonicals`, `:legacy-realm-blind-fallback?`,
-   `:jwt-issuer`, `:jwt-audiences`, `:jwt-access-tokens-only?`,
+   `:keto-subject-prefixes`, `:jwt-issuer`, `:jwt-audiences`, `:jwt-access-tokens-only?`,
    `:jwt-delegating-clients`, `:smart-discovery` and `:capability-metadata`;
    unknown keys
    are ignored. `:lifecycle`
@@ -295,6 +295,11 @@
    - :legacy-realm-blind-fallback? -- argument when non-nil, else
                                `KETO_LEGACY_REALM_BLIND_FALLBACK=0` to disable,
                                else `server.keto/default-legacy-realm-blind-fallback?`.
+   - :keto-subject-prefixes -- argument only: `server.keto/check-subject-prefixes`
+                               of it, the other spellings a person is asked
+                               about once the bare id is refused
+                               (`server.keto/subject-spellings`). A malformed
+                               value throws here.
    - :enforce-smart-scopes? -- argument when non-nil, else `ENFORCE_SMART_SCOPES=1`.
    - :jwt-issuer, :jwt-audiences, :jwt-access-tokens-only? -- argument only,
                                no environment fallback; nil leaves the
@@ -336,7 +341,8 @@
            cors-allow-headers compartment-overrides token-claims
            enforce-smart-scopes? bulk-job-store bulk-manifest-extension login-url lifecycle
            tx-metadata temporal-canonicals legacy-realm-blind-fallback? jwt-issuer jwt-audiences
-           jwt-access-tokens-only? jwt-delegating-clients smart-discovery capability-metadata]}]
+           jwt-access-tokens-only? jwt-delegating-clients smart-discovery capability-metadata
+           keto-subject-prefixes]}]
   (when-not (or (nil? bulk-manifest-extension)
                 (and (map? bulk-manifest-extension)
                      (every? string? (keys bulk-manifest-extension))))
@@ -363,6 +369,7 @@
                                    (not= "0" (System/getenv "KETO_LEGACY_REALM_BLIND_FALLBACK"))
 
                                    :else keto/default-legacy-realm-blind-fallback?)
+   :keto-subject-prefixes (keto/check-subject-prefixes keto-subject-prefixes)
    :login-url             login-url
    :enforce-smart-scopes? (if (some? enforce-smart-scopes?)
                             enforce-smart-scopes?
@@ -495,7 +502,7 @@
                  jwt-access-tokens-only? jwt-delegating-clients enforce-smart-scopes? login-url
                  narrative lifecycle tx-metadata temporal-canonicals
                  legacy-realm-blind-fallback? compartment-definitions token-claims
-                 smart-discovery capability-metadata]
+                 smart-discovery capability-metadata keto-subject-prefixes]
           :or {legacy-realm-blind-fallback? keto/default-legacy-realm-blind-fallback?
                compartment-definitions compartment/compartment-definitions}
           :as opts}]
@@ -580,7 +587,8 @@
                      handler
                      {:keto-url keto-url
                       :login-url login-url
-                      :legacy-realm-blind-fallback? legacy-realm-blind-fallback?}))})))
+                      :legacy-realm-blind-fallback? legacy-realm-blind-fallback?
+                      :subject-prefixes keto-subject-prefixes}))})))
 
 ;; ---------------------------------------------------------------------------
 ;; Recomposition helpers

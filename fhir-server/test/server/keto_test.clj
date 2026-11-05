@@ -424,3 +424,57 @@
 (deftest denial-text-without-a-type-or-realm
   (is (= "You don't have read access to system-level resources."
          (keto/denial-text {:relation "read"}))))
+
+(defn- subject-keto
+  "A hc/get stand-in that records each [subject object relation] it is asked
+   and allows exactly the ones in `allowed`."
+  [calls allowed]
+  (fn [_ opts]
+    (let [qp (:query-params opts)
+          asked [(get qp "subject_id") (get qp "object") (get qp "relation")]]
+      (swap! calls conj asked)
+      {:status 200 :body {:allowed (contains? allowed asked)}})))
+
+(deftest a-prefixed-subject-is-asked-once-the-bare-one-is-refused
+  (let [request {:identity {:sub "p1"}
+                 :request-method :get
+                 :path-params {:tenant-id "r1"}
+                 :fhir/resource-type "Measure"}
+        wrap (fn [opts] (keto/wrap-keto-authorization (fn [_] {:status 200})
+                                                      (merge {:keto-url "http://mock-keto"
+                                                              :legacy-realm-blind-fallback? false}
+                                                             opts)))]
+    (testing "a subject set whose members carry the prefix authorizes the person"
+      (let [calls (atom [])]
+        (with-redefs [hc/get (subject-keto calls #{["user:/p1" "r1/Measure" "read"]})]
+          (is (= 200 (:status ((wrap {:subject-prefixes ["user:/"]}) request))))
+          (is (= [["p1" "r1/Measure" "read"] ["user:/p1" "r1/Measure" "read"]] @calls)))))
+    (testing "a direct tuple still settles the request in one call"
+      (let [calls (atom [])]
+        (with-redefs [hc/get (subject-keto calls #{["p1" "r1/Measure" "read"]})]
+          (is (= 200 (:status ((wrap {:subject-prefixes ["user:/"]}) request))))
+          (is (= [["p1" "r1/Measure" "read"]] @calls)))))
+    (testing "without prefixes only the bare id is asked"
+      (let [calls (atom [])]
+        (with-redefs [hc/get (subject-keto calls #{["user:/p1" "r1/Measure" "read"]})]
+          (is (= 403 (:status ((wrap {}) request))))
+          (is (= [["p1" "r1/Measure" "read"]] @calls)))))
+    (testing "the read-only note is asked under every spelling too"
+      (with-redefs [hc/get (subject-keto (atom []) #{["user:/p1" "r1/Measure" "read"]})]
+        (is (= {:text "You don't have write access to Measure in realm r1. You have read access only."}
+               (-> ((wrap {:subject-prefixes ["user:/"]}) (assoc request :request-method :post))
+                   :body :issue first :details)))))
+    (testing "a delegated request is asked as its client only"
+      (let [calls (atom [])]
+        (with-redefs [hc/get (subject-keto calls #{["user:/svc" "r1/Measure" "read"]})]
+          (is (= 403 (:status ((wrap {:subject-prefixes ["user:/"]})
+                               (assoc request :fhir/delegation {:subject "p1" :client "svc"})))))
+          (is (= [["svc" "r1/Measure" "read"]] @calls)))))))
+
+(deftest check-subject-prefixes-refuses-bad-shapes
+  (is (nil? (keto/check-subject-prefixes nil)))
+  (is (nil? (keto/check-subject-prefixes [])))
+  (is (= ["user:/"] (keto/check-subject-prefixes '("user:/"))))
+  (is (thrown? clojure.lang.ExceptionInfo (keto/check-subject-prefixes "user:/")))
+  (is (thrown? clojure.lang.ExceptionInfo (keto/check-subject-prefixes [" "])))
+  (is (thrown? clojure.lang.ExceptionInfo (keto/check-subject-prefixes [:user]))))

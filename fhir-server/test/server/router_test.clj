@@ -649,7 +649,12 @@
       (is (identical? claims (:token-claims opts)))))
   (testing "a malformed override fails at startup"
     (is (thrown? clojure.lang.ExceptionInfo
-                 (router/resolve-options {:compartment-overrides {"Patient" {"Task" "requester"}}})))))
+                 (router/resolve-options {:compartment-overrides {"Patient" {"Task" "requester"}}}))))
+  (testing "Keto subject prefixes: none by default, carried through, refused when malformed"
+    (is (nil? (:keto-subject-prefixes (router/resolve-options {}))))
+    (is (= ["user:/"] (:keto-subject-prefixes (router/resolve-options {:keto-subject-prefixes ["user:/"]}))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (router/resolve-options {:keto-subject-prefixes "user:/"})))))
 
 (deftest host-extensions-reach-the-request
   (let [seen (atom nil)
