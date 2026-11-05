@@ -649,7 +649,13 @@
       (is (identical? claims (:token-claims opts)))))
   (testing "a malformed override fails at startup"
     (is (thrown? clojure.lang.ExceptionInfo
-                 (router/resolve-options {:compartment-overrides {"Patient" {"Task" "requester"}}})))))
+                 (router/resolve-options {:compartment-overrides {"Patient" {"Task" "requester"}}}))))
+  (testing "open Keto relations: none by default, normalized when given, refused when malformed"
+    (is (nil? (:keto-open-relations (router/resolve-options {}))))
+    (is (= {"r1" {"Measure" #{"read"}}}
+           (:keto-open-relations (router/resolve-options {:keto-open-relations {"r1" {"Measure" ["read"]}}}))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (router/resolve-options {:keto-open-relations {"r1" {"Measure" "read"}}})))))
 
 (deftest host-extensions-reach-the-request
   (let [seen (atom nil)
