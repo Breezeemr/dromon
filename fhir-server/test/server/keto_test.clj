@@ -424,3 +424,47 @@
 (deftest denial-text-without-a-type-or-realm
   (is (= "You don't have read access to system-level resources."
          (keto/denial-text {:relation "read"}))))
+
+(deftest open-relations-pass-without-asking-keto
+  (let [calls (atom [])
+        open {"r1" {"Measure" #{"read" "write"}}}
+        wrapped (keto/wrap-keto-authorization (fn [_] {:status 200})
+                                              {:keto-url "http://mock-keto"
+                                               :legacy-realm-blind-fallback? false
+                                               :open-relations open})
+        request (fn [method realm & {:keys [id uri fhir-type sub] :or {fhir-type "Measure" sub "user123"}}]
+                  (cond-> {:request-method method
+                           :path-params (cond-> {:tenant-id realm} id (assoc :id id))
+                           :fhir/resource-type fhir-type}
+                    sub (assoc :identity {:sub sub})
+                    uri (assoc :uri uri)))]
+    (with-redefs [hc/get (recording-keto calls (fn [_ _] false))]
+      (testing "an open relation at type, instance and operation level"
+        (is (= 200 (:status (wrapped (request :get "r1")))))
+        (is (= 200 (:status (wrapped (request :get "r1" :id "m1")))))
+        (is (= 200 (:status (wrapped (request :post "r1" :uri "/r1/fhir/Measure/$evaluate-measure")))))
+        (is (empty? @calls) "Keto is not asked"))
+      (testing "a relation, type or realm that is not listed still asks Keto"
+        (is (= 403 (:status (wrapped (request :delete "r1")))))
+        (is (= 403 (:status (wrapped (request :get "r1" :fhir-type "MeasureReport")))))
+        (is (= 403 (:status (wrapped (request :get "r2")))))
+        (is (= [["r1/Measure" "delete"] ["r1/Measure" "read"]
+                ["r1/MeasureReport" "read"]
+                ["r2/Measure" "read"]]
+               (mapv (juxt :object :relation) @calls))))
+      (testing "a request with no subject is still unauthenticated"
+        (is (= 401 (:status (wrapped (request :get "r1" :sub nil)))))))))
+
+(deftest check-open-relations-normalizes-and-refuses-bad-shapes
+  (is (nil? (keto/check-open-relations nil)))
+  (is (nil? (keto/check-open-relations {})))
+  (is (nil? (keto/check-open-relations {"r1" {"Measure" []}})) "an empty relation list opens nothing")
+  (is (= {"r1" {"Measure" #{"read" "write"}}}
+         (keto/check-open-relations {"r1" {"Measure" ["read" "write" "read"] "Task" []}})))
+  (doseq [bad [["r1/Measure#read"]
+               {"r1" ["Measure"]}
+               {"r1" {"Measure" "read"}}
+               {"" {"Measure" #{"read"}}}
+               {"r1" {"Measure" #{" "}}}
+               {:r1 {"Measure" #{"read"}}}]]
+    (is (thrown? clojure.lang.ExceptionInfo (keto/check-open-relations bad)) (pr-str bad))))

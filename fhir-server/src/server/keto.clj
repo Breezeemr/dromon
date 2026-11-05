@@ -177,6 +177,48 @@
                            :diagnostics "Missing subject in identity; cannot authorize."}]}
            (not (str/blank? login-url)) (assoc :login-url login-url))})
 
+(defn check-open-relations
+  "`open-relations` validated and normalized, or nil when there are none.
+
+   The shape is `{realm {fhir-type #{relation}}}`: a request in `realm` on
+   `fhir-type` (type, instance or operation level) for `relation` needs no
+   Keto tuple. Any collection of relations is accepted and becomes a set.
+   Anything else throws, at startup: a misspelled shape that silently opened
+   nothing would read as missing tuples, and one that silently opened more
+   would be worse."
+  [open-relations]
+  (when (some? open-relations)
+    (let [non-blank? #(and (string? %) (not (str/blank? %)))
+          valid? (and (map? open-relations)
+                      (every? (fn [[realm types]]
+                                (and (non-blank? realm)
+                                     (map? types)
+                                     (every? (fn [[fhir-type relations]]
+                                               (and (non-blank? fhir-type)
+                                                    (coll? relations)
+                                                    (every? non-blank? relations)))
+                                             types)))
+                              open-relations))]
+      (when-not valid?
+        (throw (ex-info ":keto-open-relations must be {realm {fhir-type #{relation}}} with non-blank strings"
+                        {:keto-open-relations open-relations})))
+      (not-empty
+       (into {}
+             (keep (fn [[realm types]]
+                     (some->> types
+                              (keep (fn [[fhir-type relations]]
+                                      (when (seq relations) [fhir-type (set relations)])))
+                              (into {})
+                              not-empty
+                              (vector realm))))
+             open-relations)))))
+
+(defn open-relation?
+  "Whether `open-relations` (see [[check-open-relations]]) lets `relation` on
+   `fhir-type` in `realm` through without asking Keto."
+  [open-relations realm fhir-type relation]
+  (contains? (get-in open-relations [realm fhir-type]) relation))
+
 (defn denial-text
   "The person-facing sentence of a Keto 403, for `issue.details.text`.
 
@@ -218,8 +260,12 @@
    `unauthenticated-response`.
 
    `:legacy-realm-blind-fallback?` keeps the pre-realm-scoping objects as a
-   fallback; see `default-legacy-realm-blind-fallback?`."
-  [handler {:keys [keto-url login-url legacy-realm-blind-fallback?]
+   fallback; see `default-legacy-realm-blind-fallback?`.
+
+   `:open-relations` (see [[check-open-relations]]) lets a request with a
+   subject through without asking Keto when its realm, type and relation are
+   listed. A request without a subject still gets the 401."
+  [handler {:keys [keto-url login-url legacy-realm-blind-fallback? open-relations]
             :or {keto-url default-keto-url
                  legacy-realm-blind-fallback? default-legacy-realm-blind-fallback?}}]
   (fn [request]
@@ -277,8 +323,15 @@
           (log/info "Keto authz -> subject:" subject-id
                     (if delegation (str "(delegated by " (:subject delegation) ")") "")
                     "relation:" relation "object:" object "uri:" uri)
-          (if (not subject-id)
+          (cond
+            (not subject-id)
             (unauthenticated-response login-url)
+
+            (open-relation? open-relations realm fhir-type relation)
+            (do (log/info "Keto authz -> open relation, Keto not asked:" relation object)
+                (handler request))
+
+            :else
             (let [allowed? (ftrace/trace!
                             {:id :authz/keto.check
                              :data {:subject-id subject-id
