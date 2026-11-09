@@ -3322,7 +3322,10 @@
                                         (entry-if-match em current))
                              ;; Known once the transaction commits.
                              vid :commit-time
-                             write (lifecycle-write (assoc lc-ctx :opts (entry-opts opts if-match))
+                             write (lifecycle-write (assoc lc-ctx :opts
+                                                           (cond-> (entry-opts opts if-match)
+                                                             (= "PUT" method)
+                                                             (lc/with-if-none-match (:if-none-match em))))
                                                     node
                                                     (if (= "POST" method) :create :update)
                                                     resource-type id (:resource em))

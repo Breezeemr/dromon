@@ -320,6 +320,24 @@
           (is (= 2 (count (after-commits calls))))
           (is (= true (:active (db/read-resource store tenant :Patient "g1")))))))))
 
+(deftest transaction-put-if-none-match-any-reaches-the-write
+  (each-mode [store {}]
+    (let [opts (atom [])
+          store (assoc store :resource/lifecycle
+                       (reify lc/IWriteLifecycle
+                         (prepare [_ write]
+                           (swap! opts conj (:opts write))
+                           (:resource write))
+                         (tx-ops [_ _] [])
+                         (after-commit [_ _])))
+          put (fn [id inm]
+                {:request (cond-> {:method "PUT" :url (str "Patient/" id)}
+                            inm (assoc :ifNoneMatch inm))
+                 :resource {:active true}})]
+      (db/transact-transaction store tenant [(put "a" "*") (put "b" nil)])
+      (is (= #{{:if-none-match :any} nil} (set @opts)))
+      (is (= 2 (count @opts))))))
+
 (deftest batch-bundle-fires-per-entry
   (each-mode [store {}]
     (let [calls (atom [])
