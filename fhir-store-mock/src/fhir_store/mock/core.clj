@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [fhir-store.protocol :as protocol]
             [fhir-store.lifecycle :as lc]
+            [malli.core :as m]
             [taoensso.telemere :as t]
             [fhir-store.trace :as ftrace]))
 
@@ -747,6 +748,59 @@
   [resource]
   (walk/postwalk wire-value resource))
 
+;; ---------------------------------------------------------------------------
+;; Write validation
+;;
+;; A write verb takes the decoded form: what the router's request coercion
+;; hands a handler, already checked against the type's cap schema there. An
+;; in-process caller skips the router, and the Datomic store accepts what it
+;; is given and types it by attribute (a Long in a decimal is stored as a
+;; BigDecimal), so a write that was never decoded goes unnoticed against
+;; either store. Given :resource/schemas, the mock checks every write against
+;; the schema the router would have, and refuses one that fails with the
+;; router's status for it: a 422.
+;; ---------------------------------------------------------------------------
+
+(defn- write-validators
+  "resource-type key -> a delayed explainer for that type's cap schema (the
+   schema itself when its properties name none), for every schema in
+   `schemas` that names its :resourceType. Delayed because a capability
+   carries one schema per type and a test touches a few of them."
+  [schemas]
+  (into {}
+        (keep (fn [schema]
+                (let [props (try (m/properties schema) (catch Exception _ nil))]
+                  (when-let [rt (:resourceType props)]
+                    [(type-key rt) (delay (m/explainer (or (:fhir/cap-schema props) schema)))]))))
+        schemas))
+
+(defn- element-path
+  "A malli error's `:in` as a FHIR element path: `Observation.code.coding[0]`."
+  [rt in]
+  (apply str (name rt) (map #(if (integer? %) (str "[" % "]") (str "." (name %))) in)))
+
+(defn- check-write!
+  "Throws a 422 when `resource` does not satisfy `rt`'s schema, naming each
+   failing element path in the message and in `:fhir/expression` (the
+   OperationOutcome issue's expression), with the schema type it failed.
+   Never a value: malli's own messages can carry one (malli-decimal's
+   \"1 not decimal\"), and the message and ex-data reach the log."
+  [store rt resource]
+  (when-let [explainer (get (:write-validators store) rt)]
+    (when-let [{:keys [errors]} (@explainer resource)]
+      (let [paths (into [] (comp (map #(element-path rt (:in %))) (distinct)) errors)]
+        (throw (ex-info (str "The " (name rt) " written does not satisfy its schema at "
+                             (str/join ", " paths))
+                        {:fhir/status 422
+                         :fhir/code "invalid"
+                         :fhir/expression paths
+                         :resource-type (name rt)
+                         :errors (mapv (fn [{:keys [in schema type]}]
+                                         (cond-> {:path (element-path rt in)
+                                                  :schema-type (m/type schema)}
+                                           type (assoc :type type)))
+                                       errors)}))))))
+
 (defn- stamp-version
   "The stored form of a version: the body in wire form (see `wire-form`), id
    and meta set, the write's basis attached. meta.lastUpdated is the basis's
@@ -866,6 +920,7 @@
   (create-resource [this tenant-id resource-type id resource opts]
     (let [tid (tenant-key tenant-id)
           rt (type-key resource-type)
+          _ (check-write! this rt resource)
           id (or id (mint-id this))
           write (atom nil)
           result (atom nil)
@@ -915,6 +970,7 @@
   (update-resource [this tenant-id resource-type id resource opts]
     (let [tid (tenant-key tenant-id)
           rt (type-key resource-type)
+          _ (check-write! this rt resource)
           expected (protocol/normalize-if-match (:if-match opts))
           result (atom nil)
           write (atom nil)
@@ -1370,6 +1426,12 @@
    - :strict-search?, whether a search parameter the matcher cannot evaluate
      is refused with a 501 (see fhir-store.mock.test-setup/strict-search!).
      Defaults to false.
+   - :resource/schemas, the compiled schemas `fhir-store.protocol/create-store`
+     names. Given them, every create and update -- a transaction or batch
+     entry's included -- is checked against its type's cap schema before the
+     lifecycle sees it, and one that fails is refused with a 422 (see
+     `check-write!`). A type with no schema, and a store given none, are not
+     checked.
 
    The store's :harness atom holds pins, strict mode and the log; with the
    defaults above it changes nothing."
@@ -1380,6 +1442,7 @@
            :clock (or (:clock options) #(java.time.Instant/now))
            :id-fn (or (:id-fn options) new-id)
            :registries (update-keys (or (:registries options) {}) type-key)
+           :write-validators (write-validators (:resource/schemas options))
            :harness (atom {:pins {}
                            :strict? (boolean (:strict-search? options))
                            :record? (boolean (:record? options))
