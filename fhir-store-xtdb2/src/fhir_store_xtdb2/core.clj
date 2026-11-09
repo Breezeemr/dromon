@@ -492,8 +492,9 @@
    (into [id] (version-match-args vid))])
 
 (defn- if-none-match-op
-  "The ASSERT of a transaction entry's `ifNoneMatch`, which fails the whole
-   transaction at commit, as a 412, when it does not hold:
+  "The ASSERT of a Bundle entry's `ifNoneMatch`, which fails the whole
+   transaction at commit, as a 412, when it does not hold (a batch group's
+   transaction then runs the entry alone, to answer its own 412):
 
    - `*` on `HEAD` (a fence) or `PUT` (R5 conditional update): no current
      `resource-type`/`id` exists.
@@ -516,7 +517,7 @@
        (into [id] (version-match-args v))]
 
       :else
-      (throw (ex-info (str "A transaction entry's ifNoneMatch is supported only as \"*\" on HEAD"
+      (throw (ex-info (str "A Bundle entry's ifNoneMatch is supported only as \"*\" on HEAD"
                            " and as \"*\" or a version ETag on PUT, not "
                            (pr-str if-none-match) " on " method)
                       {:fhir/status 400 :fhir/code "not-supported"
@@ -2777,15 +2778,18 @@
                        last-mod (assoc :lastModified last-mod))})
 
         "PUT"
-        (let [res (if-let [o (entry-opts opts entry-if-match)]
-                    (fp/update-resource store tenant-id (keyword resource-type) id resource o)
-                    (fp/update-resource store tenant-id (keyword resource-type) id resource))
-              vid (get-in res [:meta :versionId])
-              last-mod (str (get-in res [:meta :lastUpdated]))]
-          {:resource res
-           :response (cond-> {:status "200 OK"}
-                       vid (assoc :etag (str "W/\"" vid "\""))
-                       last-mod (assoc :lastModified last-mod))})
+        (if (some? (fp/entry-if-none-match entry))
+          ;; Checked with the write, as a transaction entry's is.
+          (fp/transact-batch-entry store tenant-id entry opts)
+          (let [res (if-let [o (entry-opts opts entry-if-match)]
+                      (fp/update-resource store tenant-id (keyword resource-type) id resource o)
+                      (fp/update-resource store tenant-id (keyword resource-type) id resource))
+                vid (get-in res [:meta :versionId])
+                last-mod (str (get-in res [:meta :lastUpdated]))]
+            {:resource res
+             :response (cond-> {:status "200 OK"}
+                         vid (assoc :etag (str "W/\"" vid "\""))
+                         last-mod (assoc :lastModified last-mod))}))
 
         "DELETE"
         (do (if-let [o (entry-opts opts entry-if-match)]
@@ -2836,7 +2840,8 @@
         [resource-type id] (when (string? (:url req)) (str/split (:url req) #"/"))
         if-match (or (:ifMatch req) (get req "ifMatch"))
         base {:idx idx :entry entry :method method :resource-type resource-type :id id
-              :key [resource-type id] :if-match if-match}]
+              :key [resource-type id] :if-match if-match
+              :if-none-match (fp/entry-if-none-match entry)}]
     (case method
       ("POST" "PUT" "DELETE")
       (if (and (not (str/blank? resource-type))
@@ -2881,7 +2886,7 @@
    `stamp` is the Bundle's stamp text: each plan carries its own stamp op, so
    a plan taken out of the group takes its stamp with it."
   [store tenant-id opts stamp db versions
-   {:keys [method resource-type id if-match entry] :as e}]
+   {:keys [method resource-type id if-match if-none-match entry] :as e}]
   (let [{:keys [query-mode storage-encoders]} store
         id (if (= "POST" method) (str (java.util.UUID/randomUUID)) id)
         _ (refuse-unencodable-input! {:resource-type resource-type :id id})
@@ -2889,14 +2894,22 @@
                 (entry-if-match {:if-match (fp/normalize-if-match if-match)
                                  :resource-type resource-type :id id}
                                 (get versions [resource-type id])))
-        assert-ops (cond-> [] guard (conj (version-assert-op resource-type id guard)))]
+        ;; A PUT's ifNoneMatch is asserted in the group's transaction, as
+        ;; in a transaction Bundle's; a value it refuses leaves the entry
+        ;; unplanned, to answer alone.
+        inm? (and (= "PUT" method) (some? if-none-match))
+        assert-ops (cond-> []
+                     guard (conj (version-assert-op resource-type id guard))
+                     inm? (conj (if-none-match-op {:method method :resource-type resource-type
+                                                   :id id :if-none-match if-none-match})))]
     (if (= "DELETE" method)
       (assoc e :id id :ops (first (delete-tx-ops (first assert-ops)
                                                  (txm/delete-op stamp (table-name resource-type)
                                                                 resource-type id)
                                                  (delete-op query-mode resource-type id))))
       (let [;; As the entry's own verb: a POST takes no If-Match.
-            lc-opts (entry-opts opts (when (= "PUT" method) if-match))
+            lc-opts (cond-> (entry-opts opts (when (= "PUT" method) if-match))
+                      inm? (lc/with-if-none-match if-none-match))
             write (lifecycle-write (lifecycle-ctx store tenant-id lc-opts)
                                    db
                                    (if (= "POST" method) :create :update)

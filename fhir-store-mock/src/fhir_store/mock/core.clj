@@ -666,16 +666,17 @@
                if-match (assoc :if-match if-match))))
 
 (defn- check-put-if-none-match!
-  "Refuse a transaction PUT entry whose `ifNoneMatch` does not hold against
-   the transaction's state so far (R5 conditional update): `*` fails 412 when
-   the resource exists, a version ETag fails 412 when that version of it
-   exists, current or in its history. A blank value is a 400."
+  "Refuse a Bundle PUT entry whose `ifNoneMatch` does not hold against the
+   transaction's state so far (R5 conditional update): `*` fails 412 when the
+   resource exists, a version ETag fails 412 when that version of it exists,
+   current or in its history. A blank value is a 400. A batch runs such an
+   entry as a transaction of its own."
   [store tenant-id rt type id url inm]
   (let [s (str/trim (str inm))
         v (when-not (str/blank? s) (protocol/normalize-if-match s))]
     (cond
       (nil? v)
-      (throw (ex-info (str "A transaction PUT entry's ifNoneMatch must be \"*\" or a version ETag, not "
+      (throw (ex-info (str "A Bundle PUT entry's ifNoneMatch must be \"*\" or a version ETag, not "
                            (pr-str inm))
                       {:fhir/status 400 :fhir/code "not-supported" :method "PUT" :url url}))
 
@@ -1161,14 +1162,16 @@
                                    last-mod (assoc :lastModified last-mod))})
 
                     "PUT"
-                    (let [res (update-with this tenant-id rt id resource
-                                           (entry-opts opts entry-if-match))
-                          vid (get-in res [:meta :versionId])
-                          last-mod (str (get-in res [:meta :lastUpdated]))]
-                      {:resource res
-                       :response (cond-> {:status "200 OK"}
-                                   vid (assoc :etag (str "W/\"" vid "\""))
-                                   last-mod (assoc :lastModified last-mod))})
+                    (if (some? (protocol/entry-if-none-match entry))
+                      (protocol/transact-batch-entry this tenant-id entry opts)
+                      (let [res (update-with this tenant-id rt id resource
+                                             (entry-opts opts entry-if-match))
+                            vid (get-in res [:meta :versionId])
+                            last-mod (str (get-in res [:meta :lastUpdated]))]
+                        {:resource res
+                         :response (cond-> {:status "200 OK"}
+                                     vid (assoc :etag (str "W/\"" vid "\""))
+                                     last-mod (assoc :lastModified last-mod))}))
 
                     "DELETE"
                     (do (delete-with this tenant-id rt id (entry-opts opts entry-if-match))

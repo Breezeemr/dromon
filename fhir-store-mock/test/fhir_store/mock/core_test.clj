@@ -551,3 +551,32 @@
     (testing "a blank ifNoneMatch is refused, never ignored"
       (is (= 400 (status [(put "blank" "  ")])))
       (is (nil? (protocol/read-resource store tenant "Patient" "blank"))))))
+
+(deftest a-batch-put-if-none-match-answers-in-its-place
+  (let [store (mock/create-mock-store {})
+        tenant "test-tenant"
+        put (fn [id inm] {:request (cond-> {:method "PUT" :url (str "Patient/" id)}
+                                     inm (assoc :ifNoneMatch inm))
+                          :resource {:resourceType "Patient" :id id :active true}})
+        statuses (fn [entries]
+                   (mapv #(subs (get-in % [:response :status]) 0 3)
+                         (:entry (protocol/transact-bundle store tenant entries))))
+        vid (fn [id] (get-in (protocol/read-resource store tenant "Patient" id) [:meta :versionId]))]
+    (testing "* writes while the resource is absent"
+      (is (= ["200"] (statuses [(put "a" "*")])))
+      (is (some? (protocol/read-resource store tenant "Patient" "a"))))
+    (testing "* once it exists is that entry's 412, nothing written; its siblings land"
+      (let [before (protocol/read-resource store tenant "Patient" "a")]
+        (is (= ["200" "412" "200"] (statuses [(put "s1" nil) (put "a" "*") (put "s2" nil)])))
+        (is (= before (protocol/read-resource store tenant "Patient" "a")))
+        (is (some? (protocol/read-resource store tenant "Patient" "s2")))))
+    (testing "a version ETag fails while that version exists, current or historical"
+      (protocol/create-resource store tenant "Patient" "v" {:resourceType "Patient"})
+      (let [v1 (vid "v")]
+        (protocol/update-resource store tenant "Patient" "v" {:resourceType "Patient" :active false})
+        (let [v2 (vid "v")]
+          (is (= ["412" "412"] (statuses [(put "v" (str "W/\"" v2 "\"")) (put "v" (str "W/\"" v1 "\""))])))
+          (is (= v2 (vid "v")) "nothing was written"))))
+    (testing "a blank ifNoneMatch is refused in its place, never ignored"
+      (is (= ["400" "200"] (statuses [(put "blank" "  ") (put "s3" nil)])))
+      (is (nil? (protocol/read-resource store tenant "Patient" "blank"))))))
