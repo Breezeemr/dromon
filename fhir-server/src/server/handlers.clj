@@ -304,6 +304,43 @@
         (not-empty (into #{} (keep (comp etag-version str/trim))
                          (str/split value #",")))))))
 
+(defn- parse-write-if-none-match
+  "What an If-None-Match header asks of a PUT: `:any` for `*` (create the
+   resource only if it does not exist, FHIR conditional create by PUT), nil
+   when the client sent none, or `{:error <400 response>}` for any other
+   value.
+
+   Strict, unlike the read-side `parse-if-none-match`: on a write the header
+   is a precondition, and one ignored turns a create-only PUT into an
+   overwrite."
+  [request]
+  (when-some [raw (get-in request [:headers "if-none-match"])]
+    (if (= "*" (str/trim raw))
+      :any
+      {:error {:status 400
+               :body {:resourceType "OperationOutcome"
+                      :issue [{:severity "error"
+                               :code "not-supported"
+                               :diagnostics (str "Invalid If-None-Match header on a PUT: '" raw
+                                                 "'. This server accepts only *, meaning create "
+                                                 "the resource only if it does not exist.")}]}}})))
+
+(defn- update-create-opts
+  "The opts of a PUT that creates the resource at the id the client chose:
+   `:update-create?` so a lifecycle can tell it from a POST, and the client's
+   `:if-none-match`."
+  [if-none-match]
+  (cond-> {:update-create? true}
+    if-none-match (assoc :if-none-match if-none-match)))
+
+(defn- resource-exists-response [resource-type id actual]
+  {:status 412
+   :body {:resourceType "OperationOutcome"
+          :issue [{:severity "error"
+                   :code "conflict"
+                   :diagnostics (str "If-None-Match: * failed: " resource-type "/" id
+                                     " exists, at version " actual)}]}})
+
 (defn- parse-if-modified-since
   "Parse If-Modified-Since header as Instant."
   [request]
@@ -473,12 +510,23 @@
                                                   resource-type
                                                   (get-in req [:parameters :body]))
         body-id (:id resource-body)
-        expected-version (parse-if-match req)]
+        expected-version (parse-if-match req)
+        if-none-match (parse-write-if-none-match req)]
     (cond
       ;; An If-Match we cannot act on is refused before anything is written.
       ;; Falling through to the unconditional path below would turn the
       ;; client's guard into a lost update.
       (:error expected-version) (:error expected-version)
+      (:error if-none-match) (:error if-none-match)
+
+      (and expected-version if-none-match)
+      {:status 400
+       :body {:resourceType "OperationOutcome"
+              :issue [{:severity "error"
+                       :code "invalid"
+                       :diagnostics (str "If-Match and If-None-Match: * contradict each other: "
+                                         "one updates an existing resource, the other creates "
+                                         "a missing one. Send one of them.")}]}}
 
       (and body-id (not= body-id id))
       {:status 400
@@ -497,13 +545,22 @@
 
       ;; Without If-Match: preserve the create-with-client-id upsert path
       ;; for nonexistent resources. Existing resources take the normal
-      ;; update path.
+      ;; update path, unless the client asked to create only. A create racing
+      ;; this read still meets the store's existence check, which a create
+      ;; at a client's id always runs.
       :else
       (let [existing (db/read-resource store tenant-id (keyword resource-type) id)]
-        (if existing
+        (cond
+          (and existing if-none-match)
+          (resource-exists-response resource-type id (get-in existing [:meta :versionId]))
+
+          existing
           (let [res (update! req store tenant-id (keyword resource-type) id resource-body)]
             {:status 200 :body (narrative/present-response req :update resource-type res)})
-          (let [res (create! req store tenant-id (keyword resource-type) id resource-body)
+
+          :else
+          (let [res (create! req store tenant-id (keyword resource-type) id resource-body
+                             (update-create-opts if-none-match))
                 base-url (str (fhir-base req) "/" resource-type "/" id)
                 vid (get-in res [:meta :versionId])]
             {:status 201
@@ -1202,19 +1259,29 @@
                                                   resource-type
                                                   (get-in req [:parameters :body]))
         search-registry (:fhir/search-registry req)
-        params (merge (or (:query-params req) {}) (or (:form-params req) {}))]
+        params (merge (or (:query-params req) {}) (or (:form-params req) {}))
+        if-none-match (parse-write-if-none-match req)]
     (or
+     (:error if-none-match)
      (conditional-criteria-error resource-type search-registry params)
      (let [results (db/search store tenant-id (keyword resource-type)
                               (assoc params :_count 2 :_skip 0) search-registry)
            match-count (count results)]
        (cond
+         (and if-none-match (pos? match-count))
+         (let [existing (first results)]
+           (resource-exists-response resource-type (:id existing)
+                                     (get-in existing [:meta :versionId])))
+
          (zero? match-count)
          ;; No matches: create
          (let [minted? (nil? (:id resource-body))
                id (or (:id resource-body) (str (java.util.UUID/randomUUID)))
                res (create! req store tenant-id (keyword resource-type) id resource-body
-                            (when minted? {:id-minted? true}))
+                            (if minted?
+                              (cond-> {:id-minted? true}
+                                if-none-match (assoc :if-none-match if-none-match))
+                              (update-create-opts if-none-match)))
                base-url (str (fhir-base req) "/" resource-type "/" id)
                vid (get-in res [:meta :versionId])]
            {:status 201

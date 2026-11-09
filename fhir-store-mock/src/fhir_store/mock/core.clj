@@ -1064,7 +1064,8 @@
                                                  _ (when (some? inm)
                                                      (check-put-if-none-match! this tenant-id rt type id url inm))
                                                  res (update-with this tenant-id rt id resource
-                                                                  (entry-opts opts entry-if-match))
+                                                                  (lc/with-if-none-match
+                                                                   (entry-opts opts entry-if-match) inm))
                                                  vid (get-in res [:meta :versionId])
                                                  last-mod (str (get-in res [:meta :lastUpdated]))]
                                              {:resource res

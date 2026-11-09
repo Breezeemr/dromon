@@ -64,7 +64,24 @@
                      plain arity: `:if-match`, `:tx-metadata`, and any key a
                      host passes for its own lifecycle. A transaction or batch
                      Bundle's opts reach every entry's write map, with the
-                     entry's own If-Match in place of the Bundle's.
+                     entry's own If-Match in place of the Bundle's. Two more
+                     say how a create was asked for:
+                       :update-create?  true on a REST PUT (plain or
+                                        conditional) that creates the
+                                        resource at the id the client chose.
+                                        A POST never carries it.
+                       :if-none-match   `:any` when the client asked to
+                                        create only if the resource is
+                                        absent: `If-None-Match: *` on a REST
+                                        PUT, `request.ifNoneMatch` `*` on a
+                                        transaction Bundle's PUT entry. The
+                                        precondition is checked before or
+                                        with the write; a write that carries
+                                        it creates.
+                     A Bundle PUT entry, and any `update-resource` call, is
+                     `:method :update` whether or not the resource exists:
+                     the version it replaces (`read-in-basis`, below) is nil
+                     when it creates.
      :db             the store's read handle for this write. Datomic: the db
                      value the tx data is built from (inside a transaction
                      Bundle, the one db every entry is built from). xtdb2:
@@ -86,8 +103,8 @@
      :store          the store itself.
 
    WHO IS WRITING. dromon never puts a host key into `:opts`, and its router
-   builds opts only from the If-Match header and the host's `:tx-metadata`
-   producer. So a host that needs to tell its own trusted writers apart (an
+   builds opts only from the If-Match and If-None-Match headers, the request
+   method, and the host's `:tx-metadata` producer. So a host that needs to tell its own trusted writers apart (an
    operation, a background worker) passes a key of its own beside them, such
    as `:write/origin`, on the writes it makes, and a write through the FHIR
    surface arrives without one. A store forwards the map and never reads a
@@ -177,7 +194,8 @@
    Stores and the server call the helpers below rather than the protocol
    methods, so a call site is one line and a nil lifecycle, or one that
    implements only some of the protocols, needs no branch of its own."
-  (:require [taoensso.telemere :as tel]))
+  (:require [clojure.string :as str]
+            [taoensso.telemere :as tel]))
 
 (defprotocol IWriteLifecycle
   (prepare [this write]
@@ -203,6 +221,14 @@
   (schema-tx [this]
     "Store-dialect schema the lifecycle needs installed per tenant (Datomic
      attribute maps). Schemaless stores ignore it."))
+
+(defn with-if-none-match
+  "`opts` for a transaction Bundle PUT entry whose `request.ifNoneMatch` is
+   `if-none-match`: with `:if-none-match :any` for `*`, unchanged otherwise.
+   Only a store that checks the entry's ifNoneMatch passes it on."
+  [opts if-none-match]
+  (cond-> opts
+    (= "*" (some-> if-none-match str str/trim)) (assoc :if-none-match :any)))
 
 (defn lifecycle?
   "True when `x` implements IWriteLifecycle or IReadLifecycle."

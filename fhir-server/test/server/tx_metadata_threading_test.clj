@@ -122,7 +122,7 @@
       (handlers/conditional-update
        (-> (req st "Substance" :body {:resourceType "Substance" :id "given"})
            (assoc :query-params {"_id" "no-match"} :fhir/search-registry {})))
-      (is (= [[:create :plain]] @seen)))
+      (is (= [[:create {:update-create? true}]] @seen)))
     (testing "and one creating without an id mints it"
       (reset! seen [])
       (handlers/conditional-update

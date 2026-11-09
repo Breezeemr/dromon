@@ -169,3 +169,19 @@
        [{:request {:method "POST" :url "Patient"} :resource {:active true}}]
        origin)
       (is (= [origin] (mapv last @seen))))))
+
+(deftest a-transaction-put-entry-forwards-if-none-match-any
+  (let [opts (atom [])
+        store (mock/create-mock-store
+               {:resource/lifecycle (reify lc/IWriteLifecycle
+                                      (prepare [_ write]
+                                        (swap! opts conj (:opts write))
+                                        (:resource write))
+                                      (tx-ops [_ _] [])
+                                      (after-commit [_ _]))})
+        put (fn [id inm] {:request (cond-> {:method "PUT" :url (str "Patient/" id)}
+                                     inm (assoc :ifNoneMatch inm))
+                          :resource {:resourceType "Patient" :id id}})]
+    (protocol/transact-transaction store tenant [(put "a" "*") (put "b" nil)])
+    (is (= [{:if-none-match :any} nil] @opts)
+        "only the entry that asked to create only if absent says so")))
