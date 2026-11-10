@@ -74,7 +74,8 @@
                                         create only if the resource is
                                         absent: `If-None-Match: *` on a REST
                                         PUT, `request.ifNoneMatch` `*` on a
-                                        transaction Bundle's PUT entry. The
+                                        transaction or batch Bundle's PUT
+                                        entry. The
                                         precondition is checked before or
                                         with the write; a write that carries
                                         it creates.
@@ -223,9 +224,10 @@
      attribute maps). Schemaless stores ignore it."))
 
 (defn with-if-none-match
-  "`opts` for a transaction Bundle PUT entry whose `request.ifNoneMatch` is
-   `if-none-match`: with `:if-none-match :any` for `*`, unchanged otherwise.
-   Only a store that checks the entry's ifNoneMatch passes it on."
+  "`opts` for a transaction or batch Bundle PUT entry whose
+   `request.ifNoneMatch` is `if-none-match`: with `:if-none-match :any` for
+   `*`, unchanged otherwise. Only a store that checks the entry's ifNoneMatch
+   passes it on."
   [opts if-none-match]
   (cond-> opts
     (= "*" (some-> if-none-match str str/trim)) (assoc :if-none-match :any)))

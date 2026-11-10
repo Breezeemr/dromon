@@ -203,3 +203,51 @@
       (is (= ["400 Bad Request" "400 Bad Request"] (statuses res)))
       (is (str/includes? (get-in res [:entry 0 :response :outcome :issue 0 :diagnostics])
                          "connection reset")))))
+
+(defn- put-inm [id active inm] (assoc-in (put id active) [:request :ifNoneMatch] inm))
+
+(deftest a-put-if-none-match-that-holds-writes-in-the-group
+  (each-mode [store {}]
+    (db/create-resource store tenant :Patient "seed" {:active true})
+    (let [opts (atom [])
+          store (assoc store :resource/lifecycle
+                       (reify lc/IWriteLifecycle
+                         (prepare [_ write]
+                           (swap! opts conj [(:id write) (:opts write)])
+                           (:resource write))
+                         (tx-ops [_ _] [])
+                         (after-commit [_ _])))
+          n (atom 0)
+          res (counting-txs n (db/transact-bundle store tenant
+                                                  [(put-inm "a" true "*") (put "b" true)]))]
+      (is (= ["200 OK" "200 OK"] (statuses res)))
+      (is (= 1 @n))
+      (is (= {"a" {:if-none-match :any} "b" nil} (into {} @opts))
+          "only the entry that asked to create only if absent says so")
+      (is (some? (db/read-resource store tenant :Patient "a"))))))
+
+(deftest a-put-if-none-match-that-fails-answers-412-in-its-place
+  (each-mode [store {}]
+    (let [v1 (get-in (db/create-resource store tenant :Patient "x" {:active true}) [:meta :versionId])
+          v2 (get-in (db/update-resource store tenant :Patient "x" {:active false}) [:meta :versionId])
+          res (db/transact-bundle store tenant
+                                  [(put "s1" true)
+                                   (put-inm "x" true "*")
+                                   (put-inm "x" true (etag v2))
+                                   (put-inm "x" true (etag v1))
+                                   (put "s2" true)])]
+      (is (= ["200 OK" "412 Precondition Failed" "412 Precondition Failed"
+              "412 Precondition Failed" "200 OK"]
+             (statuses res)))
+      (is (= v2 (get-in (db/read-resource store tenant :Patient "x") [:meta :versionId]))
+          "nothing was written")
+      (is (= false (:active (db/read-resource store tenant :Patient "x"))))
+      (is (some? (db/read-resource store tenant :Patient "s1")))
+      (is (some? (db/read-resource store tenant :Patient "s2"))))))
+
+(deftest a-put-if-none-match-the-store-refuses-answers-400-in-its-place
+  (each-mode [store {}]
+    (let [res (db/transact-bundle store tenant [(put-inm "blank" true "  ") (put "s" true)])]
+      (is (= ["400 Bad Request" "200 OK"] (statuses res)))
+      (is (nil? (db/read-resource store tenant :Patient "blank")))
+      (is (some? (db/read-resource store tenant :Patient "s"))))))

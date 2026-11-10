@@ -88,6 +88,42 @@
   (if (= if-match-any v) "*" v))
 
 ;; ---------------------------------------------------------------------------
+;; Bundle entry preconditions (request.ifNoneMatch)
+;; ---------------------------------------------------------------------------
+
+(defn entry-if-none-match
+  "A Bundle entry's `request.ifNoneMatch`, under either key spelling, or nil."
+  [entry]
+  (let [req (:request entry)]
+    (or (:ifNoneMatch req) (get req "ifNoneMatch"))))
+
+(declare transact-transaction)
+
+(defn transact-batch-entry
+  "Runs one batch Bundle entry as a transaction of its own and returns its
+   batch-response entry. A batch PUT entry that carries `request.ifNoneMatch`
+   runs this way, so the store checks the precondition exactly as its
+   transaction path does (`transact-transaction`): with the write, never in a
+   read before it, and with the same answer to every value.
+
+   A failed precondition (the entry's ifNoneMatch, or its own ifMatch) is
+   the entry's 412 response. Any other failure is thrown, for the batch's
+   own per-entry handling. The batch's `:if-match`, if any, is not the
+   entry's and is dropped."
+  [store tenant-id entry opts]
+  (try
+    (first (:entry (transact-transaction store tenant-id [entry]
+                                         (not-empty (dissoc opts :if-match)))))
+    (catch Exception e
+      (if (= 412 (some #(:fhir/status (ex-data %)) (take-while some? (iterate ex-cause e))))
+        {:response {:status "412 Precondition Failed"
+                    :outcome {:resourceType "OperationOutcome"
+                              :issue [{:severity "error"
+                                       :code "conflict"
+                                       :diagnostics (str "Entry failed: " (ex-message e))}]}}}
+        (throw e)))))
+
+;; ---------------------------------------------------------------------------
 ;; Transaction metadata (:tx-metadata)
 ;; ---------------------------------------------------------------------------
 
@@ -322,6 +358,12 @@
      independently. Per-entry failures do NOT affect other entries.
      Returns a Bundle of type `batch-response` whose :entry vector
      reports the status of each input entry in the original order.
+
+     A `PUT` entry's `request.ifNoneMatch` means what it means in
+     `transact-transaction`, checked as atomically, and is never ignored:
+     the entry answers 412 in its place when the precondition fails, and a
+     value the store does not accept fails it as any refused entry does.
+     `transact-batch-entry` runs such an entry.
 
      `opts` may contain:
      - :tx-metadata — the SAME stamp applied to each transaction the

@@ -185,3 +185,20 @@
     (protocol/transact-transaction store tenant [(put "a" "*") (put "b" nil)])
     (is (= [{:if-none-match :any} nil] @opts)
         "only the entry that asked to create only if absent says so")))
+
+(deftest a-batch-put-entry-forwards-if-none-match-any
+  (let [opts (atom [])
+        store (mock/create-mock-store
+               {:resource/lifecycle (reify lc/IWriteLifecycle
+                                      (prepare [_ write]
+                                        (swap! opts conj (:opts write))
+                                        (:resource write))
+                                      (tx-ops [_ _] [])
+                                      (after-commit [_ _]))})
+        put (fn [id inm] {:request (cond-> {:method "PUT" :url (str "Patient/" id)}
+                                     inm (assoc :ifNoneMatch inm))
+                          :resource {:resourceType "Patient" :id id}})
+        origin {:write/origin {:kind :test}}]
+    (protocol/transact-bundle store tenant [(put "a" "*") (put "b" nil)] origin)
+    (is (= [(assoc origin :if-none-match :any) origin] @opts)
+        "the entry that asked to create only if absent says so, beside the batch's own opts")))
