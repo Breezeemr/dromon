@@ -1620,6 +1620,28 @@
     (is (= [[[:ident] "a" "C.ident:a"]] (count-errors sch options (ident "A" "A" "C"))))
     (is (empty? uncompiled))))
 
+(deftest slice-counts-optional-field-hook-test
+  (let [asked (atom #{})
+        {:keys [schema options entry]}
+        (binding [fdm/*slice-minimum-optional-field-fn*
+                  (fn [{:keys [element-id]}] (swap! asked conj element-id) (= "C.ident" element-id))]
+          (generate-inherited true nil (counted-sds "open") :counts? true))
+        sch (schema "C")
+        errs (partial count-errors sch options)]
+    (is (= #{"C.ident"} @asked) "the hook is asked with the sliced element's id")
+    (testing "the mandatory slices no longer make the key required"
+      (is (not (false? (entry-optional sch :ident))))
+      (is (m/validate sch {} options))
+      (is (false? (get-in entry ["C" :slicings "C.ident" :required?]))))
+    (testing "the counts still apply when the field is present"
+      (is (= :and (m/type (mu/get sch :ident))))
+      (is (= [[[:ident] "a" "C.ident:a"] [[:ident] "c" "C.ident:c"]] (errs (ident "other"))))
+      (is (m/validate sch (ident "A" "C") options))))
+  (testing "a hook answering false keeps the key required"
+    (let [{:keys [schema]} (binding [fdm/*slice-minimum-optional-field-fn* (constantly false)]
+                             (generate-inherited true nil (counted-sds "open") :counts? true))]
+      (is (false? (entry-optional (schema "C") :ident))))))
+
 (deftest slice-counts-gate-off-emits-the-plain-sequential-test
   (let [{:keys [schema]} (generate-inherited true nil (counted-sds "open"))
         field (mu/get (schema "C") :ident)]
@@ -1886,6 +1908,7 @@
       (is (false? fdm/*honor-slice-root-profile*))
       (is (nil? fdm/*discriminator-claims-fn*))
       (is (nil? fdm/*count-soft-discriminator-fn*))
+      (is (nil? fdm/*slice-minimum-optional-field-fn*))
       (is (nil? fdm/*uncompiled-slices*))
       (is (nil? fdm/*slicings*)))
     (testing "the restated, added and counted slices emit what origin/main emitted"

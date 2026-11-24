@@ -836,3 +836,26 @@ empty, and the digest of `src src-r21 src-r11 resources` (768 files) is the same
 that agree 1,599 / 421 / 478 to 1,616 / 425 / 482; Schematron-only 83 / 12 / 23 to 66 / 8 / 19.
 The seeds' findings are unchanged, and so are the false rejections over the Schematron-clean
 mutants (24 / 2 / 6, every one a deleted templateId of the template itself).
+
+## 14. A slice minimum that holds only when the field is present (2026-11-23)
+
+**Mechanism.** `*compile-slice-counts*` makes a field with a counted slice of minimum
+above 0 a required key (`requires-field?`), because an absent field has no occurrences to
+count. Some profiles state a slice minimum that holds under a condition on the parent the
+definitions cannot express. A C-CDA "entries required" section may omit its entries when the
+section carries `@nullFlavor`, yet its entry slices are 1..*. A consumer that relaxes the
+sliced element to 0..* for that reason still gets a required key from the slices, so it had to
+relax the slices too, and then a section whose entries carry none of the required templates
+passed.
+
+**Hook, `*slice-minimum-optional-field-fn*` (default nil).** A predicate of
+`{:element-id}`, the sliced element's id, asked wherever `requires-field?` decides, for a
+slicing the definition declares and for one rebuilt from an inherited record. True keeps the
+field optional; the counted `:and` is emitted unchanged, so whenever the field is present each
+mandatory slice must still occur. The slicing record's `:required?` follows the hook. A field
+whose own element minimum is above 0 stays required through that minimum.
+
+**Tests.** `slice-counts-optional-field-hook-test`: the hook is asked with the sliced element's
+id, an instance without the field validates, an occurrence list without the mandatory slices
+reports both counts, and a hook answering false keeps the key required.
+`unbound-switches-reproduce-origin-main-test` checks the default.

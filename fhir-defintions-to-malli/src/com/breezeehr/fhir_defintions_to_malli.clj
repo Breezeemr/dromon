@@ -413,6 +413,19 @@
    output. See doc/inherited-slices-and-slice-counts.md section 5."
   false)
 
+(def ^:dynamic *slice-minimum-optional-field-fn*
+  "Optional predicate of {:element-id}, the sliced element's id. True keeps the
+   field optional although `*compile-slice-counts*` counts a slice with a
+   minimum above 0, which otherwise makes the field a required key. The counts
+   still apply whenever the field is present, so an occurrence list that lacks a
+   mandatory slice is rejected; only an absent field is let through. This is
+   for a profile whose slice minimums hold under a condition on the parent that
+   the definitions cannot state, such as a section whose entries may be omitted
+   when the section itself carries a null flavor. Nil (the default) keeps every
+   counted minimum required. See doc/inherited-slices-and-slice-counts.md
+   section 14."
+  nil)
+
 (def ^:dynamic *max-on-sequence*
   "When true, a profile that narrows the numeric `max` of a field that already
    repeats puts `{:max n}` on the field's :sequential, so an instance with more
@@ -1938,8 +1951,10 @@
             counted)]))
 
 (defn- requires-field?
-  [counted]
-  (boolean (some #(some-> (:min %) pos?) counted)))
+  [element-id counted]
+  (boolean (and (some #(some-> (:min %) pos?) counted)
+                (not (when-let [f *slice-minimum-optional-field-fn*]
+                       (f {:element-id element-id}))))))
 
 (defn- flush-own-slicings
   [acc]
@@ -2107,7 +2122,7 @@
                               [:multi {:dispatch ~dispatch-form}
                                ~@all-entries]])
                update-form `(~'mu/update ~base-k (~'fn [~'sch] ~multi-form))
-               required? (requires-field? counted)]
+               required? (requires-field? (:element-id group) counted)]
            (record-slicing! (:element-id group)
                             (assoc record :counted? (boolean (seq counted)) :required? required?))
            (cond-> (update acc :form conj update-form)
@@ -3238,7 +3253,7 @@
                                    [])))))
             with-required (fn [acc counted]
                             (cond-> acc
-                              (and (requires-field? counted) (not required?))
+                              (and (requires-field? element-id counted) (not required?))
                               (update :form conj
                                       `(~'mu/update-entry-properties ~base-k ~'merge {:optional false}))))
             inherited-dispatch `(~':dispatch (~'m/properties ~'multi))]
@@ -3251,7 +3266,7 @@
                              (assoc record
                                     :arms merged
                                     :counted? (boolean (seq counted))
-                                    :required? (or required? (requires-field? counted))))
+                                    :required? (or required? (requires-field? element-id counted))))
             (-> acc
                 (update :form conj
                         (emit (if need-rebuild? rebuilt-form inherited-dispatch)
@@ -3270,7 +3285,7 @@
                                  (assoc record
                                         :arms (mapv #(dissoc % :changed?) base-arms)
                                         :counted? (boolean (seq counted))
-                                        :required? (or required? (requires-field? counted))))
+                                        :required? (or required? (requires-field? element-id counted))))
                 (-> acc
                     (update :form conj
                             (emit inherited-dispatch (existing-entries (constantly true)) counted))
